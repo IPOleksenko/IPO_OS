@@ -28,14 +28,14 @@ static header_t* free_list;
 size_t heap_used = 0;
 
 size_t calculate_heap_size(multiboot_info_t* multiboot_info) {
-    // Calculating available physical memory
+    // Calculate available physical memory
     size_t mem_lower = multiboot_info->mem_lower << 10;
     size_t mem_upper = multiboot_info->mem_upper << 10;
 
     // Total memory in bytes
     size_t total_memory_kb = mem_lower + mem_upper;
 
-    // Calculating the heap size
+    // Calculate heap size
     size_t heap_size = (total_memory_kb / 100) * HEAP_SIZE_PERCENTAGE;
 
     return heap_size;
@@ -111,7 +111,7 @@ void kfree(void* ptr) {
         panic("Heap corruption detected!", "kheap.c", 92);
     }
 
-    heap_size -= header->size;
+    heap_used -= header->size;
 
     header->next = free_list;
     free_list = header;
