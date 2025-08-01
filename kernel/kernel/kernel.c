@@ -42,6 +42,9 @@ void kernel_main(__attribute__((unused)) multiboot_info_t* multiboot_info) {
     pic_init();
     timer_init();
     
+    // Initialize keyboard interrupt handler
+    keyboard_init();
+    
     // Initialize ATA driver
     ata_init();
     

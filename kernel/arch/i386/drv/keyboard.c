@@ -4,7 +4,43 @@
 #include <kernel/drv/keyboard.h>
 #include <kernel/drv/tty.h>
 #include <kernel/sys/ioports.h>
+#include <kernel/sys/isr.h>
 #include <kernel/drv/keymap.h>
+
+static bool extended_scancode = false;
+
+// Keyboard interrupt handler
+static void keyboard_irq_handler(__attribute__((unused)) registers_t r) {
+    uint8_t scancode = inb(0x60);
+    
+    // Handle extended scancodes
+    if (scancode == 0xE0) {
+        extended_scancode = true;
+        return;
+    }
+    
+    if (extended_scancode) {
+        extended_scancode = false;
+        
+        // Check if it's a key press (not release)
+        if (!(scancode & 0x80)) {
+            switch (scancode) {
+                case 0x48: // Up arrow
+                    scroll_up();
+                    return;
+                case 0x50: // Down arrow
+                    scroll_down();
+                    return;
+            }
+        }
+        return;
+    }
+}
+
+// Initialize keyboard interrupt handler
+void keyboard_init(void) {
+    install_irq_handler(1, keyboard_irq_handler);
+}
 
 char* keyboard_input() {
     static char input_buffer[256];
@@ -26,6 +62,11 @@ char* keyboard_input() {
             if (key_released == 0x2A || key_released == 0x36) { // Left or Right Shift released
                 shift_pressed = false;
             }
+            continue;
+        }
+
+        // Skip extended scancodes in input mode (handled by interrupt)
+        if (scancode == 0xE0) {
             continue;
         }
 

@@ -1,6 +1,7 @@
 #ifndef KEYBOARD_H
 #define KEYBOARD_H
 
-char* keyboard_input();
+void keyboard_init(void);
+char* keyboard_input(void);
 
 #endif
