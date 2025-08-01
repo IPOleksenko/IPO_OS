@@ -164,24 +164,39 @@ static file_entry_t* find_entry_in_directory(const char* name, uint32_t parent_i
 int fs_resolve_path(const char* path, uint32_t* parent_id, char* filename) {
     if (!fs || !path || !parent_id || !filename) return -1;
     
-    // Handle absolute vs relative paths
-    uint32_t current_dir = (path[0] == '/') ? 0 : fs->current_dir_id;
+    // Handle home directory prefix (~)
+    const char* actual_path = path;
+    uint32_t current_dir;
+    
+    if (path[0] == '~') {
+        // Start from root directory
+        current_dir = 0;
+        actual_path = path + 1;
+        // Skip slash after ~ if present
+        if (actual_path[0] == '/') {
+            actual_path++;
+        }
+    } else {
+        // Handle absolute vs relative paths
+        current_dir = (path[0] == '/') ? 0 : fs->current_dir_id;
+    }
     
     // Copy path for parsing - allocate dynamically
-    size_t path_len = strlen(path);
+    size_t path_len = strlen(actual_path);
     char* path_copy = (char*)kmalloc(path_len + 1);
     if (!path_copy) {
         return -1;
     }
-    strcpy(path_copy, path);
+    strcpy(path_copy, actual_path);
     
     // Skip leading slash for absolute paths
     char* start = (path_copy[0] == '/') ? path_copy + 1 : path_copy;
     
-    // If empty path after removing slash, we're at root
+    // If empty path after removing slash, we're at current directory
     if (*start == '\0') {
-        *parent_id = 0;
-        strcpy(filename, "/");
+        *parent_id = current_dir;
+        strcpy(filename, ".");
+        kfree(path_copy);
         return 0;
     }
     
@@ -227,11 +242,21 @@ int fs_resolve_path(const char* path, uint32_t* parent_id, char* filename) {
 file_entry_t* fs_find_entry_by_path(const char* path) {
     if (!path) return NULL;
     
+    // Handle special case for root directory
+    if (strcmp(path, "/") == 0 || strcmp(path, "~/") == 0 || strcmp(path, "~") == 0) {
+        return fs_find_entry_by_id(0); // Return root directory
+    }
+    
     uint32_t parent_id;
     char filename[MAX_FILENAME_LENGTH];
     
     if (fs_resolve_path(path, &parent_id, filename) != 0) {
         return NULL;
+    }
+    
+    // Handle special case where filename is "." (current directory)
+    if (strcmp(filename, ".") == 0) {
+        return fs_find_entry_by_id(parent_id);
     }
     
     return find_entry_in_directory(filename, parent_id);
@@ -523,6 +548,115 @@ int fs_rename_file(const char* old_path, const char* new_name) {
     return 0;
 }
 
+// Helper function to check if target_id is a subdirectory of source_id
+static int is_subdirectory(uint32_t source_id, uint32_t target_id) {
+    if (!fs || source_id == target_id) return 1;
+    
+    uint32_t current_id = target_id;
+    while (current_id != 0) {
+        if (current_id == source_id) return 1;
+        
+        file_entry_t* entry = fs_find_entry_by_id(current_id);
+        if (!entry) break;
+        current_id = entry->parent_id;
+    }
+    return 0;
+}
+
+// Move entry (file or directory) from source to destination path
+int fs_move_entry(const char* source_path, const char* dest_path) {
+    if (!fs || !source_path || !dest_path) return -1;
+    
+    // Find the source entry
+    file_entry_t* source_entry = fs_find_entry_by_path(source_path);
+    if (!source_entry) {
+        printf("Source '%s' not found\n", source_path);
+        return -1;
+    }
+    
+    // Cannot move root directory
+    if (source_entry->entry_id == 0) {
+        printf("Cannot move root directory\n");
+        return -1;
+    }
+    
+    // Check if destination is an existing directory
+    file_entry_t* dest_entry = fs_find_entry_by_path(dest_path);
+    uint32_t dest_parent_id;
+    char dest_filename[MAX_FILENAME_LENGTH];
+    
+    if (dest_entry && dest_entry->type == ENTRY_TYPE_DIRECTORY) {
+        // Moving to a directory - keep the original filename
+        dest_parent_id = dest_entry->entry_id;
+        strcpy(dest_filename, source_entry->name);
+        
+        // If moving a directory, check that we're not moving it into itself or its subdirectory
+        if (source_entry->type == ENTRY_TYPE_DIRECTORY) {
+            if (is_subdirectory(source_entry->entry_id, dest_parent_id)) {
+                printf("Cannot move directory into itself or its subdirectory\n");
+                return -1;
+            }
+        }
+    } else {
+        // Moving to a specific path (rename)
+        if (fs_resolve_path(dest_path, &dest_parent_id, dest_filename) != 0) {
+            printf("Invalid destination path '%s'\n", dest_path);
+            return -1;
+        }
+        
+        // Check if destination filename is valid
+        if (strlen(dest_filename) >= MAX_FILENAME_LENGTH) {
+            printf("Destination filename too long\n");
+            return -1;
+        }
+        
+        if (!is_valid_filename(dest_filename)) {
+            printf("Invalid destination filename. Name must be a single word without spaces or special characters\n");
+            return -1;
+        }
+        
+        // If moving a directory, check that we're not moving it into itself or its subdirectory
+        if (source_entry->type == ENTRY_TYPE_DIRECTORY) {
+            if (is_subdirectory(source_entry->entry_id, dest_parent_id)) {
+                printf("Cannot move directory into itself or its subdirectory\n");
+                return -1;
+            }
+        }
+    }
+    
+    // Check if destination already exists
+    if (find_entry_in_directory(dest_filename, dest_parent_id)) {
+        printf("Destination '%s' already exists\n", dest_path);
+        return -1;
+    }
+    
+    // Check if we're trying to move to the same location
+    if (source_entry->parent_id == dest_parent_id && strcmp(source_entry->name, dest_filename) == 0) {
+        printf("Source and destination are the same\n");
+        return -1;
+    }
+    
+    // Verify destination directory exists
+    if (dest_parent_id != 0) {  // If not root
+        file_entry_t* dest_dir = fs_find_entry_by_id(dest_parent_id);
+        if (!dest_dir || dest_dir->type != ENTRY_TYPE_DIRECTORY) {
+            printf("Destination directory does not exist\n");
+            return -1;
+        }
+    }
+    
+    // Perform the move by updating the file entry
+    source_entry->parent_id = dest_parent_id;
+    strcpy(source_entry->name, dest_filename);
+    
+    // Save changes to disk
+    fs_sync();
+    
+    const char* entry_type = (source_entry->type == ENTRY_TYPE_DIRECTORY) ? "Directory" : "File";
+    printf("%s moved from '%s' to '%s' successfully\n", entry_type, source_path, dest_path);
+    return 0;
+}
+
 // Change current directory
 int fs_change_directory(const char* path) {
     if (!fs) return -1;
@@ -727,7 +861,55 @@ int fs_delete_file(const char* path) {
 }
 
 int fs_write_file(const char* path, const void* data, size_t size) {
-    if (!fs || !path || !data || size == 0) return -1;
+    if (!fs || !path) return -1;
+    
+    // Allow NULL data and 0 size for clearing files
+    if (size == 0) {
+        // Handle file clearing case
+        file_entry_t* entry = fs_find_entry_by_path(path);
+        if (!entry) {
+            printf("File not found\n");
+            return -1;
+        }
+        
+        if (entry->type != ENTRY_TYPE_FILE) {
+            printf("Not a file\n");
+            return -1;
+        }
+        
+        // If file already contains data, free the space
+        if (entry->size > 0) {
+            uint32_t move_start = entry->data_offset + entry->size;
+            uint32_t move_size = fs->header.data_used - move_start;
+            
+            if (move_size > 0) {
+                memmove(fs->data_area + entry->data_offset,
+                       fs->data_area + move_start,
+                       move_size);
+                
+                // Update offsets of other files
+                for (uint32_t i = 0; i < fs->header.max_files; i++) {
+                    if (fs->files[i].used && fs->files[i].data_offset > entry->data_offset) {
+                        fs->files[i].data_offset -= entry->size;
+                    }
+                }
+            }
+            
+            fs->header.data_used -= entry->size;
+        }
+        
+        // Clear file size and data offset
+        entry->size = 0;
+        entry->data_offset = 0;
+        
+        // Save changes to disk
+        fs_sync();
+        
+        return 0;
+    }
+    
+    // Normal case - require valid data for non-zero size
+    if (!data) return -1;
     
     file_entry_t* entry = fs_find_entry_by_path(path);
     if (!entry) {

@@ -237,6 +237,26 @@ void cmd_read_file(const char* filename) {
     kfree(buffer);
 }
 
+void cmd_clear_file(const char* filename) {
+    if (!filename) {
+        terminal_writestring("Usage: truncate <filename>\n");
+        return;
+    }
+    
+    // Check if file exists
+    if (!fs_file_exists(filename)) {
+        printf("File '%s' not found\n", filename);
+        return;
+    }
+    
+    // Clear file by writing empty content
+    if (fs_write_file(filename, "", 0) == 0) {
+        printf("File '%s' cleared successfully\n", filename);
+    } else {
+        printf("Failed to clear file '%s'\n", filename);
+    }
+}
+
 // Directory commands
 void cmd_create_directory(const char* dirname) {
     if (!dirname) {
@@ -294,6 +314,17 @@ void cmd_rename(const char* old_name, const char* new_name) {
     }
 }
 
+void cmd_move_entry(const char* source_path, const char* dest_path) {
+    if (!source_path || !dest_path) {
+        terminal_writestring("Usage: mv <source_path> <dest_path>\n");
+        return;
+    }
+    
+    if (fs_move_entry(source_path, dest_path) != 0) {
+        // Error message is already printed by fs_move_entry
+    }
+}
+
 void cmd_change_directory(const char* dirname) {
     if (fs_change_directory(dirname) == 0) {
         printf("Changed to directory: %s\n", fs_get_current_path());
@@ -308,6 +339,62 @@ void cmd_change_directory(const char* dirname) {
 
 void cmd_print_working_directory(void) {
     printf("%s\n", fs_get_current_path());
+}
+
+// Help system functions
+void show_help_system(void) {
+    terminal_writestring("System Commands:\n");
+    terminal_writestring("  help              - Show this help message\n");
+    terminal_writestring("  help <category>   - Show help for specific category\n");
+    terminal_writestring("  meminfo           - Display RAM information\n");
+    terminal_writestring("  clear             - Clear the terminal screen\n");
+    terminal_writestring("  reboot            - Reboot PC\n");
+    terminal_writestring("  exit              - Exit the system\n");
+}
+
+void show_help_filesystem(void) {
+    terminal_writestring("File & Directory Management:\n");
+    terminal_writestring("  touch <filename> [content] - Create a new file with optional content\n");
+    terminal_writestring("  mkdir <dirname>   - Create a new directory\n");
+    terminal_writestring("  rm <filename>     - Delete a file\n");
+    terminal_writestring("  rmdir <dirname>   - Delete a directory\n");
+    terminal_writestring("  mv <source> <dest> - Move a file or directory to different location\n");
+    terminal_writestring("  rename <old_name> <new_name> - Rename a file or directory\n");
+    terminal_writestring("  ls                - List files and directories\n");
+}
+
+void show_help_file_content(void) {
+    terminal_writestring("File Content Operations:\n");
+    terminal_writestring("  echo <filename> <content> - Write content to file\n");
+    terminal_writestring("  cat <filename>    - Read file content\n");
+    terminal_writestring("  truncate <filename> - Clear file content (make file empty)\n");
+}
+
+void show_help_navigation(void) {
+    terminal_writestring("Navigation Commands:\n");
+    terminal_writestring("  pwd               - Print working directory\n");
+    terminal_writestring("  cd [dirname]      - Change directory (cd .. for parent, cd for root)\n");
+    terminal_writestring("  Note: Use ~ prefix for paths starting from home directory\n");
+    terminal_writestring("  Examples: cd ~/documents, mv file.txt ~/backup/\n");
+}
+
+void show_help_all(void) {
+    terminal_writestring("Available command categories:\n");
+    terminal_writestring("  help system       - System and control commands\n");
+    terminal_writestring("  help fs           - File & directory management\n");
+    terminal_writestring("  help content      - File content operations\n");
+    terminal_writestring("  help navigation   - Navigation and path commands\n");
+    terminal_writestring("\nUse 'help all' to see all commands at once.\n");
+}
+
+void show_help_complete(void) {
+    show_help_system();
+    terminal_writestring("\n");
+    show_help_filesystem();
+    terminal_writestring("\n");
+    show_help_file_content();
+    terminal_writestring("\n");
+    show_help_navigation();
 }
 
 void handle_command(char* command) {
@@ -339,22 +426,23 @@ void handle_command(char* command) {
     }
 
     if (strcmp(cmd, "help") == 0){
-        terminal_writestring("Available commands:\n");
-        terminal_writestring("  help              - Show this help message\n");
-        terminal_writestring("  meminfo           - Displaying RAM information\n");
-        terminal_writestring("  clear             - Clear the terminal screen\n");
-        terminal_writestring("  reboot            - Rebooting PC\n");
-        terminal_writestring("  exit              - Exit the system\n");
-        terminal_writestring("  ls                - List files and directories\n");
-        terminal_writestring("  pwd               - Print working directory\n");
-        terminal_writestring("  cd [dirname]      - Change directory (cd .. for parent, cd for root)\n");
-        terminal_writestring("  mkdir <dirname>   - Create a new directory\n");
-        terminal_writestring("  rmdir <dirname>   - Delete a directory\n");
-        terminal_writestring("  rename <old_name> <new_name> - Rename a file or directory\n");
-        terminal_writestring("  touch <filename> [content] - Create a new file with optional content\n");
-        terminal_writestring("  rm <filename>     - Delete a file\n");
-        terminal_writestring("  echo <filename> <content> - Write content to file\n");
-        terminal_writestring("  cat <filename>    - Read file content\n");
+        if (!arg1) {
+            // No category specified - show categories overview
+            show_help_all();
+        } else if (strcmp(arg1, "system") == 0) {
+            show_help_system();
+        } else if (strcmp(arg1, "fs") == 0 || strcmp(arg1, "filesystem") == 0) {
+            show_help_filesystem();
+        } else if (strcmp(arg1, "content") == 0) {
+            show_help_file_content();
+        } else if (strcmp(arg1, "navigation") == 0) {
+            show_help_navigation();
+        } else if (strcmp(arg1, "all") == 0) {
+            show_help_complete();
+        } else {
+            printf("Unknown help category '%s'\n", arg1);
+            show_help_all();
+        }
     } else if (strcmp(cmd, "clear") == 0 || strcmp(cmd, "clean") == 0) {
         terminal_clear();
     } else if (strcmp(cmd, "reboot") == 0) {
@@ -375,6 +463,8 @@ void handle_command(char* command) {
         cmd_delete_directory(arg1);
     } else if (strcmp(cmd, "rename") == 0) {
         cmd_rename(arg1, arg2);
+    } else if (strcmp(cmd, "mv") == 0) {
+        cmd_move_entry(arg1, arg2);
     } else if (strcmp(cmd, "touch") == 0) {
         if (arg2) {
             cmd_create_file_with_content(arg1, arg2);
@@ -405,6 +495,8 @@ void handle_command(char* command) {
         cmd_write_file(arg1, arg2);
     } else if (strcmp(cmd, "read") == 0) {
         cmd_read_file(arg1);
+    } else if (strcmp(cmd, "truncate") == 0) {
+        cmd_clear_file(arg1);
     } else {
         terminal_writestring("Unknown command.\n");
     }

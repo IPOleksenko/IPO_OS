@@ -47,6 +47,7 @@ void fs_init(void);
 int fs_create_file(const char* path);
 int fs_delete_file(const char* path);
 int fs_rename_file(const char* old_path, const char* new_name);
+int fs_move_entry(const char* source_path, const char* dest_path);
 int fs_write_file(const char* path, const void* data, size_t size);
 int fs_read_file(const char* path, void* buffer, size_t buffer_size);
 int fs_get_file_size(const char* path);
