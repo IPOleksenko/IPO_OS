@@ -110,6 +110,30 @@ void fs_init(void) {
     printf("Filesystem initialized successfully\n");
 }
 
+// Validate filename - must be a single word (no spaces)
+static int is_valid_filename(const char* name) {
+    if (!name || *name == '\0') {
+        return 0; // Empty name is invalid
+    }
+    
+    // Check for spaces or other whitespace characters
+    for (const char* p = name; *p; p++) {
+        if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+            return 0; // Contains whitespace
+        }
+    }
+    
+    // Check for invalid characters (optional - you can add more)
+    for (const char* p = name; *p; p++) {
+        if (*p == '/' || *p == '\\' || *p == ':' || *p == '*' ||
+            *p == '?' || *p == '"' || *p == '<' || *p == '>' || *p == '|') {
+            return 0; // Contains invalid characters
+        }
+    }
+    
+    return 1; // Valid filename
+}
+
 // Find entry by ID
 file_entry_t* fs_find_entry_by_id(uint32_t entry_id) {
     if (!fs) return NULL;
@@ -143,10 +167,13 @@ int fs_resolve_path(const char* path, uint32_t* parent_id, char* filename) {
     // Handle absolute vs relative paths
     uint32_t current_dir = (path[0] == '/') ? 0 : fs->current_dir_id;
     
-    // Copy path for parsing
-    char path_copy[MAX_PATH_LENGTH];
-    strncpy(path_copy, path, MAX_PATH_LENGTH - 1);
-    path_copy[MAX_PATH_LENGTH - 1] = '\0';
+    // Copy path for parsing - allocate dynamically
+    size_t path_len = strlen(path);
+    char* path_copy = (char*)kmalloc(path_len + 1);
+    if (!path_copy) {
+        return -1;
+    }
+    strcpy(path_copy, path);
     
     // Skip leading slash for absolute paths
     char* start = (path_copy[0] == '/') ? path_copy + 1 : path_copy;
@@ -180,6 +207,7 @@ int fs_resolve_path(const char* path, uint32_t* parent_id, char* filename) {
             // Regular directory
             file_entry_t* entry = find_entry_in_directory(token, current_dir);
             if (!entry || entry->type != ENTRY_TYPE_DIRECTORY) {
+                kfree(path_copy);
                 return -1; // Directory not found
             }
             current_dir = entry->entry_id;
@@ -191,6 +219,7 @@ int fs_resolve_path(const char* path, uint32_t* parent_id, char* filename) {
     // The remaining token is the filename
     *parent_id = current_dir;
     strcpy(filename, token);
+    kfree(path_copy);
     return 0;
 }
 
@@ -249,15 +278,23 @@ static file_entry_t* find_free_slot(void) {
 
 // Get current working directory path
 char* fs_get_current_path(void) {
-    static char path[MAX_PATH_LENGTH];
+    static char* path = NULL;
+    
+    // Free previous path if exists
+    if (path) {
+        kfree(path);
+        path = NULL;
+    }
     
     if (!fs) {
-        strcpy(path, "/");
+        path = (char*)kmalloc(2);
+        if (path) strcpy(path, "/");
         return path;
     }
     
     if (fs->current_dir_id == 0) {
-        strcpy(path, "/");
+        path = (char*)kmalloc(2);
+        if (path) strcpy(path, "/");
         return path;
     }
     
@@ -275,7 +312,18 @@ char* fs_get_current_path(void) {
         current_id = entry->parent_id;
     }
     
-    // Build path string
+    // Calculate required path length
+    size_t path_len = 1; // Start with "/"
+    for (int i = component_count - 1; i >= 0; i--) {
+        if (path_len > 1) path_len++; // Add "/" separator
+        path_len += strlen(components[i]);
+    }
+    path_len++; // Null terminator
+    
+    // Allocate and build path string
+    path = (char*)kmalloc(path_len);
+    if (!path) return NULL;
+    
     strcpy(path, "/");
     for (int i = component_count - 1; i >= 0; i--) {
         if (strlen(path) > 1) {
@@ -302,6 +350,12 @@ int fs_create_directory(const char* path) {
     // Check dirname length
     if (strlen(dirname) >= MAX_FILENAME_LENGTH) {
         printf("Directory name too long\n");
+        return -1;
+    }
+    
+    // Validate directory name
+    if (!is_valid_filename(dirname)) {
+        printf("Invalid directory name. Name must be a single word without spaces or special characters\n");
         return -1;
     }
     
@@ -371,6 +425,97 @@ int fs_delete_directory(const char* path) {
     // Clear directory entry
     memset(entry, 0, sizeof(file_entry_t));
     fs->header.file_count--;
+    
+    // Save changes to disk
+    fs_sync();
+    
+    return 0;
+}
+
+// Rename directory
+int fs_rename_directory(const char* old_path, const char* new_name) {
+    if (!fs || !old_path || !new_name) return -1;
+    
+    // Check new name length
+    if (strlen(new_name) >= MAX_FILENAME_LENGTH) {
+        printf("Directory name too long\n");
+        return -1;
+    }
+    
+    // Validate new directory name
+    if (!is_valid_filename(new_name)) {
+        printf("Invalid directory name. Name must be a single word without spaces or special characters\n");
+        return -1;
+    }
+    
+    // Find the directory to rename
+    file_entry_t* entry = fs_find_entry_by_path(old_path);
+    if (!entry) {
+        printf("Directory not found\n");
+        return -1;
+    }
+    
+    if (entry->type != ENTRY_TYPE_DIRECTORY) {
+        printf("Not a directory\n");
+        return -1;
+    }
+    
+    if (entry->entry_id == 0) {
+        printf("Cannot rename root directory\n");
+        return -1;
+    }
+    
+    // Check if a directory with the new name already exists in the same parent
+    if (find_entry_in_directory(new_name, entry->parent_id)) {
+        printf("Directory with name '%s' already exists\n", new_name);
+        return -1;
+    }
+    
+    // Rename the directory
+    strcpy(entry->name, new_name);
+    
+    // Save changes to disk
+    fs_sync();
+    
+    return 0;
+}
+
+// Rename file
+int fs_rename_file(const char* old_path, const char* new_name) {
+    if (!fs || !old_path || !new_name) return -1;
+    
+    // Check new name length
+    if (strlen(new_name) >= MAX_FILENAME_LENGTH) {
+        printf("Filename too long\n");
+        return -1;
+    }
+    
+    // Validate new filename
+    if (!is_valid_filename(new_name)) {
+        printf("Invalid filename. Name must be a single word without spaces or special characters\n");
+        return -1;
+    }
+    
+    // Find the file to rename
+    file_entry_t* entry = fs_find_entry_by_path(old_path);
+    if (!entry) {
+        printf("File not found\n");
+        return -1;
+    }
+    
+    if (entry->type != ENTRY_TYPE_FILE) {
+        printf("Not a file\n");
+        return -1;
+    }
+    
+    // Check if a file with the new name already exists in the same parent
+    if (find_entry_in_directory(new_name, entry->parent_id)) {
+        printf("File with name '%s' already exists\n", new_name);
+        return -1;
+    }
+    
+    // Rename the file
+    strcpy(entry->name, new_name);
     
     // Save changes to disk
     fs_sync();
@@ -499,6 +644,12 @@ int fs_create_file(const char* path) {
         return -1;
     }
     
+    // Validate filename
+    if (!is_valid_filename(filename)) {
+        printf("Invalid filename. Name must be a single word without spaces or special characters\n");
+        return -1;
+    }
+    
     // Check if file already exists
     if (find_entry_in_directory(filename, parent_id)) {
         printf("File already exists\n");
@@ -577,11 +728,6 @@ int fs_delete_file(const char* path) {
 
 int fs_write_file(const char* path, const void* data, size_t size) {
     if (!fs || !path || !data || size == 0) return -1;
-    
-    if (size > MAX_FILE_SIZE) {
-        printf("File size too large\n");
-        return -1;
-    }
     
     file_entry_t* entry = fs_find_entry_by_path(path);
     if (!entry) {

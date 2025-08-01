@@ -5,8 +5,6 @@
 #include <stdint.h>
 
 #define MAX_FILENAME_LENGTH 32
-#define MAX_FILE_SIZE 4096
-#define MAX_PATH_LENGTH 256
 #define FS_SECTOR_START 1  // Start from sector 1 (sector 0 is MBR)
 #define FS_MAGIC 0x46534950  // "FSIP" - filesystem magic number
 
@@ -48,6 +46,7 @@ void fs_init(void);
 // File operations
 int fs_create_file(const char* path);
 int fs_delete_file(const char* path);
+int fs_rename_file(const char* old_path, const char* new_name);
 int fs_write_file(const char* path, const void* data, size_t size);
 int fs_read_file(const char* path, void* buffer, size_t buffer_size);
 int fs_get_file_size(const char* path);
@@ -56,6 +55,7 @@ int fs_file_exists(const char* path);
 // Directory operations
 int fs_create_directory(const char* path);
 int fs_delete_directory(const char* path);
+int fs_rename_directory(const char* old_path, const char* new_name);
 int fs_change_directory(const char* path);
 void fs_list_directory(const char* path);
 void fs_list_files(void);  // List current directory

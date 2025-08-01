@@ -6,6 +6,8 @@
 #include <kernel/sys/ioports.h>
 #include <kernel/sys/isr.h>
 #include <kernel/drv/keymap.h>
+#include <kernel/sys/fs.h>
+#include <kernel/sys/kheap.h>
 
 static bool extended_scancode = false;
 
@@ -43,11 +45,30 @@ void keyboard_init(void) {
 }
 
 char* keyboard_input() {
-    static char input_buffer[256];
+    static char* input_buffer = NULL;
+    static size_t buffer_capacity = 0;
     size_t buffer_index = 0;
     bool shift_pressed = false;
+    
+    // Initial buffer size
+    const size_t initial_capacity = 256;
+    const size_t growth_factor = 2;
 
-    terminal_writestring("\n> ");
+    // Allocate initial buffer if it doesn't exist yet
+    if (!input_buffer) {
+        input_buffer = (char*)kmalloc(initial_capacity);
+        if (!input_buffer) {
+            terminal_writestring("Error: Out of memory for input buffer\n");
+            return NULL;
+        }
+        buffer_capacity = initial_capacity;
+    }
+
+    // Display current path instead of simple ">"
+    terminal_writestring("\n");
+    terminal_writestring(fs_get_current_path());
+    terminal_writestring(" > ");
+    
     while (1) {
         // Wait until the keyboard controller is ready
         if (!(inb(0x64) & 0x1)) {
@@ -82,6 +103,19 @@ char* keyboard_input() {
         switch (key) {
             case '\n': // Enter
                 if (buffer_index > 0) {
+                    // Make sure there's space for null terminator
+                    if (buffer_index >= buffer_capacity) {
+                        size_t new_capacity = buffer_capacity * growth_factor;
+                        char* new_buffer = (char*)kmalloc(new_capacity);
+                        if (new_buffer) {
+                            for (size_t i = 0; i < buffer_index; i++) {
+                                new_buffer[i] = input_buffer[i];
+                            }
+                            kfree(input_buffer);
+                            input_buffer = new_buffer;
+                            buffer_capacity = new_capacity;
+                        }
+                    }
                     input_buffer[buffer_index] = '\0';
                     terminal_putchar('\n');
                     return input_buffer;
@@ -98,23 +132,53 @@ char* keyboard_input() {
                 break;
 
             case '\t':  // Tab
-                if (buffer_index < sizeof(input_buffer) - 1) {
+                {
                     size_t tab_size = 4; // Tab size
                     size_t next_tab_stop = (buffer_index + tab_size) & ~(tab_size - 1);
                     size_t spaces_to_add = next_tab_stop - buffer_index;
 
-                    // Fill the buffer with spaces for the tab
-                    for (size_t i = 0; i < spaces_to_add; i++) {
-                        if (buffer_index < sizeof(input_buffer) - 1) {
-                            input_buffer[buffer_index++] = ' ';
+                    // Check if we need to expand the buffer
+                    while (buffer_index + spaces_to_add >= buffer_capacity) {
+                        size_t new_capacity = buffer_capacity * growth_factor;
+                        char* new_buffer = (char*)kmalloc(new_capacity);
+                        if (!new_buffer) {
+                            // If memory allocation failed, ignore tab
+                            break;
                         }
+                        for (size_t i = 0; i < buffer_index; i++) {
+                            new_buffer[i] = input_buffer[i];
+                        }
+                        kfree(input_buffer);
+                        input_buffer = new_buffer;
+                        buffer_capacity = new_capacity;
+                    }
+
+                    // Add spaces for tab
+                    for (size_t i = 0; i < spaces_to_add && buffer_index < buffer_capacity - 1; i++) {
+                        input_buffer[buffer_index++] = ' ';
                         terminal_putchar(' '); // Show space on the screen
                     }
                 }
                 break;
 
             default: // Regular character
-                if (key && buffer_index < sizeof(input_buffer) - 1) {
+                if (key) {
+                    // Check if we need to expand the buffer
+                    if (buffer_index >= buffer_capacity - 1) {
+                        size_t new_capacity = buffer_capacity * growth_factor;
+                        char* new_buffer = (char*)kmalloc(new_capacity);
+                        if (!new_buffer) {
+                            // If memory allocation failed, ignore character
+                            break;
+                        }
+                        for (size_t i = 0; i < buffer_index; i++) {
+                            new_buffer[i] = input_buffer[i];
+                        }
+                        kfree(input_buffer);
+                        input_buffer = new_buffer;
+                        buffer_capacity = new_capacity;
+                    }
+                    
                     input_buffer[buffer_index++] = key;
                     terminal_putchar(key);
                 }

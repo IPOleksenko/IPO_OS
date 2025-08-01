@@ -264,6 +264,36 @@ void cmd_delete_directory(const char* dirname) {
     }
 }
 
+void cmd_rename(const char* old_name, const char* new_name) {
+    if (!old_name || !new_name) {
+        terminal_writestring("Usage: rename <old_name> <new_name>\n");
+        return;
+    }
+    
+    // First try to find the entry to determine if it's a file or directory
+    file_entry_t* entry = fs_find_entry_by_path(old_name);
+    if (!entry) {
+        printf("File or directory '%s' not found\n", old_name);
+        return;
+    }
+    
+    if (entry->type == ENTRY_TYPE_DIRECTORY) {
+        if (fs_rename_directory(old_name, new_name) == 0) {
+            printf("Directory '%s' renamed to '%s' successfully\n", old_name, new_name);
+        } else {
+            printf("Failed to rename directory '%s' to '%s'\n", old_name, new_name);
+        }
+    } else if (entry->type == ENTRY_TYPE_FILE) {
+        if (fs_rename_file(old_name, new_name) == 0) {
+            printf("File '%s' renamed to '%s' successfully\n", old_name, new_name);
+        } else {
+            printf("Failed to rename file '%s' to '%s'\n", old_name, new_name);
+        }
+    } else {
+        printf("Unknown entry type for '%s'\n", old_name);
+    }
+}
+
 void cmd_change_directory(const char* dirname) {
     if (fs_change_directory(dirname) == 0) {
         printf("Changed to directory: %s\n", fs_get_current_path());
@@ -320,6 +350,7 @@ void handle_command(char* command) {
         terminal_writestring("  cd [dirname]      - Change directory (cd .. for parent, cd for root)\n");
         terminal_writestring("  mkdir <dirname>   - Create a new directory\n");
         terminal_writestring("  rmdir <dirname>   - Delete a directory\n");
+        terminal_writestring("  rename <old_name> <new_name> - Rename a file or directory\n");
         terminal_writestring("  touch <filename> [content] - Create a new file with optional content\n");
         terminal_writestring("  rm <filename>     - Delete a file\n");
         terminal_writestring("  echo <filename> <content> - Write content to file\n");
@@ -342,6 +373,8 @@ void handle_command(char* command) {
         cmd_create_directory(arg1);
     } else if (strcmp(cmd, "rmdir") == 0) {
         cmd_delete_directory(arg1);
+    } else if (strcmp(cmd, "rename") == 0) {
+        cmd_rename(arg1, arg2);
     } else if (strcmp(cmd, "touch") == 0) {
         if (arg2) {
             cmd_create_file_with_content(arg1, arg2);
