@@ -57,8 +57,13 @@ void kernel_main(__attribute__((unused)) multiboot_info_t* multiboot_info) {
 
 	copyright_text();
 	
+	// Display welcome message
+	printf("\nWelcome to IPO_OS!\n");
+	printf("Type 'help' to see available command categories.\n");
+	printf("Type 'help all' to see all commands at once.\n\n");
+	
 	while (1) {
-        handle_command(keyboard_input());
-    }
+	       handle_command(keyboard_input());
+	   }
 }
 
