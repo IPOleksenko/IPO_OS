@@ -77,6 +77,49 @@ void parse_command(char* command, char** cmd, char** arg1, char** arg2) {
         *start = '\0';
         start++;
         
+        // Special handling for echo command: echo filename content
+        if (strcmp(*cmd, "echo") == 0) {
+            // Find first argument (filename)
+            while (*start == ' ') start++; // skip spaces
+            if (*start != '\0') {
+                *arg1 = start;
+                while (*start && *start != ' ') start++; // find end of filename
+                if (*start) {
+                    *start = '\0';
+                    start++;
+                    
+                    // Rest of the line is the content (arg2)
+                    while (*start == ' ') start++; // skip spaces
+                    if (*start != '\0') {
+                        *arg2 = start;
+                    }
+                }
+            }
+            return;
+        }
+        
+        // Special handling for touch command with content
+        if (strcmp(*cmd, "touch") == 0) {
+            // Find first argument (filename)
+            while (*start == ' ') start++; // skip spaces
+            if (*start != '\0') {
+                *arg1 = start;
+                while (*start && *start != ' ') start++; // find end of filename
+                if (*start) {
+                    *start = '\0';
+                    start++;
+                    
+                    // Rest of the line is the content (arg2)
+                    while (*start == ' ') start++; // skip spaces
+                    if (*start != '\0') {
+                        *arg2 = start;
+                    }
+                }
+            }
+            return;
+        }
+        
+        // Standard parsing for other commands
         // Find first argument
         while (*start == ' ') start++; // skip spaces
         if (*start != '\0') {
@@ -99,7 +142,7 @@ void parse_command(char* command, char** cmd, char** arg1, char** arg2) {
 // Filesystem commands
 void cmd_create_file(const char* filename) {
     if (!filename) {
-        terminal_writestring("Usage: create <filename>\n");
+        terminal_writestring("Usage: touch <filename> [content]\n");
         return;
     }
     
@@ -107,6 +150,30 @@ void cmd_create_file(const char* filename) {
         printf("File '%s' created successfully\n", filename);
     } else {
         printf("Failed to create file '%s'\n", filename);
+    }
+}
+
+void cmd_create_file_with_content(const char* filename, const char* content) {
+    if (!filename) {
+        terminal_writestring("Usage: touch <filename> [content]\n");
+        return;
+    }
+    
+    // Create the file first
+    if (fs_create_file(filename) != 0) {
+        printf("Failed to create file '%s'\n", filename);
+        return;
+    }
+    
+    // If content is provided, write it to the file
+    if (content && strlen(content) > 0) {
+        if (fs_write_file(filename, content, strlen(content)) == 0) {
+            printf("File '%s' created with content\n", filename);
+        } else {
+            printf("File '%s' created but failed to write content\n", filename);
+        }
+    } else {
+        printf("Empty file '%s' created successfully\n", filename);
     }
 }
 
@@ -170,6 +237,49 @@ void cmd_read_file(const char* filename) {
     kfree(buffer);
 }
 
+// Directory commands
+void cmd_create_directory(const char* dirname) {
+    if (!dirname) {
+        terminal_writestring("Usage: mkdir <dirname>\n");
+        return;
+    }
+    
+    if (fs_create_directory(dirname) == 0) {
+        printf("Directory '%s' created successfully\n", dirname);
+    } else {
+        printf("Failed to create directory '%s'\n", dirname);
+    }
+}
+
+void cmd_delete_directory(const char* dirname) {
+    if (!dirname) {
+        terminal_writestring("Usage: rmdir <dirname>\n");
+        return;
+    }
+    
+    if (fs_delete_directory(dirname) == 0) {
+        printf("Directory '%s' deleted successfully\n", dirname);
+    } else {
+        printf("Failed to delete directory '%s'\n", dirname);
+    }
+}
+
+void cmd_change_directory(const char* dirname) {
+    if (fs_change_directory(dirname) == 0) {
+        printf("Changed to directory: %s\n", fs_get_current_path());
+    } else {
+        if (!dirname) {
+            printf("Failed to change to root directory\n");
+        } else {
+            printf("Failed to change to directory '%s'\n", dirname);
+        }
+    }
+}
+
+void cmd_print_working_directory(void) {
+    printf("%s\n", fs_get_current_path());
+}
+
 void handle_command(char* command) {
     if (!command || *command == '\0') {
         terminal_writestring("No command entered.\n");
@@ -179,9 +289,13 @@ void handle_command(char* command) {
     trim_spaces(command);
     
     // Create copy of command for parsing
-    char command_copy[256];
-    strncpy(command_copy, command, sizeof(command_copy) - 1);
-    command_copy[sizeof(command_copy) - 1] = '\0';
+    size_t command_len = strlen(command);
+    char* command_copy = (char*)kmalloc(command_len + 1);
+    if (!command_copy) {
+        terminal_writestring("Out of memory\n");
+        return;
+    }
+    strcpy(command_copy, command);
     
     char* cmd = NULL;
     char* arg1 = NULL;
@@ -198,15 +312,19 @@ void handle_command(char* command) {
         terminal_writestring("Available commands:\n");
         terminal_writestring("  help              - Show this help message\n");
         terminal_writestring("  meminfo           - Displaying RAM information\n");
-        terminal_writestring("  clean             - Clear the terminal screen\n");
+        terminal_writestring("  clear             - Clear the terminal screen\n");
         terminal_writestring("  reboot            - Rebooting PC\n");
         terminal_writestring("  exit              - Exit the system\n");
-        terminal_writestring("  ls                - List files\n");
-        terminal_writestring("  create <filename> - Create a new file\n");
-        terminal_writestring("  delete <filename> - Delete a file\n");
-        terminal_writestring("  write <file> <text> - Write text to file\n");
-        terminal_writestring("  read <filename>   - Read file content\n");
-    } else if (strcmp(cmd, "clean") == 0) {
+        terminal_writestring("  ls                - List files and directories\n");
+        terminal_writestring("  pwd               - Print working directory\n");
+        terminal_writestring("  cd [dirname]      - Change directory (cd .. for parent, cd for root)\n");
+        terminal_writestring("  mkdir <dirname>   - Create a new directory\n");
+        terminal_writestring("  rmdir <dirname>   - Delete a directory\n");
+        terminal_writestring("  touch <filename> [content] - Create a new file with optional content\n");
+        terminal_writestring("  rm <filename>     - Delete a file\n");
+        terminal_writestring("  echo <filename> <content> - Write content to file\n");
+        terminal_writestring("  cat <filename>    - Read file content\n");
+    } else if (strcmp(cmd, "clear") == 0 || strcmp(cmd, "clean") == 0) {
         terminal_clear();
     } else if (strcmp(cmd, "reboot") == 0) {
         reboot_system();
@@ -216,6 +334,36 @@ void handle_command(char* command) {
         meminfo();
     } else if (strcmp(cmd, "ls") == 0) {
         fs_list_files();
+    } else if (strcmp(cmd, "pwd") == 0) {
+        cmd_print_working_directory();
+    } else if (strcmp(cmd, "cd") == 0) {
+        cmd_change_directory(arg1);
+    } else if (strcmp(cmd, "mkdir") == 0) {
+        cmd_create_directory(arg1);
+    } else if (strcmp(cmd, "rmdir") == 0) {
+        cmd_delete_directory(arg1);
+    } else if (strcmp(cmd, "touch") == 0) {
+        if (arg2) {
+            cmd_create_file_with_content(arg1, arg2);
+        } else {
+            cmd_create_file(arg1);
+        }
+    } else if (strcmp(cmd, "rm") == 0) {
+        cmd_delete_file(arg1);
+    } else if (strcmp(cmd, "echo") == 0) {
+        // Handle "echo filename content" syntax
+        if (arg1 && arg2) {
+            // Write content to file
+            cmd_write_file(arg1, arg2);
+        } else if (arg1) {
+            // Just print filename to console (no content provided)
+            printf("%s\n", arg1);
+        } else {
+            // No arguments
+            printf("\n");
+        }
+    } else if (strcmp(cmd, "cat") == 0) {
+        cmd_read_file(arg1);
     } else if (strcmp(cmd, "create") == 0) {
         cmd_create_file(arg1);
     } else if (strcmp(cmd, "delete") == 0) {
@@ -227,4 +375,7 @@ void handle_command(char* command) {
     } else {
         terminal_writestring("Unknown command.\n");
     }
+    
+    // Free allocated memory
+    kfree(command_copy);
 }

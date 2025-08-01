@@ -6,13 +6,21 @@
 
 #define MAX_FILENAME_LENGTH 32
 #define MAX_FILE_SIZE 4096
+#define MAX_PATH_LENGTH 256
 #define FS_SECTOR_START 1  // Start from sector 1 (sector 0 is MBR)
 #define FS_MAGIC 0x46534950  // "FSIP" - filesystem magic number
+
+// Entry types
+#define ENTRY_TYPE_FILE 1
+#define ENTRY_TYPE_DIRECTORY 2
 
 typedef struct {
     char name[MAX_FILENAME_LENGTH];
     uint32_t size;
     uint32_t data_offset;
+    uint32_t parent_id;  // ID of parent directory (0 for root)
+    uint32_t entry_id;   // Unique entry ID
+    uint8_t type;        // ENTRY_TYPE_FILE or ENTRY_TYPE_DIRECTORY
     uint8_t used;
 } file_entry_t;
 
@@ -29,40 +37,38 @@ typedef struct {
     file_entry_t* files;
     uint8_t* data_area;
     uint32_t data_area_size;
+    uint32_t next_entry_id;  // Next available entry ID
+    uint32_t current_dir_id; // Current working directory ID (0 for root)
     int disk_available;
 } filesystem_t;
 
 // Initialize filesystem
 void fs_init(void);
 
-// Create file
-int fs_create_file(const char* filename);
+// File operations
+int fs_create_file(const char* path);
+int fs_delete_file(const char* path);
+int fs_write_file(const char* path, const void* data, size_t size);
+int fs_read_file(const char* path, void* buffer, size_t buffer_size);
+int fs_get_file_size(const char* path);
+int fs_file_exists(const char* path);
 
-// Delete file
-int fs_delete_file(const char* filename);
+// Directory operations
+int fs_create_directory(const char* path);
+int fs_delete_directory(const char* path);
+int fs_change_directory(const char* path);
+void fs_list_directory(const char* path);
+void fs_list_files(void);  // List current directory
+char* fs_get_current_path(void);
 
-// Write data to file
-int fs_write_file(const char* filename, const void* data, size_t size);
+// Path utilities
+int fs_resolve_path(const char* path, uint32_t* parent_id, char* filename);
+file_entry_t* fs_find_entry_by_path(const char* path);
+file_entry_t* fs_find_entry_by_id(uint32_t entry_id);
 
-// Read data from file
-int fs_read_file(const char* filename, void* buffer, size_t buffer_size);
-
-// Get file size
-int fs_get_file_size(const char* filename);
-
-// List files
-void fs_list_files(void);
-
-// Check if file exists
-int fs_file_exists(const char* filename);
-
-// Save filesystem to disk
+// Disk operations
 int fs_save_to_disk(void);
-
-// Load filesystem from disk
 int fs_load_from_disk(void);
-
-// Synchronize with disk
 int fs_sync(void);
 
 #endif

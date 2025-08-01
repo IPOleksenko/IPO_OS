@@ -41,6 +41,10 @@ void fs_init(void) {
     }
     memset(fs->files, 0, fs->header.max_files * sizeof(file_entry_t));
     
+    // Initialize directory system
+    fs->next_entry_id = 1;  // Start from 1, 0 is reserved for root
+    fs->current_dir_id = 0; // Start in root directory
+    
     // Check disk availability by attempting a simple read operation
     fs->disk_available = 0;
     
@@ -66,6 +70,17 @@ void fs_init(void) {
         fs->header.data_used = 0;
         // max_files is already set during allocation
         
+        // Create root directory (entry_id = 0)
+        file_entry_t* root = &fs->files[0];
+        strcpy(root->name, "/");
+        root->size = 0;
+        root->data_offset = 0;
+        root->parent_id = 0;  // Root is its own parent
+        root->entry_id = 0;
+        root->type = ENTRY_TYPE_DIRECTORY;
+        root->used = 1;
+        fs->header.file_count = 1;
+        
         // Save new filesystem to disk
         if (fs_save_to_disk() != 0) {
             printf("Warning: Failed to save filesystem to disk, continuing in memory-only mode\n");
@@ -79,20 +94,118 @@ void fs_init(void) {
         fs->header.file_count = 0;
         fs->header.data_used = 0;
         // max_files is already set during allocation
+        
+        // Create root directory (entry_id = 0)
+        file_entry_t* root = &fs->files[0];
+        strcpy(root->name, "/");
+        root->size = 0;
+        root->data_offset = 0;
+        root->parent_id = 0;  // Root is its own parent
+        root->entry_id = 0;
+        root->type = ENTRY_TYPE_DIRECTORY;
+        root->used = 1;
+        fs->header.file_count = 1;
     }
     
     printf("Filesystem initialized successfully\n");
 }
 
-static file_entry_t* find_file(const char* filename) {
-    if (!fs || !filename) return NULL;
+// Find entry by ID
+file_entry_t* fs_find_entry_by_id(uint32_t entry_id) {
+    if (!fs) return NULL;
     
     for (uint32_t i = 0; i < fs->header.max_files; i++) {
-        if (fs->files[i].used && strcmp(fs->files[i].name, filename) == 0) {
+        if (fs->files[i].used && fs->files[i].entry_id == entry_id) {
             return &fs->files[i];
         }
     }
     return NULL;
+}
+
+// Find entry by name in specific directory
+static file_entry_t* find_entry_in_directory(const char* name, uint32_t parent_id) {
+    if (!fs || !name) return NULL;
+    
+    for (uint32_t i = 0; i < fs->header.max_files; i++) {
+        if (fs->files[i].used &&
+            fs->files[i].parent_id == parent_id &&
+            strcmp(fs->files[i].name, name) == 0) {
+            return &fs->files[i];
+        }
+    }
+    return NULL;
+}
+
+// Parse path and resolve to parent directory ID and filename
+int fs_resolve_path(const char* path, uint32_t* parent_id, char* filename) {
+    if (!fs || !path || !parent_id || !filename) return -1;
+    
+    // Handle absolute vs relative paths
+    uint32_t current_dir = (path[0] == '/') ? 0 : fs->current_dir_id;
+    
+    // Copy path for parsing
+    char path_copy[MAX_PATH_LENGTH];
+    strncpy(path_copy, path, MAX_PATH_LENGTH - 1);
+    path_copy[MAX_PATH_LENGTH - 1] = '\0';
+    
+    // Skip leading slash for absolute paths
+    char* start = (path_copy[0] == '/') ? path_copy + 1 : path_copy;
+    
+    // If empty path after removing slash, we're at root
+    if (*start == '\0') {
+        *parent_id = 0;
+        strcpy(filename, "/");
+        return 0;
+    }
+    
+    // Parse path components
+    char* token = start;
+    char* next_slash;
+    
+    while ((next_slash = strchr((char*)token, '/')) != NULL) {
+        *next_slash = '\0';
+        
+        // Handle special directories
+        if (strcmp(token, ".") == 0) {
+            // Current directory - do nothing
+        } else if (strcmp(token, "..") == 0) {
+            // Parent directory
+            if (current_dir != 0) {
+                file_entry_t* current = fs_find_entry_by_id(current_dir);
+                if (current) {
+                    current_dir = current->parent_id;
+                }
+            }
+        } else {
+            // Regular directory
+            file_entry_t* entry = find_entry_in_directory(token, current_dir);
+            if (!entry || entry->type != ENTRY_TYPE_DIRECTORY) {
+                return -1; // Directory not found
+            }
+            current_dir = entry->entry_id;
+        }
+        
+        token = next_slash + 1;
+    }
+    
+    // The remaining token is the filename
+    *parent_id = current_dir;
+    strcpy(filename, token);
+    return 0;
+}
+
+// Find entry by full path
+file_entry_t* fs_find_entry_by_path(const char* path) {
+    if (!path) return NULL;
+    
+    uint32_t parent_id;
+    char filename[MAX_FILENAME_LENGTH];
+    
+    if (fs_resolve_path(path, &parent_id, filename) != 0) {
+        return NULL;
+    }
+    
+    return find_entry_in_directory(filename, parent_id);
 }
 
 static file_entry_t* find_free_slot(void) {
@@ -134,8 +247,251 @@ static file_entry_t* find_free_slot(void) {
     return &fs->files[old_max_files];
 }
 
-int fs_create_file(const char* filename) {
-    if (!fs || !filename) return -1;
+// Get current working directory path
+char* fs_get_current_path(void) {
+    static char path[MAX_PATH_LENGTH];
+    
+    if (!fs) {
+        strcpy(path, "/");
+        return path;
+    }
+    
+    if (fs->current_dir_id == 0) {
+        strcpy(path, "/");
+        return path;
+    }
+    
+    // Build path by traversing up to root
+    char components[32][MAX_FILENAME_LENGTH]; // Max 32 directory levels
+    int component_count = 0;
+    uint32_t current_id = fs->current_dir_id;
+    
+    while (current_id != 0 && component_count < 32) {
+        file_entry_t* entry = fs_find_entry_by_id(current_id);
+        if (!entry) break;
+        
+        strcpy(components[component_count], entry->name);
+        component_count++;
+        current_id = entry->parent_id;
+    }
+    
+    // Build path string
+    strcpy(path, "/");
+    for (int i = component_count - 1; i >= 0; i--) {
+        if (strlen(path) > 1) {
+            strcat(path, "/");
+        }
+        strcat(path, components[i]);
+    }
+    
+    return path;
+}
+
+// Create directory
+int fs_create_directory(const char* path) {
+    if (!fs || !path) return -1;
+    
+    uint32_t parent_id;
+    char dirname[MAX_FILENAME_LENGTH];
+    
+    if (fs_resolve_path(path, &parent_id, dirname) != 0) {
+        printf("Invalid path\n");
+        return -1;
+    }
+    
+    // Check dirname length
+    if (strlen(dirname) >= MAX_FILENAME_LENGTH) {
+        printf("Directory name too long\n");
+        return -1;
+    }
+    
+    // Check if directory already exists
+    if (find_entry_in_directory(dirname, parent_id)) {
+        printf("Directory already exists\n");
+        return -1;
+    }
+    
+    // Find free slot for new directory
+    file_entry_t* entry = find_free_slot();
+    if (!entry) {
+        printf("Failed to allocate directory slot\n");
+        return -1;
+    }
+    
+    // Create directory entry
+    strcpy(entry->name, dirname);
+    entry->size = 0;
+    entry->data_offset = 0;
+    entry->parent_id = parent_id;
+    entry->entry_id = fs->next_entry_id++;
+    entry->type = ENTRY_TYPE_DIRECTORY;
+    entry->used = 1;
+    
+    fs->header.file_count++;
+    
+    // Save changes to disk
+    fs_sync();
+    
+    return 0;
+}
+
+// Delete directory (must be empty)
+int fs_delete_directory(const char* path) {
+    if (!fs || !path) return -1;
+    
+    file_entry_t* entry = fs_find_entry_by_path(path);
+    if (!entry) {
+        printf("Directory not found\n");
+        return -1;
+    }
+    
+    if (entry->type != ENTRY_TYPE_DIRECTORY) {
+        printf("Not a directory\n");
+        return -1;
+    }
+    
+    if (entry->entry_id == 0) {
+        printf("Cannot delete root directory\n");
+        return -1;
+    }
+    
+    // Check if directory is empty
+    for (uint32_t i = 0; i < fs->header.max_files; i++) {
+        if (fs->files[i].used && fs->files[i].parent_id == entry->entry_id) {
+            printf("Directory not empty\n");
+            return -1;
+        }
+    }
+    
+    // If current directory is being deleted, change to parent
+    if (fs->current_dir_id == entry->entry_id) {
+        fs->current_dir_id = entry->parent_id;
+    }
+    
+    // Clear directory entry
+    memset(entry, 0, sizeof(file_entry_t));
+    fs->header.file_count--;
+    
+    // Save changes to disk
+    fs_sync();
+    
+    return 0;
+}
+
+// Change current directory
+int fs_change_directory(const char* path) {
+    if (!fs) return -1;
+    
+    // Handle special cases
+    if (!path) {
+        // No path provided - go to root
+        fs->current_dir_id = 0;
+        return 0;
+    }
+    
+    if (strcmp(path, ".") == 0) {
+        // Current directory - do nothing
+        return 0;
+    }
+    
+    if (strcmp(path, "..") == 0) {
+        // Parent directory
+        if (fs->current_dir_id == 0) {
+            // Already at root
+            return 0;
+        }
+        file_entry_t* current = fs_find_entry_by_id(fs->current_dir_id);
+        if (current) {
+            fs->current_dir_id = current->parent_id;
+            return 0;
+        }
+        return -1;
+    }
+    
+    if (strcmp(path, "/") == 0) {
+        // Root directory
+        fs->current_dir_id = 0;
+        return 0;
+    }
+    
+    // Regular path resolution
+    file_entry_t* entry = fs_find_entry_by_path(path);
+    if (!entry) {
+        printf("Directory not found\n");
+        return -1;
+    }
+    
+    if (entry->type != ENTRY_TYPE_DIRECTORY) {
+        printf("Not a directory\n");
+        return -1;
+    }
+    
+    fs->current_dir_id = entry->entry_id;
+    return 0;
+}
+
+// List directory contents
+void fs_list_directory(const char* path) {
+    if (!fs) {
+        printf("Filesystem not initialized\n");
+        return;
+    }
+    
+    uint32_t dir_id;
+    if (path) {
+        file_entry_t* entry = fs_find_entry_by_path(path);
+        if (!entry) {
+            printf("Directory not found\n");
+            return;
+        }
+        if (entry->type != ENTRY_TYPE_DIRECTORY) {
+            printf("Not a directory\n");
+            return;
+        }
+        dir_id = entry->entry_id;
+    } else {
+        dir_id = fs->current_dir_id;
+    }
+    
+    printf("Contents of %s:\n", path ? path : fs_get_current_path());
+    int entry_count = 0;
+    
+    // Show parent directory if not root
+    if (dir_id != 0) {
+        printf("  .. (parent directory)\n");
+    }
+    
+    for (uint32_t i = 0; i < fs->header.max_files; i++) {
+        if (fs->files[i].used && fs->files[i].parent_id == dir_id) {
+            // Skip root directory entry (entry_id = 0) when listing
+            if (fs->files[i].entry_id == 0) {
+                continue;
+            }
+            
+            if (fs->files[i].type == ENTRY_TYPE_DIRECTORY) {
+                printf("  %s/ (directory)\n", fs->files[i].name);
+            } else {
+                printf("  %s (%d bytes)\n", fs->files[i].name, fs->files[i].size);
+            }
+            entry_count++;
+        }
+    }
+    
+    if (entry_count == 0 && dir_id != 0) {
+        printf("  (empty)\n");
+    }
+}
+
+int fs_create_file(const char* path) {
+    if (!fs || !path) return -1;
+    
+    uint32_t parent_id;
+    char filename[MAX_FILENAME_LENGTH];
+    
+    if (fs_resolve_path(path, &parent_id, filename) != 0) {
+        printf("Invalid path\n");
+        return -1;
+    }
     
     // Check filename length
     if (strlen(filename) >= MAX_FILENAME_LENGTH) {
@@ -144,7 +500,7 @@ int fs_create_file(const char* filename) {
     }
     
     // Check if file already exists
-    if (find_file(filename)) {
+    if (find_entry_in_directory(filename, parent_id)) {
         printf("File already exists\n");
         return -1;
     }
@@ -160,6 +516,9 @@ int fs_create_file(const char* filename) {
     strcpy(entry->name, filename);
     entry->size = 0;
     entry->data_offset = 0;
+    entry->parent_id = parent_id;
+    entry->entry_id = fs->next_entry_id++;
+    entry->type = ENTRY_TYPE_FILE;
     entry->used = 1;
     
     fs->header.file_count++;
@@ -170,12 +529,17 @@ int fs_create_file(const char* filename) {
     return 0;
 }
 
-int fs_delete_file(const char* filename) {
-    if (!fs || !filename) return -1;
+int fs_delete_file(const char* path) {
+    if (!fs || !path) return -1;
     
-    file_entry_t* entry = find_file(filename);
+    file_entry_t* entry = fs_find_entry_by_path(path);
     if (!entry) {
         printf("File not found\n");
+        return -1;
+    }
+    
+    if (entry->type != ENTRY_TYPE_FILE) {
+        printf("Not a file\n");
         return -1;
     }
     
@@ -211,17 +575,22 @@ int fs_delete_file(const char* filename) {
     return 0;
 }
 
-int fs_write_file(const char* filename, const void* data, size_t size) {
-    if (!fs || !filename || !data || size == 0) return -1;
+int fs_write_file(const char* path, const void* data, size_t size) {
+    if (!fs || !path || !data || size == 0) return -1;
     
     if (size > MAX_FILE_SIZE) {
         printf("File size too large\n");
         return -1;
     }
     
-    file_entry_t* entry = find_file(filename);
+    file_entry_t* entry = fs_find_entry_by_path(path);
     if (!entry) {
         printf("File not found\n");
+        return -1;
+    }
+    
+    if (entry->type != ENTRY_TYPE_FILE) {
+        printf("Not a file\n");
         return -1;
     }
     
@@ -268,12 +637,17 @@ int fs_write_file(const char* filename, const void* data, size_t size) {
     return 0;
 }
 
-int fs_read_file(const char* filename, void* buffer, size_t buffer_size) {
-    if (!fs || !filename || !buffer) return -1;
+int fs_read_file(const char* path, void* buffer, size_t buffer_size) {
+    if (!fs || !path || !buffer) return -1;
     
-    file_entry_t* entry = find_file(filename);
+    file_entry_t* entry = fs_find_entry_by_path(path);
     if (!entry) {
         printf("File not found\n");
+        return -1;
+    }
+    
+    if (entry->type != ENTRY_TYPE_FILE) {
+        printf("Not a file\n");
         return -1;
     }
     
@@ -287,11 +661,15 @@ int fs_read_file(const char* filename, void* buffer, size_t buffer_size) {
     return bytes_to_read;
 }
 
-int fs_get_file_size(const char* filename) {
-    if (!fs || !filename) return -1;
+int fs_get_file_size(const char* path) {
+    if (!fs || !path) return -1;
     
-    file_entry_t* entry = find_file(filename);
+    file_entry_t* entry = fs_find_entry_by_path(path);
     if (!entry) {
+        return -1;
+    }
+    
+    if (entry->type != ENTRY_TYPE_FILE) {
         return -1;
     }
     
@@ -299,32 +677,12 @@ int fs_get_file_size(const char* filename) {
 }
 
 void fs_list_files(void) {
-    if (!fs) {
-        printf("Filesystem not initialized\n");
-        return;
-    }
-    
-    printf("Files:\n");
-    int file_count = 0;
-    
-    for (uint32_t i = 0; i < fs->header.max_files; i++) {
-        if (fs->files[i].used) {
-            printf("  %s (%d bytes)\n", fs->files[i].name, fs->files[i].size);
-            file_count++;
-        }
-    }
-    
-    if (file_count == 0) {
-        printf("  No files found\n");
-    }
-    
-    printf("Total files: %d (max: %d)\n", fs->header.file_count, fs->header.max_files);
-    printf("Data used: %d/%d bytes\n", fs->header.data_used, fs->data_area_size);
-    printf("Disk available: %s\n", fs->disk_available ? "Yes" : "No");
+    fs_list_directory(NULL);  // List current directory
 }
 
-int fs_file_exists(const char* filename) {
-    return find_file(filename) != NULL;
+int fs_file_exists(const char* path) {
+    file_entry_t* entry = fs_find_entry_by_path(path);
+    return (entry != NULL && entry->type == ENTRY_TYPE_FILE);
 }
 int fs_save_to_disk(void) {
     if (!fs || !fs->disk_available) {
@@ -438,6 +796,14 @@ int fs_load_from_disk(void) {
     // Copy header
     memcpy(&fs->header, header, sizeof(fs_header_t));
     
+    // Initialize next_entry_id based on loaded entries
+    fs->next_entry_id = 1;
+    for (uint32_t i = 0; i < fs->header.max_files; i++) {
+        if (fs->files && fs->files[i].used && fs->files[i].entry_id >= fs->next_entry_id) {
+            fs->next_entry_id = fs->files[i].entry_id + 1;
+        }
+    }
+    
     // Allocate file table based on loaded max_files
     if (fs->files) {
         kfree(fs->files);
@@ -501,21 +867,16 @@ int fs_load_from_disk(void) {
 
 int fs_sync(void) {
     if (!fs) {
-        printf("fs_sync: filesystem not initialized\n");
         return -1;
     }
     
     if (!fs->disk_available) {
-        printf("fs_sync: disk not available, skipping sync\n");
-        return -1;
+        // Disk not available - return success for memory-only mode
+        return 0;
     }
     
-    printf("fs_sync: syncing filesystem to disk...\n");
     int result = fs_save_to_disk();
-    if (result == 0) {
-        printf("fs_sync: filesystem synced successfully\n");
-    } else {
-        printf("fs_sync: failed to sync filesystem\n");
+    if (result != 0) {
         // If synchronization fails, disconnect the disk
         fs->disk_available = 0;
     }

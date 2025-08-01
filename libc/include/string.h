@@ -31,6 +31,7 @@ long double strtold(const char *str, char **endptr);
 float strtof(const char *str, char **endptr);
 const char* strchr(const char* str, int c);
 int strncmp(const char *s1, const char *s2, size_t n);
+char* strstr(const char* haystack, const char* needle);
 void bzero(void *s, size_t n);
 
 

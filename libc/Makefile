@@ -70,6 +70,7 @@ string/strtof.o \
 string/strtol.o \
 string/strchr.o \
 string/strncmp.o \
+string/strstr.o \
 string/bzero.o \
 stdlib/calloc.o \
 stdlib/abort.o \
