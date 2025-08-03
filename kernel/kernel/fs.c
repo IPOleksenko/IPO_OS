@@ -164,6 +164,15 @@ static file_entry_t* find_entry_in_directory(const char* name, uint32_t parent_i
 int fs_resolve_path(const char* path, uint32_t* parent_id, char* filename) {
     if (!fs || !path || !parent_id || !filename) return -1;
     
+    for (size_t i = 0; path[i]; i++) {
+        if (path[i] == '~') {
+            if (i == 0 && (path[1] == '/' || path[1] == '\0')) {
+                continue;
+            }
+            return -1;
+        }
+    }
+    
     // Handle home directory prefix (~)
     const char* actual_path = path;
     uint32_t current_dir;

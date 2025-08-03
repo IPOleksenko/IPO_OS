@@ -9,4 +9,5 @@ fi
 
 qemu-system-$(./target-triplet-to-arch.sh $HOST) -cdrom IPO_OS.iso -hda disk.img
 
+export DELETE_DISK=false
 . ./clean.sh

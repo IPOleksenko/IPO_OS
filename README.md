@@ -10,7 +10,9 @@ export PATH=~/opt/cross/bin:$PATH
 
 ### 🧹 Clean the Build Directory
 ```bash
-./clean.sh
+./clean.sh                  # normal clean
+./clean.sh --delete-disk    # full clean
+
 ```
 
 ### 🔧 Build the Project

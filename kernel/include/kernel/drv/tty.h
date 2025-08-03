@@ -7,13 +7,13 @@
 
 #define VGA_WIDTH 80
 #define VGA_HEIGHT 25
-#define SCROLL_BUFFER_SIZE 100000
+#define SCROLL_BUFFER_SIZE 1000
 
 extern size_t terminal_row;
 extern size_t terminal_column;
 extern uint8_t terminal_color;
 extern uint16_t* terminal_buffer;
-extern uint16_t scroll_buffer[SCROLL_BUFFER_SIZE * VGA_WIDTH];
+extern uint16_t scroll_buffer[SCROLL_BUFFER_SIZE][VGA_HEIGHT * VGA_WIDTH];
 extern size_t scroll_offset;
 extern size_t scroll_buffer_pos;
 

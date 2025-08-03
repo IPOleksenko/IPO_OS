@@ -33,10 +33,10 @@ size_t calculate_heap_size(multiboot_info_t* multiboot_info) {
     size_t mem_upper = multiboot_info->mem_upper << 10;
 
     // Total memory in bytes
-    size_t total_memory_kb = mem_lower + mem_upper;
+    size_t total_memory_bytes = mem_lower + mem_upper;
 
     // Calculate heap size
-    size_t heap_size = (total_memory_kb / 100) * HEAP_SIZE_PERCENTAGE;
+    size_t heap_size = (total_memory_bytes / 100) * HEAP_SIZE_PERCENTAGE;
 
     return heap_size;
 }
