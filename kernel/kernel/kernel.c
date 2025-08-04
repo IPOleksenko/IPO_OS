@@ -20,14 +20,11 @@
 void irq_disable();
 void irq_enable();
 
-extern size_t heap_used;
-extern size_t heap_size;
-
 void kernel_main(__attribute__((unused)) multiboot_info_t* multiboot_info) {
 	terminal_initialize();
     
     // Calculate heap size
-    size_t heap_size = calculate_heap_size(multiboot_info);
+    heap_size = calculate_heap_size(multiboot_info);
 
     // Initialize heap
     kheap_init((void*)HEAP_START_ADDRESS, heap_size);
@@ -57,8 +54,7 @@ void kernel_main(__attribute__((unused)) multiboot_info_t* multiboot_info) {
 
 	copyright_text();
 	
-	// Display welcome message
-	printf("\nWelcome to IPO_OS!\n");
+	// Display help message
 	printf("Type 'help' to see available command categories.\n");
 	printf("Type 'help all' to see all commands at once.\n\n");
 	

@@ -1,5 +1,6 @@
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include <kernel/drv/keyboard.h>
 #include <kernel/drv/tty.h>
@@ -58,16 +59,16 @@ char* keyboard_input() {
     if (!input_buffer) {
         input_buffer = (char*)kmalloc(initial_capacity);
         if (!input_buffer) {
-            terminal_writestring("Error: Out of memory for input buffer\n");
+            printf("Error: Out of memory for input buffer\n");
             return NULL;
         }
         buffer_capacity = initial_capacity;
     }
 
     // Display current path instead of simple ">"
-    terminal_writestring("\n");
-    terminal_writestring(fs_get_current_path());
-    terminal_writestring(" > ");
+    printf("\n");
+    printf(fs_get_current_path());
+    printf(" > ");
     
     while (1) {
         // Wait until the keyboard controller is ready
@@ -117,7 +118,7 @@ char* keyboard_input() {
                         }
                     }
                     input_buffer[buffer_index] = '\0';
-                    terminal_putchar('\n');
+                    putchar('\n');
                     return input_buffer;
                 }
                 break;
@@ -125,9 +126,9 @@ char* keyboard_input() {
             case '\b': // Backspace
                 if (buffer_index > 0) {
                     buffer_index--;
-                    terminal_putchar('\b');
-                    terminal_putchar(' ');
-                    terminal_putchar('\b');
+                    putchar('\b');
+                    putchar(' ');
+                    putchar('\b');
                 }
                 break;
 
@@ -156,7 +157,7 @@ char* keyboard_input() {
                     // Add spaces for tab
                     for (size_t i = 0; i < spaces_to_add && buffer_index < buffer_capacity - 1; i++) {
                         input_buffer[buffer_index++] = ' ';
-                        terminal_putchar(' '); // Show space on the screen
+                        putchar(' '); // Show space on the screen
                     }
                 }
                 break;
@@ -180,7 +181,7 @@ char* keyboard_input() {
                     }
                     
                     input_buffer[buffer_index++] = key;
-                    terminal_putchar(key);
+                    putchar(key);
                 }
                 break;
         }

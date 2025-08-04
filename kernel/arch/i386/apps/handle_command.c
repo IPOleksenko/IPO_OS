@@ -1,35 +1,14 @@
 #include <ctype.h>
 #include <string.h>
+#include <stdio.h>
 
 #include <kernel/apps/handle_command.h>
 #include <kernel/drv/tty.h>
 #include <kernel/sys/ioports.h>
-#include <kernel/sys/pit.h>
 #include <kernel/sys/kheap.h>
 #include <kernel/sys/fs.h>
+#include <kernel/sys/power.h>
 
-void shutdown_system() {
-    terminal_writestring("Shutting down...\n");
-    sleep(1000);
-    outw(0x604, 0x2000); // ACPI shutdown
-}
-
-void reboot_system(){
-    terminal_writestring("Rebooting...\n");
-    sleep(1000);
-    outb(0x64, 0xFE);
-}
-
-extern size_t heap_used;
-extern size_t heap_size;
-
-void meminfo(){
-    printf("\nRAM:\n");
-    printf("Used %ld B / %ld B\n", heap_used, heap_size);
-    printf("Used %ld KB / %ld KB\n", heap_used/1024, heap_size/1024);
-    printf("Used %ld MB / %ld MB\n", heap_used/1024/1024, heap_size/1024/1024);
-    printf("\n");
-}
 
 // Function to remove extra spaces
 void trim_spaces(char* str) {
@@ -142,7 +121,7 @@ void parse_command(char* command, char** cmd, char** arg1, char** arg2) {
 // Filesystem commands
 void cmd_create_file(const char* filename) {
     if (!filename) {
-        terminal_writestring("Usage: touch <filename> [content]\n");
+        printf("Usage: touch <filename> [content]\n");
         return;
     }
     
@@ -155,7 +134,7 @@ void cmd_create_file(const char* filename) {
 
 void cmd_create_file_with_content(const char* filename, const char* content) {
     if (!filename) {
-        terminal_writestring("Usage: touch <filename> [content]\n");
+        printf("Usage: touch <filename> [content]\n");
         return;
     }
     
@@ -179,7 +158,7 @@ void cmd_create_file_with_content(const char* filename, const char* content) {
 
 void cmd_delete_file(const char* filename) {
     if (!filename) {
-        terminal_writestring("Usage: delete <filename>\n");
+        printf("Usage: delete <filename>\n");
         return;
     }
     
@@ -192,7 +171,7 @@ void cmd_delete_file(const char* filename) {
 
 void cmd_write_file(const char* filename, const char* content) {
     if (!filename || !content) {
-        terminal_writestring("Usage: write <filename> <content>\n");
+        printf("Usage: write <filename> <content>\n");
         return;
     }
     
@@ -205,7 +184,7 @@ void cmd_write_file(const char* filename, const char* content) {
 
 void cmd_read_file(const char* filename) {
     if (!filename) {
-        terminal_writestring("Usage: read <filename>\n");
+        printf("Usage: read <filename>\n");
         return;
     }
     
@@ -222,7 +201,7 @@ void cmd_read_file(const char* filename) {
     
     char* buffer = (char*)kmalloc(size + 1);
     if (!buffer) {
-        terminal_writestring("Out of memory\n");
+        printf("Out of memory\n");
         return;
     }
     
@@ -239,7 +218,7 @@ void cmd_read_file(const char* filename) {
 
 void cmd_clear_file(const char* filename) {
     if (!filename) {
-        terminal_writestring("Usage: truncate <filename>\n");
+        printf("Usage: truncate <filename>\n");
         return;
     }
     
@@ -260,7 +239,7 @@ void cmd_clear_file(const char* filename) {
 // Directory commands
 void cmd_create_directory(const char* dirname) {
     if (!dirname) {
-        terminal_writestring("Usage: mkdir <dirname>\n");
+        printf("Usage: mkdir <dirname>\n");
         return;
     }
     
@@ -273,7 +252,7 @@ void cmd_create_directory(const char* dirname) {
 
 void cmd_delete_directory(const char* dirname) {
     if (!dirname) {
-        terminal_writestring("Usage: rmdir <dirname>\n");
+        printf("Usage: rmdir <dirname>\n");
         return;
     }
     
@@ -286,7 +265,7 @@ void cmd_delete_directory(const char* dirname) {
 
 void cmd_rename(const char* old_name, const char* new_name) {
     if (!old_name || !new_name) {
-        terminal_writestring("Usage: rename <old_name> <new_name>\n");
+        printf("Usage: rename <old_name> <new_name>\n");
         return;
     }
     
@@ -316,7 +295,7 @@ void cmd_rename(const char* old_name, const char* new_name) {
 
 void cmd_move_entry(const char* source_path, const char* dest_path) {
     if (!source_path || !dest_path) {
-        terminal_writestring("Usage: mv <source_path> <dest_path>\n");
+        printf("Usage: mv <source_path> <dest_path>\n");
         return;
     }
     
@@ -343,63 +322,63 @@ void cmd_print_working_directory(void) {
 
 // Help system functions
 void show_help_system(void) {
-    terminal_writestring("System Commands:\n");
-    terminal_writestring("  help              - Show this help message\n");
-    terminal_writestring("  help <category>   - Show help for specific category\n");
-    terminal_writestring("  meminfo           - Display RAM information\n");
-    terminal_writestring("  clear             - Clear the terminal screen\n");
-    terminal_writestring("  reboot            - Reboot PC\n");
-    terminal_writestring("  exit              - Exit the system\n");
+    printf("System Commands:\n");
+    printf("  help              - Show list of help categories\n");
+    printf("  help <category>   - Show help for specific category\n");
+    printf("  meminfo           - Display RAM information\n");
+    printf("  clear             - Clear the terminal screen\n");
+    printf("  reboot            - Reboot PC\n");
+    printf("  exit              - Exit the system\n");
 }
 
 void show_help_filesystem(void) {
-    terminal_writestring("File & Directory Management:\n");
-    terminal_writestring("  touch <filename> [content] - Create a new file with optional content\n");
-    terminal_writestring("  mkdir <dirname>   - Create a new directory\n");
-    terminal_writestring("  rm <filename>     - Delete a file\n");
-    terminal_writestring("  rmdir <dirname>   - Delete a directory\n");
-    terminal_writestring("  mv <source> <dest> - Move a file or directory to different location\n");
-    terminal_writestring("  rename <old_name> <new_name> - Rename a file or directory\n");
-    terminal_writestring("  ls                - List files and directories\n");
+    printf("File & Directory Management:\n");
+    printf("  touch <filename> [content] - Create a new file with optional content\n");
+    printf("  mkdir <dirname>   - Create a new directory\n");
+    printf("  rm <filename>     - Delete a file\n");
+    printf("  rmdir <dirname>   - Delete a directory\n");
+    printf("  mv <source> <dest> - Move a file or directory to different location\n");
+    printf("  rename <old_name> <new_name> - Rename a file or directory\n");
+    printf("  ls                - List files and directories\n");
 }
 
 void show_help_file_content(void) {
-    terminal_writestring("File Content Operations:\n");
-    terminal_writestring("  echo <filename> <content> - Write content to file\n");
-    terminal_writestring("  cat <filename>    - Read file content\n");
-    terminal_writestring("  truncate <filename> - Clear file content (make file empty)\n");
+    printf("File Content Operations:\n");
+    printf("  echo <filename> <content> - Write content to file\n");
+    printf("  cat <filename>    - Read file content\n");
+    printf("  truncate <filename> - Clear file content (make file empty)\n");
 }
 
 void show_help_navigation(void) {
-    terminal_writestring("Navigation Commands:\n");
-    terminal_writestring("  pwd               - Print working directory\n");
-    terminal_writestring("  cd [dirname]      - Change directory (cd .. for parent, cd for root)\n");
-    terminal_writestring("  Note: Use ~ prefix for paths starting from home directory\n");
-    terminal_writestring("  Examples: cd ~/documents, mv file.txt ~/backup/\n");
+    printf("Navigation Commands:\n");
+    printf("  pwd               - Print working directory\n");
+    printf("  cd [dirname]      - Change directory (cd .. for parent, cd for root)\n");
+    printf("  Note: Use ~ prefix for paths starting from home directory\n");
+    printf("  Examples: cd ~/documents, mv file.txt ~/backup/\n");
 }
 
 void show_help_all(void) {
-    terminal_writestring("Available command categories:\n");
-    terminal_writestring("  help system       - System and control commands\n");
-    terminal_writestring("  help fs           - File & directory management\n");
-    terminal_writestring("  help content      - File content operations\n");
-    terminal_writestring("  help navigation   - Navigation and path commands\n");
-    terminal_writestring("\nUse 'help all' to see all commands at once.\n");
+    printf("Available command categories:\n");
+    printf("  help system       - System and control commands\n");
+    printf("  help fs           - File & directory management\n");
+    printf("  help content      - File content operations\n");
+    printf("  help navigation   - Navigation and path commands\n");
+    printf("\nUse 'help all' to see all commands at once.\n");
 }
 
 void show_help_complete(void) {
     show_help_system();
-    terminal_writestring("\n");
+    printf("\n");
     show_help_filesystem();
-    terminal_writestring("\n");
+    printf("\n");
     show_help_file_content();
-    terminal_writestring("\n");
+    printf("\n");
     show_help_navigation();
 }
 
 void handle_command(char* command) {
     if (!command || *command == '\0') {
-        terminal_writestring("No command entered.\n");
+        printf("No command entered.\n");
         return;
     }
 
@@ -409,7 +388,7 @@ void handle_command(char* command) {
     size_t command_len = strlen(command);
     char* command_copy = (char*)kmalloc(command_len + 1);
     if (!command_copy) {
-        terminal_writestring("Out of memory\n");
+        printf("Out of memory\n");
         return;
     }
     strcpy(command_copy, command);
@@ -421,7 +400,7 @@ void handle_command(char* command) {
     parse_command(command_copy, &cmd, &arg1, &arg2);
     
     if (!cmd) {
-        terminal_writestring("No command entered.\n");
+        printf("No command entered.\n");
         return;
     }
 
@@ -498,7 +477,7 @@ void handle_command(char* command) {
     } else if (strcmp(cmd, "truncate") == 0) {
         cmd_clear_file(arg1);
     } else {
-        terminal_writestring("Unknown command.\n");
+        printf("Unknown command.\n");
     }
     
     // Free allocated memory

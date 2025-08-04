@@ -124,3 +124,11 @@ void kheap_dump() {
         hdr = hdr->next;
     } while(hdr);
 }
+
+void meminfo(){
+    printf("\nRAM:\n");
+    printf("Used %ld B / %ld B\n", heap_used, heap_size);
+    printf("Used %ld KB / %ld KB\n", heap_used/1024, heap_size/1024);
+    printf("Used %ld MB / %ld MB\n", heap_used/1024/1024, heap_size/1024/1024);
+    printf("\n");
+}

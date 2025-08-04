@@ -17,6 +17,12 @@ extern uint16_t scroll_buffer[SCROLL_BUFFER_SIZE][VGA_HEIGHT * VGA_WIDTH];
 extern size_t scroll_offset;
 extern size_t scroll_buffer_pos;
 
+// Store current terminal state
+extern uint16_t current_terminal_state[VGA_HEIGHT * VGA_WIDTH];
+extern size_t saved_terminal_row;
+extern size_t saved_terminal_column;
+extern bool state_saved;
+
 
 void scroll_terminal(void);
 void scroll_up(void);
@@ -33,11 +39,7 @@ void terminal_set_cursor_position(uint16_t position);
 
 void terminal_putentryat(char c, uint8_t color, size_t x, size_t y);
 
-void terminal_putchar(char c);
-
 void terminal_write(const char* data, size_t size);
-
-void terminal_writestring(const char* data);
 
 void copyright_text();
 

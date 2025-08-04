@@ -213,7 +213,7 @@ int fs_resolve_path(const char* path, uint32_t* parent_id, char* filename) {
     char* token = start;
     char* next_slash;
     
-    while ((next_slash = strchr((char*)token, '/')) != NULL) {
+    while ((next_slash = (char*)strchr(token, '/')) != NULL) {
         *next_slash = '\0';
         
         // Handle special directories

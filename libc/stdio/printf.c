@@ -13,7 +13,6 @@ void putint(const size_t i) {
     puts(res);
 }
 
-// Updated printf function
 int printf(const char* format, ...) {
     va_list args;
     va_start(args, format);
