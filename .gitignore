@@ -1,0 +1,11 @@
+*.iso
+isodir
+sysroot
+.vscode/
+*.img
+*.inc
+*.img
+*.o
+*.bin
+*.elf
+build/
