@@ -1,11 +1,11 @@
-$(BUILD)/entry.o: src/kernel/entry.asm
+$(BUILD)/entry32.o: src/kernel/entry32.asm
 	mkdir -p $(dir $@)
 	$(ASM) $(ASM_ELF_FLAGS) $< -o $@
 
-$(BUILD)/kernel_c.o: src/kernel/kernel.c
+$(BUILD)/kernel32.o: src/kernel/kernel32.c
 	mkdir -p $(dir $@)
-	gcc -m16 -ffreestanding -c $< -o $@
+	gcc -m32 -ffreestanding -fno-builtin -nostdinc -c $< -o $@
 
-$(KERNEL_BIN): $(BUILD)/entry.o $(BUILD)/kernel_c.o
-	ld -m elf_i386 -T src/kernel/linker.ld -nostdlib --oformat elf32-i386 -o $(BUILD)/kernel.elf $^
-	$(OBJCOPY) -O binary $(BUILD)/kernel.elf $@
+$(KERNEL_BIN): $(BUILD)/entry32.o $(BUILD)/kernel32.o
+	ld -m elf_i386 -T src/kernel/linker.ld -nostdlib --oformat elf32-i386 -o $(KERNEL_ELF) $^
+	$(OBJCOPY) -O binary $(KERNEL_ELF) $@
