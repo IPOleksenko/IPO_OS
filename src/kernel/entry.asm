@@ -1,23 +1,27 @@
-bits 64
+bits 16
 section .text
-global _start
+global main
+extern kmain
 
-_start:
-    mov rdi, 0xB8000
-    mov rsi, msg
+main:
+    mov si, msg
+    call print
 
-.print:
+    call kmain
+
+    cli
+
+print:
     lodsb
     test al, al
-    jz halt
-    mov ah, 0x0F
-    mov [rdi], ax
-    add rdi, 2
-    jmp .print
-
-halt:
+    jz .done
+    mov ah, 0x0E
+    int 0x10
+    jmp print
+.done:
+    ret
+.hang:
     hlt
-    jmp halt
+    jmp .hang
 
-section .rodata
-msg db "Hello from ELF64 kernel!",0
+msg db "ENTRY_OK", 10, 13, 0

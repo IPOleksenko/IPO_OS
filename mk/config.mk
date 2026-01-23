@@ -42,6 +42,6 @@ ASM_BIN_FLAGS := -f bin \
 	-I$(BUILD)/boot/stage2
 
 
-ASM_ELF_FLAGS := -f elf64
+ASM_ELF_FLAGS := -f elf32
 LD_FLAGS      := -T $(SRC)/kernel/linker.ld -nostdlib
 QEMU_FLAGS    := -drive format=raw,file=$(OS_IMAGE)
