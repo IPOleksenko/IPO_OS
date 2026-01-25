@@ -6,6 +6,8 @@ ASM     := nasm
 LD      := ld
 OBJCOPY := objcopy
 QEMU    := qemu-system-x86_64
+CC      := gcc
+AR      := ar
 
 SRC     := src
 BUILD   := build
@@ -29,6 +31,10 @@ KERNEL_ELF := $(BUILD)/kernel.elf
 KERNEL_BIN := $(BUILD)/kernel.bin
 OS_IMAGE   := $(BUILD)/IPO_OS.img
 
+LIB_DIR       := lib
+LIB_BUILD_DIR := $(BUILD)/lib
+LIB           := $(LIB_BUILD_DIR)/libc.a
+
 # ==================================================
 #                     FLAGS
 # ==================================================
@@ -45,3 +51,5 @@ ASM_BIN_FLAGS := -f bin \
 ASM_ELF_FLAGS := -f elf32
 LD_FLAGS      := -T $(SRC)/kernel/linker.ld -nostdlib
 QEMU_FLAGS    := -drive format=raw,file=$(OS_IMAGE)
+
+LIB_CFLAGS := -m32 -ffreestanding -fno-builtin -nostdinc -Ilib/h
