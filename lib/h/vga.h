@@ -41,7 +41,7 @@ void vga_reset_cursor(void);
 // Clears the screen
 static inline void vga_clear(enum vga_color fg, enum vga_color bg) {
     volatile uint16_t* vga = VGA_MEMORY;
-    uint16_t blank = vga_entry(' ', fg, bg);
+    uint16_t blank = vga_entry(0x00, fg, bg);
 
     for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
         vga[i] = blank;

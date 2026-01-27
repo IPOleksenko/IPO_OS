@@ -54,4 +54,4 @@ ASM_ELF_FLAGS := -f elf32
 LD_FLAGS      := -T $(SRC)/kernel/linker.ld -nostdlib
 QEMU_FLAGS    := -drive format=raw,file=$(OS_IMAGE)
 
-LIB_CFLAGS := -m32 -ffreestanding -fno-builtin -nostdinc -Ilib/h
+LIB_CFLAGS := -m32 -ffreestanding -fno-pic -fno-pie -fno-builtin -nostdlib -nostartfiles -Ilib/h
