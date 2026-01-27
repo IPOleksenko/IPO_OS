@@ -1,8 +1,7 @@
-#include <ioport.h>
-#include <vga.h>
+#include <kernel/terminal.h>
 
 void kmain(void) {
-    vga_clear(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+    terminal_initialize();
 
     for (;;) asm volatile("hlt");
 }

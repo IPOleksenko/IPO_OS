@@ -2,6 +2,7 @@
 #define ARCH_I386_VGA_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 enum vga_color {
     VGA_COLOR_BLACK = 0,
@@ -38,17 +39,13 @@ void vga_set_cursor(uint16_t offset);
 // Resets cursor to the top-left corner
 void vga_reset_cursor(void);
 
-// Clears the screen
-static inline void vga_clear(enum vga_color fg, enum vga_color bg) {
-    volatile uint16_t* vga = VGA_MEMORY;
-    uint16_t blank = vga_entry(0x00, fg, bg);
+// Shows the cursor
+void vga_show_cursor(void);
 
-    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
-        vga[i] = blank;
-    }
+// Hides the cursor
+void vga_hide_cursor(void);
 
-    // Reset cursor to the top-left corner
-    vga_reset_cursor();
-}
+// Clears the VGA screen with specified foreground and background colors and cursor settings
+void vga_clear(enum vga_color fg, enum vga_color bg, bool show_cursor, int cursor_position);
 
 #endif

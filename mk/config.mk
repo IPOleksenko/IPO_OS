@@ -29,6 +29,8 @@ BOOT_CFG_OUT   := $(BUILD)/boot/config.inc
 STAGE1_CFG_OUT := $(BUILD)/boot/stage1/config.inc
 STAGE2_CFG_OUT := $(BUILD)/boot/stage2/config.inc
 
+BOOT_BIN   := $(BUILD)/boot/boot.bin
+
 KERNEL_ELF := $(BUILD)/kernel.elf
 KERNEL_BIN := $(BUILD)/kernel.bin
 OS_IMAGE   := $(BUILD)/IPO_OS.img

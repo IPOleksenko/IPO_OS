@@ -1,2 +1,1 @@
-%define STAGE1_BASE     0x7C00
-%define STAGE2_BASE     0x8000
+%define KERNEL_SECTORS @KERNEL_SECTORS@

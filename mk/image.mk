@@ -1,2 +1,2 @@
-$(OS_IMAGE): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN)
+$(OS_IMAGE): $(BOOT_BIN) $(KERNEL_BIN)
 	cat $^ > $@
