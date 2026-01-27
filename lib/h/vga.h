@@ -36,9 +36,6 @@ static inline uint16_t vga_entry(unsigned char c, enum vga_color fg, enum vga_co
 // offset = row * VGA_WIDTH + col
 void vga_set_cursor(uint16_t offset);
 
-// Resets cursor to the top-left corner
-void vga_reset_cursor(void);
-
 // Shows the cursor
 void vga_show_cursor(void);
 

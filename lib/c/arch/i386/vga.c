@@ -16,11 +16,6 @@ void vga_set_cursor(uint16_t offset) {
     outb(0x3D5, offset & 0xFF);
 }
 
-// Resets cursor to the top-left corner
-void vga_reset_cursor(void) {
-    vga_set_cursor(0);
-}
-
 // Shows the cursor
 void vga_show_cursor(void) {
     // Cursor start register (0x0A) - enable cursor
