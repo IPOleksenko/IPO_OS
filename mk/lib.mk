@@ -1,17 +1,7 @@
-SRCS_C := $(shell find $(LIB_DIR)/c -type f -name '*.c' 2>/dev/null)
-SRCS_ASM := $(shell find $(LIB_DIR)/asm -type f -name '*.asm' 2>/dev/null)
-SRCS_S := $(shell find $(LIB_DIR)/asm -type f -name '*.s' 2>/dev/null)
-SRCS_CAPS_S := $(shell find $(LIB_DIR)/asm -type f -name '*.S' 2>/dev/null)
-
-LIB_OBJS := $(patsubst $(LIB_DIR)/%.c,$(LIB_BUILD_DIR)/%.o,$(SRCS_C)) \
-		$(patsubst $(LIB_DIR)/%.asm,$(LIB_BUILD_DIR)/%.o,$(SRCS_ASM)) \
-		$(patsubst $(LIB_DIR)/%.s,$(LIB_BUILD_DIR)/%.o,$(SRCS_S)) \
-		$(patsubst $(LIB_DIR)/%.S,$(LIB_BUILD_DIR)/%.o,$(SRCS_CAPS_S))
-
 .PHONY: lib
-lib: $(LIB)
+lib: $(LIB_A)
 
-$(LIB): $(LIB_OBJS)
+$(LIB_A): $(LIB_OBJS)
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $^
 
@@ -36,4 +26,4 @@ $(LIB_BUILD_DIR)/%.o: $(LIB_DIR)/%.S
 .PHONY: clean-lib
 clean-lib:
 	rm -rf $(LIB_BUILD_DIR)
-	rm -f $(LIB)
+	rm -f $(LIB_A)

@@ -1,3 +1,6 @@
+.PHONY: boot
+boot: $(BOOT_BIN)
+
 $(BUILD)/boot/config.inc: $(SRC)/boot/config.inc.in $(KERNEL_BIN)
 	@mkdir -p $(dir $@)
 	@size=$$(stat -c %s $(KERNEL_BIN)); \

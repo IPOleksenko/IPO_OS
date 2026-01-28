@@ -1,3 +1,6 @@
+.PHONY: kernel
+kernel: $(KERNEL_BIN)
+
 $(BUILD)/entry32.o: src/kernel/entry32.asm
 	mkdir -p $(dir $@)
 	$(ASM) $(ASM_ELF_FLAGS) $< -o $@

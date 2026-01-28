@@ -3,31 +3,24 @@
 # ==================================================
 
 ASM     := nasm
-LD      := ld
-OBJCOPY := objcopy
-QEMU    := qemu-system-x86_64
 CC      := gcc
+LD      := ld
 AR      := ar
+OBJCOPY := objcopy
+QEMU    := qemu-system-i386
+
+
+# ==================================================
+#                 PROJECT DIRECTORIES
+# ==================================================
 
 SRC     := src
 BUILD   := build
 
-LIBGCC := $(shell gcc -m32 -print-libgcc-file-name)
 
 # ==================================================
-#                     PATHS
+#                 OUTPUT / ARTIFACTS
 # ==================================================
-
-STAGE1_BIN := $(BUILD)/boot/stage1/stage1.bin
-STAGE2_BIN := $(BUILD)/boot/stage2/stage2.bin
-
-BOOT_CFG_IN   := $(SRC)/boot/config.inc.in
-STAGE1_CFG_IN := $(SRC)/boot/stage1/config.inc.in
-STAGE2_CFG_IN := $(SRC)/boot/stage2/config.inc.in
-
-BOOT_CFG_OUT   := $(BUILD)/boot/config.inc
-STAGE1_CFG_OUT := $(BUILD)/boot/stage1/config.inc
-STAGE2_CFG_OUT := $(BUILD)/boot/stage2/config.inc
 
 BOOT_BIN   := $(BUILD)/boot/boot.bin
 
@@ -35,9 +28,56 @@ KERNEL_ELF := $(BUILD)/kernel.elf
 KERNEL_BIN := $(BUILD)/kernel.bin
 OS_IMAGE   := $(BUILD)/IPO_OS.img
 
+
+# ==================================================
+#                 LIBRARY PATHS
+# ==================================================
+
 LIB_DIR       := lib
 LIB_BUILD_DIR := $(BUILD)/lib
-LIB           := $(LIB_BUILD_DIR)/libc.a
+LIB_A         := $(LIB_BUILD_DIR)/libc.a
+
+
+# ==================================================
+#                 BOOT CONFIG PATHS
+# ==================================================
+
+BOOT_CFG_IN    := $(SRC)/boot/config.inc.in
+STAGE1_CFG_IN  := $(SRC)/boot/stage1/config.inc.in
+STAGE2_CFG_IN  := $(SRC)/boot/stage2/config.inc.in
+
+BOOT_CFG_OUT   := $(BUILD)/boot/config.inc
+STAGE1_CFG_OUT := $(BUILD)/boot/stage1/config.inc
+STAGE2_CFG_OUT := $(BUILD)/boot/stage2/config.inc
+
+
+# ==================================================
+#                 LIBRARY SOURCES
+# ==================================================
+
+SRCS_C        := $(shell find $(LIB_DIR)/c   -type f -name '*.c'   2>/dev/null)
+SRCS_ASM      := $(shell find $(LIB_DIR)/asm -type f -name '*.asm' 2>/dev/null)
+SRCS_S        := $(shell find $(LIB_DIR)/asm -type f -name '*.s'   2>/dev/null)
+SRCS_CAPS_S   := $(shell find $(LIB_DIR)/asm -type f -name '*.S'   2>/dev/null)
+
+
+# ==================================================
+#                 LIBRARY OBJECTS
+# ==================================================
+
+LIB_OBJS := \
+	$(patsubst $(LIB_DIR)/%.c,   $(LIB_BUILD_DIR)/%.o, $(SRCS_C)) \
+	$(patsubst $(LIB_DIR)/%.asm, $(LIB_BUILD_DIR)/%.o, $(SRCS_ASM)) \
+	$(patsubst $(LIB_DIR)/%.s,   $(LIB_BUILD_DIR)/%.o, $(SRCS_S)) \
+	$(patsubst $(LIB_DIR)/%.S,   $(LIB_BUILD_DIR)/%.o, $(SRCS_CAPS_S))
+
+
+# ==================================================
+#                 RUNTIME / LINKER LIBS
+# ==================================================
+
+LIBGCC := $(shell $(CC) -m32 -print-libgcc-file-name)
+
 
 # ==================================================
 #                     FLAGS
@@ -51,9 +91,15 @@ ASM_BIN_FLAGS := -f bin \
 	-I$(BUILD)/boot/stage1 \
 	-I$(BUILD)/boot/stage2
 
-
 ASM_ELF_FLAGS := -f elf32
-LD_FLAGS      := -T $(SRC)/kernel/linker.ld -nostdlib
-QEMU_FLAGS    := -drive format=raw,file=$(OS_IMAGE)
 
-LIB_CFLAGS := -m32 -ffreestanding -fno-pic -fno-pie -fno-builtin -nostdlib -nostartfiles -Ilib/h
+LIB_CFLAGS := -m32 \
+	-ffreestanding \
+	-fno-pic -fno-pie \
+	-fno-builtin \
+	-nostdlib -nostartfiles \
+	-Ilib/h
+
+LD_FLAGS := -T $(SRC)/kernel/linker.ld -nostdlib
+
+QEMU_FLAGS := -drive format=raw,file=$(OS_IMAGE)
