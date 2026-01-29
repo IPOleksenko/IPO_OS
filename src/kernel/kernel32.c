@@ -1,7 +1,11 @@
 #include <kernel/terminal.h>
+#include <vga.h>
+#include <ioport.h>
 
 void kmain(void) {
     terminal_initialize();
-
-    for (;;) asm volatile("hlt");
+    
+    for (;;) {
+        terminal_console();
+    }
 }

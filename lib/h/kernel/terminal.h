@@ -5,4 +5,6 @@ void print_header(void);
 
 void terminal_initialize(void);
 
+void terminal_console(void);
+
 #endif
