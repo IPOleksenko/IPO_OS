@@ -23,9 +23,55 @@ void print_header(void) {
 }
 
 void terminal_initialize(void) {
-    vga_clear(VGA_COLOR_WHITE, VGA_COLOR_BLACK, true, VGA_WIDTH * 2);
+    vga_clear(VGA_COLOR_WHITE, VGA_COLOR_BLACK, true, VGA_START_CURSOR_POSITION);
 
     print_header();
+}
+
+void handle_control_char(char c) {
+    volatile uint16_t* vga = VGA_MEMORY;
+    uint16_t cursor = vga_get_cursor_position();
+    
+    switch(c) {
+        case '\n': {
+            uint16_t row = cursor / VGA_WIDTH;
+            uint16_t next_row = row + 1;
+            
+            if (next_row >= VGA_HEIGHT) {
+                for (int i = 0; i < VGA_WIDTH * (VGA_HEIGHT - 1); i++) {
+                    vga[i] = vga[i + VGA_WIDTH];
+                }
+                uint16_t blank = vga_entry(0x00, VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+                for (int i = VGA_WIDTH * (VGA_HEIGHT - 1); i < VGA_WIDTH * VGA_HEIGHT; i++) {
+                    vga[i] = blank;
+                }
+                vga_set_cursor((VGA_HEIGHT - 1) * VGA_WIDTH);
+            } else {
+                vga_set_cursor(next_row * VGA_WIDTH);
+            }
+            break;
+        }
+        
+        case '\t': {
+            uint16_t col = cursor % VGA_WIDTH;
+            uint16_t next_col = col + 4;
+            if (next_col >= VGA_WIDTH) {
+                handle_control_char('\n');
+            } else {
+                vga_set_cursor(cursor + 4);
+            }
+            break;
+        }
+        
+        case '\b': {
+            if (cursor > 0) {
+                cursor--;
+                vga[cursor] = vga_entry(0x00, VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+                vga_set_cursor(cursor);
+            }
+            break;
+        }
+    }
 }
 
 void terminal_console(void){
@@ -35,7 +81,19 @@ void terminal_console(void){
     if (scancode != 0x00) {
         update_hot_key_state(scancode);
         hot_key_handler(scancode);
-           
-        vga[80] = vga_entry(get_char(scancode), VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+        
+        bool is_break_code = (scancode & 0x80) != 0;
+        
+        if (!is_break_code) {
+            char c = get_char(scancode);
+            if (c != 0x00) {
+                if (c == '\n' || c == '\t' || c == '\b') {
+                    handle_control_char(c);
+                } else {
+                    vga[vga_get_cursor_position()] = vga_entry(c, VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+                    vga_increment_cursor_position();
+                }
+            }
+        }
     }
 }

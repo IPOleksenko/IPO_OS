@@ -40,7 +40,6 @@ void hot_key_handler(uint8_t scancode) {
     if (key_state[SC_PRESS_CTRL] && (key_state[SC_PRESS_LEFT_SHIFT] || key_state[SC_PRESS_RIGHT_SHIFT])) {
         switch_to_next_keyboard();
     }
-    
 }
 
 void update_hot_key_state(uint8_t scancode) {

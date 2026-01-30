@@ -27,6 +27,8 @@ enum vga_color {
 #define VGA_HEIGHT 25
 #define VGA_MEMORY ((volatile uint16_t*)0xB8000)
 
+#define VGA_START_CURSOR_POSITION (VGA_WIDTH * 2)
+
 // Creates a 16-bit value of a character + attribute
 static inline uint16_t vga_entry(unsigned char c, enum vga_color fg, enum vga_color bg) {
     return (uint16_t)c | ((bg << 4 | fg) << 8);
@@ -44,5 +46,11 @@ void vga_hide_cursor(void);
 
 // Clears the VGA screen with specified foreground and background colors and cursor settings
 void vga_clear(enum vga_color fg, enum vga_color bg, bool show_cursor, int cursor_position);
+
+uint16_t vga_get_cursor_position(void);
+
+uint16_t vga_increment_cursor_position(void);
+
+uint16_t vga_decrement_cursor_position(void);
 
 #endif
