@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <vga.h>
+#include <ioport.h>
 
 /**
  * Output a single character to VGA memory at cursor position

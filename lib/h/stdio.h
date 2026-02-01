@@ -5,6 +5,12 @@
 #include <stdarg.h>
 
 /**
+ * Low-level serial output (COM1)
+ * @param c Character to output
+ */
+void serial_putc(char c);
+
+/**
  * Output a single character to VGA memory at cursor position
  * @param c Character to output
  */

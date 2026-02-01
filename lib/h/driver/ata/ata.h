@@ -57,4 +57,10 @@ ata_device_t* ata_get_device(uint8_t index);
  */
 void ata_print_devices(void);
 
+/* Read/write sectors using PIO (LBA28). Buffer is 512 * count bytes.
+ * Returns true on success. Simple implementation for primary channel.
+ */
+bool ata_read_sectors_lba28(uint32_t lba, uint8_t count, void *buf);
+bool ata_write_sectors_lba28(uint32_t lba, uint8_t count, const void *buf);
+
 #endif /* _ATA_H */

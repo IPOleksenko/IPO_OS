@@ -51,9 +51,12 @@ static bool ata_wait_bsy_clear(uint16_t base) {
 static bool ata_wait_drq(uint16_t base) {
     for (int i = 0; i < 100000; i++) {
         uint8_t st = inb(base + ATA_REG_STATUS);
-        if (st & ATA_SR_ERR) return false;
+        if (st & ATA_SR_ERR) { printf("ata_wait_drq: ERR status=%u\n", (unsigned)st); return false; }
         if (st & ATA_SR_DRQ) return true;
+        ata_io_wait();
     }
+    uint8_t st = inb(base + ATA_REG_STATUS);
+    printf("ata_wait_drq: timeout status=%u\n", (unsigned)st);
     return false;
 }
 
@@ -162,4 +165,84 @@ void ata_print_devices(void) {
         printf("  Size: %llu MB\n", d->capacity_sectors / 2048);
         printf("\n");
     }
+}
+
+bool ata_read_sectors_lba28(uint32_t lba, uint8_t count, void *buf) {
+    if (count == 0 || buf == NULL) return false;
+    if (ata_device_count == 0) return false;
+
+    uint16_t base = ATA_PRIMARY_BASE;
+
+    /* select device (master/slave based on ata_device_count), set LBA high bits */
+    uint8_t drive_bit = (ata_device_count > 1) ? 0x10 : 0x00;
+    outb(base + ATA_REG_HDDEVSEL, 0xE0 | drive_bit | ((lba >> 24) & 0x0F));
+    ata_io_wait();
+
+    outb(base + ATA_REG_SECCOUNT0, count);
+    outb(base + ATA_REG_LBA0, (uint8_t)(lba & 0xFF));
+    outb(base + ATA_REG_LBA1, (uint8_t)((lba >> 8) & 0xFF));
+    outb(base + ATA_REG_LBA2, (uint8_t)((lba >> 16) & 0xFF));
+
+    if (!ata_wait_bsy_clear(base)) { printf("ata_read_sectors_lba28: device bsy not cleared\n"); return false; }
+
+    /* READ PIO */
+    outb(base + ATA_REG_COMMAND, 0x20);
+
+    uint16_t *wptr = (uint16_t *)buf;
+    for (int s = 0; s < count; s++) {
+        if (!ata_wait_drq(base)) return false;
+        for (int i = 0; i < 256; i++) {
+            wptr[i] = inw(base + ATA_REG_DATA);
+        }
+        wptr += 256;
+    }
+
+    return true;
+}
+
+bool ata_write_sectors_lba28(uint32_t lba, uint8_t count, const void *buf) {
+    if (count == 0 || buf == NULL) return false;
+    if (ata_device_count == 0) return false;
+
+    uint16_t base = ATA_PRIMARY_BASE;
+
+    /* select device (master/slave based on ata_device_count), set LBA high bits */
+    uint8_t drive_bit = (ata_device_count > 1) ? 0x10 : 0x00;
+    outb(base + ATA_REG_HDDEVSEL, 0xE0 | drive_bit | ((lba >> 24) & 0x0F));
+    ata_io_wait();
+
+    outb(base + ATA_REG_SECCOUNT0, count);
+    outb(base + ATA_REG_LBA0, (uint8_t)(lba & 0xFF));
+    outb(base + ATA_REG_LBA1, (uint8_t)((lba >> 8) & 0xFF));
+    outb(base + ATA_REG_LBA2, (uint8_t)((lba >> 16) & 0xFF));
+
+    /* Ensure device is ready */
+    if (!ata_wait_bsy_clear(base)) { printf("ata_write_sectors_lba28: device bsy not cleared\n"); return false; }
+
+    /* WRITE PIO */
+    outb(base + ATA_REG_COMMAND, 0x30);
+
+    const uint16_t *wptr = (const uint16_t *)buf;
+    for (int s = 0; s < count; s++) {
+        if (!ata_wait_drq(base)) {
+            /* small retry attempts */
+            int retry = 0;
+            while (retry < 5 && !ata_wait_drq(base)) { ata_io_wait(); retry++; }
+            if (retry == 5) { printf("ata_write_sectors_lba28: ata_wait_drq failed for sector %d after retries\n", s); return false; }
+        }
+        for (int i = 0; i < 256; i++) {
+            outw(base + ATA_REG_DATA, wptr[i]);
+        }
+        wptr += 256;
+        ata_io_wait();
+    }
+
+    /* flush cache */
+    outb(base + ATA_REG_COMMAND, 0xE7);
+    ata_io_wait();
+    if (!ata_wait_bsy_clear(base)) { printf("ata_write_sectors_lba28: flush bsy not cleared\n"); return false; }
+    uint8_t st = inb(base + ATA_REG_STATUS);
+    if (st & ATA_SR_ERR) { printf("ata_write_sectors_lba28: status error after flush=%u\n", (unsigned)st); return false; }
+
+    return true;
 }

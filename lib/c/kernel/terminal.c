@@ -3,10 +3,13 @@
 #include <vga.h>
 #include <driver/keyboard.h>
 #include <driver/input/keymap/keymap.h>
+#include <file_system/ipo_fs.h>
 
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdio.h>
+
 
 #define TERM_BUFFER_SIZE (256 * 1024) // 256KB history buffer
 #define MAX_LINE_OFFSETS 65536        // max number of lines remembered
@@ -75,30 +78,19 @@ static void append_string_to_history(const char* s, size_t len) {
 }
 
 // commit current input to history (handles wrapping and newlines)
-static void commit_input_to_history(void) {
-    // Append the input chars and a terminating newline
-    append_string_to_history(input_buffer, input_size);
-    append_char_to_history('\n');
-
-    // Recompute line offsets from scratch (robust against previous state)
+static void recompute_line_offsets(void) {
     line_count = 0;
-    if (term_buffer_size == 0) {
-        // nothing to index
-        input_size = 0;
-        return;
-    }
+    if (term_buffer_size == 0) return;
 
     uint16_t col = 0;
     uint16_t width = VGA_WIDTH;
 
-    // first line always starts at 0
     if (line_count < MAX_LINE_OFFSETS) line_offsets[line_count++] = 0;
 
     for (size_t i = 0; i < term_buffer_size; i++) {
         char ch = term_buffer[i];
         if (ch == '\n') {
             size_t next = i + 1;
-            // avoid adding trailing offset equal to term_buffer_size (no content)
             if (next < term_buffer_size && line_count < MAX_LINE_OFFSETS) {
                 line_offsets[line_count++] = next;
             }
@@ -114,7 +106,13 @@ static void commit_input_to_history(void) {
             }
         }
     }
+}
 
+static void commit_input_to_history(void) {
+    // Append the input chars and a terminating newline
+    append_string_to_history(input_buffer, input_size);
+    append_char_to_history('\n');
+    recompute_line_offsets();
     // reset input
     input_size = 0;
 }
@@ -296,6 +294,43 @@ void print_header(void) {
     }
 }
 
+/* Append a printed line to the terminal history and re-render */
+void terminal_print(const char *s) {
+    if (!s) return;
+    size_t len = 0; while (s[len]) len++;
+    append_string_to_history(s, len);
+    append_char_to_history('\n');
+    recompute_line_offsets();
+    render();
+}
+
+static void cmd_help(const char *arg) {
+    if (!arg || arg[0] == '\0') {
+        terminal_print("Available commands: mkdir touch ls rm cat write append mv stat help");
+        terminal_print("Usage: mkdir <path> - create directory");
+        terminal_print("       touch <path> - create file");
+        terminal_print("       ls [path] - list directory");
+        terminal_print("       rm <path> - delete file or empty dir");
+        terminal_print("       cat <path> - print file");
+        terminal_print("       write <path> <text> - overwrite file");
+        terminal_print("       append <path> <text> - append to file");
+        terminal_print("       mv <src> <dst> - rename/move");
+        terminal_print("       stat <path> - file info");
+        terminal_print("       help [cmd] - this help");
+    } else {
+        if (strncmp(arg, "mkdir", 5) == 0) terminal_print("mkdir <path> - create directory");
+        else if (strncmp(arg, "touch", 5) == 0) terminal_print("touch <path> - create file");
+        else if (strncmp(arg, "ls", 2) == 0) terminal_print("ls [path] - list directory");
+        else if (strncmp(arg, "rm", 2) == 0) terminal_print("rm <path> - delete file or empty dir");
+        else if (strncmp(arg, "cat", 3) == 0) terminal_print("cat <path> - print file");
+        else if (strncmp(arg, "write", 5) == 0) terminal_print("write <path> <text> - overwrite file");
+        else if (strncmp(arg, "append", 6) == 0) terminal_print("append <path> <text> - append to file");
+        else if (strncmp(arg, "mv", 2) == 0) terminal_print("mv <src> <dst> - rename/move");
+        else if (strncmp(arg, "stat", 4) == 0) terminal_print("stat <path> - file info");
+        else terminal_print("Unknown command for help");
+    }
+}
+
 void terminal_initialize(void) {
     vga_clear(VGA_COLOR_WHITE, VGA_COLOR_BLACK, true, VGA_START_CURSOR_POSITION);
 
@@ -313,10 +348,121 @@ void terminal_initialize(void) {
 void handle_control_char(char c) {
     switch(c) {
         case '\n': {
-            // commit current input to history and render
+            /* capture the command before clearing input */
+            char cmd[INPUT_BUFFER_SIZE];
+            size_t cmd_len = (input_size < (INPUT_BUFFER_SIZE-1)) ? input_size : (INPUT_BUFFER_SIZE-1);
+            for (size_t i = 0; i < cmd_len; i++) cmd[i] = input_buffer[i];
+            cmd[cmd_len] = '\0';
+
+            /* commit input to history */
             commit_input_to_history();
             if (view_offset != 0) view_offset = 0; // go to bottom on new input
             render();
+
+            /* process commands with minimal in-terminal parsing */
+            /* trim leading spaces */
+            char *p = cmd;
+            while (*p == ' ') p++;
+            if (strncmp(p, "mkdir", 5) == 0 && (p[5] == ' ' || p[5] == '\0')) {
+                char *arg = p + 5; while (*arg == ' ') arg++;
+                if (*arg == '\0') terminal_print("mkdir: missing path");
+                else if (ipo_fs_create(arg, IPO_INODE_TYPE_DIR) >= 0) terminal_print("mkdir: OK"); else terminal_print("mkdir: failed");
+            } else if (strncmp(p, "touch", 5) == 0 && (p[5] == ' ' || p[5] == '\0')) {
+                char *arg = p + 5; while (*arg == ' ') arg++;
+                if (*arg == '\0') terminal_print("touch: missing path");
+                else if (ipo_fs_create(arg, IPO_INODE_TYPE_FILE) >= 0) terminal_print("touch: OK"); else terminal_print("touch: failed");
+            } else if (strncmp(p, "ls", 2) == 0 && (p[2] == ' ' || p[2] == '\0')) {
+                char *arg = p + 2; while (*arg == ' ') arg++;
+                char *path = (*arg == '\0') ? "/" : arg;
+                char out[4096]; int r = ipo_fs_list_dir(path, out, sizeof(out));
+                if (r < 0) terminal_print("ls: failed"); else terminal_print(out);
+            } else if (strncmp(p, "rm", 2) == 0 && (p[2] == ' ' || p[2] == '\0')) {
+                char *arg = p + 2; while (*arg == ' ') arg++;
+                if (*arg == '\0') terminal_print("rm: missing path");
+                else if (ipo_fs_delete(arg)) terminal_print("rm: OK"); else terminal_print("rm: failed");
+            } else if (strncmp(p, "cat", 3) == 0 && (p[3] == ' ' || p[3] == '\0')) {
+                char *arg = p + 3; while (*arg == ' ') arg++;
+                if (*arg == '\0') { terminal_print("cat: missing path"); }
+                else {
+                    struct ipo_inode st;
+                    if (!ipo_fs_stat(arg, &st)) { terminal_print("cat: failed"); }
+                    else if ((st.mode & IPO_INODE_TYPE_DIR) != 0) { terminal_print("cat: path is a directory"); }
+                    else {
+                        int fd = ipo_fs_open(arg);
+                        if (fd < 0) { terminal_print("cat: failed"); }
+                        else {
+                            uint32_t remaining = st.size; uint32_t offset = 0; char buf[512+1];
+                            while (remaining > 0) {
+                                uint32_t r = (remaining > 512) ? 512 : remaining;
+                                int got = ipo_fs_read(fd, buf, r, offset);
+                                if (got <= 0) break;
+                                buf[got] = '\0'; terminal_print(buf);
+                                remaining -= got; offset += got;
+                            }
+                        }
+                    }
+                }
+            } else if (strncmp(p, "mv", 2) == 0 && (p[2] == ' ' || p[2] == '\0')) {
+                char *arg = p + 2; while (*arg == ' ') arg++;
+                char *space = strchr(arg, ' ');
+                if (!space) { terminal_print("mv: usage: mv <src> <dst>"); }
+                else {
+                    size_t sl = space - arg; char src[INPUT_BUFFER_SIZE]; char dst[INPUT_BUFFER_SIZE];
+                    if (sl >= sizeof(src)) { terminal_print("mv: src too long"); }
+                    else {
+                        strncpy(src, arg, sl); src[sl] = '\0';
+                        char *d = space + 1; while (*d == ' ') d++;
+                        size_t dl = 0; const char *q = d; while (*q && *q != ' ') { q++; dl++; }
+                        if (dl == 0) { terminal_print("mv: usage: mv <src> <dst>"); }
+                        else if (dl >= sizeof(dst)) { terminal_print("mv: dst too long"); }
+                        else {
+                            strncpy(dst, d, dl); dst[dl] = '\0';
+                            if (ipo_fs_rename(src, dst)) terminal_print("mv: OK"); else terminal_print("mv: failed");
+                        }
+                    }
+                }
+            } else if (strncmp(p, "write", 5) == 0 && (p[5] == ' ' || p[5] == '\0')) {
+                char *arg = p + 5; while (*arg == ' ') arg++;
+                char *space = strchr(arg, ' ');
+                if (!space) { terminal_print("write: usage: write <path> <text>"); }
+                else {
+                    size_t plen = space - arg; char path[INPUT_BUFFER_SIZE]; char text[INPUT_BUFFER_SIZE];
+                    if (plen >= sizeof(path)) { terminal_print("write: path too long"); }
+                    else {
+                        strncpy(path, arg, plen); path[plen] = '\0';
+                        char *t = space + 1; while (*t == ' ') t++;
+                        if (*t == '\0') { terminal_print("write: missing text"); }
+                        else { strncpy(text, t, sizeof(text)-1); text[sizeof(text)-1] = '\0'; if (ipo_fs_write_text(path, text, false)) terminal_print("write: OK"); else terminal_print("write: failed"); }
+                    }
+                }
+            } else if (strncmp(p, "append", 6) == 0 && (p[6] == ' ' || p[6] == '\0')) {
+                char *arg = p + 6; while (*arg == ' ') arg++;
+                char *space = strchr(arg, ' ');
+                if (!space) { terminal_print("append: usage: append <path> <text>"); }
+                else {
+                    size_t plen = space - arg; char path[INPUT_BUFFER_SIZE]; char text[INPUT_BUFFER_SIZE];
+                    if (plen >= sizeof(path)) { terminal_print("append: path too long"); }
+                    else {
+                        strncpy(path, arg, plen); path[plen] = '\0';
+                        char *t = space + 1; while (*t == ' ') t++;
+                        if (*t == '\0') { terminal_print("append: missing text"); }
+                        else { strncpy(text, t, sizeof(text)-1); text[sizeof(text)-1] = '\0'; if (ipo_fs_write_text(path, text, true)) terminal_print("append: OK"); else terminal_print("append: failed"); }
+                    }
+                }
+            } else if (strncmp(p, "stat", 4) == 0 && (p[4] == ' ' || p[4] == '\0')) {
+                char *arg = p + 4; while (*arg == ' ') arg++;
+                if (*arg == '\0') terminal_print("stat: missing path"); else {
+                    struct ipo_inode st; if (!ipo_fs_stat(arg, &st)) { terminal_print("stat: failed"); }
+                    else {
+                        char out[128]; char numbuf[32]; if (st.mode & IPO_INODE_TYPE_DIR) { strcpy(out, "type=dir size="); } else { strcpy(out, "type=file size="); }
+                        size_t pos = strlen(out); int n = itoa(st.size, numbuf, 10); if (n < 0) n = 0; if (n > (int)sizeof(numbuf)-1) n = sizeof(numbuf)-1; numbuf[n] = '\0'; memcpy(out + pos, numbuf, n); pos += n; out[pos] = '\0'; const char *links_str = " links="; size_t ls = 0; while (links_str[ls]) { out[pos++] = links_str[ls++]; } int m = itoa(st.links_count, numbuf, 10); if (m < 0) m = 0; if (m > (int)sizeof(numbuf)-1) m = sizeof(numbuf)-1; numbuf[m] = '\0'; memcpy(out + pos, numbuf, m); pos += m; out[pos] = '\0'; terminal_print(out);
+                    }
+                }
+            } else if (strncmp(p, "help", 4) == 0 && (p[4] == ' ' || p[4] == '\0')) {
+                char *arg = p + 4; while (*arg == ' ') arg++; cmd_help(arg);
+            } else {
+                if (p[0] != '\0') terminal_print("unknown command, type 'help'");
+            }
             break;
         }
         case '\t': {
