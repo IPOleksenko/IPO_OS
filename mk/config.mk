@@ -102,4 +102,7 @@ LIB_CFLAGS := -m32 \
 
 LD_FLAGS := -T $(SRC)/kernel/linker.ld -nostdlib
 
-QEMU_FLAGS := -drive format=raw,file=$(OS_IMAGE) -audiodev pa,id=pa -machine pcspk-audiodev=pa
+QEMU_FLAGS := -drive format=raw,file=$(OS_IMAGE),if=ide,index=0 \
+              -drive format=raw,file=build/disk.img,if=ide,index=1 \
+              -cdrom build/disk.iso \
+              -audiodev pa,id=pa -machine pcspk-audiodev=pa
