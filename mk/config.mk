@@ -24,8 +24,8 @@ BUILD   := build
 
 BOOT_BIN   := $(BUILD)/boot/boot.bin
 
-KERNEL_ELF := $(BUILD)/kernel.elf
-KERNEL_BIN := $(BUILD)/kernel.bin
+KERNEL_ELF := $(BUILD)/kernel/kernel.elf
+KERNEL_BIN := $(BUILD)/kernel/kernel.bin
 OS_IMAGE   := $(BUILD)/IPO_OS.img
 
 
@@ -102,4 +102,4 @@ LIB_CFLAGS := -m32 \
 
 LD_FLAGS := -T $(SRC)/kernel/linker.ld -nostdlib
 
-QEMU_FLAGS := -drive format=raw,file=$(OS_IMAGE)
+QEMU_FLAGS := -drive format=raw,file=$(OS_IMAGE) -audiodev pa,id=pa -machine pcspk-audiodev=pa
