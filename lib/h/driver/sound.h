@@ -3,13 +3,6 @@
 
 #include <stdint.h>
 
-/* IO ports for PC Speaker */
-#define SOUND_CTRL_PORT 0x61    /* Control port for speaker */
-
-/* Control bits */
-#define SOUND_CTRL_GATE 0x01    /* Gate for speaker enable */
-#define SOUND_CTRL_SPEAKER 0x02 /* Speaker on/off bit */
-
 /**
  * Initialize sound driver
  */
@@ -17,7 +10,7 @@ void sound_init(void);
 
 /**
  * Play sound at specified frequency (Hz)
- * @param frequency Frequency in Hz (440 = A4, typical range 37-32767 Hz)
+ * @param frequency Frequency in Hz (440 = A4, typical range 37-20000 Hz)
  */
 void sound_play(uint16_t frequency);
 
