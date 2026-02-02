@@ -10,3 +10,4 @@ sysroot
 *.elf
 build/
 *.log
+__pycache__

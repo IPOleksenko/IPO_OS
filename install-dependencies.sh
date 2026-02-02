@@ -8,7 +8,7 @@ echo "Updating package lists..."
 sudo apt update || { echo "Failed to update package lists"; exit 1; }
 
 # Check and install only missing packages
-REQUIRED_PACKAGES=("build-essential" "bison" "flex" "libgmp3-dev" "libmpc-dev" "libmpfr-dev" "texinfo" "qemu-system-x86" "xorriso" "grub-pc-bin")
+REQUIRED_PACKAGES=("build-essential" "bison" "flex" "libgmp3-dev" "libmpc-dev" "libmpfr-dev" "texinfo" "qemu-system-x86" "xorriso" "grub-pc-bin" "python3" "python3-pip" "python3-venv")
 for PACKAGE in "${REQUIRED_PACKAGES[@]}"; do
     if dpkg -s $PACKAGE &> /dev/null; then
         echo "$PACKAGE is already installed. Skipping..."
