@@ -17,6 +17,7 @@ Executes the complete build pipeline in order, then runs the OS in QEMU:
 - Compiles the kernel
 - Builds the bootloader
 - Creates the OS image
+- Build applications
 - Launches QEMU with the OS
 
 ```bash
@@ -47,6 +48,12 @@ Combines bootloader and kernel into a single OS image:
 make image
 ```
 
+#### `make apps` — Build applications
+Build applications:
+```bash
+make apps
+```
+
 #### `make run` — Launch in QEMU
 Runs the OS image in QEMU emulator:
 ```bash
@@ -71,6 +78,12 @@ make clean
 Removes only the library build artifacts:
 ```bash
 make clean-lib
+```
+
+#### `make clean-apps` — Clean Applications Only
+Removes only the applications build artifacts:
+```bash
+make clean-apps
 ```
 
 ### 🔧 Utility Commands

@@ -11,7 +11,10 @@ void handle_control_char(char c);
 
 void terminal_console(void);
 
-/* Print a line to the terminal history */
 void terminal_print(const char *s);
+
+int try_execute_command(const char *cmd);
+
+char* resolve_command_path(const char *cmd);
 
 #endif

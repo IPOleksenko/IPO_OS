@@ -1,25 +1,15 @@
 #include <vga.h>
 #include <ioport.h>
 
-uint16_t cursor_position = VGA_START_CURSOR_POSITION;
-
 // Sets the cursor position
 // offset = row * VGA_WIDTH + col
 void vga_set_cursor(uint16_t offset) {
-    uint16_t position = offset + VGA_WIDTH;
-
-    // 0x3D4 is the cursor location register high byte
-    // 0x3D5 is the cursor location register low byte
-    
-    // Set high byte
+    // Write directly to hardware (no VGA_WIDTH addition!)
     outb(0x3D4, 0x0E);
-    outb(0x3D5, (position >> 8) & 0xFF);
+    outb(0x3D5, (offset >> 8) & 0xFF);
     
-    // Set low byte
     outb(0x3D4, 0x0F);
-    outb(0x3D5, position & 0xFF);
-
-    cursor_position = offset;
+    outb(0x3D5, offset & 0xFF);
 }
 
 // Shows the cursor
@@ -55,19 +45,29 @@ void vga_clear(enum vga_color fg, enum vga_color bg, bool show_cursor, int curso
 }
 
 uint16_t vga_get_cursor_position(void) {
-    return cursor_position;
+    uint16_t cursor_hw = 0;
+    outb(0x3D4, 0x0E);
+    cursor_hw = (uint16_t)inb(0x3D5) << 8;
+    outb(0x3D4, 0x0F);
+    cursor_hw |= inb(0x3D5);
+    return cursor_hw;
 }
 
 uint16_t vga_increment_cursor_position(void) {
-    cursor_position++;
-    vga_set_cursor(cursor_position);
-    return cursor_position;
+    uint16_t cursor = vga_get_cursor_position();
+    cursor++;
+    if (cursor >= VGA_WIDTH * VGA_HEIGHT) {
+        cursor = VGA_WIDTH * VGA_HEIGHT - 1;
+    }
+    vga_set_cursor(cursor);
+    return cursor;
 }
 
 uint16_t vga_decrement_cursor_position(void) {
-    if (cursor_position > 0) {
-        cursor_position--;
+    uint16_t cursor = vga_get_cursor_position();
+    if (cursor > 0) {
+        cursor--;
     }
-    vga_set_cursor(cursor_position);
-    return cursor_position;
+    vga_set_cursor(cursor);
+    return cursor;
 }

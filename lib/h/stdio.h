@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdarg.h>
 
+#include <stddef.h>
+
 /**
  * Low-level serial output (COM1)
  * @param c Character to output
@@ -24,6 +26,16 @@ void putchar(char c);
  * @return Number of characters printed
  */
 int printf(const char *format, ...);
+
+/**
+ * Formatted print to buffer
+ * @param buf Output buffer
+ * @param size Maximum size to write (including null terminator)
+ * @param format Format string
+ * @param ... Variable arguments
+ * @return Number of characters written (excluding null terminator)
+ */
+int snprintf(char *buf, size_t size, const char *format, ...);
 
 /**
  * Convert unsigned integer to string (internal use)

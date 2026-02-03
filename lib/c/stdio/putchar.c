@@ -29,7 +29,7 @@ void putchar(char c) {
     
     /* Wrap to next line if needed */
     if (cursor >= VGA_WIDTH * VGA_HEIGHT) {
-        cursor = VGA_WIDTH * VGA_HEIGHT - VGA_WIDTH;  /* Stay at last line */
+        cursor = VGA_WIDTH * VGA_HEIGHT - 1;  /* Stay at last line */
     }
     
     vga_set_cursor(cursor);

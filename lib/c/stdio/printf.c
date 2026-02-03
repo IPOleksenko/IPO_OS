@@ -1,5 +1,4 @@
 #include <stdio.h>
-#include <vga.h>
 #include <stdint.h>
 
 /**
