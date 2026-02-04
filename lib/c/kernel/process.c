@@ -121,9 +121,11 @@ static int load_ipob_file(const char *path, ipob_header_t *header_out, void **da
 /**
  * Execute an IPOB application
  * 
- * Entry point function signature: void (*entry_point)(void)
+ * Entry point function signature: int (*entry_point)(void)
+ * The application should return an integer exit code using 'return <code>;' in its
+ * entry function. The kernel will capture and store this in 'last_exit_code'.
  */
-typedef void (*ipob_entry_t)(void);
+typedef int (*ipob_entry_t)(void);
 
 /**
  * process_exec_with_args - Execute application with arguments
@@ -150,15 +152,18 @@ int process_exec(const char *path, int argc, char **argv) {
         (uint8_t *)binary_image + header.entry_offset
     );
     
-    entry_point();
-    
-    // Store exit code
+    /* Initialize exit code to 0. Applications should return a value from their
+       entry point using a 'return' statement; we capture it below. */
     last_exit_code = 0;
-    
-    // Free the binary image after execution
+
+    /* Run application entry point and capture its return value */
+    int app_ret = entry_point();
+    last_exit_code = app_ret;
+
+    /* Free the binary image after execution */
     kfree(binary_image);
-    
-    // Return success (PID 1 for now, real implementation would allocate PIDs)
+
+    /* Return success (PID 1 for now, real implementation would allocate PIDs) */
     return 1;
 }
 

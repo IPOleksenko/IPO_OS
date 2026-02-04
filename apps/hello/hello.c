@@ -1,5 +1,5 @@
 /*
- * hello.c - Simple "Hello World" application for IPO OS
+ * hello.c - Simple "Hello World" application for IPO_OS
  * 
  * This application demonstrates the IPOB executable format and
  * can be run from the terminal or autorun.

@@ -13,6 +13,8 @@ void terminal_console(void);
 
 void terminal_print(const char *s);
 
+void terminal_auto_scroll(void);
+
 int try_execute_command(const char *cmd);
 
 char* resolve_command_path(const char *cmd);

@@ -24,6 +24,22 @@
 #define PROMPT_FG VGA_COLOR_LIGHT_GREEN
 #define INPUT_FG VGA_COLOR_LIGHT_GREY
 
+/* Terminal Buffers - each can store multiple lines of history */
+#define SCROLL_HISTORY_SIZE 1024  // Number of lines to store in history
+static uint16_t terminal_top_buffer[SCROLL_HISTORY_SIZE][VGA_WIDTH];
+static uint16_t terminal_bottom_buffer[SCROLL_HISTORY_SIZE][VGA_WIDTH];
+
+/* Input buffer for simple command handling */
+#define INPUT_BUF_SIZE 256
+
+static char input_buf[INPUT_BUF_SIZE];
+static int input_len = 0;
+static bool prompt_shown = false;
+
+/* Scroll state */
+static int top_buffer_count = 0;      // How many lines are stored in terminal_top_buffer
+static int bottom_buffer_count = 0;   // How many lines are stored in terminal_bottom_buffer
+
 // Terminal drawing area (below header)
 static inline uint16_t terminal_top_row(void) {
     return VGA_START_CURSOR_POSITION / VGA_WIDTH;
@@ -63,6 +79,172 @@ void print_header(void) {
     for (uint8_t i = 0; i < created_by_length; i++) {
         vga[VGA_WIDTH - created_by_length + i] = vga_entry(created_by[i], VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
     }
+}
+
+/* Read a line from VGA screen */
+static void read_line_from_vga(uint16_t row, uint16_t *buffer) {
+    volatile uint16_t* vga = VGA_MEMORY;
+    uint16_t offset = row * VGA_WIDTH;
+    
+    for (uint16_t col = 0; col < VGA_WIDTH; col++) {
+        buffer[col] = vga[offset + col];  // Save full value with colors
+    }
+}
+
+/* Write a line to VGA screen with preserved colors */
+static void write_line_to_vga(uint16_t row, const uint16_t *buffer) {
+    volatile uint16_t* vga = VGA_MEMORY;
+    uint16_t offset = row * VGA_WIDTH;
+    
+    for (uint16_t col = 0; col < VGA_WIDTH; col++) {
+        vga[offset + col] = buffer[col];  // Restore full value with colors
+    }
+}
+
+/* Auto scroll when terminal overflows - called by putchar/printf when needed */
+void terminal_auto_scroll(void) {
+    volatile uint16_t* vga = VGA_MEMORY;
+    uint16_t top = terminal_top_row();
+    uint16_t rows = terminal_rows();
+    
+    // Save the TOP line (which will disappear) to top_buffer history before shifting
+    if (top_buffer_count < SCROLL_HISTORY_SIZE) {
+        read_line_from_vga(top, terminal_top_buffer[top_buffer_count]);
+        top_buffer_count++;
+    } else {
+        // Buffer is full, shift all lines and add new at end
+        for (int i = 0; i < SCROLL_HISTORY_SIZE - 1; i++) {
+            for (uint16_t c = 0; c < VGA_WIDTH; c++) {
+                terminal_top_buffer[i][c] = terminal_top_buffer[i + 1][c];
+            }
+        }
+        read_line_from_vga(top, terminal_top_buffer[SCROLL_HISTORY_SIZE - 1]);
+    }
+    
+    // Reset bottom buffer since we got new output
+    bottom_buffer_count = 0;
+    
+    // Shift lines up by one
+    for (uint16_t r = 0; r < rows - 1; r++) {
+        uint16_t src_offset = (top + r + 1) * VGA_WIDTH;
+        uint16_t dst_offset = (top + r) * VGA_WIDTH;
+        
+        for (uint16_t c = 0; c < VGA_WIDTH; c++) {
+            vga[dst_offset + c] = vga[src_offset + c];
+        }
+    }
+    
+    // Clear bottom line
+    uint16_t blank = vga_entry(0x00, VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+    for (uint16_t c = 0; c < VGA_WIDTH; c++) {
+        vga[(top + rows - 1) * VGA_WIDTH + c] = blank;
+    }
+}
+
+/* Return to present - restore current output when user starts typing */
+static void return_to_present(void) {
+    // If we're in history, restore to the present
+    if (bottom_buffer_count == 0) {
+        return;  // Already at present
+    }
+    
+    volatile uint16_t* vga = VGA_MEMORY;
+    uint16_t top = terminal_top_row();
+    uint16_t rows = terminal_rows();
+    
+    // Restore all lines from bottom_buffer by scrolling down (reverse of scroll up)
+    while (bottom_buffer_count > 0) {
+        // Save the current top line to top_buffer
+        read_line_from_vga(top, terminal_top_buffer[top_buffer_count]);
+        top_buffer_count++;
+        
+        // Shift lines up by one (move forward in time)
+        for (uint16_t r = 0; r < rows - 1; r++) {
+            uint16_t src_offset = (top + r + 1) * VGA_WIDTH;
+            uint16_t dst_offset = (top + r) * VGA_WIDTH;
+            
+            for (uint16_t c = 0; c < VGA_WIDTH; c++) {
+                vga[dst_offset + c] = vga[src_offset + c];
+            }
+        }
+        
+        // Restore line from bottom_buffer at the bottom (move toward present)
+        write_line_to_vga(top + rows - 1, terminal_bottom_buffer[bottom_buffer_count - 1]);
+        bottom_buffer_count--;
+    }
+    
+    // Show cursor when returning to present
+    vga_show_cursor();
+}
+
+/* Scroll down - restore next line from history if available */
+static void scroll_down(void) {
+    // Can only scroll down if we're in scroll history (in the past)
+    if (bottom_buffer_count == 0) {
+        return;  // Can't scroll further, we're at the current output
+    }
+    
+    volatile uint16_t* vga = VGA_MEMORY;
+    uint16_t top = terminal_top_row();
+    uint16_t rows = terminal_rows();
+    
+    // Save the current top line to top_buffer
+    read_line_from_vga(top, terminal_top_buffer[top_buffer_count]);
+    top_buffer_count++;
+    
+    // Shift lines up by one (move forward in time)
+    for (uint16_t r = 0; r < rows - 1; r++) {
+        uint16_t src_offset = (top + r + 1) * VGA_WIDTH;
+        uint16_t dst_offset = (top + r) * VGA_WIDTH;
+        
+        for (uint16_t c = 0; c < VGA_WIDTH; c++) {
+            vga[dst_offset + c] = vga[src_offset + c];
+        }
+    }
+    
+    // Restore line from bottom_buffer at the bottom (move toward present)
+    write_line_to_vga(top + rows - 1, terminal_bottom_buffer[bottom_buffer_count - 1]);
+    bottom_buffer_count--;
+    
+    // Show cursor when we return to present (bottom_buffer is now empty)
+    if (bottom_buffer_count == 0) {
+        vga_show_cursor();
+    }
+}
+
+/* Scroll up - show previous line from history */
+static void scroll_up(void) {
+    // Only scroll up if we have history to go back to
+    if (top_buffer_count == 0) {
+        return;  // Nothing to scroll back to
+    }
+    
+    volatile uint16_t* vga = VGA_MEMORY;
+    uint16_t top = terminal_top_row();
+    uint16_t rows = terminal_rows();
+    
+    // Hide cursor when entering history
+    vga_hide_cursor();
+    
+    // Save the current bottom line to bottom_buffer before shifting
+    if (bottom_buffer_count < SCROLL_HISTORY_SIZE) {
+        read_line_from_vga(top + rows - 1, terminal_bottom_buffer[bottom_buffer_count]);
+        bottom_buffer_count++;
+    }
+    
+    // Shift lines down by one
+    for (uint16_t r = rows - 1; r > 0; r--) {
+        uint16_t src_offset = (top + r - 1) * VGA_WIDTH;
+        uint16_t dst_offset = (top + r) * VGA_WIDTH;
+        
+        for (uint16_t c = 0; c < VGA_WIDTH; c++) {
+            vga[dst_offset + c] = vga[src_offset + c];
+        }
+    }
+    
+    // Restore line from top_buffer at the top (go back in history)
+    write_line_to_vga(top, terminal_top_buffer[top_buffer_count - 1]);
+    top_buffer_count--;
 }
 
 char* resolve_command_path(const char *cmd) {
@@ -113,16 +295,9 @@ void terminal_initialize(void) {
     print_header();
 }
 
-/* Input buffer for simple command handling */
-#define INPUT_BUF_SIZE 256
-
-static char input_buf[INPUT_BUF_SIZE];
-static int input_len = 0;
-static bool prompt_shown = false;
-
 /* Print the command prompt */
 static void print_prompt(void) {
-    for (int i = 0; i < PROMPT_LEN; i++) putchar(PROMPT_STR[i]);
+    for (int i = 0; i < PROMPT_LEN; i++) putchar_color(PROMPT_STR[i], PROMPT_FG, VGA_COLOR_BLACK);
     prompt_shown = true;
 }
 
@@ -164,9 +339,24 @@ void terminal_console(void){
 
         bool is_break_code = (scancode & 0x80) != 0;
 
+        /* Handle scroll navigation - no break code check needed */
+        if (!is_break_code) {
+            if (scancode == SC_PAGE_DOWN || scancode == SC_ARROW_DOWN) {
+                scroll_down();
+                return;
+            }
+            if (scancode == SC_PAGE_UP || scancode == SC_ARROW_UP) {
+                scroll_up();
+                return;
+            }
+        }
+
         if (!is_break_code) {
             char c = get_char(scancode);
             if (c != 0x00) {
+                // Return to present when user starts typing
+                return_to_present();
+                
                 /* Handle newline / carriage return */
                 if (c == '\n' || c == '\r') {
                     putchar('\n');
@@ -179,6 +369,9 @@ void terminal_console(void){
                             printf("Command not found: %s\n", input_buf);
                         } else if (exec < 0) {
                             printf("Execution failed (error %d): %s\n", exec, input_buf);
+                        } else {
+                            int ret = process_get_exit_code();
+                            printf("Return value: %d\n", ret);
                         }
                     }
 
@@ -198,6 +391,23 @@ void terminal_console(void){
                             vga_set_cursor(cur - 1);
                         }
                         input_len--;
+                    }
+                }
+                else if (c == '\t') {
+                    int tab_size = 4;
+                    int col = vga_get_cursor_position() % VGA_WIDTH;
+                    int spaces = tab_size - (col % tab_size);
+
+                    int free_space = INPUT_BUF_SIZE - 1 - input_len;
+                    if (free_space <= 0) return;
+
+                    if (spaces > free_space) {
+                        spaces = free_space;
+                    }
+
+                    for (int i = 0; i < spaces; i++) {
+                        putchar(' ');
+                        input_buf[input_len++] = ' ';
                     }
                 }
                 /* Printable characters */

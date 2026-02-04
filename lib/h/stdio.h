@@ -7,6 +7,15 @@
 #include <stddef.h>
 
 /**
+ * Output a single character to VGA memory at cursor position with specified colors
+ * @param c Character to output
+ * @param fg Foreground color
+ * @param bg Background color
+ */
+
+void putchar_color(char c, uint8_t fg, uint8_t bg);
+
+/**
  * Low-level serial output (COM1)
  * @param c Character to output
  */

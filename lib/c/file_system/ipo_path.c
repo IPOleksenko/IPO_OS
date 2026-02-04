@@ -15,7 +15,7 @@ int path_resolve(const char *path, uint32_t *out_inode) {
         if (len >= sizeof(token)) { printf("path_resolve: token too long in '%s' (tmp='%s')\n", path, tmp); return -1; }
         strncpy(token, p, len); token[len] = '\0';
         struct ipo_dir_entry de;
-        if (dir_find_entry(cur, token, &de, NULL, NULL) < 0) { printf("path_resolve: dir_find_entry failed for '%s' under inode %u (tmp='%s')\n", token, cur, tmp); return -1; }
+        if (dir_find_entry(cur, token, &de, NULL, NULL) < 0) { return -1; }
         cur = de.inode;
         if (!slash) break;
         p = slash + 1;
