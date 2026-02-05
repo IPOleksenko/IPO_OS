@@ -25,6 +25,39 @@ static void ensure_fs_mounted(void) {
     }
 }
 
+#define STARTUP_SOUND {NOTE_C6, 150}, {NOTE_E6, 150}, {NOTE_G6, 150}, {NOTE_C7, 200}
+
+static void play_note_smooth(uint16_t freq, uint16_t duration_ms) {
+    if (freq == NOTE_REST) {
+        sound_stop();
+    } else {
+        sound_play(freq);
+    }
+
+    for (volatile uint32_t i = 0; i < duration_ms * 10000; i++) {
+        io_wait(); // busy-wait loop
+    }
+
+    sound_stop();
+
+    for (volatile uint32_t i = 0; i < 20000; i++) io_wait();
+}
+
+void play_startup_sound(void) {
+    typedef struct {
+        uint16_t note;
+        uint16_t duration;
+    } NoteDuration;
+
+    NoteDuration startup_sound[] = { STARTUP_SOUND };
+    size_t notes_count = sizeof(startup_sound) / sizeof(startup_sound[0]);
+
+    for (size_t i = 0; i < notes_count; i++) {
+        play_note_smooth(startup_sound[i].note, startup_sound[i].duration);
+    }
+}
+
+
 void kmain(void) {
     terminal_initialize();
     
@@ -38,7 +71,9 @@ void kmain(void) {
 
     ensure_fs_mounted();
 
-    sound_beep(1000, 200);
+    play_startup_sound();
+
+    terminal_initialize();
 
     autorun_init();
 
