@@ -7,7 +7,7 @@
 #include <stdio.h>
 
 #define AUTORUN_PATH "/autorun"
-#define AUTORUN_BUF_SIZE (64 * 1024)
+#define AUTORUN_BUF_SIZE (10 * 1024 * 1024)  // 10 MB for autorun file
 #define AUTORUN_LINE_SIZE 512
 
 /**

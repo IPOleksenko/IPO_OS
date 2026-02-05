@@ -8,10 +8,12 @@ import sys
 BLOCK_SIZE = 512
 IPO_FS_MAX_NAME = 64
 IPO_FS_DIRECT_BLOCKS = 6
+IPO_INODE_TYPE_DIR = 0x1
+IPO_INODE_TYPE_FILE = 0x2
 
 SB_FMT = '<8sIIIIIII'
 SB_SIZE = struct.calcsize(SB_FMT)
-INODE_FMT = '<III' + ('I' * IPO_FS_DIRECT_BLOCKS) + 'I36s'
+INODE_FMT = '<III' + ('I' * IPO_FS_DIRECT_BLOCKS) + 'II32s'
 INODE_SIZE = struct.calcsize(INODE_FMT)
 INODES_PER_BLOCK = BLOCK_SIZE // INODE_SIZE
 DIRENTRY_FMT = '<I B B 2s {}s'.format(IPO_FS_MAX_NAME)
@@ -23,13 +25,20 @@ class DiskError(Exception):
 
 
 class DiskImage:
-    def __init__(self, path, start_lba=2048):
+    def __init__(self, path, start_lba=2048, require_format=False):
         if not os.path.exists(path):
             raise DiskError(f"image not found: {path}")
         self.path = path
         self.start_lba = start_lba
         self.f = open(path, 'r+b')
-        self._load_superblock()
+        self.sb = None
+        try:
+            self._load_superblock()
+        except DiskError as e:
+            if require_format:
+                self.sb = None
+            else:
+                raise
 
     def close(self):
         self.f.flush()
@@ -73,6 +82,83 @@ class DiskImage:
             'data_blocks_start': sb[7],
         }
 
+    def format_disk(self, total_inodes=256):
+        """Format disk with a new IPO_FS filesystem"""
+        # Get disk size  
+        self.f.seek(0, 2)  # seek to end
+        disk_size = self.f.tell() // BLOCK_SIZE
+        total_blocks = disk_size - self.start_lba
+        
+        if total_blocks < 100:
+            raise DiskError("disk too small")
+        
+        # Calculate layout
+        inode_bitmap_blocks = (total_inodes + 4095) // 4096
+        block_bitmap_blocks = (total_blocks + 4095) // 4096
+        inode_table_blocks = (total_inodes * INODE_SIZE + BLOCK_SIZE - 1) // BLOCK_SIZE
+        
+        inode_bitmap_start = 1
+        block_bitmap_start = inode_bitmap_start + inode_bitmap_blocks
+        inode_table_start = block_bitmap_start + block_bitmap_blocks
+        data_blocks_start = inode_table_start + inode_table_blocks
+        
+        # Create superblock
+        self.sb = {
+            'fs_size_blocks': total_blocks,
+            'block_size': BLOCK_SIZE,
+            'inode_count': total_inodes,
+            'inode_bitmap_start': inode_bitmap_start,
+            'block_bitmap_start': block_bitmap_start,
+            'inode_table_start': inode_table_start,
+            'data_blocks_start': data_blocks_start,
+        }
+        
+        # Write superblock
+        magic = b'IPO_FS\x00\x00'
+        sb_data = struct.pack(SB_FMT,
+            magic,
+            self.sb['fs_size_blocks'],
+            self.sb['block_size'],
+            self.sb['inode_count'],
+            self.sb['inode_bitmap_start'],
+            self.sb['block_bitmap_start'],
+            self.sb['inode_table_start'],
+            self.sb['data_blocks_start'],
+        )
+        # Pad to BLOCK_SIZE
+        sb_block = sb_data + b'\x00' * (BLOCK_SIZE - len(sb_data))
+        self.write_block(0, sb_block)
+        
+        # Zero out bitmaps and inode table
+        zero_block = b'\x00' * BLOCK_SIZE
+        for i in range(inode_bitmap_start, inode_table_start + inode_table_blocks):
+            self.write_block(i, zero_block)
+        
+        # Allocate root inode and create root directory
+        self.bitmap_set(inode_bitmap_start, 0, 1)  # inode 1 is root
+        root_inode = {
+            'mode': IPO_INODE_TYPE_DIR,
+            'size': 0,
+            'links_count': 1,
+            'direct': [0] * IPO_FS_DIRECT_BLOCKS,
+            'indirect': 0,
+            'double_indirect': 0,
+        }
+        self.write_inode(1, root_inode)
+        
+        # Create /app directory
+        self.bitmap_set(inode_bitmap_start, 1, 1)  # inode 2 is /app
+        app_inode = {
+            'mode': IPO_INODE_TYPE_DIR,
+            'size': 0,
+            'links_count': 1,
+            'direct': [0] * IPO_FS_DIRECT_BLOCKS,
+            'indirect': 0,
+            'double_indirect': 0,
+        }
+        self.write_inode(2, app_inode)
+        
+        print("Disk formatted successfully")
     # ================= INODES =================
 
     def read_inode(self, ino):
@@ -89,6 +175,7 @@ class DiskImage:
             'links_count': t[2],
             'direct': list(t[3:3 + IPO_FS_DIRECT_BLOCKS]),
             'indirect': t[3 + IPO_FS_DIRECT_BLOCKS],
+            'double_indirect': t[3 + IPO_FS_DIRECT_BLOCKS + 1],
         }
 
     def write_inode(self, ino, inode):
@@ -99,14 +186,14 @@ class DiskImage:
         packed = struct.pack(
             INODE_FMT,
             inode['mode'], inode['size'], inode['links_count'],
-            *inode['direct'], inode['indirect'], b'\x00' * 36
+            *inode['direct'], inode['indirect'], inode['double_indirect'], b'\x00' * 32
         )
         buf[offset:offset + INODE_SIZE] = packed
         self.write_block(block, bytes(buf))
 
     def empty_inode(self):
         return {'mode': 0, 'size': 0, 'links_count': 0,
-                'direct': [0] * IPO_FS_DIRECT_BLOCKS, 'indirect': 0}
+                'direct': [0] * IPO_FS_DIRECT_BLOCKS, 'indirect': 0, 'double_indirect': 0}
 
     # ================= BITMAPS =================
 
@@ -158,23 +245,61 @@ class DiskImage:
 
         idx = logical - IPO_FS_DIRECT_BLOCKS
         per = BLOCK_SIZE // 4
-        if idx >= per:
-            return -1
+        
+        # Single indirect
+        if idx < per:
+            if inode['indirect'] == 0:
+                if not alloc:
+                    return -1
+                inode['indirect'] = self.allocate_block()
+                self.write_block(inode['indirect'], b'\x00' * BLOCK_SIZE)
 
-        if inode['indirect'] == 0:
+            ibuf = bytearray(self.read_block(inode['indirect']))
+            ptr = struct.unpack('<I', ibuf[idx * 4:(idx + 1) * 4])[0]
+            if ptr == 0:
+                if not alloc:
+                    return -1
+                ptr = self.allocate_block()
+                ibuf[idx * 4:(idx + 1) * 4] = struct.pack('<I', ptr)
+                self.write_block(inode['indirect'], bytes(ibuf))
+            return ptr
+        
+        # Double indirect
+        idx -= per
+        if idx >= per * per:
+            return -1  # File too large
+        
+        if inode['double_indirect'] == 0:
             if not alloc:
                 return -1
-            inode['indirect'] = self.allocate_block()
-            self.write_block(inode['indirect'], b'\x00' * BLOCK_SIZE)
-
-        ibuf = bytearray(self.read_block(inode['indirect']))
-        ptr = struct.unpack('<I', ibuf[idx * 4:(idx + 1) * 4])[0]
+            inode['double_indirect'] = self.allocate_block()
+            self.write_block(inode['double_indirect'], b'\x00' * BLOCK_SIZE)
+        
+        # Read double indirect block
+        dibuf = bytearray(self.read_block(inode['double_indirect']))
+        di_idx = idx // per      # index in double indirect block
+        si_idx = idx % per       # index in single indirect block
+        
+        # Get single indirect block pointer
+        si_ptr = struct.unpack('<I', dibuf[di_idx * 4:(di_idx + 1) * 4])[0]
+        if si_ptr == 0:
+            if not alloc:
+                return -1
+            si_ptr = self.allocate_block()
+            dibuf[di_idx * 4:(di_idx + 1) * 4] = struct.pack('<I', si_ptr)
+            self.write_block(inode['double_indirect'], bytes(dibuf))
+            self.write_block(si_ptr, b'\x00' * BLOCK_SIZE)
+        
+        # Read single indirect block
+        sibuf = bytearray(self.read_block(si_ptr))
+        ptr = struct.unpack('<I', sibuf[si_idx * 4:(si_idx + 1) * 4])[0]
         if ptr == 0:
             if not alloc:
                 return -1
             ptr = self.allocate_block()
-            ibuf[idx * 4:(idx + 1) * 4] = struct.pack('<I', ptr)
-            self.write_block(inode['indirect'], bytes(ibuf))
+            sibuf[si_idx * 4:(si_idx + 1) * 4] = struct.pack('<I', ptr)
+            self.write_block(si_ptr, bytes(sibuf))
+        
         return ptr
 
     # ================= PATH =================
@@ -500,6 +625,23 @@ class DiskImage:
             # free the indirect block itself
             self.bitmap_set(self.sb['block_bitmap_start'], inode['indirect'] - self.sb['data_blocks_start'], 0)
             inode['indirect'] = 0
+        # free double indirect
+        if inode['double_indirect']:
+            dibuf = self.read_block(inode['double_indirect'])
+            for di in range(0, BLOCK_SIZE, 4):
+                si_ptr = struct.unpack('<I', dibuf[di:di+4])[0]
+                if si_ptr:
+                    # Free blocks in single indirect block
+                    sibuf = self.read_block(si_ptr)
+                    for si in range(0, BLOCK_SIZE, 4):
+                        ptr = struct.unpack('<I', sibuf[si:si+4])[0]
+                        if ptr:
+                            self.bitmap_set(self.sb['block_bitmap_start'], ptr - self.sb['data_blocks_start'], 0)
+                    # Free the single indirect block
+                    self.bitmap_set(self.sb['block_bitmap_start'], si_ptr - self.sb['data_blocks_start'], 0)
+            # Free the double indirect block itself
+            self.bitmap_set(self.sb['block_bitmap_start'], inode['double_indirect'] - self.sb['data_blocks_start'], 0)
+            inode['double_indirect'] = 0
         # clear inode bitmap
         self.bitmap_set(self.sb['inode_bitmap_start'], ino-1, 0)
         # zero the inode on disk
@@ -514,6 +656,7 @@ def main():
     p.add_argument('-i', '--image', default='build/disk.img')
     p.add_argument('-s', '--start-lba', type=int, default=2048)
     sub = p.add_subparsers(dest='cmd')
+    sub.add_parser('format')
     sub.add_parser('ls').add_argument('path', nargs='?', default='/')
     sub.add_parser('cat').add_argument('path')
     sub.add_parser('mkdir').add_argument('path')
@@ -527,9 +670,12 @@ def main():
     p_rm.add_argument('path')
     args = p.parse_args()
 
-    d = DiskImage(args.image, args.start_lba)
+    require_format = args.cmd == 'format'
+    d = DiskImage(args.image, args.start_lba, require_format=require_format)
 
-    if args.cmd == 'ls':
+    if args.cmd == 'format':
+        d.format_disk()
+    elif args.cmd == 'ls':
         for n, t in d.ls(args.path):
             print(n + ('/' if t & 1 else ''))
     elif args.cmd == 'cat':

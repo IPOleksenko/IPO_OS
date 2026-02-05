@@ -108,27 +108,75 @@ int get_data_block_for_inode(struct ipo_inode *inode, uint32_t logical_index, bo
         }
         return inode->direct[logical_index];
     }
-    /* single indirect */
-    uint32_t idx = logical_index - IPO_FS_DIRECT_BLOCKS;
+    
     uint32_t per_block = IPO_FS_BLOCK_SIZE / 4;
-    if (idx >= per_block) return -1;
-    uint8_t ibuf[IPO_FS_BLOCK_SIZE];
-    if (!inode->indirect) {
-        if (!alloc) return -1;
-        int indirect_block = allocate_block();
-        if (indirect_block < 0) return -1;
-        inode->indirect = indirect_block;
-        uint8_t zero[IPO_FS_BLOCK_SIZE]; memset(zero,0,sizeof(zero));
-        block_write(indirect_block, zero);
+    uint32_t idx = logical_index - IPO_FS_DIRECT_BLOCKS;
+    
+    /* single indirect */
+    if (idx < per_block) {
+        uint8_t ibuf[IPO_FS_BLOCK_SIZE];
+        if (!inode->indirect) {
+            if (!alloc) return -1;
+            int indirect_block = allocate_block();
+            if (indirect_block < 0) return -1;
+            inode->indirect = indirect_block;
+            uint8_t zero[IPO_FS_BLOCK_SIZE]; memset(zero,0,sizeof(zero));
+            block_write(indirect_block, zero);
+        }
+        if (!block_read(inode->indirect, ibuf)) return -1;
+        uint32_t *ptrs = (uint32_t *)ibuf;
+        if (!ptrs[idx]) {
+            if (!alloc) return -1;
+            int phys = allocate_block();
+            if (phys < 0) return -1;
+            ptrs[idx] = phys;
+            block_write(inode->indirect, ibuf);
+        }
+        return ptrs[idx];
     }
-    if (!block_read(inode->indirect, ibuf)) return -1;
-    uint32_t *ptrs = (uint32_t *)ibuf;
-    if (!ptrs[idx]) {
+    
+    /* double indirect */
+    idx -= per_block;
+    if (idx >= per_block * per_block) return -1;
+    
+    uint8_t dibuf[IPO_FS_BLOCK_SIZE];  // double indirect block
+    uint8_t ibuf[IPO_FS_BLOCK_SIZE];   // single indirect block
+    
+    if (!inode->double_indirect) {
+        if (!alloc) return -1;
+        int di_block = allocate_block();
+        if (di_block < 0) return -1;
+        inode->double_indirect = di_block;
+        uint8_t zero[IPO_FS_BLOCK_SIZE]; memset(zero,0,sizeof(zero));
+        block_write(di_block, zero);
+    }
+    
+    if (!block_read(inode->double_indirect, dibuf)) return -1;
+    uint32_t *di_ptrs = (uint32_t *)dibuf;
+    
+    uint32_t di_idx = idx / per_block;      // index in double indirect block
+    uint32_t si_idx = idx % per_block;      // index in single indirect block
+    
+    if (!di_ptrs[di_idx]) {
+        if (!alloc) return -1;
+        int si_block = allocate_block();
+        if (si_block < 0) return -1;
+        di_ptrs[di_idx] = si_block;
+        block_write(inode->double_indirect, dibuf);
+        uint8_t zero[IPO_FS_BLOCK_SIZE]; memset(zero,0,sizeof(zero));
+        block_write(si_block, zero);
+    }
+    
+    if (!block_read(di_ptrs[di_idx], ibuf)) return -1;
+    uint32_t *si_ptrs = (uint32_t *)ibuf;
+    
+    if (!si_ptrs[si_idx]) {
         if (!alloc) return -1;
         int phys = allocate_block();
         if (phys < 0) return -1;
-        ptrs[idx] = phys;
-        block_write(inode->indirect, ibuf);
+        si_ptrs[si_idx] = phys;
+        block_write(di_ptrs[di_idx], ibuf);
     }
-    return ptrs[idx];
+    
+    return si_ptrs[si_idx];
 }

@@ -111,7 +111,7 @@ void terminal_auto_scroll(void) {
     if (top_buffer_count < SCROLL_HISTORY_SIZE) {
         read_line_from_vga(top, terminal_top_buffer[top_buffer_count]);
         top_buffer_count++;
-    } else {
+     } else {
         // Buffer is full, shift all lines and add new at end
         for (int i = 0; i < SCROLL_HISTORY_SIZE - 1; i++) {
             for (uint16_t c = 0; c < VGA_WIDTH; c++) {
@@ -293,6 +293,13 @@ void terminal_initialize(void) {
     vga_clear(VGA_COLOR_WHITE, VGA_COLOR_BLACK, true, VGA_START_CURSOR_POSITION);
 
     print_header();
+
+    terminal_top_buffer[0][0] = 0;
+    terminal_bottom_buffer[0][0] = 0;
+    top_buffer_count = 0;
+    bottom_buffer_count = 0;
+    input_len = 0;
+    prompt_shown = false;
 }
 
 /* Print the command prompt */
@@ -319,9 +326,63 @@ int try_execute_command(const char *cmdline) {
     char *path = resolve_command_path(name);
     if (!path) return 0; // not found
 
-    // Execute program
-    int result = process_exec_simple(path);
+    // Parse arguments from the remaining part of cmdline
+    char *argv[32];  // Support up to 32 arguments
+    int argc = 0;
+    argv[argc++] = name;  // First argument is program name
+    
+    // Skip whitespace after command name
+    while (*cmdline && (*cmdline == ' ' || *cmdline == '\t')) cmdline++;
+    
+    // Parse remaining arguments
+    char arg_buf[512];  // Temporary buffer for arguments
+    int arg_pos = 0;
+    int in_arg = 0;
+    
+    while (*cmdline && argc < 31) {  // Leave room for NULL terminator
+        if (*cmdline == ' ' || *cmdline == '\t') {
+            if (in_arg) {
+                // End current argument
+                arg_buf[arg_pos] = '\0';
+                char *arg_copy = kmalloc(arg_pos + 1);
+                if (arg_copy) {
+                    strcpy(arg_copy, arg_buf);
+                    argv[argc++] = arg_copy;
+                }
+                arg_pos = 0;
+                in_arg = 0;
+            }
+            cmdline++;
+        } else {
+            // Add character to current argument
+            if (arg_pos < (int)sizeof(arg_buf) - 1) {
+                arg_buf[arg_pos++] = *cmdline;
+                in_arg = 1;
+            }
+            cmdline++;
+        }
+    }
+    
+    // Handle last argument
+    if (in_arg) {
+        arg_buf[arg_pos] = '\0';
+        char *arg_copy = kmalloc(arg_pos + 1);
+        if (arg_copy) {
+            strcpy(arg_copy, arg_buf);
+            argv[argc++] = arg_copy;
+        }
+    }
+    
+    argv[argc] = NULL;  // NULL-terminate argv
 
+    // Execute program with arguments
+    int result = process_exec(path, argc, argv);
+
+    // Free allocated argument copies
+    for (int j = 1; j < argc; j++) {
+        kfree(argv[j]);
+    }
+    
     kfree(path);
     return result;
 }

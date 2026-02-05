@@ -17,6 +17,11 @@ void putchar_color(char c, uint8_t fg, uint8_t bg) {
     uint16_t terminal_rows = VGA_HEIGHT - top_row;
     uint16_t terminal_bottom = (top_row + terminal_rows) * VGA_WIDTH;
     
+    // Safety check: if cursor is completely out of bounds, reset it
+    if (cursor >= terminal_bottom || cursor < VGA_START_CURSOR_POSITION) {
+        cursor = VGA_START_CURSOR_POSITION;
+    }
+    
     if (c == '\n') {
         /* Move to next line */
         uint16_t row = cursor / VGA_WIDTH;
@@ -28,7 +33,13 @@ void putchar_color(char c, uint8_t fg, uint8_t bg) {
     } else if (c == '\t') {
         /* Move to next tab stop (8 chars) */
         uint16_t col = cursor % VGA_WIDTH;
-        cursor += (8 - (col % 8));
+        uint16_t spaces = 8 - (col % 8);
+        // Don't exceed terminal bounds
+        if (cursor + spaces >= terminal_bottom) {
+            cursor = terminal_bottom - VGA_WIDTH;
+        } else {
+            cursor += spaces;
+        }
     } else {
         /* Print character at current position */
         vga[cursor] = vga_entry((unsigned char)c, fg, bg);

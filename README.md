@@ -112,6 +112,7 @@ python3 disk_editor.py [-i IMAGE] [-s START_LBA] <command> [arguments]
 
 Supported commands:
 
+- `format` — clear the filesystem by deleting all files and directories
 - `ls [path]` — list directory contents (default: `/`).
 - `cat <path>` — print a file's contents to stdout (use `--` or shell redirection if needed).
 - `mkdir <path>` — create a directory at the specified path.
@@ -120,6 +121,12 @@ Supported commands:
 - `rm <path>` — remove a file or an empty directory.
 
 ### Examples
+
+- Clear the filesystem
+
+```bash
+python3 disk_editor.py format
+```
 
 - List the image root:
 

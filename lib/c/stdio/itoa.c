@@ -11,16 +11,18 @@ int itoa64(uint64_t num, char *str, int base) {
     
     if (num == 0) {
         str[0] = '0';
+        str[1] = '\0';
         return 1;
     }
     
-    while (num > 0) {
+    while (num > 0 && i < 63) {
         digits[i++] = num % base;
         num /= base;
     }
     
     for (int j = i - 1; j >= 0; j--) {
         uint64_t digit = digits[j];
+        if (len >= 63) break;  // Leave space for null terminator
         if (digit < 10) {
             str[len++] = '0' + digit;
         } else {
@@ -28,6 +30,8 @@ int itoa64(uint64_t num, char *str, int base) {
         }
     }
     
+    // Always null-terminate for safety
+    str[len] = '\0';
     return len;
 }
 
@@ -44,13 +48,15 @@ int itoa(unsigned int num, char *str, int base) {
         return 1;
     }
     
-    while (num > 0) {
+    while (num > 0 && i < 32) {
         digits[i++] = num % base;
         num /= base;
     }
     
+    // i now contains the number of digits (max 32 for 32-bit unsigned)
     for (int j = i - 1; j >= 0; j--) {
         unsigned int digit = digits[j];
+        if (len >= 31) break;  // Leave space for null terminator
         if (digit < 10) {
             str[len++] = '0' + digit;
         } else {
@@ -58,5 +64,7 @@ int itoa(unsigned int num, char *str, int base) {
         }
     }
     
+    // Always null-terminate for safety
+    str[len] = '\0';
     return len;
 }

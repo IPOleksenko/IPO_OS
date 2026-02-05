@@ -34,7 +34,8 @@ struct ipo_inode {
     uint32_t links_count;
     uint32_t direct[IPO_FS_DIRECT_BLOCKS];
     uint32_t indirect;
-    uint8_t  _pad[36]; /* padding to make inode reasonably sized */
+    uint32_t double_indirect;
+    uint8_t  _pad[32]; /* padding to make inode reasonably sized */
 };
 
 struct ipo_dir_entry {

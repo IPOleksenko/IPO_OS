@@ -56,4 +56,13 @@ int itoa(unsigned int num, char *str, int base);
  */
 int itoa64(uint64_t num, char *str, int base);
 
+/**
+ * Formatted print to serial port
+ * Supports: %d (int), %u (unsigned), %x (hex), %c (char), %s (string), %%
+ * @param format Format string
+ * @param ... Variable arguments
+ * @return Number of characters printed
+ */
+int serial_printf(const char *format, ...);
+
 #endif

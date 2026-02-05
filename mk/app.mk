@@ -1,4 +1,4 @@
-.PHONY: apps clean-apps install-apps
+.PHONY: apps clean-apps
 
 APPS_DIR     := apps
 APPS_BUILD   := build/apps
@@ -28,7 +28,7 @@ $(APPS_BUILD)/%.bin: $(APPS_BUILD)/%.o $(LIB_A)
 	@echo "[apps] Building: $*.c → $@"
 	
 	@# Link with kernel library and runtime libs (suppress PIE warnings)
-	@$(CC) $(APPS_CFLAGS) -Wl,--entry=app_entry \
+	@$(CC) $(APPS_CFLAGS) -Wl,--entry=main \
 		$< $(LIB_A) -lgcc -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
 	
 	@# Extract only program sections (not dynamic/debug)
@@ -46,16 +46,6 @@ $(APPS_BUILD)/%.bin: $(APPS_BUILD)/%.o $(LIB_A)
 	@# Show result
 	@SIZE=$$(stat -c%s "$@" 2>/dev/null || stat -f%z "$@" 2>/dev/null); \
 	echo "[apps] ✓ Created: $@ ($$SIZE bytes)"
-
-# Install applications to filesystem image
-install-apps: apps
-	@echo "[apps] Applications built successfully:"
-	@for app in $(APPS_BINS); do \
-		if [ -f "$$app" ]; then \
-			SIZE=$$(stat -c%s "$$app" 2>/dev/null || stat -f%z "$$app" 2>/dev/null); \
-			echo "  $$app ($$SIZE bytes)"; \
-		fi; \
-	done
 
 # Clean applications
 clean-apps:

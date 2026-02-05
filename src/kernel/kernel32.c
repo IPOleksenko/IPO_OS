@@ -71,6 +71,8 @@ void kmain(void) {
 
     ensure_fs_mounted();
 
+    process_init();
+
     play_startup_sound();
 
     terminal_initialize();
