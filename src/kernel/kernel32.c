@@ -6,6 +6,8 @@
 #include <driver/ata/ata.h>
 #include <file_system/ipo_fs.h>
 #include <kernel/process.h>
+#include <syscall.h>
+#include <system/timer.h>
 #include <stdio.h>
 
 #define FS_START_LBA (uint32_t)2048
@@ -60,8 +62,11 @@ void play_startup_sound(void) {
 
 void kmain(void) {
     terminal_initialize();
-    
+
     process_init();
+    syscall_init();
+    timer_init();
+    async_scheduler_init();
 
     sound_init();
     
@@ -71,8 +76,6 @@ void kmain(void) {
 
     ensure_fs_mounted();
 
-    process_init();
-
     play_startup_sound();
 
     terminal_initialize();
@@ -80,6 +83,8 @@ void kmain(void) {
     autorun_init();
 
     for (;;) {
+        timer_tick();
+        async_scheduler_tick();
         terminal_console();
     }
 }

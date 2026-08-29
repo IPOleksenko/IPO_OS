@@ -24,6 +24,22 @@ static process_t *current_process = NULL;
 static process_t *process_list = NULL;
 static uint32_t next_pid = 1;
 
+void process_set_keep_alive(process_t *proc, int enabled) {
+    if (proc == NULL) {
+        return;
+    }
+
+    if (enabled) {
+        proc->async_task_count++;
+        serial_printf("[process] pid=%u keep_alive++ -> %u\n",
+                      proc->pid, proc->async_task_count);
+    } else if (proc->async_task_count > 0) {
+        proc->async_task_count--;
+        serial_printf("[process] pid=%u keep_alive-- -> %u\n",
+                      proc->pid, proc->async_task_count);
+    }
+}
+
 /**
  * process_init - Initialize process manager
  */
@@ -38,19 +54,21 @@ void process_init(void) {
  * allocate_process_memory - Allocates memory for a process at a fixed address.
  */
 static void *allocate_process_memory(uint32_t base, uint32_t size, uint32_t prot_flags) {
-    void *addr = kmalloc(size);
-    if (!addr) {
+    (void)prot_flags;
+    if (base != PROCESS_BASE_ADDR || size == 0 ||
+        size > MAX_PROCESS_SIZE || base + size < base) {
         return NULL;
     }
-    
-    return addr;
+
+    return (void *)base;
 }
 
 /**
  * free_process_memory - Frees up process memory
  */
 static void free_process_memory(void *addr, uint32_t size) {
-    kfree(addr);
+    (void)addr;
+    (void)size;
 }
 
 /**
@@ -124,11 +142,36 @@ static int setup_arguments(process_t *proc, int argc, char **argv, uint32_t *arg
  * setup_stack - Configures the process stack for startup.
  */
 static uint32_t setup_stack(process_t *proc) {
-    proc->stack_ptr = PROCESS_STACK_TOP;
-    proc->stack_start = PROCESS_STACK_TOP - PROCESS_STACK_SIZE;
+    proc->stack_base = kmalloc(PROCESS_STACK_SIZE);
+    if (proc->stack_base == NULL) {
+        return 0;
+    }
+
+    proc->stack_start = (uint32_t)proc->stack_base;
+    proc->stack_ptr = proc->stack_start + PROCESS_STACK_SIZE;
     proc->stack_size = PROCESS_STACK_SIZE;
     
-    return PROCESS_STACK_TOP;
+    return proc->stack_ptr;
+}
+
+static int process_call_entry(ipob_entry_t entry, int argc, char **argv,
+                              uint32_t stack_top) {
+    int result;
+    uint32_t old_stack;
+
+    __asm__ volatile(
+        "movl %%esp, %0\n"
+        "movl %5, %%esp\n"
+        "pushl %3\n"
+        "pushl %2\n"
+        "call *%4\n"
+        "addl $8, %%esp\n"
+        "movl %0, %%esp\n"
+        : "=m"(old_stack), "=a"(result)
+        : "r"(argc), "r"(argv), "r"(entry), "r"(stack_top)
+        : "ecx", "edx", "memory");
+
+    return result;
 }
 
 /**
@@ -212,9 +255,10 @@ static int load_ipob_file(const char *path, ipob_header_t *header_out, void **da
         return -2;  // Invalid executable format
     }
     
-    if (header->entry_offset >= stat.size) {
+    uint32_t payload_size = stat.size - IPOB_HEADER_SIZE;
+    if (header->entry_offset >= payload_size) {
         kfree(binary_image);
-        printf("Entry offset out of bounds: %d >= %d\n", header->entry_offset, stat.size);
+        printf("Entry offset out of bounds: %d >= %d\n", header->entry_offset, payload_size);
         return -2;  // Entry offset out of bounds
     }
     
@@ -247,10 +291,23 @@ void process_cleanup(process_t *proc) {
     if (!proc) return;
     
     serial_printf("Cleaning up process %d\n", proc->pid);
+
+    if (proc->async_task_count > 0) {
+        proc->is_running = 0;
+        return;
+    }
     
-    // Freeing up binary memory
+    // Keep the binary resident if it owns background async tasks.
+    // The callback function pointer remains valid only while the code stays in memory.
+    // Releasing it immediately would invalidate the async task after the app exits.
     if (proc->binary_base) {
         free_process_memory(proc->binary_base, proc->binary_size);
+        proc->binary_base = NULL;
+    }
+
+    if (proc->stack_base) {
+        kfree(proc->stack_base);
+        proc->stack_base = NULL;
     }
     
     // Freeing arguments
@@ -267,6 +324,7 @@ void process_cleanup(process_t *proc) {
         
         // Freeing the array itself
         kfree(argv_array);
+        proc->argv_kernel = NULL;
     }
     
     // Remove from the list of processes
@@ -281,6 +339,10 @@ void process_cleanup(process_t *proc) {
             prev->next = proc->next;
         }
     }
+
+    if (current_process == proc) {
+        current_process = NULL;
+    }
     
     kfree(proc);
 }
@@ -291,6 +353,11 @@ void process_cleanup(process_t *proc) {
 int process_exec(const char *path, int argc, char **argv) {
     if (path == NULL) {
         return -1;
+    }
+
+    if (process_list != NULL) {
+        printf("Cannot start '%s': another process is still alive\n", path);
+        return -8;
     }
     
     serial_printf("process_exec: %s, argc=%d\n", path, argc);
@@ -326,7 +393,7 @@ int process_exec(const char *path, int argc, char **argv) {
     
     // Allocating memory at a fixed address
     // Applications are compiled for the PROCESS_BASE_ADDR address
-    void *target_addr = allocate_process_memory(PROCESS_BASE_ADDR, size, 
+    void *target_addr = allocate_process_memory(PROCESS_BASE_ADDR, size,
                                                PROT_READ | PROT_WRITE | PROT_EXEC);
     
     if (!target_addr) {
@@ -336,8 +403,9 @@ int process_exec(const char *path, int argc, char **argv) {
         return -5;
     }
     
-    // Copy the binary to the desired address
-    memcpy(target_addr, binary_image, size);
+    memset(target_addr, 0, size - IPOB_HEADER_SIZE);
+    memcpy(target_addr, (uint8_t *)binary_image + IPOB_HEADER_SIZE,
+           size - IPOB_HEADER_SIZE);
     
     // Relocate if necessary.
     if (relocate_binary(target_addr, PROCESS_BASE_ADDR, size) < 0) {
@@ -353,12 +421,9 @@ int process_exec(const char *path, int argc, char **argv) {
     
     // Saving information about the process
     proc->binary_base = target_addr;
-    proc->binary_size = size;
+    proc->binary_size = size - IPOB_HEADER_SIZE;
     // Entry point is relative to where we actually loaded the binary in memory
     proc->entry_point = (uint32_t)target_addr + header.entry_offset;
-    
-    // Setting up the stack
-    proc->stack_ptr = PROCESS_STACK_TOP;
     
     // Setting up arguments - argv is allocated in kernel memory
     uint32_t argv_addr = 0;
@@ -369,7 +434,11 @@ int process_exec(const char *path, int argc, char **argv) {
     }
     
     // Setting up the stack for calling main()
-    setup_stack(proc);
+    if (setup_stack(proc) == 0) {
+        printf("Failed to allocate process stack\n");
+        process_cleanup(proc);
+        return -7;
+    }
     
     serial_printf("Process %d ready: entry=0x%x, argc=%d, argv=0x%x\n",
            proc->pid, proc->entry_point, proc->argc, argv_addr);
@@ -382,19 +451,27 @@ int process_exec(const char *path, int argc, char **argv) {
     serial_printf("Calling entry point with argc=%d, argv at 0x%x...\n", proc->argc, argv_addr);
     
     // The entry point has a signature: int main(int argc, char **argv)
-    // argv is now a pointer to an array in kernel memory
     char **argv_ptr = (char**)argv_addr;
     
     // Call with arguments
     typedef int (*entry_func_t)(int, char**);
     entry_func_t entry_point = (entry_func_t)proc->entry_point;
-    int exit_code = entry_point(proc->argc, argv_ptr);
+    int exit_code = process_call_entry(entry_point, proc->argc, argv_ptr,
+                                       proc->stack_ptr);
     last_exit_code = exit_code;
     
     serial_printf("Process returned\n");
     
     // Restoring the old process
     current_process = old_process;
+
+    if (proc->async_task_count > 0) {
+        proc->is_running = 0;
+        proc->exit_code = exit_code;
+        printf("[process] keeping process %u alive because it owns %u async tasks\n",
+               proc->pid, proc->async_task_count);
+        return proc->pid;
+    }
     
     // Cleaning resources
     process_cleanup(proc);

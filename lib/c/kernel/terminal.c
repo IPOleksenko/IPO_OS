@@ -6,6 +6,8 @@
 #include <file_system/ipo_fs.h>
 #include <kernel/process.h>
 #include <memory/kmalloc.h>
+#include <system/timer.h>
+#include <kernel/async.h>
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -17,6 +19,9 @@
 #define SC_PAGE_DOWN 0x51
 #define SC_ARROW_UP  0x48
 #define SC_ARROW_DOWN 0x50
+#define SC_ARROW_LEFT 0x4B
+#define SC_ARROW_RIGHT 0x4D
+#define COMMAND_HISTORY_SIZE 128
 
 /* Prompt / styling */
 #define PROMPT_STR "> "
@@ -35,6 +40,14 @@ static uint16_t terminal_bottom_buffer[SCROLL_HISTORY_SIZE][VGA_WIDTH];
 static char input_buf[INPUT_BUF_SIZE];
 static int input_len = 0;
 static bool prompt_shown = false;
+static uint16_t input_start_cursor = 0;
+
+static char command_history[COMMAND_HISTORY_SIZE][INPUT_BUF_SIZE];
+static int command_history_count = 0;
+static int command_history_index = -1;
+static char current_input_snapshot[INPUT_BUF_SIZE];
+static uint8_t last_terminal_scancode = 0;
+static uint32_t last_history_action_ms = 0;
 
 /* Scroll state */
 static int top_buffer_count = 0;      // How many lines are stored in terminal_top_buffer
@@ -99,6 +112,102 @@ static void write_line_to_vga(uint16_t row, const uint16_t *buffer) {
     for (uint16_t col = 0; col < VGA_WIDTH; col++) {
         vga[offset + col] = buffer[col];  // Restore full value with colors
     }
+}
+
+static void render_input_line(const char *text) {
+    if (!text) {
+        text = "";
+    }
+
+    volatile uint16_t *vga = VGA_MEMORY;
+    uint16_t row = input_start_cursor / VGA_WIDTH;
+    uint16_t col = input_start_cursor % VGA_WIDTH;
+    uint16_t blank = vga_entry(0x00, VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+
+    while (row < VGA_HEIGHT) {
+        uint16_t offset = row * VGA_WIDTH + col;
+        if (offset >= VGA_WIDTH * VGA_HEIGHT) {
+            break;
+        }
+        vga[offset] = blank;
+        col++;
+        if (col >= VGA_WIDTH) {
+            row++;
+            col = 0;
+        }
+    }
+
+    row = input_start_cursor / VGA_WIDTH;
+    col = input_start_cursor % VGA_WIDTH;
+    const unsigned char *p = (const unsigned char *)text;
+    while (*p && row < VGA_HEIGHT) {
+        uint16_t offset = row * VGA_WIDTH + col;
+        if (offset >= VGA_WIDTH * VGA_HEIGHT) {
+            break;
+        }
+        vga[offset] = vga_entry(*p, INPUT_FG, VGA_COLOR_BLACK);
+        p++;
+        col++;
+        if (col >= VGA_WIDTH) {
+            row++;
+            col = 0;
+        }
+    }
+
+    uint16_t end_offset = row * VGA_WIDTH + col;
+    vga_set_cursor(end_offset);
+}
+
+static void push_command_history(const char *cmd) {
+    if (!cmd || !cmd[0]) {
+        return;
+    }
+
+    for (int i = 0; i < command_history_count; i++) {
+        if (strcmp(command_history[i], cmd) == 0) {
+            for (int j = i; j < command_history_count - 1; j++) {
+                strncpy(command_history[j], command_history[j + 1], INPUT_BUF_SIZE - 1);
+                command_history[j][INPUT_BUF_SIZE - 1] = '\0';
+            }
+            strncpy(command_history[command_history_count - 1], cmd, INPUT_BUF_SIZE - 1);
+            command_history[command_history_count - 1][INPUT_BUF_SIZE - 1] = '\0';
+            command_history_index = -1;
+            return;
+        }
+    }
+
+    if (command_history_count < COMMAND_HISTORY_SIZE) {
+        strncpy(command_history[command_history_count], cmd, INPUT_BUF_SIZE - 1);
+        command_history[command_history_count][INPUT_BUF_SIZE - 1] = '\0';
+        command_history_count++;
+    } else {
+        for (int i = 0; i < COMMAND_HISTORY_SIZE - 1; i++) {
+            strncpy(command_history[i], command_history[i + 1], INPUT_BUF_SIZE - 1);
+            command_history[i][INPUT_BUF_SIZE - 1] = '\0';
+        }
+        strncpy(command_history[COMMAND_HISTORY_SIZE - 1], cmd, INPUT_BUF_SIZE - 1);
+        command_history[COMMAND_HISTORY_SIZE - 1][INPUT_BUF_SIZE - 1] = '\0';
+    }
+
+    command_history_index = -1;
+}
+
+static void load_history_command(int index) {
+    if (index < 0 || index >= command_history_count) {
+        return;
+    }
+
+    strncpy(input_buf, command_history[index], INPUT_BUF_SIZE - 1);
+    input_buf[INPUT_BUF_SIZE - 1] = '\0';
+    input_len = (int)strlen(input_buf);
+    render_input_line(input_buf);
+}
+
+static void restore_snapshot_input(void) {
+    strncpy(input_buf, current_input_snapshot, INPUT_BUF_SIZE - 1);
+    input_buf[INPUT_BUF_SIZE - 1] = '\0';
+    input_len = (int)strlen(input_buf);
+    render_input_line(input_buf);
 }
 
 /* Auto scroll when terminal overflows - called by putchar/printf when needed */
@@ -300,12 +409,17 @@ void terminal_initialize(void) {
     bottom_buffer_count = 0;
     input_len = 0;
     prompt_shown = false;
+    input_start_cursor = 0;
+    command_history_count = 0;
+    command_history_index = -1;
+    current_input_snapshot[0] = '\0';
 }
 
 /* Print the command prompt */
 static void print_prompt(void) {
     for (int i = 0; i < PROMPT_LEN; i++) putchar_color(PROMPT_STR[i], PROMPT_FG, VGA_COLOR_BLACK);
     prompt_shown = true;
+    input_start_cursor = vga_get_cursor_position();
 }
 
 int try_execute_command(const char *cmdline) {
@@ -395,10 +509,20 @@ void terminal_console(void){
     if (!prompt_shown) print_prompt();
 
     if (scancode != 0x00) {
+        bool is_break_code = (scancode & 0x80) != 0;
+
+        if (!is_break_code && scancode == last_terminal_scancode) {
+            return;
+        }
+
+        if (is_break_code) {
+            last_terminal_scancode = 0;
+        } else {
+            last_terminal_scancode = scancode;
+        }
+
         update_hot_key_state(scancode);
         hot_key_handler(scancode);
-
-        bool is_break_code = (scancode & 0x80) != 0;
 
         /* Handle scroll navigation - no break code check needed */
         if (!is_break_code) {
@@ -408,6 +532,49 @@ void terminal_console(void){
             }
             if (scancode == SC_PAGE_UP || scancode == SC_ARROW_UP) {
                 scroll_up();
+                return;
+            }
+            if (scancode == SC_ARROW_LEFT) {
+                if (command_history_count > 0) {
+                    uint32_t now = timer_millis();
+                    if (now - last_history_action_ms < 150u) {
+                        return;
+                    }
+                    last_history_action_ms = now;
+
+                    return_to_present();
+
+                    if (command_history_index < 0) {
+                        strncpy(current_input_snapshot, input_buf, INPUT_BUF_SIZE - 1);
+                        current_input_snapshot[INPUT_BUF_SIZE - 1] = '\0';
+                        command_history_index = command_history_count - 1;
+                    } else if (command_history_index > 0) {
+                        command_history_index--;
+                    }
+
+                    load_history_command(command_history_index);
+                }
+                return;
+            }
+            if (scancode == SC_ARROW_RIGHT) {
+                if (command_history_index >= 0) {
+                    uint32_t now = timer_millis();
+                    if (now - last_history_action_ms < 150u) {
+                        return;
+                    }
+                    last_history_action_ms = now;
+
+                    return_to_present();
+
+                    if (command_history_index < command_history_count - 1) {
+                        command_history_index++;
+                        load_history_command(command_history_index);
+                    } else {
+                        command_history_index = -1;
+                        restore_snapshot_input();
+                        current_input_snapshot[0] = '\0';
+                    }
+                }
                 return;
             }
         }
@@ -425,6 +592,7 @@ void terminal_console(void){
                     input_buf[input_len] = '\0';
 
                     if (input_len > 0) {
+                        push_command_history(input_buf);
                         int exec = try_execute_command(input_buf);
                         if (exec == 0) {
                             printf("Command not found: %s\n", input_buf);
@@ -438,6 +606,9 @@ void terminal_console(void){
 
                     /* Reset buffer and show prompt */
                     input_len = 0;
+                    input_buf[0] = '\0';
+                    current_input_snapshot[0] = '\0';
+                    command_history_index = -1;
                     prompt_shown = false;
                     print_prompt();
                 }

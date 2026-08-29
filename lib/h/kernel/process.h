@@ -9,7 +9,7 @@
 #define MAX_ARG_LENGTH 256
 
 // Fixed addresses for process loading
-#define PROCESS_BASE_ADDR   0x10000000  // Base address for all applications
+#define PROCESS_BASE_ADDR   0x00800000  // Fixed app slot below the kernel heap
 #define PROCESS_STACK_TOP   0xC0000000  // Top of the stack
 #define PROCESS_STACK_SIZE  (2 * 1024 * 1024)  // 2MB stack
 
@@ -29,6 +29,7 @@ typedef struct process {
     uint32_t entry_point;   // Absolute entry point address
     
     // Stack
+    void *stack_base;       // Allocated process stack
     uint32_t stack_ptr;     // Current stack pointer
     uint32_t stack_start;   // Start of the stack region
     uint32_t stack_size;    // Stack size
@@ -41,6 +42,7 @@ typedef struct process {
     // State
     int exit_code;          // Exit code
     uint8_t is_running;     // Running flag
+    uint32_t async_task_count; // number of active async tasks owned by this process
     
     // Debugging
     char name[256];         // Process name
@@ -58,6 +60,7 @@ int process_exec(const char *path, int argc, char **argv);
 int process_exec_simple(const char *path);
 int process_get_exit_code(void);
 process_t *process_get_current(void);
+void process_set_keep_alive(process_t *proc, int enabled);
 void process_cleanup(process_t *proc);
 
 #endif
