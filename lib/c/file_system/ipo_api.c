@@ -110,12 +110,12 @@ bool ipo_fs_format(uint32_t disk_start_lba, uint32_t total_blocks, uint32_t tota
     write_inode(autorun_ino, &ar_inode);
     if (!dir_add_entry(1, "autorun", autorun_ino, IPO_INODE_TYPE_FILE)) { printf("ipo_fs_format: dir_add_entry failed for /autorun\n"); return false; }
 
-    /* create /terminal_history file (protected, empty) */
+    /* create /terminal_history file as a transient terminal log (not protected) */
     int terminal_history_ino = allocate_inode();
     if (terminal_history_ino < 0) { printf("ipo_fs_format: allocate_inode failed for /terminal_history\n"); return false; }
     struct ipo_inode ch_inode;
     memset(&ch_inode, 0, sizeof(ch_inode));
-    ch_inode.mode = IPO_INODE_TYPE_FILE | IPO_INODE_FLAG_PROTECTED;
+    ch_inode.mode = IPO_INODE_TYPE_FILE;
     ch_inode.size = 0;
     ch_inode.links_count = 1;
     write_inode(terminal_history_ino, &ch_inode);

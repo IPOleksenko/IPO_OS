@@ -75,6 +75,7 @@ void kmain(void) {
     ipo_fs_init();
 
     ensure_fs_mounted();
+    clear_terminal_history_file();
 
     play_startup_sound();
 

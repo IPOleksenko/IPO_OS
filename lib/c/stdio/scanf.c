@@ -2,8 +2,29 @@
 #include <syscall.h>
 #include <string.h>
 #include <stdint.h>
+#include <memory/kmalloc.h>
 
-#define SCANF_BUFFER_SIZE 256
+static void *xrealloc(void *ptr, size_t old_size, size_t new_size) {
+    if (new_size == 0u) {
+        if (ptr != NULL) {
+            kfree(ptr);
+        }
+        return NULL;
+    }
+
+    void *new_ptr = kmalloc(new_size);
+    if (new_ptr == NULL) {
+        return NULL;
+    }
+
+    if (ptr != NULL) {
+        size_t copy_size = old_size < new_size ? old_size : new_size;
+        memcpy(new_ptr, ptr, copy_size);
+        kfree(ptr);
+    }
+
+    return new_ptr;
+}
 
 static const char *skip_spaces(const char *text) {
     while (*text == ' ' || *text == '\t' || *text == '\n' || *text == '\r') {
@@ -17,14 +38,49 @@ int scanf(const char *format, ...) {
         return -1;
     }
 
-    char input[SCANF_BUFFER_SIZE];
-    int length = ipo_syscall(IPO_SYSCALL_READ,
-                             (uint32_t)(uintptr_t)input,
-                             sizeof(input), 0, 0, 0);
-    if (length < 0) {
+    size_t capacity = 256u;
+    char *input = kmalloc(capacity);
+    if (input == NULL) {
         return -1;
     }
-    input[length < SCANF_BUFFER_SIZE ? length : SCANF_BUFFER_SIZE - 1] = '\0';
+
+    size_t length = 0u;
+    while (1) {
+        if (length + 128u >= capacity) {
+            size_t new_capacity = capacity ? capacity * 2u : 256u;
+            char *larger = xrealloc(input, capacity, new_capacity);
+            if (larger == NULL) {
+                kfree(input);
+                return -1;
+            }
+            input = larger;
+            capacity = new_capacity;
+        }
+
+        int chunk = ipo_syscall(IPO_SYSCALL_READ,
+                                (uint32_t)(uintptr_t)(input + length),
+                                128u,
+                                0, 0, 0);
+        if (chunk <= 0) {
+            break;
+        }
+
+        length += (size_t)chunk;
+        input[length] = '\0';
+
+        if (length > 0u && (input[length - 1u] == '\n' || input[length - 1u] == '\r')) {
+            break;
+        }
+    }
+
+    if (length == 0u) {
+        kfree(input);
+        return -1;
+    }
+
+    while (length > 0u && (input[length - 1u] == '\n' || input[length - 1u] == '\r')) {
+        input[--length] = '\0';
+    }
 
     va_list args;
     va_start(args, format);
@@ -82,16 +138,13 @@ int scanf(const char *format, ...) {
                 assigned++;
             } else if (*pattern == 's') {
                 char *output = va_arg(args, char *);
-                int copied = 0;
+                size_t copied = 0u;
 
                 while (*text != '\0' && *text != ' ' && *text != '\t' &&
                        *text != '\n' && *text != '\r') {
-                    if (copied < SCANF_BUFFER_SIZE - 1) {
-                        output[copied++] = *text;
-                    }
-                    text++;
+                    output[copied++] = *text++;
                 }
-                if (copied == 0) {
+                if (copied == 0u) {
                     break;
                 }
                 output[copied] = '\0';
@@ -118,5 +171,6 @@ int scanf(const char *format, ...) {
     }
 
     va_end(args);
+    kfree(input);
     return assigned;
 }

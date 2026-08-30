@@ -164,13 +164,7 @@ static int setup_arguments(process_t *proc, int argc, char **argv, uint32_t *arg
         return 0;
     }
     
-    // Limiting the number of arguments
-    if (argc > MAX_ARGV_COUNT) {
-        argc = MAX_ARGV_COUNT;
-    }
-    
-    // Allocate memory in the kernel for the argv pointer array
-    uint32_t argv_array_size = (argc + 1) * sizeof(uint32_t);
+    // No hard argument-count cap: argv is sized to the caller-provided count.
     char **argv_array = kmalloc((argc + 1) * sizeof(char *));
     if (!argv_array) {
         return -1;

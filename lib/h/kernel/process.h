@@ -5,8 +5,8 @@
 
 // Maximum sizes
 #define MAX_PROCESS_SIZE (512 * 1024 * 1024)  // 512 MB max per app
-#define MAX_ARGV_COUNT 64
-#define MAX_ARG_LENGTH 256
+
+// No hard argv or argument-length limits: argv arrays are allocated dynamically.
 
 // Dynamic memory allocation for processes
 #define PROCESS_HEAP_START  0x00800000  // Start of process heap area

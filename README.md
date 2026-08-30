@@ -94,6 +94,19 @@ Updates the boot configuration with kernel size information:
 make patch-config
 ```
 
+## **load_apps.py**
+
+- **File:** [load_apps.py](load_apps.py)
+- **Purpose:** loads compiled applications into the OS disk image so they are available from `/app` at runtime.
+
+### Usage
+
+```bash
+python3 load_apps.py
+```
+
+It scans the built app binaries in `build/apps`, copies them into the filesystem image, and makes them executable from the shell.
+
 ## **Disk Editor**
 
 - **File:** [disk_editor.py](disk_editor.py)

@@ -56,14 +56,14 @@ int main(int argc, char **argv) {
 
     int reg_a = ipo_syscall(IPO_SYSCALL_ASYNC_START,
                             (uint32_t)(uintptr_t)"async_demo_task_a",
-                            20000u,
+                            2000u,
                             (uint32_t)(uintptr_t)periodic_async_message_a,
                             0,
                             0);
 
     int reg_b = ipo_syscall(IPO_SYSCALL_ASYNC_START,
                             (uint32_t)(uintptr_t)"async_demo_task_b",
-                            30000u,
+                            3000u,
                             (uint32_t)(uintptr_t)periodic_async_message_b,
                             0,
                             0);

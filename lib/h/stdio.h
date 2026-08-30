@@ -16,6 +16,11 @@
 void putchar_color(char c, uint8_t fg, uint8_t bg);
 
 /**
+ * Clear the terminal log file on disk.
+ */
+void clear_terminal_history_file(void);
+
+/**
  * Low-level serial output (COM1)
  * @param c Character to output
  */

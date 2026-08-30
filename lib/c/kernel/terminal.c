@@ -22,6 +22,7 @@
 #define SC_ARROW_LEFT 0x4B
 #define SC_ARROW_RIGHT 0x4D
 #define COMMAND_HISTORY_SIZE 128
+#define COMMAND_HISTORY_ENTRY_SIZE 1024
 #define terminal_history_PATH "/terminal_history"
 
 /* Prompt / styling */
@@ -30,20 +31,20 @@
 #define PROMPT_FG VGA_COLOR_LIGHT_GREEN
 #define INPUT_FG VGA_COLOR_LIGHT_GREY
 
-/* Input buffer for simple command handling */
-#define INPUT_BUF_SIZE 256
-
-static char input_buf[INPUT_BUF_SIZE];
-static int input_len = 0;
+/* Input buffer for simple command handling: no hard maximum length. */
+static char *input_buf = NULL;
+static size_t input_capacity = 0;
+static size_t input_len = 0;
 static bool prompt_shown = false;
 static uint16_t input_start_cursor = 0;
 
-static char command_history[COMMAND_HISTORY_SIZE][INPUT_BUF_SIZE];
+static char **command_history = NULL;
 static int command_history_count = 0;
 static int command_history_index = -1;
 static int command_history_scroll_offset = 0;
-static char current_input_snapshot[INPUT_BUF_SIZE];
+static char *current_input_snapshot = NULL;
 static uint8_t last_terminal_scancode = 0;
+static uint32_t last_terminal_key_ms = 0;
 static uint32_t last_history_action_ms = 0;
 
 #define SCROLL_HISTORY_SIZE 1024
@@ -117,10 +118,36 @@ static void write_line_to_vga(uint16_t row, const uint16_t *buffer) {
     }
 }
 
+static void ensure_input_line_visible(const char *text) {
+    if (!text) {
+        return;
+    }
+
+    size_t text_len = strlen(text);
+    uint16_t prompt_row = input_start_cursor / VGA_WIDTH;
+    uint16_t prompt_col = input_start_cursor % VGA_WIDTH;
+    size_t cols_used = text_len + prompt_col;
+    uint16_t max_row = terminal_top_row() + terminal_rows() - 1u;
+    uint16_t end_row = prompt_row + (uint16_t)((cols_used + VGA_WIDTH - 1u) / VGA_WIDTH);
+
+    int scrolls = 0;
+    while (end_row > max_row && scrolls < (int)terminal_rows()) {
+        terminal_auto_scroll();
+        prompt_row = input_start_cursor / VGA_WIDTH;
+        prompt_col = input_start_cursor % VGA_WIDTH;
+        cols_used = text_len + prompt_col;
+        max_row = terminal_top_row() + terminal_rows() - 1u;
+        end_row = prompt_row + (uint16_t)((cols_used + VGA_WIDTH - 1u) / VGA_WIDTH);
+        scrolls++;
+    }
+}
+
 static void render_input_line(const char *text) {
     if (!text) {
         text = "";
     }
+
+    ensure_input_line_visible(text);
 
     volatile uint16_t *vga = VGA_MEMORY;
     uint16_t row = input_start_cursor / VGA_WIDTH;
@@ -161,91 +188,54 @@ static void render_input_line(const char *text) {
     vga_set_cursor(end_offset);
 }
 
-static void load_command_history_from_file(void) {
+static void ensure_input_buffer(size_t needed) {
+    if (input_buf == NULL || input_capacity < needed + 1u) {
+        size_t new_capacity = input_capacity ? input_capacity : 256u;
+        while (new_capacity < needed + 1u) {
+            new_capacity *= 2u;
+        }
+        char *new_buf = kmalloc(new_capacity);
+        if (new_buf == NULL) {
+            return;
+        }
+        if (input_buf != NULL) {
+            memcpy(new_buf, input_buf, input_len + 1u);
+            kfree(input_buf);
+        }
+        input_buf = new_buf;
+        input_capacity = new_capacity;
+    }
+}
+
+static void ensure_history_storage(void) {
+    if (command_history != NULL) {
+        return;
+    }
+
+    command_history = kmalloc(COMMAND_HISTORY_SIZE * sizeof(char *));
+    if (command_history == NULL) {
+        return;
+    }
+
     for (int i = 0; i < COMMAND_HISTORY_SIZE; i++) {
-        command_history[i][0] = '\0';
+        command_history[i] = kmalloc(COMMAND_HISTORY_ENTRY_SIZE);
+        if (command_history[i] == NULL) {
+            command_history[i] = NULL;
+        } else {
+            command_history[i][0] = '\0';
+        }
+    }
+}
+
+static void load_command_history_from_file(void) {
+    ensure_history_storage();
+    for (int i = 0; i < COMMAND_HISTORY_SIZE; i++) {
+        if (command_history[i] != NULL) {
+            command_history[i][0] = '\0';
+        }
     }
     command_history_count = 0;
-
-    if (!fs_mounted) {
-        return;
-    }
-
-    struct ipo_inode inode;
-    if (!ipo_fs_stat(terminal_history_PATH, &inode)) {
-        return;
-    }
-
-    if (inode.size == 0) {
-        return;
-    }
-
-    uint32_t size = inode.size;
-    if (size > 65535u) {
-        size = 65535u;
-    }
-
-    char *buffer = kmalloc((size + 1) * sizeof(char));
-    if (!buffer) {
-        return;
-    }
-
-    int fd = ipo_fs_open(terminal_history_PATH);
-    if (fd < 0) {
-        kfree(buffer);
-        return;
-    }
-
-    int bytes_read = ipo_fs_read(fd, buffer, size, 0);
-    ipo_fs_close(fd);
-
-    if (bytes_read <= 0) {
-        kfree(buffer);
-        return;
-    }
-
-    buffer[bytes_read] = '\0';
-
-    char *line = buffer;
-    char *cursor = buffer;
-    char *end = buffer + bytes_read;
-
-    while (cursor <= end && command_history_count < COMMAND_HISTORY_SIZE) {
-        if (cursor == end || *cursor == '\n') {
-            bool end_of_file = (cursor == end);
-            if (cursor != end) {
-                *cursor = '\0';
-            }
-
-            if (strncmp(line, "CMD:", 4) == 0) {
-                char *cmd = line + 4;
-                while (*cmd == ' ' || *cmd == '\t') {
-                    cmd++;
-                }
-
-                char *trim_end = cmd + strlen(cmd);
-                while (trim_end > cmd && (trim_end[-1] == ' ' || trim_end[-1] == '\t' || trim_end[-1] == '\r' || trim_end[-1] == '\n')) {
-                    trim_end--;
-                }
-                *trim_end = '\0';
-
-                if (*cmd != '\0') {
-                    strncpy(command_history[command_history_count], cmd, INPUT_BUF_SIZE - 1);
-                    command_history[command_history_count][INPUT_BUF_SIZE - 1] = '\0';
-                    command_history_count++;
-                }
-            }
-
-            if (end_of_file) {
-                break;
-            }
-
-            line = cursor + 1;
-        }
-        cursor++;
-    }
-
-    kfree(buffer);
+    command_history_index = -1;
 }
 
 static void push_command_history(const char *cmd) {
@@ -253,17 +243,32 @@ static void push_command_history(const char *cmd) {
         return;
     }
 
-    char record[INPUT_BUF_SIZE + 8];
-    int len = snprintf(record, sizeof(record), "CMD:%s\n", cmd);
-    if (len <= 0) {
+    if (strlen(cmd) >= COMMAND_HISTORY_ENTRY_SIZE) {
         return;
     }
 
-    if (fs_mounted) {
-        ipo_fs_write_text(terminal_history_PATH, record, true);
+    if (command_history_count < COMMAND_HISTORY_SIZE) {
+        if (command_history[command_history_count] == NULL) {
+            command_history[command_history_count] = kmalloc(COMMAND_HISTORY_ENTRY_SIZE);
+        }
+        if (command_history[command_history_count] != NULL) {
+            strncpy(command_history[command_history_count], cmd, COMMAND_HISTORY_ENTRY_SIZE - 1u);
+            command_history[command_history_count][COMMAND_HISTORY_ENTRY_SIZE - 1u] = '\0';
+            command_history_count++;
+        }
+    } else {
+        for (int i = 1; i < COMMAND_HISTORY_SIZE; i++) {
+            if (command_history[i] != NULL) {
+                strncpy(command_history[i - 1], command_history[i], COMMAND_HISTORY_ENTRY_SIZE - 1u);
+                command_history[i - 1][COMMAND_HISTORY_ENTRY_SIZE - 1u] = '\0';
+            }
+        }
+        if (command_history[COMMAND_HISTORY_SIZE - 1] != NULL) {
+            strncpy(command_history[COMMAND_HISTORY_SIZE - 1], cmd, COMMAND_HISTORY_ENTRY_SIZE - 1u);
+            command_history[COMMAND_HISTORY_SIZE - 1][COMMAND_HISTORY_ENTRY_SIZE - 1u] = '\0';
+        }
     }
 
-    load_command_history_from_file();
     command_history_index = -1;
 }
 
@@ -274,9 +279,9 @@ static void load_history_command(int index) {
         return;
     }
 
-    strncpy(input_buf, command_history[index], INPUT_BUF_SIZE - 1);
-    input_buf[INPUT_BUF_SIZE - 1] = '\0';
-    input_len = (int)strlen(input_buf);
+    ensure_input_buffer(strlen(command_history[index]));
+    strcpy(input_buf, command_history[index]);
+    input_len = strlen(input_buf);
     render_input_line(input_buf);
 }
 
@@ -287,13 +292,22 @@ static void apply_history_position(void) {
     }
 
     load_history_command(command_history_index);
+    vga_set_cursor(input_start_cursor + (uint16_t)input_len);
 }
 
 static void restore_snapshot_input(void) {
-    strncpy(input_buf, current_input_snapshot, INPUT_BUF_SIZE - 1);
-    input_buf[INPUT_BUF_SIZE - 1] = '\0';
-    input_len = (int)strlen(input_buf);
+    if (current_input_snapshot == NULL) {
+        input_len = 0;
+        if (input_buf != NULL) {
+            input_buf[0] = '\0';
+        }
+        return;
+    }
+    ensure_input_buffer(strlen(current_input_snapshot));
+    strcpy(input_buf, current_input_snapshot);
+    input_len = strlen(input_buf);
     render_input_line(input_buf);
+    vga_set_cursor(input_start_cursor + (uint16_t)input_len);
 }
 
 static void trim_top_buffer(void) {
@@ -494,6 +508,11 @@ void terminal_initialize(void) {
     input_len = 0;
     prompt_shown = false;
 
+    ensure_input_buffer(0);
+    if (input_buf != NULL) {
+        input_buf[0] = '\0';
+    }
+
     input_start_cursor = 0;
 
     command_history_count = 0;
@@ -502,9 +521,15 @@ void terminal_initialize(void) {
     top_buffer_count = 0;
     bottom_buffer_count = 0;
 
-    current_input_snapshot[0] = '\0';
+    if (current_input_snapshot == NULL) {
+        current_input_snapshot = kmalloc(256u);
+    }
+    if (current_input_snapshot != NULL) {
+        current_input_snapshot[0] = '\0';
+    }
 
     last_terminal_scancode = 0;
+    last_terminal_key_ms = 0;
     last_history_action_ms = 0;
 
     load_command_history_from_file();
@@ -524,9 +549,13 @@ int try_execute_command(const char *cmdline) {
     while (*cmdline == ' ' || *cmdline == '\t') cmdline++;
     if (*cmdline == '\0') return 0;
 
-    char name[128];
-    int i = 0;
-    while (*cmdline && *cmdline != ' ' && *cmdline != '\t' && i < (int)sizeof(name)-1) {
+    size_t name_cap = 256u;
+    char *name = kmalloc(name_cap);
+    if (name == NULL) {
+        return -1;
+    }
+    size_t i = 0u;
+    while (*cmdline && *cmdline != ' ' && *cmdline != '\t' && i + 1u < name_cap) {
         name[i++] = *cmdline++;
     }
     name[i] = '\0';
@@ -535,54 +564,98 @@ int try_execute_command(const char *cmdline) {
     char *path = resolve_command_path(name);
     if (!path) return 0; // not found
 
-    // Parse arguments from the remaining part of cmdline
-    char *argv[32];  // Support up to 32 arguments
+    // Parse arguments from the remaining part of cmdline without fixed-size args.
+    char **argv = NULL;
     int argc = 0;
-    argv[argc++] = name;  // First argument is program name
+    int argv_cap = 8;
+    argv = kmalloc((size_t)argv_cap * sizeof(char *));
+    if (argv == NULL) {
+        kfree(name);
+        return -1;
+    }
+    argv[argc++] = name;
     
     // Skip whitespace after command name
     while (*cmdline && (*cmdline == ' ' || *cmdline == '\t')) cmdline++;
     
-    // Parse remaining arguments
-    char arg_buf[512];  // Temporary buffer for arguments
-    int arg_pos = 0;
+    // Parse remaining arguments into a dynamically growing vector.
+    char *arg_buf = kmalloc(256u);
+    size_t arg_pos = 0u;
     int in_arg = 0;
-    
-    while (*cmdline && argc < 31) {  // Leave room for NULL terminator
+
+    while (*cmdline) {
         if (*cmdline == ' ' || *cmdline == '\t') {
             if (in_arg) {
-                // End current argument
                 arg_buf[arg_pos] = '\0';
-                char *arg_copy = kmalloc(arg_pos + 1);
+                char *arg_copy = kmalloc(arg_pos + 1u);
                 if (arg_copy) {
                     strcpy(arg_copy, arg_buf);
+                    if (argc + 1 >= argv_cap) {
+                        int new_cap = argv_cap * 2;
+                        char **new_argv = kmalloc((size_t)new_cap * sizeof(char *));
+                        if (new_argv == NULL) {
+                            kfree(arg_copy);
+                            kfree(arg_buf);
+                            kfree(argv);
+                            kfree(name);
+                            return -1;
+                        }
+                        memcpy(new_argv, argv, (size_t)argc * sizeof(char *));
+                        kfree(argv);
+                        argv = new_argv;
+                        argv_cap = new_cap;
+                    }
                     argv[argc++] = arg_copy;
                 }
-                arg_pos = 0;
+                arg_pos = 0u;
                 in_arg = 0;
             }
             cmdline++;
-        } else {
-            // Add character to current argument
-            if (arg_pos < (int)sizeof(arg_buf) - 1) {
-                arg_buf[arg_pos++] = *cmdline;
-                in_arg = 1;
-            }
-            cmdline++;
+            continue;
         }
+
+        if (arg_pos + 1u >= 256u) {
+            char *extended = kmalloc(arg_pos + 256u);
+            if (extended == NULL) {
+                kfree(arg_buf);
+                kfree(argv);
+                kfree(name);
+                return -1;
+            }
+            memcpy(extended, arg_buf, arg_pos);
+            kfree(arg_buf);
+            arg_buf = extended;
+        }
+        arg_buf[arg_pos++] = *cmdline++;
+        in_arg = 1;
     }
-    
-    // Handle last argument
+
     if (in_arg) {
         arg_buf[arg_pos] = '\0';
-        char *arg_copy = kmalloc(arg_pos + 1);
+        char *arg_copy = kmalloc(arg_pos + 1u);
         if (arg_copy) {
             strcpy(arg_copy, arg_buf);
+            if (argc + 1 >= argv_cap) {
+                int new_cap = argv_cap * 2;
+                char **new_argv = kmalloc((size_t)new_cap * sizeof(char *));
+                if (new_argv == NULL) {
+                    kfree(arg_copy);
+                    kfree(arg_buf);
+                    kfree(argv);
+                    kfree(name);
+                    return -1;
+                }
+                memcpy(new_argv, argv, (size_t)argc * sizeof(char *));
+                kfree(argv);
+                argv = new_argv;
+                argv_cap = new_cap;
+            }
             argv[argc++] = arg_copy;
         }
     }
-    
-    argv[argc] = NULL;  // NULL-terminate argv
+
+    kfree(arg_buf);
+    argv[argc] = NULL;
 
     // Execute program with arguments
     int result = process_exec(path, argc, argv);
@@ -591,7 +664,7 @@ int try_execute_command(const char *cmdline) {
     for (int j = 1; j < argc; j++) {
         kfree(argv[j]);
     }
-    
+    kfree(argv);
     kfree(path);
     return result;
 }
@@ -606,14 +679,18 @@ void terminal_console(void){
     if (scancode != 0x00) {
         bool is_break_code = (scancode & 0x80) != 0;
 
+        uint32_t now = timer_millis();
         if (!is_break_code && scancode == last_terminal_scancode) {
-            return;
+            if (now - last_terminal_key_ms < 30u) {
+                return;
+            }
         }
 
         if (is_break_code) {
             last_terminal_scancode = 0;
         } else {
             last_terminal_scancode = scancode;
+            last_terminal_key_ms = now;
         }
 
         update_hot_key_state(scancode);
@@ -641,8 +718,23 @@ void terminal_console(void){
                         return_to_present();
 
                         if (command_history_index < 0) {
-                            strncpy(current_input_snapshot, input_buf, INPUT_BUF_SIZE - 1);
-                            current_input_snapshot[INPUT_BUF_SIZE - 1] = '\0';
+                            size_t snapshot_len = strlen(input_buf);
+                            if (current_input_snapshot == NULL || strlen(current_input_snapshot) < snapshot_len + 1u) {
+                                size_t new_cap = snapshot_len + 1u;
+                                if (new_cap < 256u) {
+                                    new_cap = 256u;
+                                }
+                                char *new_snapshot = kmalloc(new_cap);
+                                if (new_snapshot == NULL) {
+                                    return;
+                                }
+                                if (current_input_snapshot != NULL) {
+                                    strcpy(new_snapshot, current_input_snapshot);
+                                    kfree(current_input_snapshot);
+                                }
+                                current_input_snapshot = new_snapshot;
+                            }
+                            strcpy(current_input_snapshot, input_buf);
                             command_history_index = command_history_count - 1;
                             command_history_scroll_offset = 1;
                         } else if (command_history_index > 0) {
@@ -688,8 +780,23 @@ void terminal_console(void){
                     return_to_present();
 
                     if (command_history_index < 0) {
-                        strncpy(current_input_snapshot, input_buf, INPUT_BUF_SIZE - 1);
-                        current_input_snapshot[INPUT_BUF_SIZE - 1] = '\0';
+                        size_t snapshot_len = strlen(input_buf);
+                        if (current_input_snapshot == NULL || strlen(current_input_snapshot) < snapshot_len + 1u) {
+                            size_t new_cap = snapshot_len + 1u;
+                            if (new_cap < 256u) {
+                                new_cap = 256u;
+                            }
+                            char *new_snapshot = kmalloc(new_cap);
+                            if (new_snapshot == NULL) {
+                                return;
+                            }
+                            if (current_input_snapshot != NULL) {
+                                strcpy(new_snapshot, current_input_snapshot);
+                                kfree(current_input_snapshot);
+                            }
+                            current_input_snapshot = new_snapshot;
+                        }
+                        strcpy(current_input_snapshot, input_buf);
                         command_history_index = command_history_count - 1;
                         command_history_scroll_offset = 1;
                     } else if (command_history_index > 0) {
@@ -778,24 +885,28 @@ void terminal_console(void){
                     int col = vga_get_cursor_position() % VGA_WIDTH;
                     int spaces = tab_size - (col % tab_size);
 
-                    int free_space = INPUT_BUF_SIZE - 1 - input_len;
-                    if (free_space <= 0) return;
+                    size_t free_space = input_capacity - 1u - input_len;
+                    if (free_space <= 0u) {
+                        ensure_input_buffer(input_len + 4u);
+                        free_space = input_capacity - 1u - input_len;
+                    }
 
-                    if (spaces > free_space) {
-                        spaces = free_space;
+                    if (spaces > (int)free_space) {
+                        spaces = (int)free_space;
                     }
 
                     for (int i = 0; i < spaces; i++) {
                         putchar(' ');
                         input_buf[input_len++] = ' ';
                     }
+                    input_buf[input_len] = '\0';
                 }
                 /* Printable characters */
                 else if (c >= 32 && c < 127) {
-                    if (input_len < INPUT_BUF_SIZE - 1) {
-                        putchar(c);
-                        input_buf[input_len++] = c;
-                    }
+                    ensure_input_buffer(input_len + 1u);
+                    putchar(c);
+                    input_buf[input_len++] = c;
+                    input_buf[input_len] = '\0';
                 }
             }
         }
@@ -805,6 +916,10 @@ void terminal_console(void){
 /* Auto scroll when terminal overflows - keep only current screen in RAM */
 void terminal_auto_scroll(void) {
     volatile uint16_t *vga = VGA_MEMORY;
+
+    if (prompt_shown && input_start_cursor >= VGA_WIDTH) {
+        input_start_cursor -= VGA_WIDTH;
+    }
 
     uint16_t top = terminal_top_row();
     uint16_t rows = terminal_rows();

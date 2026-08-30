@@ -11,6 +11,24 @@ static int terminal_history_line_len = 0;
 static uint8_t terminal_history_line_fg = VGA_COLOR_LIGHT_GREY;
 static uint8_t terminal_history_line_bg = VGA_COLOR_BLACK;
 
+void clear_terminal_history_file(void) {
+    if (!fs_mounted) {
+        return;
+    }
+
+    struct ipo_inode inode;
+    if (ipo_fs_stat("/terminal_history", &inode)) {
+        ipo_fs_delete("/terminal_history");
+    }
+
+    if (ipo_fs_create("/terminal_history", IPO_INODE_TYPE_FILE) < 0) {
+        return;
+    }
+
+    terminal_history_line_len = 0;
+    terminal_history_line[0] = '\0';
+}
+
 static void flush_terminal_history_line(void) {
     if (!fs_mounted || terminal_history_line_len <= 0) {
         return;
