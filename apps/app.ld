@@ -1,27 +1,33 @@
 ENTRY(main)
 
+PHDRS
+{
+    text PT_LOAD;
+    data PT_LOAD;
+}
+
 SECTIONS
 {
-    . = 0x00800000;
+    . = 0;
 
-    .text : ALIGN(16)
+    .text : ALIGN(4096)
     {
         *(.text*)
-    }
+    } :text
 
-    .rodata : ALIGN(16)
+    .rodata : ALIGN(4096)
     {
         *(.rodata*)
-    }
+    } :text
 
-    .data : ALIGN(16)
+    .data : ALIGN(4096)
     {
         *(.data*)
-    }
+    } :data
 
-    .bss : ALIGN(16)
+    .bss : ALIGN(4096)
     {
         *(COMMON)
         *(.bss*)
-    }
+    } :data
 }

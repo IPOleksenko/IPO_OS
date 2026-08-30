@@ -110,6 +110,18 @@ bool ipo_fs_format(uint32_t disk_start_lba, uint32_t total_blocks, uint32_t tota
     write_inode(autorun_ino, &ar_inode);
     if (!dir_add_entry(1, "autorun", autorun_ino, IPO_INODE_TYPE_FILE)) { printf("ipo_fs_format: dir_add_entry failed for /autorun\n"); return false; }
 
+    /* create /terminal_history file (protected, empty) */
+    int terminal_history_ino = allocate_inode();
+    if (terminal_history_ino < 0) { printf("ipo_fs_format: allocate_inode failed for /terminal_history\n"); return false; }
+    struct ipo_inode ch_inode;
+    memset(&ch_inode, 0, sizeof(ch_inode));
+    ch_inode.mode = IPO_INODE_TYPE_FILE | IPO_INODE_FLAG_PROTECTED;
+    ch_inode.size = 0;
+    ch_inode.links_count = 1;
+    write_inode(terminal_history_ino, &ch_inode);
+    if (!dir_add_entry(1, "terminal_history", terminal_history_ino, IPO_INODE_TYPE_FILE)) { printf("ipo_fs_format: dir_add_entry failed for /terminal_history\n"); return false; }
+
+
     /* save superblock to disk */
     if (!block_write(0, &sb)) { printf("ipo_fs_format: failed to write superblock\n"); return false; }
     return true;
@@ -164,6 +176,17 @@ int ipo_fs_open(const char *path) {
         }
     }
     return -1;
+}
+
+int ipo_fs_close(int fd) {
+    if (fd < 0 || fd >= IPO_MAX_FDS) return -1;
+    if (!fds[fd].used) return -1;
+
+    fds[fd].used = 0;
+    fds[fd].inode = 0;
+    fds[fd].offset = 0;
+    fds[fd].flags = 0;
+    return 0;
 }
 
 int ipo_fs_read(int fd, void *buffer, uint32_t size, uint32_t offset) {

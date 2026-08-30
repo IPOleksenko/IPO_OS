@@ -18,11 +18,68 @@ typedef struct {
 
 #define IPOB_HEADER_SIZE 20
 
+/**
+ * Memory allocation tracker for process binaries
+ */
+typedef struct {
+    void *base;             // Base address of allocated block
+    uint32_t size;          // Size of allocated block
+    uint32_t pid;           // Owner process ID (0 = free)
+} memory_block_t;
+
 // Global variables
 static int last_exit_code = 0;
 static process_t *current_process = NULL;
 static process_t *process_list = NULL;
 static uint32_t next_pid = 1;
+
+// Memory allocation tracking
+static memory_block_t *allocated_blocks = NULL;
+static int block_count = 0;
+static int max_blocks = 0;
+
+// Current position in process heap
+static uint32_t heap_offset = 0;
+
+/**
+ * Add a memory block to tracking
+ */
+static int add_memory_block(void *base, uint32_t size, uint32_t pid) {
+    // Expand array if needed
+    if (block_count >= max_blocks) {
+        int new_max = max_blocks + 16;
+        memory_block_t *new_blocks = kmalloc(new_max * sizeof(memory_block_t));
+        if (!new_blocks) return -1;
+        
+        if (allocated_blocks) {
+            memcpy(new_blocks, allocated_blocks, block_count * sizeof(memory_block_t));
+            kfree(allocated_blocks);
+        }
+        allocated_blocks = new_blocks;
+        max_blocks = new_max;
+    }
+    
+    allocated_blocks[block_count].base = base;
+    allocated_blocks[block_count].size = size;
+    allocated_blocks[block_count].pid = pid;
+    block_count++;
+    
+    return 0;
+}
+
+/**
+ * Find and remove a memory block
+ */
+static int remove_memory_block(void *base) {
+    for (int i = 0; i < block_count; i++) {
+        if (allocated_blocks[i].base == base) {
+            allocated_blocks[i] = allocated_blocks[block_count - 1];
+            block_count--;
+            return 0;
+        }
+    }
+    return -1;
+}
 
 void process_set_keep_alive(process_t *proc, int enabled) {
     if (proc == NULL) {
@@ -47,20 +104,43 @@ void process_init(void) {
     // Initialize memory allocator
     kmalloc_init();
     
+    // Initialize process memory tracking
+    heap_offset = 0;
+    block_count = 0;
+    max_blocks = 0;
+    allocated_blocks = NULL;
+    
     printf("Process manager initialized\n");
 }
 
 /**
- * allocate_process_memory - Allocates memory for a process at a fixed address.
+ * allocate_process_memory - Allocates memory for a process dynamically
  */
-static void *allocate_process_memory(uint32_t base, uint32_t size, uint32_t prot_flags) {
+static void *allocate_process_memory(uint32_t size, uint32_t prot_flags) {
     (void)prot_flags;
-    if (base != PROCESS_BASE_ADDR || size == 0 ||
-        size > MAX_PROCESS_SIZE || base + size < base) {
+    
+    if (size == 0 || size > MAX_PROCESS_SIZE) {
         return NULL;
     }
-
-    return (void *)base;
+    
+    // Check if there's enough space
+    if (heap_offset + size > PROCESS_HEAP_SIZE) {
+        serial_printf("Process heap exhausted: need %u, have %u\n", 
+                     heap_offset + size, PROCESS_HEAP_SIZE);
+        return NULL;
+    }
+    
+    uint32_t base = PROCESS_HEAP_START + heap_offset;
+    void *addr = (void *)base;
+    
+    heap_offset += size;
+    // Align to 4KB for safety
+    heap_offset = (heap_offset + 0xFFF) & ~0xFFF;
+    
+    serial_printf("Allocated process memory: base=0x%x, size=%u, new_offset=%u\n", 
+                 base, size, heap_offset);
+    
+    return addr;
 }
 
 /**
@@ -69,24 +149,9 @@ static void *allocate_process_memory(uint32_t base, uint32_t size, uint32_t prot
 static void free_process_memory(void *addr, uint32_t size) {
     (void)addr;
     (void)size;
-}
 
-/**
- * copy_string_to_process - Copies a string into the process's address space.
- */
-static uint32_t copy_string_to_process(process_t *proc, const char *str) {
-    if (!str) return 0;
-    
-    size_t len = strlen(str) + 1;
-    
-    // Allocate memory in the process stack for the string
-    proc->stack_ptr -= len;
-    proc->stack_ptr &= ~0x3;  // 4-byte alignment
-    
-    // Copy the line
-    memcpy((void*)proc->stack_ptr, str, len);
-    
-    return proc->stack_ptr;
+    heap_offset = 0;
+    serial_printf("Marked memory as free: base=0x%x, size=%u\n", (uint32_t)addr, size);
 }
 
 /**
@@ -142,7 +207,8 @@ static int setup_arguments(process_t *proc, int argc, char **argv, uint32_t *arg
  * setup_stack - Configures the process stack for startup.
  */
 static uint32_t setup_stack(process_t *proc) {
-    proc->stack_base = kmalloc(PROCESS_STACK_SIZE);
+    proc->stack_base = allocate_process_memory(PROCESS_STACK_SIZE,
+                                              PROT_READ | PROT_WRITE);
     if (proc->stack_base == NULL) {
         return 0;
     }
@@ -162,8 +228,8 @@ static int process_call_entry(ipob_entry_t entry, int argc, char **argv,
     __asm__ volatile(
         "movl %%esp, %0\n"
         "movl %5, %%esp\n"
-        "pushl %3\n"
-        "pushl %2\n"
+        "pushl %3\n"   /* argv */
+        "pushl %2\n"   /* argc */
         "call *%4\n"
         "addl $8, %%esp\n"
         "movl %0, %%esp\n"
@@ -237,6 +303,7 @@ static int load_ipob_file(const char *path, ipob_header_t *header_out, void **da
         int bytes_read = ipo_fs_read(fd, (uint8_t*)binary_image + total_read, to_read, total_read);
         
         if (bytes_read <= 0) {
+            ipo_fs_close(fd);
             kfree(binary_image);
             printf("Read failed at offset %d, read %d bytes\n", total_read, bytes_read);
             return -4;  // Read failed
@@ -245,6 +312,8 @@ static int load_ipob_file(const char *path, ipob_header_t *header_out, void **da
         total_read += bytes_read;
         serial_printf("Read chunk: %d bytes, total: %d/%d\n", bytes_read, total_read, stat.size);
     }
+
+    ipo_fs_close(fd);
     
     // Parse and check the header
     ipob_header_t *header = (ipob_header_t *)binary_image;
@@ -299,14 +368,18 @@ void process_cleanup(process_t *proc) {
     
     // Keep the binary resident if it owns background async tasks.
     // The callback function pointer remains valid only while the code stays in memory.
-    // Releasing it immediately would invalidate the async task after the app exits.
     if (proc->binary_base) {
         free_process_memory(proc->binary_base, proc->binary_size);
         proc->binary_base = NULL;
     }
 
     if (proc->stack_base) {
-        kfree(proc->stack_base);
+        if ((uintptr_t)proc->stack_base >= PROCESS_HEAP_START &&
+            (uintptr_t)proc->stack_base < PROCESS_HEAP_START + PROCESS_HEAP_SIZE) {
+            free_process_memory(proc->stack_base, proc->stack_size);
+        } else {
+            kfree(proc->stack_base);
+        }
         proc->stack_base = NULL;
     }
     
@@ -355,11 +428,6 @@ int process_exec(const char *path, int argc, char **argv) {
         return -1;
     }
 
-    if (process_list != NULL) {
-        printf("Cannot start '%s': another process is still alive\n", path);
-        return -8;
-    }
-    
     serial_printf("process_exec: %s, argc=%d\n", path, argc);
     
     // Creating a process structure
@@ -372,6 +440,9 @@ int process_exec(const char *path, int argc, char **argv) {
     memset(proc, 0, sizeof(process_t));
     proc->pid = next_pid++;
     proc->is_running = 1;
+    
+    // Store process name
+    strncpy(proc->name, path, sizeof(proc->name) - 1);
     
     // Add to the list of processes
     proc->next = process_list;
@@ -391,13 +462,12 @@ int process_exec(const char *path, int argc, char **argv) {
     serial_printf("File loaded, entry offset: 0x%x, total size: %d\n", 
            header.entry_offset, header.total_size);
     
-    // Allocating memory at a fixed address
-    // Applications are compiled for the PROCESS_BASE_ADDR address
-    void *target_addr = allocate_process_memory(PROCESS_BASE_ADDR, size,
+    // Allocating memory dynamically for the binary
+    void *target_addr = allocate_process_memory(size,
                                                PROT_READ | PROT_WRITE | PROT_EXEC);
     
     if (!target_addr) {
-        printf("Failed to allocate memory at 0x%x\n", PROCESS_BASE_ADDR);
+        printf("Failed to allocate memory for process (need %d bytes)\n", size);
         kfree(binary_image);
         process_cleanup(proc);
         return -5;
@@ -408,7 +478,8 @@ int process_exec(const char *path, int argc, char **argv) {
            size - IPOB_HEADER_SIZE);
     
     // Relocate if necessary.
-    if (relocate_binary(target_addr, PROCESS_BASE_ADDR, size) < 0) {
+    uint32_t load_address = (uint32_t)target_addr;
+    if (relocate_binary(target_addr, load_address, size) < 0) {
         printf("Relocation failed\n");
         free_process_memory(target_addr, size);
         kfree(binary_image);
@@ -446,16 +517,33 @@ int process_exec(const char *path, int argc, char **argv) {
     // Save the current process
     process_t *old_process = current_process;
     current_process = proc;
+
+    // Defensive validation: a broken application must never crash the kernel.
+    if (proc->binary_base == NULL || proc->binary_size == 0 ||
+        proc->entry_point < PROCESS_HEAP_START ||
+        proc->entry_point >= PROCESS_HEAP_START + PROCESS_HEAP_SIZE) {
+        printf("[process] pid=%u: invalid app image, closing process safely\n", proc->pid);
+        current_process = old_process;
+        process_cleanup(proc);
+        return -9;
+    }
     
     // Call the entry point with arguments
     serial_printf("Calling entry point with argc=%d, argv at 0x%x...\n", proc->argc, argv_addr);
     
     // The entry point has a signature: int main(int argc, char **argv)
     char **argv_ptr = (char**)argv_addr;
-    
-    // Call with arguments
+
+    // If the executable is invalid or takes too long, the kernel must still recover.
     typedef int (*entry_func_t)(int, char**);
     entry_func_t entry_point = (entry_func_t)proc->entry_point;
+    if (entry_point == NULL) {
+        printf("[process] pid=%u: entry point is NULL, closing process\n", proc->pid);
+        current_process = old_process;
+        process_cleanup(proc);
+        return -10;
+    }
+
     int exit_code = process_call_entry(entry_point, proc->argc, argv_ptr,
                                        proc->stack_ptr);
     last_exit_code = exit_code;
@@ -470,6 +558,22 @@ int process_exec(const char *path, int argc, char **argv) {
         proc->exit_code = exit_code;
         printf("[process] keeping process %u alive because it owns %u async tasks\n",
                proc->pid, proc->async_task_count);
+
+        // Detach background process from the active chain so it does not remain
+        // as a zombie entry that can block later command executions.
+        if (process_list == proc) {
+            process_list = proc->next;
+        } else {
+            process_t *prev = process_list;
+            while (prev && prev->next != proc) {
+                prev = prev->next;
+            }
+            if (prev) {
+                prev->next = proc->next;
+            }
+        }
+        proc->next = NULL;
+        current_process = old_process;
         return proc->pid;
     }
     

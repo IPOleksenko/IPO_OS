@@ -32,6 +32,26 @@ static async_task_t *async_task_list = NULL;
 static uint32_t async_ticks = 0;
 static bool async_initialized = false;
 
+static void remove_inactive_tasks(void) {
+    async_task_t **it = &async_task_list;
+
+    while (*it != NULL) {
+        async_task_t *task = *it;
+        if (!task->active) {
+            *it = task->next;
+            kfree(task);
+            continue;
+        }
+        it = &task->next;
+    }
+}
+
+static void run_async_task(async_task_t *task) {
+    if (task == NULL || task->fn == NULL) {
+        return;
+    }
+    task->fn();
+}
 
 void async_scheduler_init(void)
 {
@@ -67,19 +87,13 @@ int async_start_task(
 
     uint32_t now_ms = timer_millis();
 
-    /*
-     * Check whether task with this name already exists.
-     */
     async_task_t *node = async_task_list;
 
     while (node != NULL) {
-
-        if (node->active && strcmp(node->name, name) == 0) {
-
+        if (node->active && strcmp(node->name, name) == 0 && node->owner == owner) {
             node->interval_ms = interval_ms;
             node->last_run_ms = now_ms;
             node->fn = fn;
-
             return 0;
         }
 
@@ -135,24 +149,17 @@ int async_stop_task(const char *name)
     async_task_t **it = &async_task_list;
 
     while (*it != NULL) {
-
         async_task_t *node = *it;
 
-        if (node->active &&
-            strcmp(node->name, name) == 0) {
-
+        if (node->active && strcmp(node->name, name) == 0) {
             process_t *owner = node->owner;
 
-            *it = node->next;
-
-            kfree(node);
+            node->active = false;
 
             if (owner != NULL) {
-
                 process_set_keep_alive(owner, 0);
-
                 if (owner->async_task_count == 0) {
-                    process_cleanup(owner);
+                    owner->is_running = 0;
                 }
             }
 
@@ -179,23 +186,24 @@ void async_scheduler_tick(void)
         return;
     }
 
+    remove_inactive_tasks();
+
     async_task_t *node = async_task_list;
 
     while (node != NULL) {
+        async_task_t *next = node->next;
 
         if (node->active && node->fn != NULL) {
-
-            uint32_t elapsed =
-                now_ms - node->last_run_ms;
+            uint32_t elapsed = now_ms - node->last_run_ms;
 
             if (elapsed >= node->interval_ms) {
-
                 node->last_run_ms = now_ms;
-
-                node->fn();
+                run_async_task(node);
             }
         }
 
-        node = node->next;
+        node = next;
     }
+
+    remove_inactive_tasks();
 }

@@ -22,17 +22,13 @@
 #define SC_ARROW_LEFT 0x4B
 #define SC_ARROW_RIGHT 0x4D
 #define COMMAND_HISTORY_SIZE 128
+#define terminal_history_PATH "/terminal_history"
 
 /* Prompt / styling */
 #define PROMPT_STR "> "
 #define PROMPT_LEN 2
 #define PROMPT_FG VGA_COLOR_LIGHT_GREEN
 #define INPUT_FG VGA_COLOR_LIGHT_GREY
-
-/* Terminal Buffers - each can store multiple lines of history */
-#define SCROLL_HISTORY_SIZE 1024  // Number of lines to store in history
-static uint16_t terminal_top_buffer[SCROLL_HISTORY_SIZE][VGA_WIDTH];
-static uint16_t terminal_bottom_buffer[SCROLL_HISTORY_SIZE][VGA_WIDTH];
 
 /* Input buffer for simple command handling */
 #define INPUT_BUF_SIZE 256
@@ -45,13 +41,20 @@ static uint16_t input_start_cursor = 0;
 static char command_history[COMMAND_HISTORY_SIZE][INPUT_BUF_SIZE];
 static int command_history_count = 0;
 static int command_history_index = -1;
+static int command_history_scroll_offset = 0;
 static char current_input_snapshot[INPUT_BUF_SIZE];
 static uint8_t last_terminal_scancode = 0;
 static uint32_t last_history_action_ms = 0;
 
+#define SCROLL_HISTORY_SIZE 1024
+#define SCROLL_HISTORY_CLEAR_THRESHOLD (SCROLL_HISTORY_SIZE * 3 / 4)
+#define SCROLL_HISTORY_KEEP_SIZE (SCROLL_HISTORY_SIZE / 2)
+static uint16_t terminal_top_buffer[SCROLL_HISTORY_SIZE][VGA_WIDTH];
+static uint16_t terminal_bottom_buffer[SCROLL_HISTORY_SIZE][VGA_WIDTH];
+
 /* Scroll state */
-static int top_buffer_count = 0;      // How many lines are stored in terminal_top_buffer
-static int bottom_buffer_count = 0;   // How many lines are stored in terminal_bottom_buffer
+static int top_buffer_count = 0;
+static int bottom_buffer_count = 0;
 
 // Terminal drawing area (below header)
 static inline uint16_t terminal_top_row(void) {
@@ -158,39 +161,113 @@ static void render_input_line(const char *text) {
     vga_set_cursor(end_offset);
 }
 
+static void load_command_history_from_file(void) {
+    for (int i = 0; i < COMMAND_HISTORY_SIZE; i++) {
+        command_history[i][0] = '\0';
+    }
+    command_history_count = 0;
+
+    if (!fs_mounted) {
+        return;
+    }
+
+    struct ipo_inode inode;
+    if (!ipo_fs_stat(terminal_history_PATH, &inode)) {
+        return;
+    }
+
+    if (inode.size == 0) {
+        return;
+    }
+
+    uint32_t size = inode.size;
+    if (size > 65535u) {
+        size = 65535u;
+    }
+
+    char *buffer = kmalloc((size + 1) * sizeof(char));
+    if (!buffer) {
+        return;
+    }
+
+    int fd = ipo_fs_open(terminal_history_PATH);
+    if (fd < 0) {
+        kfree(buffer);
+        return;
+    }
+
+    int bytes_read = ipo_fs_read(fd, buffer, size, 0);
+    ipo_fs_close(fd);
+
+    if (bytes_read <= 0) {
+        kfree(buffer);
+        return;
+    }
+
+    buffer[bytes_read] = '\0';
+
+    char *line = buffer;
+    char *cursor = buffer;
+    char *end = buffer + bytes_read;
+
+    while (cursor <= end && command_history_count < COMMAND_HISTORY_SIZE) {
+        if (cursor == end || *cursor == '\n') {
+            bool end_of_file = (cursor == end);
+            if (cursor != end) {
+                *cursor = '\0';
+            }
+
+            if (strncmp(line, "CMD:", 4) == 0) {
+                char *cmd = line + 4;
+                while (*cmd == ' ' || *cmd == '\t') {
+                    cmd++;
+                }
+
+                char *trim_end = cmd + strlen(cmd);
+                while (trim_end > cmd && (trim_end[-1] == ' ' || trim_end[-1] == '\t' || trim_end[-1] == '\r' || trim_end[-1] == '\n')) {
+                    trim_end--;
+                }
+                *trim_end = '\0';
+
+                if (*cmd != '\0') {
+                    strncpy(command_history[command_history_count], cmd, INPUT_BUF_SIZE - 1);
+                    command_history[command_history_count][INPUT_BUF_SIZE - 1] = '\0';
+                    command_history_count++;
+                }
+            }
+
+            if (end_of_file) {
+                break;
+            }
+
+            line = cursor + 1;
+        }
+        cursor++;
+    }
+
+    kfree(buffer);
+}
+
 static void push_command_history(const char *cmd) {
     if (!cmd || !cmd[0]) {
         return;
     }
 
-    for (int i = 0; i < command_history_count; i++) {
-        if (strcmp(command_history[i], cmd) == 0) {
-            for (int j = i; j < command_history_count - 1; j++) {
-                strncpy(command_history[j], command_history[j + 1], INPUT_BUF_SIZE - 1);
-                command_history[j][INPUT_BUF_SIZE - 1] = '\0';
-            }
-            strncpy(command_history[command_history_count - 1], cmd, INPUT_BUF_SIZE - 1);
-            command_history[command_history_count - 1][INPUT_BUF_SIZE - 1] = '\0';
-            command_history_index = -1;
-            return;
-        }
+    char record[INPUT_BUF_SIZE + 8];
+    int len = snprintf(record, sizeof(record), "CMD:%s\n", cmd);
+    if (len <= 0) {
+        return;
     }
 
-    if (command_history_count < COMMAND_HISTORY_SIZE) {
-        strncpy(command_history[command_history_count], cmd, INPUT_BUF_SIZE - 1);
-        command_history[command_history_count][INPUT_BUF_SIZE - 1] = '\0';
-        command_history_count++;
-    } else {
-        for (int i = 0; i < COMMAND_HISTORY_SIZE - 1; i++) {
-            strncpy(command_history[i], command_history[i + 1], INPUT_BUF_SIZE - 1);
-            command_history[i][INPUT_BUF_SIZE - 1] = '\0';
-        }
-        strncpy(command_history[COMMAND_HISTORY_SIZE - 1], cmd, INPUT_BUF_SIZE - 1);
-        command_history[COMMAND_HISTORY_SIZE - 1][INPUT_BUF_SIZE - 1] = '\0';
+    if (fs_mounted) {
+        ipo_fs_write_text(terminal_history_PATH, record, true);
     }
 
+    load_command_history_from_file();
     command_history_index = -1;
 }
+
+static void restore_snapshot_input(void);
 
 static void load_history_command(int index) {
     if (index < 0 || index >= command_history_count) {
@@ -203,6 +280,15 @@ static void load_history_command(int index) {
     render_input_line(input_buf);
 }
 
+static void apply_history_position(void) {
+    if (command_history_index < 0) {
+        restore_snapshot_input();
+        return;
+    }
+
+    load_history_command(command_history_index);
+}
+
 static void restore_snapshot_input(void) {
     strncpy(input_buf, current_input_snapshot, INPUT_BUF_SIZE - 1);
     input_buf[INPUT_BUF_SIZE - 1] = '\0';
@@ -210,112 +296,109 @@ static void restore_snapshot_input(void) {
     render_input_line(input_buf);
 }
 
-/* Auto scroll when terminal overflows - called by putchar/printf when needed */
-void terminal_auto_scroll(void) {
-    volatile uint16_t* vga = VGA_MEMORY;
-    uint16_t top = terminal_top_row();
-    uint16_t rows = terminal_rows();
-    
-    // Save the TOP line (which will disappear) to top_buffer history before shifting
+static void trim_top_buffer(void) {
+    if (top_buffer_count < SCROLL_HISTORY_CLEAR_THRESHOLD) {
+        return;
+    }
+
+    int remove_count = top_buffer_count - SCROLL_HISTORY_KEEP_SIZE;
+    if (remove_count <= 0) {
+        return;
+    }
+
+    for (int i = 0; i < SCROLL_HISTORY_KEEP_SIZE; i++) {
+        memcpy(
+            terminal_top_buffer[i],
+            terminal_top_buffer[i + remove_count],
+            VGA_WIDTH * sizeof(uint16_t)
+        );
+    }
+
+    top_buffer_count = SCROLL_HISTORY_KEEP_SIZE;
+}
+
+static void save_top_line(uint16_t row) {
+    if (top_buffer_count >= SCROLL_HISTORY_SIZE) {
+        trim_top_buffer();
+    }
+
     if (top_buffer_count < SCROLL_HISTORY_SIZE) {
-        read_line_from_vga(top, terminal_top_buffer[top_buffer_count]);
+        read_line_from_vga(row, terminal_top_buffer[top_buffer_count]);
         top_buffer_count++;
-     } else {
-        // Buffer is full, shift all lines and add new at end
-        for (int i = 0; i < SCROLL_HISTORY_SIZE - 1; i++) {
-            for (uint16_t c = 0; c < VGA_WIDTH; c++) {
-                terminal_top_buffer[i][c] = terminal_top_buffer[i + 1][c];
-            }
-        }
-        read_line_from_vga(top, terminal_top_buffer[SCROLL_HISTORY_SIZE - 1]);
-    }
-    
-    // Reset bottom buffer since we got new output
-    bottom_buffer_count = 0;
-    
-    // Shift lines up by one
-    for (uint16_t r = 0; r < rows - 1; r++) {
-        uint16_t src_offset = (top + r + 1) * VGA_WIDTH;
-        uint16_t dst_offset = (top + r) * VGA_WIDTH;
-        
-        for (uint16_t c = 0; c < VGA_WIDTH; c++) {
-            vga[dst_offset + c] = vga[src_offset + c];
-        }
-    }
-    
-    // Clear bottom line
-    uint16_t blank = vga_entry(0x00, VGA_COLOR_WHITE, VGA_COLOR_BLACK);
-    for (uint16_t c = 0; c < VGA_WIDTH; c++) {
-        vga[(top + rows - 1) * VGA_WIDTH + c] = blank;
     }
 }
 
 /* Return to present - restore current output when user starts typing */
 static void return_to_present(void) {
-    // If we're in history, restore to the present
     if (bottom_buffer_count == 0) {
-        return;  // Already at present
+        return;
     }
-    
-    volatile uint16_t* vga = VGA_MEMORY;
+
+    volatile uint16_t *vga = VGA_MEMORY;
+
     uint16_t top = terminal_top_row();
     uint16_t rows = terminal_rows();
-    
-    // Restore all lines from bottom_buffer by scrolling down (reverse of scroll up)
+
+    if (rows <= 1) {
+        bottom_buffer_count = 0;
+        vga_show_cursor();
+        return;
+    }
+
     while (bottom_buffer_count > 0) {
-        // Save the current top line to top_buffer
-        read_line_from_vga(top, terminal_top_buffer[top_buffer_count]);
-        top_buffer_count++;
-        
-        // Shift lines up by one (move forward in time)
+        if (top_buffer_count < SCROLL_HISTORY_SIZE) {
+            read_line_from_vga(top, terminal_top_buffer[top_buffer_count]);
+            top_buffer_count++;
+        }
+
         for (uint16_t r = 0; r < rows - 1; r++) {
             uint16_t src_offset = (top + r + 1) * VGA_WIDTH;
             uint16_t dst_offset = (top + r) * VGA_WIDTH;
-            
+
             for (uint16_t c = 0; c < VGA_WIDTH; c++) {
                 vga[dst_offset + c] = vga[src_offset + c];
             }
         }
-        
-        // Restore line from bottom_buffer at the bottom (move toward present)
+
         write_line_to_vga(top + rows - 1, terminal_bottom_buffer[bottom_buffer_count - 1]);
         bottom_buffer_count--;
     }
-    
-    // Show cursor when returning to present
+
     vga_show_cursor();
 }
 
 /* Scroll down - restore next line from history if available */
 static void scroll_down(void) {
-    // Can only scroll down if we're in scroll history (in the past)
     if (bottom_buffer_count == 0) {
-        return;  // Can't scroll further, we're at the current output
+        return;
     }
-    
-    volatile uint16_t* vga = VGA_MEMORY;
+
+    volatile uint16_t *vga = VGA_MEMORY;
+
     uint16_t top = terminal_top_row();
     uint16_t rows = terminal_rows();
-    
-    // Save the current top line to top_buffer
-    read_line_from_vga(top, terminal_top_buffer[top_buffer_count]);
-    top_buffer_count++;
-    
-    // Shift lines up by one (move forward in time)
+
+    if (rows <= 1) {
+        return;
+    }
+
+    if (top_buffer_count < SCROLL_HISTORY_SIZE) {
+        read_line_from_vga(top, terminal_top_buffer[top_buffer_count]);
+        top_buffer_count++;
+    }
+
     for (uint16_t r = 0; r < rows - 1; r++) {
         uint16_t src_offset = (top + r + 1) * VGA_WIDTH;
         uint16_t dst_offset = (top + r) * VGA_WIDTH;
-        
+
         for (uint16_t c = 0; c < VGA_WIDTH; c++) {
             vga[dst_offset + c] = vga[src_offset + c];
         }
     }
-    
-    // Restore line from bottom_buffer at the bottom (move toward present)
+
     write_line_to_vga(top + rows - 1, terminal_bottom_buffer[bottom_buffer_count - 1]);
     bottom_buffer_count--;
-    
-    // Show cursor when we return to present (bottom_buffer is now empty)
+
     if (bottom_buffer_count == 0) {
         vga_show_cursor();
     }
@@ -323,35 +406,35 @@ static void scroll_down(void) {
 
 /* Scroll up - show previous line from history */
 static void scroll_up(void) {
-    // Only scroll up if we have history to go back to
     if (top_buffer_count == 0) {
-        return;  // Nothing to scroll back to
+        return;
     }
-    
-    volatile uint16_t* vga = VGA_MEMORY;
+
+    volatile uint16_t *vga = VGA_MEMORY;
+
     uint16_t top = terminal_top_row();
     uint16_t rows = terminal_rows();
-    
-    // Hide cursor when entering history
+
+    if (rows <= 1) {
+        return;
+    }
+
     vga_hide_cursor();
-    
-    // Save the current bottom line to bottom_buffer before shifting
+
     if (bottom_buffer_count < SCROLL_HISTORY_SIZE) {
         read_line_from_vga(top + rows - 1, terminal_bottom_buffer[bottom_buffer_count]);
         bottom_buffer_count++;
     }
-    
-    // Shift lines down by one
+
     for (uint16_t r = rows - 1; r > 0; r--) {
         uint16_t src_offset = (top + r - 1) * VGA_WIDTH;
         uint16_t dst_offset = (top + r) * VGA_WIDTH;
-        
+
         for (uint16_t c = 0; c < VGA_WIDTH; c++) {
             vga[dst_offset + c] = vga[src_offset + c];
         }
     }
-    
-    // Restore line from top_buffer at the top (go back in history)
+
     write_line_to_vga(top, terminal_top_buffer[top_buffer_count - 1]);
     top_buffer_count--;
 }
@@ -399,20 +482,32 @@ char* resolve_command_path(const char *cmd) {
 }
 
 void terminal_initialize(void) {
-    vga_clear(VGA_COLOR_WHITE, VGA_COLOR_BLACK, true, VGA_START_CURSOR_POSITION);
+    vga_clear(
+        VGA_COLOR_WHITE,
+        VGA_COLOR_BLACK,
+        true,
+        VGA_START_CURSOR_POSITION
+    );
 
     print_header();
 
-    terminal_top_buffer[0][0] = 0;
-    terminal_bottom_buffer[0][0] = 0;
-    top_buffer_count = 0;
-    bottom_buffer_count = 0;
     input_len = 0;
     prompt_shown = false;
+
     input_start_cursor = 0;
+
     command_history_count = 0;
     command_history_index = -1;
+    command_history_scroll_offset = 0;
+    top_buffer_count = 0;
+    bottom_buffer_count = 0;
+
     current_input_snapshot[0] = '\0';
+
+    last_terminal_scancode = 0;
+    last_history_action_ms = 0;
+
+    load_command_history_from_file();
 }
 
 /* Print the command prompt */
@@ -524,14 +619,62 @@ void terminal_console(void){
         update_hot_key_state(scancode);
         hot_key_handler(scancode);
 
-        /* Handle scroll navigation - no break code check needed */
+        /* Screen scrolling uses Up/Down arrows; history navigation stays on PageUp/PageDown. */
         if (!is_break_code) {
-            if (scancode == SC_PAGE_DOWN || scancode == SC_ARROW_DOWN) {
+            if (scancode == SC_ARROW_UP) {
+                scroll_up();
+                return;
+            }
+            if (scancode == SC_ARROW_DOWN) {
                 scroll_down();
                 return;
             }
-            if (scancode == SC_PAGE_UP || scancode == SC_ARROW_UP) {
-                scroll_up();
+            if (scancode == SC_PAGE_UP || scancode == SC_PAGE_DOWN) {
+                if (scancode == SC_PAGE_UP) {
+                    if (command_history_count > 0) {
+                        uint32_t now = timer_millis();
+                        if (now - last_history_action_ms < 150u) {
+                            return;
+                        }
+                        last_history_action_ms = now;
+
+                        return_to_present();
+
+                        if (command_history_index < 0) {
+                            strncpy(current_input_snapshot, input_buf, INPUT_BUF_SIZE - 1);
+                            current_input_snapshot[INPUT_BUF_SIZE - 1] = '\0';
+                            command_history_index = command_history_count - 1;
+                            command_history_scroll_offset = 1;
+                        } else if (command_history_index > 0) {
+                            command_history_index--;
+                            command_history_scroll_offset++;
+                        }
+
+                        apply_history_position();
+                    }
+                    return;
+                }
+
+                if (command_history_index >= 0) {
+                    uint32_t now = timer_millis();
+                    if (now - last_history_action_ms < 150u) {
+                        return;
+                    }
+                    last_history_action_ms = now;
+
+                    return_to_present();
+
+                    if (command_history_index < command_history_count - 1) {
+                        command_history_index++;
+                        command_history_scroll_offset--;
+                        apply_history_position();
+                    } else {
+                        command_history_index = -1;
+                        command_history_scroll_offset = 0;
+                        restore_snapshot_input();
+                        current_input_snapshot[0] = '\0';
+                    }
+                }
                 return;
             }
             if (scancode == SC_ARROW_LEFT) {
@@ -548,11 +691,13 @@ void terminal_console(void){
                         strncpy(current_input_snapshot, input_buf, INPUT_BUF_SIZE - 1);
                         current_input_snapshot[INPUT_BUF_SIZE - 1] = '\0';
                         command_history_index = command_history_count - 1;
+                        command_history_scroll_offset = 1;
                     } else if (command_history_index > 0) {
                         command_history_index--;
+                        command_history_scroll_offset++;
                     }
 
-                    load_history_command(command_history_index);
+                    apply_history_position();
                 }
                 return;
             }
@@ -568,9 +713,11 @@ void terminal_console(void){
 
                     if (command_history_index < command_history_count - 1) {
                         command_history_index++;
-                        load_history_command(command_history_index);
+                        command_history_scroll_offset--;
+                        apply_history_position();
                     } else {
                         command_history_index = -1;
+                        command_history_scroll_offset = 0;
                         restore_snapshot_input();
                         current_input_snapshot[0] = '\0';
                     }
@@ -609,6 +756,7 @@ void terminal_console(void){
                     input_buf[0] = '\0';
                     current_input_snapshot[0] = '\0';
                     command_history_index = -1;
+                    command_history_scroll_offset = 0;
                     prompt_shown = false;
                     print_prompt();
                 }
@@ -651,5 +799,36 @@ void terminal_console(void){
                 }
             }
         }
+    }
+}
+
+/* Auto scroll when terminal overflows - keep only current screen in RAM */
+void terminal_auto_scroll(void) {
+    volatile uint16_t *vga = VGA_MEMORY;
+
+    uint16_t top = terminal_top_row();
+    uint16_t rows = terminal_rows();
+
+    if (rows <= 1) {
+        return;
+    }
+
+    save_top_line(top);
+    bottom_buffer_count = 0;
+
+    for (uint16_t r = 0; r < rows - 1; r++) {
+        uint16_t src_offset = (top + r + 1) * VGA_WIDTH;
+        uint16_t dst_offset = (top + r) * VGA_WIDTH;
+
+        for (uint16_t c = 0; c < VGA_WIDTH; c++) {
+            vga[dst_offset + c] = vga[src_offset + c];
+        }
+    }
+
+    uint16_t blank = vga_entry(0x00, VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+    uint16_t bottom_offset = (top + rows - 1) * VGA_WIDTH;
+
+    for (uint16_t c = 0; c < VGA_WIDTH; c++) {
+        vga[bottom_offset + c] = blank;
     }
 }

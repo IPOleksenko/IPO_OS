@@ -19,6 +19,11 @@ void* memset(void *s, int c, size_t n);
 void* memcpy(void *dest, const void *src, size_t n);
 
 /**
+ * Copy memory area with overlapping support
+ */
+void* memmove(void *dest, const void *src, size_t n);
+
+/**
  * Get string length
  */
 size_t strlen(const char *s);
@@ -42,6 +47,11 @@ int strncmp(const char *a, const char *b, size_t n);
  * Find character in string
  */
 char *strchr(const char *s, int c);
+
+/**
+ * Find a substring in a string
+ */
+char *strstr(const char *haystack, const char *needle);
 
 /* Compare memory areas */
 int memcmp(const void *a, const void *b, size_t n);

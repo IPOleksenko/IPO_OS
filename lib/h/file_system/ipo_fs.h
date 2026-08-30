@@ -15,7 +15,7 @@
 #define IPO_INODE_TYPE_FILE 0x2
 #define IPO_INODE_FLAG_PROTECTED 0x80000000u
 
-#define IPO_MAX_FDS 32
+#define IPO_MAX_FDS 4096
 
 struct ipo_superblock {
     char magic[8];
@@ -92,6 +92,7 @@ bool ipo_fs_format(uint32_t disk_start_lba, uint32_t total_blocks, uint32_t tota
 bool ipo_fs_mount(uint32_t disk_start_lba);
 int ipo_fs_create(const char *path, uint8_t type);
 int ipo_fs_open(const char *path);
+int ipo_fs_close(int fd);
 int ipo_fs_read(int fd, void *buffer, uint32_t size, uint32_t offset);
 int ipo_fs_write(int fd, const void *buffer, uint32_t size, uint32_t offset);
 bool ipo_fs_delete(const char *path);

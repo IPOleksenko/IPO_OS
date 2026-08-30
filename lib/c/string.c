@@ -40,6 +40,25 @@ char *strchr(const char *s, int c) {
     return NULL;
 }
 
+char *strstr(const char *haystack, const char *needle) {
+    if (!haystack || !needle) {
+        return NULL;
+    }
+
+    size_t needle_len = strlen(needle);
+    if (needle_len == 0) {
+        return (char *)haystack;
+    }
+
+    for (const char *p = haystack; *p; p++) {
+        if (strncmp(p, needle, needle_len) == 0) {
+            return (char *)p;
+        }
+    }
+
+    return NULL;
+}
+
 void* memset(void *s, int c, size_t n) {
     unsigned char *p = (unsigned char *)s;
     for (size_t i = 0; i < n; i++) {
@@ -54,6 +73,23 @@ void* memcpy(void *dest, const void *src, size_t n) {
     for (size_t i = 0; i < n; i++) {
         d[i] = s[i];
     }
+    return dest;
+}
+
+void* memmove(void *dest, const void *src, size_t n) {
+    unsigned char *d = (unsigned char *)dest;
+    const unsigned char *s = (const unsigned char *)src;
+
+    if (d < s) {
+        for (size_t i = 0; i < n; i++) {
+            d[i] = s[i];
+        }
+    } else if (d > s) {
+        for (size_t i = n; i > 0; i--) {
+            d[i - 1] = s[i - 1];
+        }
+    }
+
     return dest;
 }
 

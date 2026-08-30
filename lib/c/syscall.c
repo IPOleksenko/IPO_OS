@@ -5,6 +5,8 @@
 #include <kernel/process.h>
 #include <memory/kmalloc.h>
 #include <kernel/terminal.h>
+#include <driver/keyboard.h>
+#include <driver/input/keymap/keymap.h>
 
 #define IPO_IDT_ENTRY_FLAGS 0xEEu
 #define IPO_KERNEL_CODE_SEG 0x08u
@@ -91,7 +93,7 @@ static uint32_t syscall_default_handler(uint32_t num,
                                        uint32_t arg3, uint32_t arg4,
                                        uint32_t arg5) {
     (void)arg1; (void)arg2; (void)arg3; (void)arg4; (void)arg5;
-    printf("syscall: unregistered 0x%x\n", num);
+    serial_printf("syscall: unregistered 0x%x\n", num);
     return IPO_SYSCALL_ENOSYS;
 }
 
@@ -99,6 +101,22 @@ static uint32_t syscall_builtin_print(uint32_t num, uint32_t arg1, uint32_t arg2
                                      uint32_t arg3, uint32_t arg4, uint32_t arg5) {
     (void)num; (void)arg2; (void)arg3; (void)arg4; (void)arg5;
     return (uint32_t)printf((const char *)arg1);
+}
+
+static uint32_t syscall_builtin_write(uint32_t num, uint32_t arg1, uint32_t arg2,
+                                     uint32_t arg3, uint32_t arg4, uint32_t arg5) {
+    (void)num; (void)arg2; (void)arg3; (void)arg4; (void)arg5;
+    const char *text = (const char *)arg1;
+    if (text == NULL) {
+        return IPO_SYSCALL_ENOSYS;
+    }
+
+    uint32_t count = 0;
+    while (text[count] != '\0') {
+        putchar(text[count]);
+        count++;
+    }
+    return count;
 }
 
 static uint32_t syscall_builtin_fs_create(uint32_t num, uint32_t arg1, uint32_t arg2,
@@ -159,6 +177,61 @@ static uint32_t syscall_builtin_exec(uint32_t num, uint32_t arg1, uint32_t arg2,
     return (uint32_t)process_exec((const char *)arg1, (int)arg2, (char **)arg3);
 }
 
+static uint32_t syscall_builtin_read(uint32_t num, uint32_t arg1, uint32_t arg2,
+                                    uint32_t arg3, uint32_t arg4, uint32_t arg5) {
+    (void)num; (void)arg3; (void)arg4; (void)arg5;
+    char *buffer = (char *)arg1;
+    uint32_t max_len = arg2;
+
+    if (buffer == NULL || max_len == 0u) {
+        return IPO_SYSCALL_ENOSYS;
+    }
+
+    keyboard_flush_queue();
+
+    uint32_t len = 0u;
+    while (len + 1u < max_len) {
+        uint8_t scancode = keyboard_wait_scancode();
+        if (scancode == 0x00u) {
+            continue;
+        }
+
+        if (scancode & 0x80u) {
+            continue;
+        }
+
+        char ch = get_char(scancode);
+        if (ch == 0x00) {
+            continue;
+        }
+
+        if (ch == '\r' || ch == '\n') {
+            putchar('\n');
+            buffer[len] = '\0';
+            return len;
+        }
+
+        if (ch == '\b' || ch == 127) {
+            if (len > 0u) {
+                len--;
+                buffer[len] = '\0';
+                putchar('\b');
+                putchar(' ');
+                putchar('\b');
+            }
+            continue;
+        }
+
+        if (ch >= 32 && ch < 127) {
+            buffer[len++] = ch;
+            putchar(ch);
+        }
+    }
+
+    buffer[len] = '\0';
+    return len;
+}
+
 static uint32_t syscall_builtin_async_start(uint32_t num, uint32_t arg1, uint32_t arg2,
                                                    uint32_t arg3, uint32_t arg4, uint32_t arg5) {
     (void)num; (void)arg4; (void)arg5;
@@ -166,13 +239,13 @@ static uint32_t syscall_builtin_async_start(uint32_t num, uint32_t arg1, uint32_
     uint32_t interval_ms = arg2 ? arg2 : 10000u;
     void (*task_fn)(void) = (void (*)(void))arg3;
     if (task_fn == NULL) {
-        printf("[syscall] async start rejected: null fn for '%s'\n", task_name ? task_name : "(null)");
+        serial_printf("[syscall] async start rejected: null fn for '%s'\n", task_name ? task_name : "(null)");
         return IPO_SYSCALL_ENOSYS;
     }
 
     int result = async_start_task(task_name, interval_ms, task_fn);
     if (result < 0) {
-        printf("[syscall] async start failed for '%s'\n", task_name ? task_name : "(null)");
+        serial_printf("[syscall] async start failed for '%s'\n", task_name ? task_name : "(null)");
         return IPO_SYSCALL_ENOSYS;
     }
 
@@ -193,6 +266,7 @@ void syscall_init(void) {
     ipo_register_syscall(IPO_SYSCALL_REGISTER, syscall_builtin_register);
     ipo_register_syscall(IPO_SYSCALL_CALL, syscall_builtin_call);
     ipo_register_syscall(IPO_SYSCALL_PRINT, syscall_builtin_print);
+    ipo_register_syscall(IPO_SYSCALL_WRITE, syscall_builtin_write);
     ipo_register_syscall(IPO_SYSCALL_FS_CREATE, syscall_builtin_fs_create);
     ipo_register_syscall(IPO_SYSCALL_FS_OPEN, syscall_builtin_fs_open);
     ipo_register_syscall(IPO_SYSCALL_FS_READ, syscall_builtin_fs_read);
@@ -202,6 +276,7 @@ void syscall_init(void) {
     ipo_register_syscall(IPO_SYSCALL_FS_LIST, syscall_builtin_fs_list);
     ipo_register_syscall(IPO_SYSCALL_FS_RENAME, syscall_builtin_fs_rename);
     ipo_register_syscall(IPO_SYSCALL_EXEC, syscall_builtin_exec);
+    ipo_register_syscall(IPO_SYSCALL_READ, syscall_builtin_read);
     ipo_register_syscall(IPO_SYSCALL_ASYNC_START, syscall_builtin_async_start);
     ipo_register_syscall(IPO_SYSCALL_ASYNC_STOP, syscall_builtin_async_stop);
 

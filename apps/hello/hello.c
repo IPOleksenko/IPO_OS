@@ -19,12 +19,14 @@
 int main(int argc, char **argv) {
     if (argc == 1) {
         printf("Hello, World!\n");
+        serial_printf("Hello, World!\n");
         return 0;
     }
 
     for (int i = 1; i < argc; i++)
     {
         printf("Hello, %s!\n", argv[i]);
+        serial_printf("Hello, %s!\n", argv[i]);
     }
 
     return 0;

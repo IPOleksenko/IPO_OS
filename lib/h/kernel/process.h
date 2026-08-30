@@ -8,10 +8,10 @@
 #define MAX_ARGV_COUNT 64
 #define MAX_ARG_LENGTH 256
 
-// Fixed addresses for process loading
-#define PROCESS_BASE_ADDR   0x00800000  // Fixed app slot below the kernel heap
-#define PROCESS_STACK_TOP   0xC0000000  // Top of the stack
-#define PROCESS_STACK_SIZE  (2 * 1024 * 1024)  // 2MB stack
+// Dynamic memory allocation for processes
+#define PROCESS_HEAP_START  0x00800000  // Start of process heap area
+#define PROCESS_HEAP_SIZE   0x3C000000  // 960 MB available for processes (up to 0xBE000000)
+#define PROCESS_STACK_SIZE  (2 * 1024 * 1024)  // 2MB stack per process
 
 // Protection flags
 #define PROT_NONE  0

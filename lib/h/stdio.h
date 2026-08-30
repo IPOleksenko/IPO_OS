@@ -37,6 +37,12 @@ void putchar(char c);
 int printf(const char *format, ...);
 
 /**
+ * Minimal scanf implementation for keyboard input.
+ * Supports: %s, %c, %d, %u.
+ */
+int scanf(const char *format, ...);
+
+/**
  * Formatted print to buffer
  * @param buf Output buffer
  * @param size Maximum size to write (including null terminator)
