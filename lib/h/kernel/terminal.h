@@ -2,12 +2,14 @@
 #define _TERMINAL_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 void print_header(void);
 
 void terminal_initialize(void);
 void terminal_lock_input(void);
 void terminal_unlock_input(void);
+bool terminal_is_input_locked(void);
 
 void handle_control_char(char c);
 

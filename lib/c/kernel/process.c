@@ -1,4 +1,6 @@
 #include <kernel/process.h>
+#include <kernel/terminal.h>
+#include <system/state.h>
 #include <file_system/ipo_fs.h>
 #include <memory/kmalloc.h>
 #include <vga.h>
@@ -655,11 +657,17 @@ int process_exec(const char *path, int argc, char **argv) {
         return -10;
     }
 
+    terminal_lock_input();
+    system_set_state(SYSTEM_STATE_PROCESS_RUNNING);
+    serial_printf("[process] pid=%u start execution: %s\n", proc->pid, path);
+
     int exit_code = process_call_entry(entry_point, proc->argc, argv_ptr,
                                        proc->stack_ptr);
     last_exit_code = exit_code;
 
-    serial_printf("Process returned\n");
+    serial_printf("[process] pid=%u returned, exit_code=%d\n", proc->pid, exit_code);
+    terminal_unlock_input();
+    system_set_state(SYSTEM_STATE_TERMINAL_IDLE);
 
     // Restoring the old process
     current_process = old_process;

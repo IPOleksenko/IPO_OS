@@ -2,29 +2,8 @@
 #include <syscall.h>
 #include <string.h>
 #include <stdint.h>
-#include <memory/kmalloc.h>
 
-static void *xrealloc(void *ptr, size_t old_size, size_t new_size) {
-    if (new_size == 0u) {
-        if (ptr != NULL) {
-            kfree(ptr);
-        }
-        return NULL;
-    }
-
-    void *new_ptr = kmalloc(new_size);
-    if (new_ptr == NULL) {
-        return NULL;
-    }
-
-    if (ptr != NULL) {
-        size_t copy_size = old_size < new_size ? old_size : new_size;
-        memcpy(new_ptr, ptr, copy_size);
-        kfree(ptr);
-    }
-
-    return new_ptr;
-}
+#define SCANF_BUF_SIZE 512
 
 static const char *skip_spaces(const char *text) {
     while (*text == ' ' || *text == '\t' || *text == '\n' || *text == '\r') {
@@ -38,60 +17,37 @@ int scanf(const char *format, ...) {
         return -1;
     }
 
-    size_t capacity = 256u;
-    char *input = kmalloc(capacity);
-    if (input == NULL) {
+    char input[SCANF_BUF_SIZE];
+    memset(input, 0, sizeof(input));
+
+    uint32_t syscall_args[] = {
+        (uint32_t)(uintptr_t)input,
+        (uint32_t)sizeof(input)
+    };
+
+    serial_printf("[scanf] waiting for input, format=\"%s\"\n", format);
+
+    int bytes_read = ipo_syscall(
+        IPO_SYSCALL_READ,
+        2u,
+        syscall_args
+    );
+
+    if (bytes_read < 0) {
+        serial_printf("[scanf] syscall read failed (error %d)\n", bytes_read);
         return -1;
     }
 
-    size_t length = 0u;
-    while (1) {
-        if (length + 128u >= capacity) {
-            size_t new_capacity = capacity ? capacity * 2u : 256u;
-            char *larger = xrealloc(input, capacity, new_capacity);
-            if (larger == NULL) {
-                kfree(input);
-                return -1;
-            }
-            input = larger;
-            capacity = new_capacity;
-        }
-
-        uint32_t syscall_args[] = {
-            (uint32_t)(uintptr_t)(input + length),
-            128u
-        };
-
-        int chunk = ipo_syscall(
-            IPO_SYSCALL_READ,
-            2u,
-            syscall_args
-        );
-
-        if (chunk <= 0) {
-            break;
-        }
-
-        length += (size_t)chunk;
-        input[length] = '\0';
-
-        if (length > 0u &&
-            (input[length - 1u] == '\n' ||
-             input[length - 1u] == '\r')) {
-            break;
-        }
-    }
-
-    if (length == 0u) {
-        kfree(input);
-        return -1;
-    }
+    size_t length = (size_t)bytes_read;
+    input[length] = '\0';
 
     while (length > 0u &&
            (input[length - 1u] == '\n' ||
             input[length - 1u] == '\r')) {
         input[--length] = '\0';
     }
+
+    serial_printf("[scanf] received line=\"%s\" (len=%u)\n", input, length);
 
     va_list args;
     va_start(args, format);
@@ -133,18 +89,17 @@ int scanf(const char *format, ...) {
                     break;
                 }
 
-                *output = value * sign;
-                assigned++;
+                if (output != NULL) {
+                    *output = value * sign;
+                    assigned++;
+                }
             } else if (*pattern == 'u') {
                 uint32_t value = 0;
                 int digits = 0;
-                unsigned int *output =
-                    va_arg(args, unsigned int *);
+                unsigned int *output = va_arg(args, unsigned int *);
 
                 while (*text >= '0' && *text <= '9') {
-                    value =
-                        value * 10u +
-                        (uint32_t)(*text - '0');
+                    value = value * 10u + (uint32_t)(*text - '0');
                     text++;
                     digits++;
                 }
@@ -153,8 +108,48 @@ int scanf(const char *format, ...) {
                     break;
                 }
 
-                *output = (unsigned int)value;
-                assigned++;
+                if (output != NULL) {
+                    *output = (unsigned int)value;
+                    assigned++;
+                }
+            } else if (*pattern == 'f') {
+                double sign = 1.0;
+                double value = 0.0;
+                int digits = 0;
+                float *output = va_arg(args, float *);
+
+                if (*text == '-') {
+                    sign = -1.0;
+                    text++;
+                } else if (*text == '+') {
+                    text++;
+                }
+
+                while (*text >= '0' && *text <= '9') {
+                    value = value * 10.0 + (double)(*text - '0');
+                    text++;
+                    digits++;
+                }
+
+                if (*text == '.') {
+                    text++;
+                    double frac = 0.1;
+                    while (*text >= '0' && *text <= '9') {
+                        value += (double)(*text - '0') * frac;
+                        frac *= 0.1;
+                        text++;
+                        digits++;
+                    }
+                }
+
+                if (digits == 0) {
+                    break;
+                }
+
+                if (output != NULL) {
+                    *output = (float)(value * sign);
+                    assigned++;
+                }
             } else if (*pattern == 's') {
                 char *output = va_arg(args, char *);
                 size_t copied = 0u;
@@ -164,15 +159,21 @@ int scanf(const char *format, ...) {
                        *text != '\t' &&
                        *text != '\n' &&
                        *text != '\r') {
-                    output[copied++] = *text++;
+                    if (output != NULL) {
+                        output[copied] = *text;
+                    }
+                    copied++;
+                    text++;
                 }
 
                 if (copied == 0u) {
                     break;
                 }
 
-                output[copied] = '\0';
-                assigned++;
+                if (output != NULL) {
+                    output[copied] = '\0';
+                    assigned++;
+                }
             } else if (*pattern == 'c') {
                 char *output = va_arg(args, char *);
 
@@ -180,8 +181,11 @@ int scanf(const char *format, ...) {
                     break;
                 }
 
-                *output = *text++;
-                assigned++;
+                if (output != NULL) {
+                    *output = *text;
+                    assigned++;
+                }
+                text++;
             } else {
                 break;
             }
@@ -193,7 +197,6 @@ int scanf(const char *format, ...) {
             if (*text != *pattern) {
                 break;
             }
-
             text++;
         }
 
@@ -201,7 +204,7 @@ int scanf(const char *format, ...) {
     }
 
     va_end(args);
-    kfree(input);
 
+    serial_printf("[scanf] completed, assigned=%d\n", assigned);
     return assigned;
 }

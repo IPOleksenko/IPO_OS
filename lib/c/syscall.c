@@ -7,6 +7,8 @@
 #include <kernel/terminal.h>
 #include <driver/keyboard.h>
 #include <driver/input/keymap/keymap.h>
+#include <system/state.h>
+#include <system/timer.h>
 
 #define IPO_IDT_ENTRY_FLAGS 0xEEu
 #define IPO_KERNEL_CODE_SEG 0x08u
@@ -464,7 +466,14 @@ static uint32_t syscall_builtin_read(uint32_t num,
         return IPO_SYSCALL_ENOSYS;
     }
 
-    keyboard_flush_queue();
+    process_t *proc = process_get_current();
+    uint32_t pid = proc ? proc->pid : 0u;
+
+    system_state_t prev_state = system_get_state();
+    system_set_state(SYSTEM_STATE_TEXT_INPUT);
+    keyboard_set_app_input_mode(true);
+
+    serial_printf("[syscall_read] started: pid=%u max_len=%u (state=TEXT_INPUT)\n", pid, max_len);
 
     uint32_t len = 0u;
 
@@ -474,6 +483,9 @@ static uint32_t syscall_builtin_read(uint32_t num,
         if (scancode == 0x00u) {
             continue;
         }
+
+        update_hot_key_state(scancode);
+        hot_key_handler(scancode);
 
         if (scancode & 0x80u) {
             continue;
@@ -488,7 +500,7 @@ static uint32_t syscall_builtin_read(uint32_t num,
         if (ch == '\r' || ch == '\n') {
             putchar('\n');
             buffer[len] = '\0';
-            return len;
+            break;
         }
 
         if (ch == '\b' || ch == 127) {
@@ -510,6 +522,12 @@ static uint32_t syscall_builtin_read(uint32_t num,
     }
 
     buffer[len] = '\0';
+
+    keyboard_set_app_input_mode(false);
+    system_set_state(proc ? SYSTEM_STATE_PROCESS_RUNNING : prev_state);
+
+    serial_printf("[syscall_read] completed: pid=%u bytes_read=%u text=\"%s\"\n",
+                  pid, len, buffer);
 
     return len;
 }

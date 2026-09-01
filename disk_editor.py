@@ -62,8 +62,6 @@ class DiskImage:
             raise DiskError("bad block size")
         self._seek_block(idx)
         self.f.write(data)
-        self.f.flush()
-        os.fsync(self.f.fileno())
 
     # ================= SUPERBLOCK =================
 

@@ -8,11 +8,29 @@
 #include <memory/kmalloc.h>
 #include <system/timer.h>
 #include <kernel/async.h>
+#include <system/state.h>
 
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
 #include <stdio.h>
+
+/* Terminal input locking */
+static bool terminal_input_locked = false;
+
+void terminal_lock_input(void) {
+    terminal_input_locked = true;
+    serial_printf("[terminal] input locked\n");
+}
+
+void terminal_unlock_input(void) {
+    terminal_input_locked = false;
+    serial_printf("[terminal] input unlocked\n");
+}
+
+bool terminal_is_input_locked(void) {
+    return terminal_input_locked;
+}
 
 /* Scancodes for navigation */
 #define SC_PAGE_UP   0x49
@@ -670,6 +688,16 @@ int try_execute_command(const char *cmdline) {
 }
 
 void terminal_console(void){
+    if (terminal_input_locked || system_is_input_state()) {
+        return;
+    }
+
+    if (process_get_current() == NULL &&
+        system_get_state() != SYSTEM_STATE_TERMINAL_IDLE &&
+        system_get_state() != SYSTEM_STATE_BOOT) {
+        system_set_state(SYSTEM_STATE_TERMINAL_IDLE);
+    }
+
     uint8_t scancode = keyboard_get_scancode();
     update_hot_key_state(scancode);
     hot_key_handler(scancode);

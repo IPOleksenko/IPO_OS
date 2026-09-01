@@ -1,5 +1,6 @@
 #include <kernel/terminal.h>
 #include <kernel/autorun.h>
+#include <system/state.h>
 #include <vga.h>
 #include <ioport.h>
 #include <driver/sound.h>
@@ -61,6 +62,8 @@ void play_startup_sound(void) {
 
 
 void kmain(void) {
+    system_set_state(SYSTEM_STATE_BOOT);
+
     terminal_initialize();
 
     process_init();
@@ -82,6 +85,8 @@ void kmain(void) {
     terminal_initialize();
 
     autorun_init();
+
+    system_set_state(SYSTEM_STATE_TERMINAL_IDLE);
 
     for (;;) {
         timer_tick();
