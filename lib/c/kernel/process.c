@@ -53,10 +53,10 @@ static void log_process_heap_state(const char *stage) {
     }
 
     uint64_t remaining = (used < total) ? (total - used) : 0;
-    uint64_t remaining_pct = (total == 0) ? 0 : ((remaining * 100ull) / total);
+    uint64_t used_pct = (total == 0) ? 0 : ((used * 100ull) / total);
 
-    serial_printf("[process] %s: remaining=%llu total=%llu remaining_pct=%llu%%\n",
-                 stage, remaining, total, remaining_pct);
+    serial_printf("[process] %s: used=%llu total=%llu used_pct=%llu%% remaining=%llu\n",
+                 stage, used, total, used_pct, remaining);
 }
 
 /**
@@ -269,9 +269,10 @@ static int setup_arguments(process_t *proc, int argc, char **argv, uint32_t *arg
 
 /**
  * setup_stack - Configures the process stack for startup.
+ * Start with a modest reserve and let the app request more when it actually needs it.
  */
 static uint32_t setup_stack(process_t *proc) {
-    const uint32_t stack_size = 2u * 1024u * 1024u;
+    const uint32_t stack_size = 256u * 1024u;
 
     proc->stack_base = allocate_process_memory(proc, stack_size,
                                               PROT_READ | PROT_WRITE);
@@ -284,6 +285,56 @@ static uint32_t setup_stack(process_t *proc) {
     proc->stack_size = stack_size;
     
     return proc->stack_ptr;
+}
+
+int process_adjust_stack_size(process_t *proc, int32_t delta) {
+    if (proc == NULL || proc->stack_base == NULL) {
+        return -1;
+    }
+
+    if (delta == 0) {
+        return (int32_t)proc->stack_size;
+    }
+
+    if (delta > 0) {
+        uint32_t grow = (uint32_t)delta;
+        uint64_t heap_capacity = get_process_heap_capacity();
+        uint64_t new_used = (uint64_t)global_process_heap_used + grow;
+
+        if (new_used > heap_capacity) {
+            serial_printf("[process] stack grow rejected: need %llu, have %llu\n",
+                         new_used, heap_capacity);
+            return -1;
+        }
+
+        void *extra = allocate_process_memory(proc, grow, PROT_READ | PROT_WRITE);
+        if (extra == NULL) {
+            return -1;
+        }
+
+        proc->stack_size += grow;
+        proc->stack_ptr = proc->stack_start + proc->stack_size;
+        serial_printf("[process] stack grown: pid=%u size=%u top=0x%x\n",
+                     proc->pid, proc->stack_size, proc->stack_ptr);
+        return (int32_t)proc->stack_size;
+    }
+
+    uint32_t shrink = (uint32_t)(-delta);
+    if (shrink > proc->stack_size) {
+        serial_printf("[process] stack shrink rejected: pid=%u try=%u current=%u\n",
+                     proc->pid, shrink, proc->stack_size);
+        return -1;
+    }
+
+    proc->stack_size -= shrink;
+    proc->stack_ptr = proc->stack_start + proc->stack_size;
+    if (global_process_heap_used >= shrink) {
+        global_process_heap_used -= shrink;
+    }
+
+    serial_printf("[process] stack shrunk: pid=%u size=%u top=0x%x\n",
+                 proc->pid, proc->stack_size, proc->stack_ptr);
+    return (int32_t)proc->stack_size;
 }
 
 static int process_call_entry(ipob_entry_t entry, int argc, char **argv,

@@ -52,6 +52,7 @@ void process_init(void);
 int process_exec(const char *path, int argc, char **argv);
 int process_get_exit_code(void);
 process_t *process_get_current(void);
+int process_adjust_stack_size(process_t *proc, int32_t delta);
 void process_set_keep_alive(process_t *proc, int enabled);
 void process_cleanup(process_t *proc);
 

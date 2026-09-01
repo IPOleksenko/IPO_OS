@@ -69,6 +69,49 @@ int serial_printf(const char *format, ...) {
                     break;
                 }
 
+                case 'f': {
+                    double val = va_arg(args, double);
+                    char int_buf[32];
+                    char frac_buf[16];
+                    int frac_len = 0;
+
+                    if (val < 0.0) {
+                        serial_putc('-');
+                        count++;
+                        val = -val;
+                    }
+
+                    unsigned long long whole = (unsigned long long)val;
+                    double fraction = val - (double)whole;
+                    uint64_t scaled = (uint64_t)((fraction * 1000000.0) + 0.5);
+                    if (scaled >= 1000000ULL) {
+                        whole++;
+                        scaled = 0ULL;
+                    }
+
+                    int whole_len = itoa64(whole, int_buf, 10);
+                    for (int i = 0; i < whole_len; i++) {
+                        serial_putc(int_buf[i]);
+                        count++;
+                    }
+
+                    serial_putc('.');
+                    count++;
+
+                    uint64_t divisor = 100000ULL;
+                    for (int i = 0; i < 6; i++) {
+                        uint64_t digit = (scaled / divisor) % 10ULL;
+                        frac_buf[frac_len++] = (char)('0' + digit);
+                        divisor /= 10ULL;
+                    }
+
+                    for (int i = 0; i < frac_len; i++) {
+                        serial_putc(frac_buf[i]);
+                        count++;
+                    }
+                    break;
+                }
+
                 case 'x': {
                     unsigned int val = va_arg(args, unsigned int);
                     char buf[32];
