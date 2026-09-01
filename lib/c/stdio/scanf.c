@@ -2,8 +2,7 @@
 #include <syscall.h>
 #include <string.h>
 #include <stdint.h>
-
-#define SCANF_BUF_SIZE 512
+#include <memory/kmalloc.h>
 
 static const char *skip_spaces(const char *text) {
     while (*text == ' ' || *text == '\t' || *text == '\n' || *text == '\r') {
@@ -17,12 +16,11 @@ int scanf(const char *format, ...) {
         return -1;
     }
 
-    char input[SCANF_BUF_SIZE];
-    memset(input, 0, sizeof(input));
+    char *input = NULL;
 
     uint32_t syscall_args[] = {
-        (uint32_t)(uintptr_t)input,
-        (uint32_t)sizeof(input)
+        (uint32_t)(uintptr_t)&input,
+        0u
     };
 
     serial_printf("[scanf] waiting for input, format=\"%s\"\n", format);
@@ -33,8 +31,11 @@ int scanf(const char *format, ...) {
         syscall_args
     );
 
-    if (bytes_read < 0) {
+    if (bytes_read < 0 || input == NULL) {
         serial_printf("[scanf] syscall read failed (error %d)\n", bytes_read);
+        if (input != NULL) {
+            kfree(input);
+        }
         return -1;
     }
 
@@ -204,6 +205,8 @@ int scanf(const char *format, ...) {
     }
 
     va_end(args);
+
+    kfree(input);
 
     serial_printf("[scanf] completed, assigned=%d\n", assigned);
     return assigned;

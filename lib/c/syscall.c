@@ -459,11 +459,27 @@ static uint32_t syscall_builtin_read(uint32_t num,
         return IPO_SYSCALL_ENOSYS;
     }
 
-    char *buffer = (char *)(uintptr_t)argv[0];
     uint32_t max_len = argv[1];
+    char **out_ptr = NULL;
+    char *buffer = NULL;
+    uint32_t capacity = 0u;
 
-    if (buffer == NULL || max_len == 0u) {
-        return IPO_SYSCALL_ENOSYS;
+    if (max_len == 0u) {
+        out_ptr = (char **)(uintptr_t)argv[0];
+        if (out_ptr == NULL) {
+            return IPO_SYSCALL_ENOSYS;
+        }
+        capacity = 256u;
+        buffer = (char *)kmalloc(capacity);
+        if (buffer == NULL) {
+            return IPO_SYSCALL_ENOSYS;
+        }
+    } else {
+        buffer = (char *)(uintptr_t)argv[0];
+        if (buffer == NULL) {
+            return IPO_SYSCALL_ENOSYS;
+        }
+        capacity = max_len;
     }
 
     process_t *proc = process_get_current();
@@ -477,7 +493,7 @@ static uint32_t syscall_builtin_read(uint32_t num,
 
     uint32_t len = 0u;
 
-    while (len + 1u < max_len) {
+    for (;;) {
         uint8_t scancode = keyboard_wait_scancode();
 
         if (scancode == 0x00u) {
@@ -516,12 +532,34 @@ static uint32_t syscall_builtin_read(uint32_t num,
         }
 
         if (ch >= 32 && ch < 127) {
+            if (max_len == 0u) {
+                if (len + 1u >= capacity) {
+                    uint32_t new_cap = capacity * 2u;
+                    char *new_buf = (char *)kmalloc(new_cap);
+                    if (new_buf != NULL) {
+                        memcpy(new_buf, buffer, len);
+                        kfree(buffer);
+                        buffer = new_buf;
+                        capacity = new_cap;
+                    }
+                }
+            } else {
+                if (len + 1u >= capacity) {
+                    break;
+                }
+            }
+
             buffer[len++] = ch;
+            buffer[len] = '\0';
             putchar(ch);
         }
     }
 
     buffer[len] = '\0';
+
+    if (max_len == 0u && out_ptr != NULL) {
+        *out_ptr = buffer;
+    }
 
     keyboard_set_app_input_mode(false);
     system_set_state(proc ? SYSTEM_STATE_PROCESS_RUNNING : prev_state);
