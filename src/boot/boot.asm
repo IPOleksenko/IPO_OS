@@ -60,8 +60,81 @@ start:
     or al, 00000010b
     out 0x92, al
 
+    ; detect RAM size using BIOS E820 and store total bytes at 0x8FF0
+    call detect_memory
+
     cli
-    jmp short pm_setup       ; >>> skip over GDT data <<<
+    jmp pm_setup
+
+; ---------------------------------------------------------------
+; Detect available RAM using BIOS E820.
+; Writes total RAM size in bytes to memory location 0x8FF0.
+; ---------------------------------------------------------------
+detect_memory:
+    push di
+    push bx
+    push cx
+    push dx
+    push eax
+    push es
+
+    xor ebx, ebx
+    mov dword [0x8FF0], 0
+    mov di, 0x8000
+    mov es, di
+    mov di, 0
+
+.detect_loop:
+    mov eax, 0xE820
+    mov ecx, 20
+    mov edx, 0x534D4150
+    int 0x15
+    jc .done
+    cmp eax, 0x534D4150
+    jne .done
+
+    cmp dword [es:di+16], 1
+    jne .next_entry
+
+    mov eax, [es:di+8]
+    mov edx, [es:di+12]
+    add dword [0x8FF0], eax
+
+.next_entry:
+    test ebx, ebx
+    jz .done
+    add di, 20
+    jmp .detect_loop
+
+.done:
+    cmp dword [0x8FF0], 0
+    jne .exit
+
+    ; fallback: E801 for common BIOSes
+    mov ax, 0xE801
+    int 0x15
+    jc .exit
+
+    mov bx, 0x0000
+    mov ax, ax
+    ; ax = memory between 1MB and 16MB in KB
+    ; bx = memory between 16MB and 64MB in 64KB blocks
+    ; convert to bytes: (ax + bx * 64) * 1024
+    xor edx, edx
+    mov dx, bx
+    shl edx, 6
+    add dx, ax
+    shl edx, 10
+    mov dword [0x8FF0], edx
+
+.exit:
+    pop es
+    pop eax
+    pop dx
+    pop cx
+    pop bx
+    pop di
+    ret
 
 align 8
 gdt_start:

@@ -101,3 +101,12 @@ uint8_t keyboard_get_scancode(void) {
     }
     return scancode;
 }
+
+uint8_t keyboard_read_app_scancode(void) {
+    uint8_t scancode = 0x00u;
+    while (scancode == 0x00u) {
+        keyboard_get_scancode();
+        scancode = keyboard_queue_pop(&app_queue);
+    }
+    return scancode;
+}

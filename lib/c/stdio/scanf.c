@@ -57,10 +57,17 @@ int scanf(const char *format, ...) {
             capacity = new_capacity;
         }
 
-        int chunk = ipo_syscall(IPO_SYSCALL_READ,
-                                (uint32_t)(uintptr_t)(input + length),
-                                128u,
-                                0, 0, 0);
+        uint32_t syscall_args[] = {
+            (uint32_t)(uintptr_t)(input + length),
+            128u
+        };
+
+        int chunk = ipo_syscall(
+            IPO_SYSCALL_READ,
+            2u,
+            syscall_args
+        );
+
         if (chunk <= 0) {
             break;
         }
@@ -68,7 +75,9 @@ int scanf(const char *format, ...) {
         length += (size_t)chunk;
         input[length] = '\0';
 
-        if (length > 0u && (input[length - 1u] == '\n' || input[length - 1u] == '\r')) {
+        if (length > 0u &&
+            (input[length - 1u] == '\n' ||
+             input[length - 1u] == '\r')) {
             break;
         }
     }
@@ -78,7 +87,9 @@ int scanf(const char *format, ...) {
         return -1;
     }
 
-    while (length > 0u && (input[length - 1u] == '\n' || input[length - 1u] == '\r')) {
+    while (length > 0u &&
+           (input[length - 1u] == '\n' ||
+            input[length - 1u] == '\r')) {
         input[--length] = '\0';
     }
 
@@ -92,6 +103,7 @@ int scanf(const char *format, ...) {
     while (*pattern != '\0') {
         if (*pattern == '%') {
             pattern++;
+
             if (*pattern == '\0') {
                 break;
             }
@@ -116,61 +128,80 @@ int scanf(const char *format, ...) {
                     text++;
                     digits++;
                 }
+
                 if (digits == 0) {
                     break;
                 }
+
                 *output = value * sign;
                 assigned++;
             } else if (*pattern == 'u') {
                 uint32_t value = 0;
                 int digits = 0;
-                unsigned int *output = va_arg(args, unsigned int *);
+                unsigned int *output =
+                    va_arg(args, unsigned int *);
 
                 while (*text >= '0' && *text <= '9') {
-                    value = value * 10u + (uint32_t)(*text - '0');
+                    value =
+                        value * 10u +
+                        (uint32_t)(*text - '0');
                     text++;
                     digits++;
                 }
+
                 if (digits == 0) {
                     break;
                 }
+
                 *output = (unsigned int)value;
                 assigned++;
             } else if (*pattern == 's') {
                 char *output = va_arg(args, char *);
                 size_t copied = 0u;
 
-                while (*text != '\0' && *text != ' ' && *text != '\t' &&
-                       *text != '\n' && *text != '\r') {
+                while (*text != '\0' &&
+                       *text != ' ' &&
+                       *text != '\t' &&
+                       *text != '\n' &&
+                       *text != '\r') {
                     output[copied++] = *text++;
                 }
+
                 if (copied == 0u) {
                     break;
                 }
+
                 output[copied] = '\0';
                 assigned++;
             } else if (*pattern == 'c') {
                 char *output = va_arg(args, char *);
+
                 if (*text == '\0') {
                     break;
                 }
+
                 *output = *text++;
                 assigned++;
             } else {
                 break;
             }
-        } else if (*pattern == ' ' || *pattern == '\t' || *pattern == '\n') {
+        } else if (*pattern == ' ' ||
+                   *pattern == '\t' ||
+                   *pattern == '\n') {
             text = skip_spaces(text);
         } else {
             if (*text != *pattern) {
                 break;
             }
+
             text++;
         }
+
         pattern++;
     }
 
     va_end(args);
     kfree(input);
+
     return assigned;
 }

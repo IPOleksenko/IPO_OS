@@ -3,15 +3,8 @@
 
 #include <stdint.h>
 
-// Maximum sizes
-#define MAX_PROCESS_SIZE (512 * 1024 * 1024)  // 512 MB max per app
-
-// No hard argv or argument-length limits: argv arrays are allocated dynamically.
-
 // Dynamic memory allocation for processes
 #define PROCESS_HEAP_START  0x00800000  // Start of process heap area
-#define PROCESS_HEAP_SIZE   0x3C000000  // 960 MB available for processes (up to 0xBE000000)
-#define PROCESS_STACK_SIZE  (2 * 1024 * 1024)  // 2MB stack per process
 
 // Protection flags
 #define PROT_NONE  0
@@ -57,7 +50,6 @@ typedef int (*ipob_entry_t)(int argc, char **argv);
 // Function prototypes
 void process_init(void);
 int process_exec(const char *path, int argc, char **argv);
-int process_exec_simple(const char *path);
 int process_get_exit_code(void);
 process_t *process_get_current(void);
 void process_set_keep_alive(process_t *proc, int enabled);

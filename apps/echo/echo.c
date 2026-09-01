@@ -9,7 +9,6 @@ int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
 
-    printf("scanf demo\n");
     printf("Enter an integer: ");
     if (scanf("%d", &number) != 1) {
         printf("Invalid integer\n");

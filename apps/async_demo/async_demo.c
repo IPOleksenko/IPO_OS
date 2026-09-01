@@ -15,9 +15,11 @@ static uint32_t parse_count(const char *text, uint32_t default_value) {
 
     while (*text != '\0') {
         char c = *text++;
+
         if (c < '0' || c > '9') {
             return default_value;
         }
+
         value = value * 10u + (uint32_t)(c - '0');
     }
 
@@ -26,55 +28,99 @@ static uint32_t parse_count(const char *text, uint32_t default_value) {
 
 static void periodic_async_message_a(void) {
     tick_a++;
+
     printf("[async-demo A] tick=%u\n", tick_a);
     serial_printf("[async-demo A] tick=%u\n", tick_a);
 
     if (total_runs > 0u && tick_a >= total_runs) {
-        ipo_syscall(IPO_SYSCALL_ASYNC_STOP,
-                    (uint32_t)(uintptr_t)"async_demo_task_a",
-                    0, 0, 0, 0);
+        uint32_t syscall_args[] = {
+            (uint32_t)(uintptr_t)"async_demo_task_a"
+        };
+
+        ipo_syscall(
+            IPO_SYSCALL_ASYNC_STOP,
+            1u,
+            syscall_args
+        );
     }
 }
 
 static void periodic_async_message_b(void) {
     tick_b++;
+
     printf("[async-demo B] tick=%u\n", tick_b);
     serial_printf("[async-demo B] tick=%u\n", tick_b);
 
     if (total_runs > 0u && tick_b >= total_runs) {
-        ipo_syscall(IPO_SYSCALL_ASYNC_STOP,
-                    (uint32_t)(uintptr_t)"async_demo_task_b",
-                    0, 0, 0, 0);
+        uint32_t syscall_args[] = {
+            (uint32_t)(uintptr_t)"async_demo_task_b"
+        };
+
+        ipo_syscall(
+            IPO_SYSCALL_ASYNC_STOP,
+            1u,
+            syscall_args
+        );
     }
 }
 
 int main(int argc, char **argv) {
-    uint32_t runs = parse_count((argc > 1) ? argv[1] : NULL, 3u);
+    uint32_t runs =
+        parse_count(
+            (argc > 1) ? argv[1] : NULL,
+            3u
+        );
+
     total_runs = runs;
 
-    serial_printf("[async-demo] registering two background tasks, limit=%u\n", runs);
+    serial_printf(
+        "[async-demo] registering two background tasks, limit=%u\n",
+        runs
+    );
 
-    int reg_a = ipo_syscall(IPO_SYSCALL_ASYNC_START,
-                            (uint32_t)(uintptr_t)"async_demo_task_a",
-                            2000u,
-                            (uint32_t)(uintptr_t)periodic_async_message_a,
-                            0,
-                            0);
+    uint32_t reg_a_args[] = {
+        (uint32_t)(uintptr_t)"async_demo_task_a",
+        2000u,
+        (uint32_t)(uintptr_t)periodic_async_message_a
+    };
 
-    int reg_b = ipo_syscall(IPO_SYSCALL_ASYNC_START,
-                            (uint32_t)(uintptr_t)"async_demo_task_b",
-                            3000u,
-                            (uint32_t)(uintptr_t)periodic_async_message_b,
-                            0,
-                            0);
+    int reg_a = ipo_syscall(
+        IPO_SYSCALL_ASYNC_START,
+        3u,
+        reg_a_args
+    );
+
+    uint32_t reg_b_args[] = {
+        (uint32_t)(uintptr_t)"async_demo_task_b",
+        3000u,
+        (uint32_t)(uintptr_t)periodic_async_message_b
+    };
+
+    int reg_b = ipo_syscall(
+        IPO_SYSCALL_ASYNC_START,
+        3u,
+        reg_b_args
+    );
 
     if (reg_a < 0 || reg_b < 0) {
-        printf("[async-demo] registration failed: A=%d B=%d\n", reg_a, reg_b);
-        serial_printf("[async-demo] registration failed: A=%d B=%d\n", reg_a, reg_b);
+        printf(
+            "[async-demo] registration failed: A=%d B=%d\n",
+            reg_a,
+            reg_b
+        );
+
+        serial_printf(
+            "[async-demo] registration failed: A=%d B=%d\n",
+            reg_a,
+            reg_b
+        );
+
         return 1;
     }
 
-    serial_printf("[async-demo] tasks registered, returning to shell now\n");
+    serial_printf(
+        "[async-demo] tasks registered, returning to shell now\n"
+    );
 
     return 0;
 }

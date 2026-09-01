@@ -37,9 +37,27 @@ static uint32_t next_pid = 1;
 static memory_block_t *allocated_blocks = NULL;
 static int block_count = 0;
 static int max_blocks = 0;
+static uint64_t global_process_heap_used = 0;
 
-// Current position in process heap
-static uint32_t heap_offset = 0;
+static uint64_t get_process_heap_capacity(void) {
+    volatile uint32_t *ram_size_ptr = (volatile uint32_t *)0x8FF0;
+    uint32_t detected = *ram_size_ptr;
+    return (uint64_t)detected;
+}
+
+static void log_process_heap_state(const char *stage) {
+    uint64_t total = get_process_heap_capacity();
+    uint64_t used = global_process_heap_used;
+    if (used > total) {
+        used = total;
+    }
+
+    uint64_t remaining = (used < total) ? (total - used) : 0;
+    uint64_t remaining_pct = (total == 0) ? 0 : ((remaining * 100ull) / total);
+
+    serial_printf("[process] %s: remaining=%llu total=%llu remaining_pct=%llu%%\n",
+                 stage, remaining, total, remaining_pct);
+}
 
 /**
  * Add a memory block to tracking
@@ -90,10 +108,20 @@ void process_set_keep_alive(process_t *proc, int enabled) {
         proc->async_task_count++;
         serial_printf("[process] pid=%u keep_alive++ -> %u\n",
                       proc->pid, proc->async_task_count);
-    } else if (proc->async_task_count > 0) {
+        return;
+    }
+
+    if (proc->async_task_count > 0) {
         proc->async_task_count--;
         serial_printf("[process] pid=%u keep_alive-- -> %u\n",
                       proc->pid, proc->async_task_count);
+    }
+
+    if (proc->async_task_count == 0) {
+        serial_printf("[process] pid=%u final async cleanup\n", proc->pid);
+        proc->is_running = 0;
+        process_cleanup(proc);
+        log_process_heap_state("after cleanup");
     }
 }
 
@@ -105,7 +133,7 @@ void process_init(void) {
     kmalloc_init();
     
     // Initialize process memory tracking
-    heap_offset = 0;
+    global_process_heap_used = 0;
     block_count = 0;
     max_blocks = 0;
     allocated_blocks = NULL;
@@ -116,42 +144,84 @@ void process_init(void) {
 /**
  * allocate_process_memory - Allocates memory for a process dynamically
  */
-static void *allocate_process_memory(uint32_t size, uint32_t prot_flags) {
+static void *allocate_process_memory(process_t *proc, uint32_t size, uint32_t prot_flags) {
     (void)prot_flags;
-    
-    if (size == 0 || size > MAX_PROCESS_SIZE) {
+
+    if (proc == NULL || size == 0) {
         return NULL;
     }
+
+    uint64_t heap_capacity = get_process_heap_capacity();
     
-    // Check if there's enough space
-    if (heap_offset + size > PROCESS_HEAP_SIZE) {
-        serial_printf("Process heap exhausted: need %u, have %u\n", 
-                     heap_offset + size, PROCESS_HEAP_SIZE);
-        return NULL;
+    // First, try to find a free block that fits
+    for (int i = 0; i < block_count; i++) {
+        if (allocated_blocks[i].pid == 0 && allocated_blocks[i].size >= size) {
+            // Found a free block that fits
+            void *addr = allocated_blocks[i].base;
+            uint32_t old_size = allocated_blocks[i].size;
+            
+            // Mark as allocated
+            allocated_blocks[i].pid = proc->pid;
+            
+            // If the block is larger than needed, split it
+            if (old_size > size) {
+                // Create a new free block for the remaining space
+                if (add_memory_block((uint8_t*)addr + size, old_size - size, 0) < 0) {
+                    // Failed to create free block, use the whole block
+                    allocated_blocks[i].size = old_size;
+                } else {
+                    allocated_blocks[i].size = size;
+                }
+            }
+            
+            serial_printf("Reused free block at 0x%x, size=%u (was %u)\n", 
+                         (uint32_t)addr, size, old_size);
+            return addr;
+        }
     }
     
-    uint32_t base = PROCESS_HEAP_START + heap_offset;
+    // No suitable free block found, allocate at the end
+    if (global_process_heap_used + size > heap_capacity) {
+        serial_printf("Process heap exhausted: need %llu, have %llu\n",
+                     global_process_heap_used + size, heap_capacity);
+        return NULL;
+    }
+
+    uint32_t base = PROCESS_HEAP_START + (uint32_t)global_process_heap_used;
     void *addr = (void *)base;
-    
-    heap_offset += size;
-    // Align to 4KB for safety
-    heap_offset = (heap_offset + 0xFFF) & ~0xFFF;
-    
-    serial_printf("Allocated process memory: base=0x%x, size=%u, new_offset=%u\n", 
-                 base, size, heap_offset);
-    
+
+    // Track this allocation
+    if (add_memory_block(addr, size, proc->pid) < 0) {
+        return NULL;
+    }
+
+    global_process_heap_used += size;
+
+    serial_printf("Allocated process memory at end: base=0x%x, size=%u, used=%llu\n",
+                 base, size, global_process_heap_used);
+
     return addr;
 }
 
 /**
  * free_process_memory - Frees up process memory
+ * Marks block as free (pid=0) so it can be reused
  */
-static void free_process_memory(void *addr, uint32_t size) {
-    (void)addr;
+static void free_process_memory(process_t *proc, void *addr, uint32_t size) {
+    (void)proc;
     (void)size;
 
-    heap_offset = 0;
-    serial_printf("Marked memory as free: base=0x%x, size=%u\n", (uint32_t)addr, size);
+    // Find the block and mark it as free
+    for (int i = 0; i < block_count; i++) {
+        if (allocated_blocks[i].base == addr) {
+            allocated_blocks[i].pid = 0;  // Mark as free
+            serial_printf("Marked memory as free: base=0x%x, size=%u\n", 
+                         (uint32_t)addr, allocated_blocks[i].size);
+            return;
+        }
+    }
+    
+    serial_printf("Warning: tried to free unknown block at 0x%x\n", (uint32_t)addr);
 }
 
 /**
@@ -201,15 +271,17 @@ static int setup_arguments(process_t *proc, int argc, char **argv, uint32_t *arg
  * setup_stack - Configures the process stack for startup.
  */
 static uint32_t setup_stack(process_t *proc) {
-    proc->stack_base = allocate_process_memory(PROCESS_STACK_SIZE,
+    const uint32_t stack_size = 2u * 1024u * 1024u;
+
+    proc->stack_base = allocate_process_memory(proc, stack_size,
                                               PROT_READ | PROT_WRITE);
     if (proc->stack_base == NULL) {
         return 0;
     }
 
     proc->stack_start = (uint32_t)proc->stack_base;
-    proc->stack_ptr = proc->stack_start + PROCESS_STACK_SIZE;
-    proc->stack_size = PROCESS_STACK_SIZE;
+    proc->stack_ptr = proc->stack_start + stack_size;
+    proc->stack_size = stack_size;
     
     return proc->stack_ptr;
 }
@@ -259,12 +331,6 @@ static int load_ipob_file(const char *path, ipob_header_t *header_out, void **da
     if (stat.size < IPOB_HEADER_SIZE) {
         printf("File too small: %s (%d bytes)\n", path, stat.size);
         return -1;  // File too small for header
-    }
-    
-    if (stat.size > MAX_PROCESS_SIZE) {
-        printf("File too large: %s (%d bytes, max %d)\n", 
-               path, stat.size, MAX_PROCESS_SIZE);
-        return -1;  // File too large
     }
     
     serial_printf("Loading file: %s, size: %d bytes\n", path, stat.size);
@@ -363,14 +429,13 @@ void process_cleanup(process_t *proc) {
     // Keep the binary resident if it owns background async tasks.
     // The callback function pointer remains valid only while the code stays in memory.
     if (proc->binary_base) {
-        free_process_memory(proc->binary_base, proc->binary_size);
+        free_process_memory(proc, proc->binary_base, proc->binary_size);
         proc->binary_base = NULL;
     }
 
     if (proc->stack_base) {
-        if ((uintptr_t)proc->stack_base >= PROCESS_HEAP_START &&
-            (uintptr_t)proc->stack_base < PROCESS_HEAP_START + PROCESS_HEAP_SIZE) {
-            free_process_memory(proc->stack_base, proc->stack_size);
+        if ((uintptr_t)proc->stack_base >= PROCESS_HEAP_START) {
+            free_process_memory(proc, proc->stack_base, proc->stack_size);
         } else {
             kfree(proc->stack_base);
         }
@@ -423,7 +488,8 @@ int process_exec(const char *path, int argc, char **argv) {
     }
 
     serial_printf("process_exec: %s, argc=%d\n", path, argc);
-    
+    log_process_heap_state("before exec");
+
     // Creating a process structure
     process_t *proc = kmalloc(sizeof(process_t));
     if (!proc) {
@@ -457,7 +523,7 @@ int process_exec(const char *path, int argc, char **argv) {
            header.entry_offset, header.total_size);
     
     // Allocating memory dynamically for the binary
-    void *target_addr = allocate_process_memory(size,
+    void *target_addr = allocate_process_memory(proc, size,
                                                PROT_READ | PROT_WRITE | PROT_EXEC);
     
     if (!target_addr) {
@@ -475,7 +541,7 @@ int process_exec(const char *path, int argc, char **argv) {
     uint32_t load_address = (uint32_t)target_addr;
     if (relocate_binary(target_addr, load_address, size) < 0) {
         printf("Relocation failed\n");
-        free_process_memory(target_addr, size);
+        free_process_memory(proc, target_addr, size);
         kfree(binary_image);
         process_cleanup(proc);
         return -6;
@@ -514,8 +580,7 @@ int process_exec(const char *path, int argc, char **argv) {
 
     // Defensive validation: a broken application must never crash the kernel.
     if (proc->binary_base == NULL || proc->binary_size == 0 ||
-        proc->entry_point < PROCESS_HEAP_START ||
-        proc->entry_point >= PROCESS_HEAP_START + PROCESS_HEAP_SIZE) {
+        proc->entry_point < PROCESS_HEAP_START) {
         printf("[process] pid=%u: invalid app image, closing process safely\n", proc->pid);
         current_process = old_process;
         process_cleanup(proc);
@@ -524,6 +589,7 @@ int process_exec(const char *path, int argc, char **argv) {
     
     // Call the entry point with arguments
     serial_printf("Calling entry point with argc=%d, argv at 0x%x...\n", proc->argc, argv_addr);
+    log_process_heap_state("during exec");
     
     // The entry point has a signature: int main(int argc, char **argv)
     char **argv_ptr = (char**)argv_addr;
@@ -541,9 +607,9 @@ int process_exec(const char *path, int argc, char **argv) {
     int exit_code = process_call_entry(entry_point, proc->argc, argv_ptr,
                                        proc->stack_ptr);
     last_exit_code = exit_code;
-    
+
     serial_printf("Process returned\n");
-    
+
     // Restoring the old process
     current_process = old_process;
 
@@ -573,15 +639,9 @@ int process_exec(const char *path, int argc, char **argv) {
     
     // Cleaning resources
     process_cleanup(proc);
+    log_process_heap_state("after cleanup");
     
     return proc->pid;
-}
-
-/**
- * process_exec_simple - Simplified launch without arguments
- */
-int process_exec_simple(const char *path) {
-    return process_exec(path, 0, NULL);
 }
 
 /**

@@ -158,9 +158,6 @@ int async_stop_task(const char *name)
 
             if (owner != NULL) {
                 process_set_keep_alive(owner, 0);
-                if (owner->async_task_count == 0) {
-                    owner->is_running = 0;
-                }
             }
 
             return 0;
