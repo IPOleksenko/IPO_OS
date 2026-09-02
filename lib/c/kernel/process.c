@@ -131,9 +131,6 @@ void process_set_keep_alive(process_t *proc, int enabled) {
  * process_init - Initialize process manager
  */
 void process_init(void) {
-    // Initialize memory allocator
-    kmalloc_init();
-    
     // Initialize process memory tracking
     global_process_heap_used = 0;
     block_count = 0;

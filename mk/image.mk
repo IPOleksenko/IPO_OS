@@ -3,6 +3,9 @@ image: $(OS_IMAGE) disks
 
 $(OS_IMAGE): $(BOOT_BIN) $(KERNEL_BIN)
 	cat $^ > $@
+	@size=$$(stat -c %s $@); \
+	padded=$$(( ($$size + 511) / 512 * 512 )); \
+	truncate -s $$padded $@
 
 # Create a 10MB IMG disk (raw format)
 build/disk.img:

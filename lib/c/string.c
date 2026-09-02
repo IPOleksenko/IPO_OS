@@ -40,6 +40,17 @@ char *strchr(const char *s, int c) {
     return NULL;
 }
 
+char *strrchr(const char *s, int c) {
+    char cc = (char)c;
+    const char *last = NULL;
+    while (*s) {
+        if (*s == cc) last = s;
+        s++;
+    }
+    if (cc == '\0') return (char *)s;
+    return (char *)last;
+}
+
 char *strstr(const char *haystack, const char *needle) {
     if (!haystack || !needle) {
         return NULL;

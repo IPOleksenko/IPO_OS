@@ -59,8 +59,9 @@ static kmalloc_block_t* find_free_block(size_t size) {
 static void split_block(kmalloc_block_t *block, size_t needed_size) {
     size_t total_needed = needed_size + BLOCK_HEADER_SIZE;
     
-    if (block->size <= total_needed) {
-        return;  // Not enough space to split
+    // Remainder must be able to hold a full block header plus at least 4 bytes of data
+    if (block->size < total_needed + BLOCK_HEADER_SIZE + 4u) {
+        return;  // Not enough space to split safely
     }
     
     // Create new free block for the remainder
@@ -70,7 +71,7 @@ static void split_block(kmalloc_block_t *block, size_t needed_size) {
     );
     
     remainder->size = remainder_size;
-    remainder->magic = KMALLOC_MAGIC;
+    remainder->magic = KMALLOC_FREED_MAGIC;
     remainder->is_free = 1;
     
     block->size = total_needed;
@@ -107,9 +108,8 @@ void* kmalloc(size_t size) {
         heap_used += total_needed;
     } else {
         // Use existing free block
-        if (block->size > (size + BLOCK_HEADER_SIZE)) {
-            split_block(block, size);
-        }
+        split_block(block, size);
+        block->magic = KMALLOC_MAGIC;
         block->is_free = 0;
     }
     

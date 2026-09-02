@@ -102,6 +102,7 @@ void putchar(char c) {
 }
 
 void putchar_color(char c, uint8_t fg, uint8_t bg) {
+    terminal_on_external_output();
     acquire_output_lock();
 
     volatile uint16_t *vga = VGA_MEMORY;

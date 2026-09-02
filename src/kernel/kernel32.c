@@ -86,6 +86,8 @@ void kmain(void) {
 
     autorun_init();
 
+    printf("Type 'help' to view all available commands and OS features.\n");
+
     system_set_state(SYSTEM_STATE_TERMINAL_IDLE);
 
     for (;;) {

@@ -18,6 +18,7 @@ void terminal_console(void);
 void terminal_print(const char *s);
 
 void terminal_auto_scroll(void);
+void terminal_on_external_output(void);
 
 void async_scheduler_init(void);
 void async_scheduler_tick(void);

@@ -4,6 +4,17 @@ BITS 16
 ORG 0x7C00
 
 start:
+    ; Immediately setup segments and stack
+    cli
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov sp, 0x7C00
+    sti
+
+    mov [BOOT_DRIVE], dl
+
     mov si, msg
     call print
     
@@ -22,15 +33,6 @@ start:
     mov si, new_line
     call print
 
-    ; setup segments + stack
-    xor ax, ax
-    mov ds, ax
-    mov es, ax
-    mov ss, ax
-    mov sp, 0x7C00
-
-    mov [BOOT_DRIVE], dl
-
     ; progress: A
     mov ax, 0x0E41
     int 0x10
@@ -44,12 +46,38 @@ start:
     cmp bx, 0xAA55
     jne disk_error
 
-    ; DAP-based LBA read: read KERNEL_SECTORS from LBA 1 to 0x10000
+    ; DAP-based LBA read: read KERNEL_SECTORS from LBA 1 to 0x10000 in safe chunks (max 64 sectors per read)
+    mov cx, KERNEL_SECTORS
+    mov dword [dap_lba], 1
+    mov word [dap_seg], 0x1000
+
+.read_loop:
+    test cx, cx
+    jz .read_done
+
+    mov ax, cx
+    cmp ax, 64
+    jbe .do_read
+    mov ax, 64
+
+.do_read:
+    mov [dap_sectors], ax
     mov si, dap
     mov dl, [BOOT_DRIVE]
     mov ah, 0x42
     int 0x13
     jc disk_error
+
+    mov ax, [dap_sectors]
+    sub cx, ax
+    movzx eax, ax
+    add dword [dap_lba], eax
+
+    shl ax, 5
+    add word [dap_seg], ax
+    jmp .read_loop
+
+.read_done:
 
     ; progress: R
     mov ax, 0x0E52
@@ -182,20 +210,35 @@ pmode_entry:
 
 [BITS 16]
 disk_error:
-    mov ax, 0x0E45          ; 'E'
+    push ax
+    mov al, 'E'
+    mov ah, 0x0E
+    int 0x10
+    pop ax
+    mov al, ah
+    shr al, 4
+    add al, '0'
+    cmp al, '9'
+    jbe .p1
+    add al, 7
+.p1:
+    mov ah, 0x0E
     int 0x10
 .hang:  hlt
         jmp .hang
 
 BOOT_DRIVE: db 0
 
-; DAP: read KERNEL_SECTORS from LBA=1 into 0x10000
+; DAP: read kernel into 0x10000
 dap:
     db 16
     db 0
-    dw KERNEL_SECTORS
+dap_sectors:
+    dw 0
     dw 0x0000               ; offset
+dap_seg:
     dw 0x1000               ; segment 0x1000:0000 = phys 0x10000
+dap_lba:
     dd 1                    ; LBA start
     dd 0
 

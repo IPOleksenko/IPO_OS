@@ -12,3 +12,6 @@ $(BUILD)/kernel/kernel32.o: src/kernel/kernel32.c
 $(KERNEL_BIN): $(BUILD)/kernel/entry32.o $(BUILD)/kernel/kernel32.o $(LIB_OBJS)
 	ld -m elf_i386 -T src/kernel/linker.ld -nostdlib --oformat elf32-i386 -o $(KERNEL_ELF) $^ $(LIBGCC)
 	$(OBJCOPY) -O binary $(KERNEL_ELF) $@
+	@size=$$(stat -c %s $@); \
+	padded=$$(( ($$size + 511) / 512 * 512 )); \
+	truncate -s $$padded $@

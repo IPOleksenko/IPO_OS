@@ -49,6 +49,11 @@ int strncmp(const char *a, const char *b, size_t n);
 char *strchr(const char *s, int c);
 
 /**
+ * Find last occurrence of character in string
+ */
+char *strrchr(const char *s, int c);
+
+/**
  * Find a substring in a string
  */
 char *strstr(const char *haystack, const char *needle);
