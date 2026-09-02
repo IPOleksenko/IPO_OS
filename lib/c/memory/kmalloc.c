@@ -144,3 +144,38 @@ void kfree(void* ptr) {
     block->is_free = 1;
     block->magic = KMALLOC_FREED_MAGIC;
 }
+
+/**
+ * kmalloc_get_stats - fills stat structure with heap usage info
+ */
+void kmalloc_get_stats(kmalloc_stats_t *out) {
+    if (out == NULL) return;
+
+    out->heap_total   = KMALLOC_HEAP_SIZE;
+    out->heap_used    = heap_used;
+    out->alloc_bytes  = 0;
+    out->free_bytes   = 0;
+    out->alloc_blocks = 0;
+    out->free_blocks  = 0;
+    out->block_header = BLOCK_HEADER_SIZE;
+
+    if (heap_start == NULL) return;
+
+    uint8_t *ptr = heap_start;
+    while ((size_t)(ptr - heap_start) < heap_used) {
+        kmalloc_block_t *block = (kmalloc_block_t *)ptr;
+        if (block->magic != KMALLOC_MAGIC && block->magic != KMALLOC_FREED_MAGIC) {
+            break; /* corruption guard */
+        }
+        size_t user_size = block->size > BLOCK_HEADER_SIZE
+                           ? block->size - BLOCK_HEADER_SIZE : 0;
+        if (block->is_free) {
+            out->free_bytes  += user_size;
+            out->free_blocks += 1;
+        } else {
+            out->alloc_bytes  += user_size;
+            out->alloc_blocks += 1;
+        }
+        ptr += block->size;
+    }
+}

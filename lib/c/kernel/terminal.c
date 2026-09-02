@@ -9,6 +9,7 @@
 #include <system/timer.h>
 #include <kernel/async.h>
 #include <system/state.h>
+#include <driver/sound.h>
 #include <ioport.h>
 
 #include <stdint.h>
@@ -45,7 +46,6 @@ bool terminal_is_input_locked(void) {
 #define SC_DELETE    0x53
 #define COMMAND_HISTORY_SIZE 128
 #define COMMAND_HISTORY_ENTRY_SIZE 1024
-#define terminal_history_PATH "/terminal_history"
 
 /* Prompt / styling */
 #define PROMPT_STR "> "
@@ -59,8 +59,9 @@ static size_t input_capacity = 0;
 static size_t input_len = 0;
 static size_t cursor_pos = 0;
 static bool prompt_shown = false;
-static uint16_t prompt_start_cursor = 0;
-static uint16_t input_start_cursor = 0;
+static int32_t prompt_start_cursor = 0;
+static int32_t prompt_origin = 0;
+static int32_t input_start_cursor = 0;
 static bool terminal_suppress_external_hook = false;
 
 static char **command_history = NULL;
@@ -83,6 +84,9 @@ static uint16_t terminal_bottom_buffer[SCROLL_HISTORY_SIZE][VGA_WIDTH];
 static int top_buffer_count = 0;
 static int bottom_buffer_count = 0;
 
+void terminal_scroll_up(void);
+void terminal_scroll_down(void);
+
 // Terminal drawing area (below header)
 static inline uint16_t terminal_top_row(void) {
     return VGA_START_CURSOR_POSITION / VGA_WIDTH;
@@ -99,19 +103,27 @@ static void make_abs_path(const char *rel_or_abs, char *out, size_t out_size) {
         out[out_size - 1] = '\0';
         return;
     }
-    char temp[512];
+    size_t cwd_l = terminal_cwd ? strlen(terminal_cwd) : 0u;
+    size_t rel_l = strlen(rel_or_abs);
+    size_t temp_size = cwd_l + rel_l + 32u;
+    if (temp_size < out_size) temp_size = out_size;
+    char *temp = kmalloc(temp_size);
+    if (!temp) return;
+
     if (rel_or_abs[0] == '/') {
-        strncpy(temp, rel_or_abs, sizeof(temp) - 1);
-        temp[sizeof(temp) - 1] = '\0';
+        strncpy(temp, rel_or_abs, temp_size - 1);
+        temp[temp_size - 1] = '\0';
     } else {
         if (strcmp(terminal_cwd, "/") == 0) {
-            snprintf(temp, sizeof(temp), "/%s", rel_or_abs);
+            snprintf(temp, temp_size, "/%s", rel_or_abs);
         } else {
-            snprintf(temp, sizeof(temp), "%s/%s", terminal_cwd, rel_or_abs);
+            snprintf(temp, temp_size, "%s/%s", terminal_cwd, rel_or_abs);
         }
     }
     fs_canonicalize(temp, out, out_size);
+    kfree(temp);
 }
+
 
 void print_header(void) {
     volatile uint16_t* vga = VGA_MEMORY;
@@ -151,81 +163,97 @@ static void write_line_to_vga(uint16_t row, const uint16_t *buffer) {
     }
 }
 
-static void ensure_input_line_visible(const char *text) {
-    if (!text) {
-        return;
-    }
+static size_t previous_rendered_vis_len = 0;
 
-    size_t text_len = strlen(text);
-    uint16_t prompt_row = input_start_cursor / VGA_WIDTH;
-    uint16_t prompt_col = input_start_cursor % VGA_WIDTH;
-    size_t cols_used = text_len + prompt_col;
-    uint16_t max_row = terminal_top_row() + terminal_rows() - 1u;
-    uint16_t end_row = prompt_row + (uint16_t)((cols_used + VGA_WIDTH - 1u) / VGA_WIDTH);
-
-    int scrolls = 0;
-    while (end_row > max_row && scrolls < (int)terminal_rows()) {
-        terminal_auto_scroll();
-        prompt_row = input_start_cursor / VGA_WIDTH;
-        prompt_col = input_start_cursor % VGA_WIDTH;
-        cols_used = text_len + prompt_col;
-        max_row = terminal_top_row() + terminal_rows() - 1u;
-        end_row = prompt_row + (uint16_t)((cols_used + VGA_WIDTH - 1u) / VGA_WIDTH);
-        scrolls++;
+static size_t terminal_visual_offset(size_t index) {
+    size_t vcol = 0;
+    for (size_t i = 0; i < index && i < input_len; i++) {
+        if (input_buf[i] == '\t') {
+            size_t tab_spaces = 4 - (vcol % 4);
+            if (tab_spaces == 0) tab_spaces = 4;
+            vcol += tab_spaces;
+        } else {
+            vcol += 1;
+        }
     }
+    return vcol;
 }
 
-static void render_input_line(const char *text) {
-    if (!text) {
-        text = "";
-    }
+static void render_input_line(size_t previous_len) {
+    (void)previous_len;
 
-    ensure_input_line_visible(text);
+    size_t vis_cursor = terminal_visual_offset(cursor_pos);
+    size_t vis_len = terminal_visual_offset(input_len);
+
+    /* If cursor is off the bottom of the screen, scroll up */
+    while (input_start_cursor + (int32_t)vis_cursor >= VGA_WIDTH * VGA_HEIGHT) {
+        terminal_auto_scroll();
+    }
+    /* If text tail exceeds bottom of screen, scroll up */
+    while (input_start_cursor + (int32_t)vis_len >= VGA_WIDTH * VGA_HEIGHT) {
+        terminal_auto_scroll();
+    }
 
     volatile uint16_t *vga = VGA_MEMORY;
-    uint16_t row = input_start_cursor / VGA_WIDTH;
-    uint16_t col = input_start_cursor % VGA_WIDTH;
-    uint16_t blank = vga_entry(0x00, VGA_COLOR_WHITE, VGA_COLOR_BLACK);
 
-    while (row < VGA_HEIGHT) {
-        uint16_t offset = row * VGA_WIDTH + col;
-        if (offset >= VGA_WIDTH * VGA_HEIGHT) {
-            break;
+    /* Draw prompt prefix if visible */
+    size_t cwd_len = strlen(terminal_cwd);
+    int32_t p_cur = prompt_start_cursor;
+    for (size_t i = 0; i < cwd_len; i++) {
+        if (p_cur >= VGA_START_CURSOR_POSITION && p_cur < VGA_WIDTH * VGA_HEIGHT) {
+            vga[p_cur] = vga_entry((unsigned char)terminal_cwd[i], PROMPT_FG, VGA_COLOR_BLACK);
         }
-        vga[offset] = blank;
-        col++;
-        if (col >= VGA_WIDTH) {
-            row++;
-            col = 0;
+        p_cur++;
+    }
+    if (p_cur >= VGA_START_CURSOR_POSITION && p_cur < VGA_WIDTH * VGA_HEIGHT) {
+        vga[p_cur] = vga_entry('>', PROMPT_FG, VGA_COLOR_BLACK);
+    }
+    p_cur++;
+    if (p_cur >= VGA_START_CURSOR_POSITION && p_cur < VGA_WIDTH * VGA_HEIGHT) {
+        vga[p_cur] = vga_entry(' ', PROMPT_FG, VGA_COLOR_BLACK);
+    }
+
+    /* Draw text: expand '\t' into visual tab spacing (no circle glyph) */
+    size_t vcol = 0;
+    for (size_t i = 0; i < input_len; i++) {
+        if (input_buf[i] == '\t') {
+            size_t tab_spaces = 4 - (vcol % 4);
+            if (tab_spaces == 0) tab_spaces = 4;
+            for (size_t s = 0; s < tab_spaces; s++) {
+                int32_t offset = input_start_cursor + (int32_t)(vcol + s);
+                if (offset >= VGA_START_CURSOR_POSITION && offset < VGA_WIDTH * VGA_HEIGHT) {
+                    vga[offset] = vga_entry(' ', INPUT_FG, VGA_COLOR_BLACK);
+                }
+            }
+            vcol += tab_spaces;
+        } else {
+            int32_t offset = input_start_cursor + (int32_t)vcol;
+            if (offset >= VGA_START_CURSOR_POSITION && offset < VGA_WIDTH * VGA_HEIGHT) {
+                vga[offset] = vga_entry((unsigned char)input_buf[i], INPUT_FG, VGA_COLOR_BLACK);
+            }
+            vcol += 1;
         }
     }
 
-    row = input_start_cursor / VGA_WIDTH;
-    col = input_start_cursor % VGA_WIDTH;
-    const unsigned char *p = (const unsigned char *)text;
-    while (*p && row < VGA_HEIGHT) {
-        uint16_t offset = row * VGA_WIDTH + col;
-        if (offset >= VGA_WIDTH * VGA_HEIGHT) {
-            break;
-        }
-        vga[offset] = vga_entry(*p, INPUT_FG, VGA_COLOR_BLACK);
-        p++;
-        col++;
-        if (col >= VGA_WIDTH) {
-            row++;
-            col = 0;
+    /* Clear any old characters if line became shorter */
+    for (size_t i = vcol; i < previous_rendered_vis_len; i++) {
+        int32_t offset = input_start_cursor + (int32_t)i;
+        if (offset >= VGA_START_CURSOR_POSITION && offset < VGA_WIDTH * VGA_HEIGHT) {
+            vga[offset] = vga_entry(' ', INPUT_FG, VGA_COLOR_BLACK);
         }
     }
+    previous_rendered_vis_len = vcol;
 
-    if (cursor_pos > input_len) {
-        cursor_pos = input_len;
+    /* Position cursor */
+    int32_t cur = input_start_cursor + (int32_t)vis_cursor;
+    if (cur < VGA_START_CURSOR_POSITION) {
+        cur = VGA_START_CURSOR_POSITION;
     }
-
-    uint16_t cursor_offset = input_start_cursor + (uint16_t)cursor_pos;
-    if (cursor_offset >= VGA_WIDTH * VGA_HEIGHT) {
-        cursor_offset = VGA_WIDTH * VGA_HEIGHT - 1;
+    if (cur >= VGA_WIDTH * VGA_HEIGHT) {
+        cur = VGA_WIDTH * VGA_HEIGHT - 1;
     }
-    vga_set_cursor(cursor_offset);
+    vga_set_cursor((uint16_t)cur);
+    vga_show_cursor();
 }
 
 void terminal_on_external_output(void) {
@@ -234,19 +262,19 @@ void terminal_on_external_output(void) {
     }
 
     volatile uint16_t *vga = VGA_MEMORY;
-    uint16_t current_cursor = vga_get_cursor_position();
     uint16_t blank = vga_entry(0x00, VGA_COLOR_WHITE, VGA_COLOR_BLACK);
 
-    uint16_t end_clear = current_cursor;
-    if (input_start_cursor + (uint16_t)input_len > end_clear) {
-        end_clear = input_start_cursor + (uint16_t)input_len;
-    }
-
-    for (uint16_t p = prompt_start_cursor; p <= end_clear && p < VGA_WIDTH * VGA_HEIGHT; p++) {
+    int32_t start_clear = prompt_start_cursor >= VGA_START_CURSOR_POSITION ? prompt_start_cursor : VGA_START_CURSOR_POSITION;
+    int32_t end_clear = input_start_cursor + (int32_t)input_len;
+    for (int32_t p = start_clear; p <= end_clear && p < VGA_WIDTH * VGA_HEIGHT; p++) {
         vga[p] = blank;
     }
 
-    vga_set_cursor(prompt_start_cursor);
+    if (prompt_start_cursor >= VGA_START_CURSOR_POSITION && prompt_start_cursor < VGA_WIDTH * VGA_HEIGHT) {
+        vga_set_cursor((uint16_t)prompt_start_cursor);
+    } else {
+        vga_set_cursor(VGA_START_CURSOR_POSITION);
+    }
     prompt_shown = false;
 }
 
@@ -341,11 +369,12 @@ static void load_history_command(int index) {
         return;
     }
 
+    size_t old_len = input_len;
     ensure_input_buffer(strlen(command_history[index]));
     strcpy(input_buf, command_history[index]);
     input_len = strlen(input_buf);
     cursor_pos = input_len;
-    render_input_line(input_buf);
+    render_input_line(old_len);
 }
 
 static void apply_history_position(void) {
@@ -358,20 +387,21 @@ static void apply_history_position(void) {
 }
 
 static void restore_snapshot_input(void) {
+    size_t old_len = input_len;
     if (current_input_snapshot == NULL) {
         input_len = 0;
         cursor_pos = 0;
         if (input_buf != NULL) {
             input_buf[0] = '\0';
         }
-        render_input_line("");
+        render_input_line(old_len);
         return;
     }
     ensure_input_buffer(strlen(current_input_snapshot));
     strcpy(input_buf, current_input_snapshot);
     input_len = strlen(input_buf);
     cursor_pos = input_len;
-    render_input_line(input_buf);
+    render_input_line(old_len);
 }
 
 static void trim_top_buffer(void) {
@@ -406,47 +436,8 @@ static void save_top_line(uint16_t row) {
     }
 }
 
-/* Return to present - restore current output when user starts typing */
-static void return_to_present(void) {
-    if (bottom_buffer_count == 0) {
-        return;
-    }
-
-    volatile uint16_t *vga = VGA_MEMORY;
-
-    uint16_t top = terminal_top_row();
-    uint16_t rows = terminal_rows();
-
-    if (rows <= 1) {
-        bottom_buffer_count = 0;
-        vga_show_cursor();
-        return;
-    }
-
-    while (bottom_buffer_count > 0) {
-        if (top_buffer_count < SCROLL_HISTORY_SIZE) {
-            read_line_from_vga(top, terminal_top_buffer[top_buffer_count]);
-            top_buffer_count++;
-        }
-
-        for (uint16_t r = 0; r < rows - 1; r++) {
-            uint16_t src_offset = (top + r + 1) * VGA_WIDTH;
-            uint16_t dst_offset = (top + r) * VGA_WIDTH;
-
-            for (uint16_t c = 0; c < VGA_WIDTH; c++) {
-                vga[dst_offset + c] = vga[src_offset + c];
-            }
-        }
-
-        write_line_to_vga(top + rows - 1, terminal_bottom_buffer[bottom_buffer_count - 1]);
-        bottom_buffer_count--;
-    }
-
-    vga_show_cursor();
-}
-
 /* Scroll down - restore next line from history if available */
-static void scroll_down(void) {
+void terminal_scroll_down(void) {
     if (bottom_buffer_count == 0) {
         return;
     }
@@ -458,6 +449,11 @@ static void scroll_down(void) {
 
     if (rows <= 1) {
         return;
+    }
+
+    if (prompt_shown) {
+        prompt_start_cursor -= VGA_WIDTH;
+        input_start_cursor -= VGA_WIDTH;
     }
 
     if (top_buffer_count < SCROLL_HISTORY_SIZE) {
@@ -482,8 +478,24 @@ static void scroll_down(void) {
     }
 }
 
+/* Return to present - restore current output when user starts typing */
+void terminal_return_to_present(void) {
+    while (bottom_buffer_count > 0) {
+        terminal_scroll_down();
+    }
+    vga_show_cursor();
+}
+
+int terminal_get_top_buffer_count(void) {
+    return top_buffer_count;
+}
+
+int terminal_get_bottom_buffer_count(void) {
+    return bottom_buffer_count;
+}
+
 /* Scroll up - show previous line from history */
-static void scroll_up(void) {
+void terminal_scroll_up(void) {
     if (top_buffer_count == 0) {
         return;
     }
@@ -495,6 +507,11 @@ static void scroll_up(void) {
 
     if (rows <= 1) {
         return;
+    }
+
+    if (prompt_shown) {
+        prompt_start_cursor += VGA_WIDTH;
+        input_start_cursor += VGA_WIDTH;
     }
 
     vga_hide_cursor();
@@ -519,120 +536,148 @@ static void scroll_up(void) {
 
 char* resolve_command_path(const char *cmd) {
     if (!cmd || !cmd[0]) return NULL;
-    
-    char *path = kmalloc(256);
-    if (!path) return NULL;
-    
-    char to_check[256];
-    char canonical[256];
+
+    size_t cmd_len = strlen(cmd);
+    size_t cwd_len = terminal_cwd ? strlen(terminal_cwd) : 0u;
+    size_t buf_size = cmd_len + cwd_len + 32u;
+    if (buf_size < 256u) {
+        buf_size = 256u;
+    }
+
+    char *to_check = kmalloc(buf_size);
+    char *canonical = kmalloc(buf_size);
+    char *path = kmalloc(buf_size);
+
+    if (!to_check || !canonical || !path) {
+        if (to_check) kfree(to_check);
+        if (canonical) kfree(canonical);
+        if (path) kfree(path);
+        return NULL;
+    }
+
     uint32_t inode;
     struct ipo_inode stat;
-    
-    // 1. Absolute path
+
+    // Absolute path
     if (cmd[0] == '/') {
-        strncpy(to_check, cmd, sizeof(to_check) - 1);
-        to_check[sizeof(to_check) - 1] = '\0';
+        strncpy(to_check, cmd, buf_size - 1);
+        to_check[buf_size - 1] = '\0';
     } 
-    // 2. Relative path with ./ or ../ or subdirectories
+    // Relative path with ./ or ../ or subdirectories
     else if (cmd[0] == '.' || strchr(cmd, '/')) {
-        make_abs_path(cmd, to_check, sizeof(to_check));
+        make_abs_path(cmd, to_check, buf_size);
     }
-    // 3. Simple command name: try in cwd first, then in /app/
+    // Simple command name: try in cwd first, then in /app/
     else {
-        make_abs_path(cmd, to_check, sizeof(to_check));
-        fs_canonicalize(to_check, canonical, sizeof(canonical));
+        make_abs_path(cmd, to_check, buf_size);
+        fs_canonicalize(to_check, canonical, buf_size);
         if (path_resolve(canonical, &inode) == 0 && 
             ipo_fs_stat(canonical, &stat) && 
             (stat.mode & IPO_INODE_TYPE_DIR) == 0) {
-            strncpy(path, canonical, 255);
-            path[255] = '\0';
+            strncpy(path, canonical, buf_size - 1);
+            path[buf_size - 1] = '\0';
+            kfree(to_check);
+            kfree(canonical);
             return path;
         }
 
-        snprintf(to_check, sizeof(to_check), "/app/%s", cmd);
+        snprintf(to_check, buf_size, "/app/%s", cmd);
     }
-    
+
     // Canonicalize to handle .., ., //, etc
-    fs_canonicalize(to_check, canonical, sizeof(canonical));
-    
+    fs_canonicalize(to_check, canonical, buf_size);
+
     // Try to resolve and verify it's a file (not directory)
     if (path_resolve(canonical, &inode) == 0 && 
         ipo_fs_stat(canonical, &stat) && 
         (stat.mode & IPO_INODE_TYPE_DIR) == 0) {
-        strncpy(path, canonical, 255);
-        path[255] = '\0';
+        strncpy(path, canonical, buf_size - 1);
+        path[buf_size - 1] = '\0';
+        kfree(to_check);
+        kfree(canonical);
         return path;
     }
-    
+
+    kfree(to_check);
+    kfree(canonical);
     kfree(path);
     return NULL;
 }
 
 static void builtin_help(void) {
-    printf("======================== IPO_OS SYSTEM HELP ========================\n");
-    printf("1. BUILTIN SHELL COMMANDS & SYNTAX:\n");
-    printf("  Navigation & Working Directory:\n");
+    printf("======================= IPO_OS SYSTEM HELP =======================\n");
+    printf("\n");
+    printf("1. BUILTIN SHELL COMMANDS & SYNTAX\n");
+    printf("  [Navigation]\n");
     printf("    pwd\n");
     printf("      - Print absolute path of current working directory.\n");
-    printf("    cd [path]\n");
-    printf("      - Change working directory to absolute or relative [path].\n");
-    printf("      - Variations: 'cd', 'cd ~' (go to /), 'cd ..' (parent), 'cd .' (current).\n");
+    printf("    cd [path | ~ | .. | .]\n");
+    printf("      - Change working directory to target path, root (~), or parent (..).\n");
     printf("\n");
-    printf("  File & Directory Operations:\n");
+    printf("  [File & Directory Operations]\n");
     printf("    ls [path] | dir [path]\n");
-    printf("      - List contents of directory with [DIR]/[FILE] type and size in bytes.\n");
-    printf("      - If [path] omitted, lists current working directory.\n");
-    printf("    cat <file> | type <file>\n");
-    printf("      - Read and display text contents of <file>.\n");
-    printf("    touch <file>\n");
-    printf("      - Create a new empty file at specified path.\n");
-    printf("    mkdir <dir>\n");
-    printf("      - Create a new directory at specified path.\n");
-    printf("    rm <file|dir> | del <file|dir> | rmdir <file|dir>\n");
-    printf("      - Remove a file or an empty directory.\n");
+    printf("      - List directory contents showing item type and file size.\n");
+    printf("    cat <file...>\n");
+    printf("      - Display contents of one or multiple files sequentially.\n");
+    printf("    touch <file...>\n");
+    printf("      - Create one or multiple new empty files.\n");
+    printf("    mkdir <dir...>\n");
+    printf("      - Create one or multiple new directories.\n");
+    printf("    rm <path...> | del <path...> | rmdir <path...>\n");
+    printf("      - Delete one or multiple files or empty directories.\n");
     printf("    cp <src> <dst> | copy <src> <dst>\n");
-    printf("      - Copy file from <src> path to <dst> path or destination directory.\n");
+    printf("      - Copy file to destination path or into destination directory.\n");
     printf("    mv <src> <dst> | move <src> <dst> | rename <src> <dst>\n");
-    printf("      - Move or rename file or directory from <src> to <dst>.\n");
-    printf("    stat <path>\n");
-    printf("      - Display inode details: type, size, protection flags, link count.\n");
+    printf("      - Move or rename a file or directory.\n");
+    printf("    stat <path...>\n");
+    printf("      - Display inode number, type, size, protection and links count.\n");
     printf("\n");
-    printf("  Text Output & File Redirection:\n");
+    printf("  [Process & Task Management]\n");
+    printf("    ps | tasks | procs\n");
+    printf("      - List all active and background processes with PID, state, memory.\n");
+    printf("    kill <pid>\n");
+    printf("      - Terminate a running or background process and free its resources.\n");
+    printf("    killall\n");
+    printf("      - Terminate all active processes and stop background async tasks.\n");
+    printf("\n");
+    printf("  [Output & Redirection]\n");
     printf("    echo [text] [> file | >> file]\n");
-    printf("      - Output text to screen, or overwrite (>) / append (>>) to a file.\n");
+    printf("      - Print text to stdout, overwrite to file (>), or append (>>).\n");
     printf("\n");
-    printf("  System & Power Controls:\n");
+    printf("  [System & Power Controls]\n");
     printf("    clear | cls\n");
     printf("      - Clear terminal screen and reset VGA scrollback buffer.\n");
     printf("    reboot | restart\n");
-    printf("      - Perform hardware system reboot (8042 / port 0x92 / triple fault).\n");
+    printf("      - Reboot hardware via 8042 controller, port 0x92 or triple fault.\n");
     printf("    shutdown | poweroff | exit | halt\n");
     printf("      - Power off machine via ACPI/APM or halt CPU execution safely.\n");
     printf("    help | ?\n");
-    printf("      - Display this system documentation and reference guide.\n");
+    printf("      - Display this system documentation and syntax reference.\n");
     printf("\n");
-    printf("2. APPLICATION EXECUTION:\n");
-    printf("  Syntax: <program> [arguments...]\n");
-    printf("  - Resolves executable by searching: current directory, then /app/, then /.\n");
-    printf("  - Arguments are parsed and passed as argc/argv to process entrypoint.\n");
-    printf("  - Exit code of the completed process is reported upon termination.\n");
+    printf("  [Disk & Memory Info]\n");
+    printf("    df | diskinfo\n");
+    printf("      - Show filesystem space: total, used, free blocks, inodes, FS metadata.\n");
+    printf("    meminfo | free\n");
+    printf("      - Show kernel heap stats: total, used, free, block count, overhead.\n");
     printf("\n");
-    printf("3. INTERACTIVE TERMINAL & EDITING KEYBINDINGS:\n");
-    printf("  - Left / Right Arrows  : Move cursor inside current command line.\n");
-    printf("  - Home / End           : Jump to beginning / end of line.\n");
-    printf("  - Backspace            : Delete character before cursor with text shift.\n");
-    printf("  - Delete               : Delete character under cursor with text shift.\n");
-    printf("  - Tab                  : Insert 4 spaces at cursor.\n");
-    printf("  - Up / Down Arrows     : History navigation (previous / next command).\n");
-    printf("  - Page Up / Page Down  : Scroll terminal output buffer up / down.\n");
-    printf("  - Ctrl + Shift         : Switch active keyboard layout.\n");
+    printf("2. APPLICATION EXECUTION (Launch Methods & Resolution)\n");
+    printf("  IPO_OS executes Position Independent Executables (.bin) via four methods:\n");
+    printf("  [Method 1: Direct Name (Automatic PATH Resolution)]\n");
+    printf("    Syntax: <command> [arguments...]\n");
+    printf("    - Searches current directory, /app directory, then root directory.\n");
+    printf("  [Method 2: Explicit Relative or Absolute Path]\n");
+    printf("    Syntax: <path/to/binary> [arguments...]\n");
+    printf("    - Resolves absolute paths starting with '/' or relative paths.\n");
+    printf("  [Method 3: Batch Startup Script]\n");
+    printf("    - Reads commands line-by-line from '/autorun' during kernel boot.\n");
     printf("\n");
-    printf("4. SYSTEM ARCHITECTURE & FEATURES:\n");
-    printf("  - IPO_FS: Hierarchical inode-based file system on ATA IDE storage.\n");
-    printf("  - Process Manager: Isolated task heap, multi-tasking and ELF execution.\n");
-    printf("  - Async Engine: Cooperative kernel scheduler for background tasks.\n");
-    printf("  - Non-blocking I/O: Background task output seamlessly integrates into CLI.\n");
-    printf("====================================================================\n");
+    printf("3. TERMINAL SHORTCUTS & KEYBOARD CONTROLS\n");
+    printf("    - Ctrl + C            : Instant cancel/abort of active task or queue.\n");
+    printf("    - Page Up / Page Down : Scroll terminal output 5 lines up / down.\n");
+    printf("    - Up / Down Arrows    : Command history navigation or line scroll.\n");
+    printf("    - Left / Right Arrows : Move cursor across current line.\n");
+    printf("    - Home / End          : Move cursor to beginning / end of line.\n");
+    printf("============================================================================\n");
 }
 
 static void builtin_clear(void) {
@@ -648,6 +693,7 @@ static void builtin_clear(void) {
     input_start_cursor = VGA_START_CURSOR_POSITION;
     prompt_start_cursor = VGA_START_CURSOR_POSITION;
     cursor_pos = 0;
+    previous_rendered_vis_len = 0;
 }
 
 static void builtin_pwd(void) {
@@ -1037,6 +1083,137 @@ static void builtin_shutdown(void) {
     }
 }
 
+static void builtin_ps(void) {
+    process_list_print();
+}
+
+static void builtin_kill(int argc, char **argv) {
+    if (argc < 2) {
+        printf("Usage: kill <pid>\n");
+        return;
+    }
+    const char *str = argv[1];
+    uint32_t pid = 0;
+    while (*str >= '0' && *str <= '9') {
+        pid = pid * 10 + (uint32_t)(*str - '0');
+        str++;
+    }
+    if (pid == 0 || *str != '\0') {
+        printf("kill: invalid PID '%s'\n", argv[1]);
+        return;
+    }
+    process_kill_by_pid(pid);
+}
+
+static void builtin_killall(void) {
+    process_kill_all();
+}
+
+/* ---------------------------------------------------------------
+ * Helper: count used/total blocks by scanning the block bitmap
+ * --------------------------------------------------------------- */
+static void fs_count_blocks(uint32_t *out_used, uint32_t *out_total) {
+    *out_total = 0;
+    *out_used  = 0;
+    if (!fs_mounted) return;
+
+    /* data_blocks_start is the first LBA of data area;
+       total data blocks = fs_size_blocks - data_blocks_start */
+    uint32_t data_start = sb.data_blocks_start;
+    uint32_t total = (sb.fs_size_blocks > data_start)
+                     ? sb.fs_size_blocks - data_start : 0;
+    *out_total = total;
+
+    uint32_t used = 0;
+    for (uint32_t i = 0; i < total; i++) {
+        if (bitmap_get(sb.block_bitmap_start, i)) {
+            used++;
+        }
+    }
+    *out_used = used;
+}
+
+/* ---------------------------------------------------------------
+ * Helper: count used/total inodes by scanning the inode bitmap
+ * --------------------------------------------------------------- */
+static void fs_count_inodes(uint32_t *out_used, uint32_t *out_total) {
+    *out_total = sb.inode_count;
+    uint32_t used = 0;
+    for (uint32_t i = 0; i < sb.inode_count; i++) {
+        if (bitmap_get(sb.inode_bitmap_start, i)) {
+            used++;
+        }
+    }
+    *out_used = used;
+}
+
+static void builtin_df(void) {
+    if (!fs_mounted) {
+        printf("df: no filesystem mounted\n");
+        return;
+    }
+
+    uint32_t blk_used, blk_total;
+    fs_count_blocks(&blk_used, &blk_total);
+
+    uint32_t ino_used, ino_total;
+    fs_count_inodes(&ino_used, &ino_total);
+
+    uint32_t blk_free = (blk_total >= blk_used) ? blk_total - blk_used : 0;
+
+    uint32_t bs   = sb.block_size;           /* bytes per block */
+    uint32_t used_kb = (blk_used  * bs) / 1024;
+    uint32_t free_kb = (blk_free  * bs) / 1024;
+    uint32_t total_kb = (blk_total * bs) / 1024;
+    uint32_t used_pct = blk_total ? (blk_used * 100u) / blk_total : 0;
+
+    printf("Filesystem : IPO_FS\n");
+    printf("Block size : %u bytes\n", bs);
+    printf("Blocks     : %u total, %u used, %u free\n",
+           blk_total, blk_used, blk_free);
+    printf("Space      : %u KB total, %u KB used, %u KB free  (%u%% used)\n",
+           total_kb, used_kb, free_kb, used_pct);
+    printf("Inodes     : %u total, %u used, %u free\n",
+           ino_total, ino_used,
+           (ino_total >= ino_used) ? ino_total - ino_used : 0);
+    printf("FS size    : %u blocks (%u KB)\n",
+           sb.fs_size_blocks, (sb.fs_size_blocks * bs) / 1024);
+    printf("Start LBA  : %u\n", fs_start_lba);
+}
+
+static void builtin_meminfo(void) {
+    kmalloc_stats_t st;
+    kmalloc_get_stats(&st);
+
+    size_t heap_avail  = (st.heap_total > st.heap_used)
+                         ? st.heap_total - st.heap_used : 0;
+    size_t real_free   = st.free_bytes + heap_avail;
+    size_t header_overhead = (st.alloc_blocks + st.free_blocks) * st.block_header;
+    size_t used_pct = st.heap_total
+                      ? (st.heap_used * 100u) / st.heap_total : 0;
+
+    printf("=== Memory (Kernel Heap) ===\n");
+    printf("Heap start : 0x%x\n", 0x1000000);
+    printf("Heap total : %u KB  (%u MB)\n",
+           (uint32_t)(st.heap_total / 1024),
+           (uint32_t)(st.heap_total / 1024 / 1024));
+    printf("Heap used  : %u KB  (watermark, %u%% of capacity)\n",
+           (uint32_t)(st.heap_used / 1024), (uint32_t)used_pct);
+    printf("Heap avail : %u KB  (never-touched tail)\n",
+           (uint32_t)(heap_avail / 1024));
+    printf("\n");
+    printf("Alloc'd    : %u KB  in %u block(s)\n",
+           (uint32_t)(st.alloc_bytes / 1024), (uint32_t)st.alloc_blocks);
+    printf("Freed      : %u KB  in %u block(s)\n",
+           (uint32_t)(st.free_bytes / 1024), (uint32_t)st.free_blocks);
+    printf("Total free : %u KB  (freed blocks + untouched tail)\n",
+           (uint32_t)(real_free / 1024));
+    printf("Overhead   : %u bytes  (%u block headers)\n",
+           (uint32_t)header_overhead,
+           (uint32_t)(st.alloc_blocks + st.free_blocks));
+    printf("Block hdr  : %u bytes\n", (uint32_t)st.block_header);
+}
+
 void terminal_initialize(void) {
     vga_clear(
         VGA_COLOR_WHITE,
@@ -1086,16 +1263,96 @@ void terminal_initialize(void) {
 /* Print the command prompt */
 static void print_prompt(void) {
     terminal_suppress_external_hook = true;
-    prompt_start_cursor = vga_get_cursor_position();
+    prompt_origin = (int32_t)vga_get_cursor_position();
+    if (prompt_origin < VGA_START_CURSOR_POSITION || prompt_origin >= VGA_WIDTH * VGA_HEIGHT) {
+        prompt_origin = VGA_START_CURSOR_POSITION;
+        vga_set_cursor((uint16_t)prompt_origin);
+    }
+    prompt_start_cursor = prompt_origin;
     for (const char *p = terminal_cwd; *p; p++) {
         putchar_color(*p, PROMPT_FG, VGA_COLOR_BLACK);
     }
     putchar_color('>', PROMPT_FG, VGA_COLOR_BLACK);
     putchar(' ');
     prompt_shown = true;
-    input_start_cursor = vga_get_cursor_position();
-    render_input_line(input_buf);
+    input_start_cursor = (int32_t)vga_get_cursor_position();
+    input_len = 0;
+    cursor_pos = 0;
+    previous_rendered_vis_len = 0;
+    if (input_buf != NULL) {
+        input_buf[0] = '\0';
+    }
     terminal_suppress_external_hook = false;
+    terminal_apply_pending_input();
+}
+
+static char *pending_terminal_input = NULL;
+static bool pending_terminal_auto_exec = false;
+
+void terminal_inject_input(const char *text, bool auto_execute) {
+    if (pending_terminal_input != NULL) {
+        kfree(pending_terminal_input);
+        pending_terminal_input = NULL;
+    }
+    if (text != NULL) {
+        size_t len = strlen(text);
+        pending_terminal_input = kmalloc(len + 1u);
+        if (pending_terminal_input != NULL) {
+            memcpy(pending_terminal_input, text, len + 1u);
+            pending_terminal_auto_exec = auto_execute;
+        }
+    }
+}
+
+void terminal_apply_pending_input(void) {
+    if (pending_terminal_input == NULL || !prompt_shown) {
+        return;
+    }
+    char *text = pending_terminal_input;
+    bool auto_exec = pending_terminal_auto_exec;
+    pending_terminal_input = NULL;
+
+    size_t len = strlen(text);
+    ensure_input_buffer(len + 1u);
+    if (input_buf != NULL) {
+        memcpy(input_buf, text, len + 1u);
+        input_len = len;
+        cursor_pos = len;
+        render_input_line(0);
+
+        if (auto_exec) {
+            terminal_suppress_external_hook = true;
+            uint16_t cur_end = input_start_cursor + (uint16_t)terminal_visual_offset(input_len);
+            if (cur_end >= VGA_WIDTH * VGA_HEIGHT) {
+                cur_end = VGA_WIDTH * VGA_HEIGHT - 1;
+            }
+            vga_set_cursor(cur_end);
+            putchar('\n');
+
+            push_command_history(input_buf);
+            int exec = try_execute_command(input_buf);
+            if (exec == 0) {
+                printf("Command not found: %s\n", input_buf);
+            } else if (exec < 0) {
+                printf("Execution failed (error %d): %s\n", exec, input_buf);
+            } else if (exec != 1000) {
+                int ret = process_get_exit_code();
+                printf("Return value: %d\n", ret);
+            }
+
+            input_len = 0;
+            cursor_pos = 0;
+            input_buf[0] = '\0';
+            if (current_input_snapshot != NULL) {
+                current_input_snapshot[0] = '\0';
+            }
+            command_history_index = -1;
+            prompt_shown = false;
+            terminal_suppress_external_hook = false;
+            print_prompt();
+        }
+    }
+    kfree(text);
 }
 
 int try_execute_command(const char *cmdline) {
@@ -1256,6 +1513,21 @@ int try_execute_command(const char *cmdline) {
                strcmp(name, "exit") == 0 || strcmp(name, "halt") == 0) {
         builtin_shutdown();
         builtin_handled = 1;
+    } else if (strcmp(name, "ps") == 0 || strcmp(name, "tasks") == 0 || strcmp(name, "procs") == 0) {
+        builtin_ps();
+        builtin_handled = 1;
+    } else if (strcmp(name, "kill") == 0) {
+        builtin_kill(argc, argv);
+        builtin_handled = 1;
+    } else if (strcmp(name, "killall") == 0) {
+        builtin_killall();
+        builtin_handled = 1;
+    } else if (strcmp(name, "df") == 0 || strcmp(name, "diskinfo") == 0) {
+        builtin_df();
+        builtin_handled = 1;
+    } else if (strcmp(name, "meminfo") == 0 || strcmp(name, "free") == 0) {
+        builtin_meminfo();
+        builtin_handled = 1;
     }
 
     if (builtin_handled) {
@@ -1300,12 +1572,18 @@ void terminal_console(void){
     }
 
     uint8_t scancode = keyboard_get_scancode();
-    update_hot_key_state(scancode);
-    hot_key_handler(scancode);
 
     if (!prompt_shown) print_prompt();
+    terminal_apply_pending_input();
 
     if (scancode != 0x00) {
+        update_hot_key_state(scancode);
+
+        /* 1. Dispatch application hotkeys (highest priority) and system hotkeys */
+        if (keyboard_dispatch_hotkey(scancode)) {
+            return;
+        }
+
         bool is_break_code = (scancode & 0x80) != 0;
 
         uint32_t now = timer_millis();
@@ -1322,8 +1600,18 @@ void terminal_console(void){
             last_terminal_key_ms = now;
         }
 
-        update_hot_key_state(scancode);
-        hot_key_handler(scancode);
+        /* 2. Default Ctrl + C: clear current command input and request interrupt */
+        if (!is_break_code && keyboard_is_ctrl_pressed() && scancode == 0x2E) {
+            sound_stop();
+            system_request_interrupt();
+            terminal_return_to_present();
+            printf("^C\n");
+            input_len = 0;
+            cursor_pos = 0;
+            if (input_buf) input_buf[0] = '\0';
+            print_prompt();
+            return;
+        }
 
         /* Keybindings:
          * Left / Right arrows: cursor movement in current line
@@ -1333,14 +1621,27 @@ void terminal_console(void){
          */
         if (!is_break_code) {
             if (scancode == SC_PAGE_UP) {
-                scroll_up();
+                for (int i = 0; i < 5 && top_buffer_count > 0; i++) {
+                    terminal_scroll_up();
+                }
                 return;
             }
             if (scancode == SC_PAGE_DOWN) {
-                scroll_down();
+                for (int i = 0; i < 5 && bottom_buffer_count > 0; i++) {
+                    terminal_scroll_down();
+                }
                 return;
             }
             if (scancode == SC_ARROW_UP) {
+                if (bottom_buffer_count > 0) {
+                    terminal_scroll_up();
+                    return;
+                }
+                if (cursor_pos >= VGA_WIDTH) {
+                    cursor_pos -= VGA_WIDTH;
+                    render_input_line(input_len);
+                    return;
+                }
                 if (command_history_count > 0) {
                     uint32_t now = timer_millis();
                     if (now - last_history_action_ms < 150u) {
@@ -1348,7 +1649,7 @@ void terminal_console(void){
                     }
                     last_history_action_ms = now;
 
-                    return_to_present();
+                    terminal_return_to_present();
 
                     if (command_history_index < 0) {
                         size_t snapshot_len = strlen(input_buf);
@@ -1378,6 +1679,15 @@ void terminal_console(void){
                 return;
             }
             if (scancode == SC_ARROW_DOWN) {
+                if (bottom_buffer_count > 0) {
+                    terminal_scroll_down();
+                    return;
+                }
+                if (cursor_pos + VGA_WIDTH <= input_len) {
+                    cursor_pos += VGA_WIDTH;
+                    render_input_line(input_len);
+                    return;
+                }
                 if (command_history_index >= 0) {
                     uint32_t now = timer_millis();
                     if (now - last_history_action_ms < 150u) {
@@ -1385,7 +1695,7 @@ void terminal_console(void){
                     }
                     last_history_action_ms = now;
 
-                    return_to_present();
+                    terminal_return_to_present();
 
                     if (command_history_index < command_history_count - 1) {
                         command_history_index++;
@@ -1401,40 +1711,41 @@ void terminal_console(void){
                 return;
             }
             if (scancode == SC_ARROW_LEFT) {
-                return_to_present();
+                terminal_return_to_present();
                 if (cursor_pos > 0) {
                     cursor_pos--;
-                    render_input_line(input_buf);
+                    render_input_line(input_len);
                 }
                 return;
             }
             if (scancode == SC_ARROW_RIGHT) {
-                return_to_present();
+                terminal_return_to_present();
                 if (cursor_pos < input_len) {
                     cursor_pos++;
-                    render_input_line(input_buf);
+                    render_input_line(input_len);
                 }
                 return;
             }
             if (scancode == SC_HOME) {
-                return_to_present();
+                terminal_return_to_present();
                 cursor_pos = 0;
-                render_input_line(input_buf);
+                render_input_line(input_len);
                 return;
             }
             if (scancode == SC_END) {
-                return_to_present();
+                terminal_return_to_present();
                 cursor_pos = input_len;
-                render_input_line(input_buf);
+                render_input_line(input_len);
                 return;
             }
             if (scancode == SC_DELETE) {
-                return_to_present();
+                terminal_return_to_present();
                 if (cursor_pos < input_len) {
+                    size_t old_len = input_len;
                     memmove(&input_buf[cursor_pos], &input_buf[cursor_pos + 1], input_len - cursor_pos);
                     input_len--;
                     input_buf[input_len] = '\0';
-                    render_input_line(input_buf);
+                    render_input_line(old_len);
                 }
                 return;
             }
@@ -1444,7 +1755,7 @@ void terminal_console(void){
             char c = get_char(scancode);
             if (c != 0x00) {
                 // Return to present when user starts typing
-                return_to_present();
+                terminal_return_to_present();
                 
                 /* Handle newline / carriage return */
                 if (c == '\n' || c == '\r') {
@@ -1486,33 +1797,34 @@ void terminal_console(void){
                 /* Handle backspace */
                 else if (c == '\b' || c == 127) {
                     if (cursor_pos > 0) {
+                        size_t old_len = input_len;
                         memmove(&input_buf[cursor_pos - 1], &input_buf[cursor_pos], input_len - cursor_pos + 1);
                         cursor_pos--;
                         input_len--;
                         input_buf[input_len] = '\0';
-                        render_input_line(input_buf);
+                        render_input_line(old_len);
                     }
                 }
                 else if (c == '\t') {
-                    ensure_input_buffer(input_len + 4u);
-                    memmove(&input_buf[cursor_pos + 4], &input_buf[cursor_pos], input_len - cursor_pos + 1);
-                    for (int s = 0; s < 4; s++) {
-                        input_buf[cursor_pos + s] = ' ';
-                    }
-                    cursor_pos += 4;
-                    input_len += 4;
+                    ensure_input_buffer(input_len + 1u);
+                    size_t old_len = input_len;
+                    memmove(&input_buf[cursor_pos + 1], &input_buf[cursor_pos], input_len - cursor_pos + 1);
+                    input_buf[cursor_pos] = '\t';
+                    cursor_pos++;
+                    input_len++;
                     input_buf[input_len] = '\0';
-                    render_input_line(input_buf);
+                    render_input_line(old_len);
                 }
                 /* Printable characters */
                 else if (c >= 32 && c < 127) {
                     ensure_input_buffer(input_len + 1u);
+                    size_t old_len = input_len;
                     memmove(&input_buf[cursor_pos + 1], &input_buf[cursor_pos], input_len - cursor_pos + 1);
                     input_buf[cursor_pos] = c;
                     cursor_pos++;
                     input_len++;
                     input_buf[input_len] = '\0';
-                    render_input_line(input_buf);
+                    render_input_line(old_len);
                 }
             }
         }
@@ -1524,12 +1836,8 @@ void terminal_auto_scroll(void) {
     volatile uint16_t *vga = VGA_MEMORY;
 
     if (prompt_shown) {
-        if (input_start_cursor >= VGA_WIDTH) {
-            input_start_cursor -= VGA_WIDTH;
-        }
-        if (prompt_start_cursor >= VGA_WIDTH) {
-            prompt_start_cursor -= VGA_WIDTH;
-        }
+        prompt_start_cursor -= VGA_WIDTH;
+        input_start_cursor -= VGA_WIDTH;
     }
 
     uint16_t top = terminal_top_row();

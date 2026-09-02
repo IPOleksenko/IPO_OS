@@ -41,3 +41,18 @@ bool system_is_input_state(void) {
     return current_system_state == SYSTEM_STATE_TEXT_INPUT;
 }
 
+static volatile bool system_interrupted_flag = false;
+
+void system_request_interrupt(void) {
+    system_interrupted_flag = true;
+    serial_printf("[system_state] global interrupt (Ctrl+C) requested\n");
+}
+
+void system_clear_interrupt(void) {
+    system_interrupted_flag = false;
+}
+
+bool system_is_interrupted(void) {
+    return system_interrupted_flag;
+}
+

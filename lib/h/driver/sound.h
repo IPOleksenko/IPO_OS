@@ -12,7 +12,7 @@ void sound_init(void);
  * Play sound at specified frequency (Hz)
  * @param frequency Frequency in Hz (440 = A4, typical range 37-20000 Hz)
  */
-void sound_play(uint16_t frequency);
+void sound_play(uint32_t frequency);
 
 /**
  * Stop playing sound
@@ -24,7 +24,7 @@ void sound_stop(void);
  * @param frequency Frequency in Hz
  * @param duration Duration in milliseconds (approximate)
  */
-void sound_beep(uint16_t frequency, uint16_t duration);
+void sound_beep(uint32_t frequency, uint32_t duration);
 
 /* Define musical notes with their corresponding frequencies (in Hz) */
 #define NOTE_REST 0

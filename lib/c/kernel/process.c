@@ -1,8 +1,11 @@
 #include <kernel/process.h>
+#include <kernel/async.h>
 #include <kernel/terminal.h>
 #include <system/state.h>
 #include <file_system/ipo_fs.h>
 #include <memory/kmalloc.h>
+#include <driver/input/keymap/keymap.h>
+#include <driver/keyboard.h>
 #include <vga.h>
 #include <string.h>
 #include <stdio.h>
@@ -537,13 +540,23 @@ int process_exec(const char *path, int argc, char **argv) {
         return -1;
     }
 
-    serial_printf("process_exec: %s, argc=%d\n", path, argc);
+    char *resolved = NULL;
+    const char *actual_path = path;
+    if (path[0] != '/') {
+        resolved = resolve_command_path(path);
+        if (resolved != NULL) {
+            actual_path = resolved;
+        }
+    }
+
+    serial_printf("process_exec: %s (actual=%s), argc=%d\n", path, actual_path, argc);
     log_process_heap_state("before exec");
 
     // Creating a process structure
     process_t *proc = kmalloc(sizeof(process_t));
     if (!proc) {
         printf("Failed to allocate process structure\n");
+        if (resolved != NULL) kfree(resolved);
         return -2;
     }
     
@@ -552,7 +565,7 @@ int process_exec(const char *path, int argc, char **argv) {
     proc->is_running = 1;
     
     // Store process name
-    strncpy(proc->name, path, sizeof(proc->name) - 1);
+    strncpy(proc->name, actual_path, sizeof(proc->name) - 1);
     
     // Add to the list of processes
     proc->next = process_list;
@@ -562,10 +575,11 @@ int process_exec(const char *path, int argc, char **argv) {
     ipob_header_t header;
     void *binary_image;
     
-    int size = load_ipob_file(path, &header, &binary_image);
+    int size = load_ipob_file(actual_path, &header, &binary_image);
     if (size < 0) {
         printf("Failed to load file: error %d\n", size);
         process_cleanup(proc);
+        if (resolved != NULL) kfree(resolved);
         return size;
     }
     
@@ -580,6 +594,7 @@ int process_exec(const char *path, int argc, char **argv) {
         printf("Failed to allocate memory for process (need %d bytes)\n", size);
         kfree(binary_image);
         process_cleanup(proc);
+        if (resolved != NULL) kfree(resolved);
         return -5;
     }
     
@@ -594,11 +609,13 @@ int process_exec(const char *path, int argc, char **argv) {
         free_process_memory(proc, target_addr, size);
         kfree(binary_image);
         process_cleanup(proc);
+        if (resolved != NULL) kfree(resolved);
         return -6;
     }
     
     // Freeing up the temporary buffer
     kfree(binary_image);
+    if (resolved != NULL) kfree(resolved);
     
     // Saving information about the process
     proc->binary_base = target_addr;
@@ -663,8 +680,16 @@ int process_exec(const char *path, int argc, char **argv) {
     last_exit_code = exit_code;
 
     serial_printf("[process] pid=%u returned, exit_code=%d\n", proc->pid, exit_code);
+    keyboard_set_app_input_mode(false);
+    keyboard_clear_key_state();
     terminal_unlock_input();
     system_set_state(SYSTEM_STATE_TERMINAL_IDLE);
+
+    /* If Ctrl+C was used to stop the process, print a clean message */
+    if (system_is_interrupted()) {
+        printf("Application stopped.\n");
+        system_clear_interrupt();
+    }
 
     // Restoring the old process
     current_process = old_process;
@@ -672,23 +697,8 @@ int process_exec(const char *path, int argc, char **argv) {
     if (proc->async_task_count > 0) {
         proc->is_running = 0;
         proc->exit_code = exit_code;
-        printf("[process] keeping process %u alive because it owns %u async tasks\n",
+        printf("[process] keeping process %u alive in background (owns %u async task(s))\n",
                proc->pid, proc->async_task_count);
-
-        // Detach background process from the active chain so it does not remain
-        // as a zombie entry that can block later command executions.
-        if (process_list == proc) {
-            process_list = proc->next;
-        } else {
-            process_t *prev = process_list;
-            while (prev && prev->next != proc) {
-                prev = prev->next;
-            }
-            if (prev) {
-                prev->next = proc->next;
-            }
-        }
-        proc->next = NULL;
         current_process = old_process;
         return proc->pid;
     }
@@ -712,4 +722,108 @@ int process_get_exit_code(void) {
  */
 process_t *process_get_current(void) {
     return current_process;
+}
+
+/**
+ * process_list_print - Lists all running and background processes
+ */
+void process_list_print(void) {
+    if (process_list == NULL) {
+        printf("No active or background processes running.\n");
+        return;
+    }
+
+    printf("  PID  STATE         ASYNC    MEMORY      NAME\n");
+    printf("  ------------------------------------------------------------\n");
+
+    process_t *curr = process_list;
+    uint32_t count = 0;
+    while (curr != NULL) {
+        const char *state = curr->is_running ? "RUNNING" : "BACKGROUND";
+        uint32_t mem_kb = (curr->binary_size + curr->stack_size + 1023) / 1024;
+
+        printf("  %u", curr->pid);
+        if (curr->pid < 10) printf("   ");
+        else if (curr->pid < 100) printf("  ");
+        else printf(" ");
+
+        printf("%s", state);
+        size_t slen = strlen(state);
+        for (size_t s = slen; s < 14; s++) putchar(' ');
+
+        printf("%u", curr->async_task_count);
+        if (curr->async_task_count < 10) printf("        ");
+        else if (curr->async_task_count < 100) printf("       ");
+        else printf("      ");
+
+        printf("%u KB", mem_kb);
+        if (mem_kb < 10) printf("       ");
+        else if (mem_kb < 100) printf("      ");
+        else if (mem_kb < 1000) printf("     ");
+        else if (mem_kb < 10000) printf("    ");
+        else printf("   ");
+
+        printf("%s\n", curr->name[0] ? curr->name : "unnamed");
+
+        count++;
+        curr = curr->next;
+    }
+    printf("  ------------------------------------------------------------\n");
+    printf("  Total processes: %u\n", count);
+}
+
+/**
+ * process_kill_by_pid - Terminates a process and its async tasks by PID
+ */
+int process_kill_by_pid(uint32_t pid) {
+    process_t *curr = process_list;
+    while (curr != NULL) {
+        if (curr->pid == pid) {
+            char name_copy[256];
+            strncpy(name_copy, curr->name, sizeof(name_copy) - 1);
+            name_copy[sizeof(name_copy) - 1] = '\0';
+
+            /* Stop all async tasks owned by this process */
+            async_stop_tasks_by_owner(curr);
+            curr->async_task_count = 0;
+
+            /* Cleanup memory and unlink from list */
+            process_cleanup(curr);
+            printf("[process] pid=%u (%s) killed and memory freed.\n", pid, name_copy);
+            return 0;
+        }
+        curr = curr->next;
+    }
+
+    printf("kill: no process found with PID %u\n", pid);
+    return -1;
+}
+
+/**
+ * process_kill_all - Terminates all active and background processes
+ */
+int process_kill_all(void) {
+    if (process_list == NULL) {
+        printf("No active processes to kill.\n");
+        return 0;
+    }
+
+    async_stop_all_tasks();
+
+    uint32_t killed = 0;
+    while (process_list != NULL) {
+        process_t *proc = process_list;
+        proc->async_task_count = 0;
+        char name_copy[256];
+        strncpy(name_copy, proc->name, sizeof(name_copy) - 1);
+        name_copy[sizeof(name_copy) - 1] = '\0';
+        uint32_t pid = proc->pid;
+
+        process_cleanup(proc);
+        printf("[process] killed pid=%u (%s)\n", pid, name_copy);
+        killed++;
+    }
+
+    printf("[process] Terminated %u process(es).\n", killed);
+    return (int)killed;
 }

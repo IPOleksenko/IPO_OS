@@ -11,8 +11,8 @@ void sound_init(void) {
     pit_init(0);  /* Just initialize PIT structure */
 }
 
-void sound_play(uint16_t frequency) {
-    if (frequency == 0 || frequency > 20000)
+void sound_play(uint32_t frequency) {
+    if (frequency == 0)
         return;
     
     /* Set PIT counter 2 to desired frequency */
@@ -29,7 +29,7 @@ void sound_stop(void) {
     outb(SOUND_CTRL_PORT, control & ~(SOUND_CTRL_GATE | SOUND_CTRL_SPEAKER));
 }
 
-void sound_beep(uint16_t frequency, uint16_t duration) {
+void sound_beep(uint32_t frequency, uint32_t duration) {
     sound_play(frequency);
     
     /* Delay in milliseconds (busy-wait loop) */

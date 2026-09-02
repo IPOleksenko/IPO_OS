@@ -55,5 +55,8 @@ process_t *process_get_current(void);
 int process_adjust_stack_size(process_t *proc, int32_t delta);
 void process_set_keep_alive(process_t *proc, int enabled);
 void process_cleanup(process_t *proc);
+void process_list_print(void);
+int process_kill_by_pid(uint32_t pid);
+int process_kill_all(void);
 
 #endif

@@ -2,11 +2,16 @@
 #include <ioport.h>
 
 uint16_t pit_get_divisor(uint32_t hz) {
-    return PIT_FREQUENCY / hz;
+    if (hz == 0) return 0;
+    if (hz >= PIT_FREQUENCY) return 1;
+    uint32_t d = PIT_FREQUENCY / hz;
+    if (d > 65535) d = 65535;
+    if (d == 0) d = 1;
+    return (uint16_t)d;
 }
 
 void pit_set_frequency(uint8_t counter, uint32_t hz) {
-    if (hz == 0 || hz > PIT_FREQUENCY)
+    if (hz == 0)
         return;
     
     uint16_t divisor = pit_get_divisor(hz);

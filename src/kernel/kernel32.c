@@ -12,6 +12,7 @@
 #include <stdio.h>
 
 #define FS_START_LBA (uint32_t)2048
+#define STARTUP_SOUND {NOTE_C6, 150}, {NOTE_E6, 150}, {NOTE_G6, 150}, {NOTE_C7, 200}
 
 static void ensure_fs_mounted(void) {
     if (ipo_fs_mount(FS_START_LBA)) {
@@ -27,8 +28,6 @@ static void ensure_fs_mounted(void) {
         }
     }
 }
-
-#define STARTUP_SOUND {NOTE_C6, 150}, {NOTE_E6, 150}, {NOTE_G6, 150}, {NOTE_C7, 200}
 
 static void play_note_smooth(uint16_t freq, uint16_t duration_ms) {
     if (freq == NOTE_REST) {
@@ -78,15 +77,12 @@ void kmain(void) {
     ipo_fs_init();
 
     ensure_fs_mounted();
-    clear_terminal_history_file();
 
     play_startup_sound();
 
-    terminal_initialize();
-
     autorun_init();
 
-    printf("Type 'help' to view all available commands and OS features.\n");
+    printf("Type \"help\" or \"?\" on your keyboard to view commands, shortcuts, and OS features\n\n");
 
     system_set_state(SYSTEM_STATE_TERMINAL_IDLE);
 

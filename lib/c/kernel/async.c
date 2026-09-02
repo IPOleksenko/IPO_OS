@@ -169,6 +169,35 @@ int async_stop_task(const char *name)
     return -1;
 }
 
+void async_stop_tasks_by_owner(process_t *owner)
+{
+    if (owner == NULL) return;
+
+    async_task_t *node = async_task_list;
+    while (node != NULL) {
+        if (node->active && node->owner == owner) {
+            node->active = false;
+            printf("[async] stopped task '%s' for pid=%u\n", node->name, owner->pid);
+        }
+        node = node->next;
+    }
+    owner->async_task_count = 0;
+    remove_inactive_tasks();
+}
+
+void async_stop_all_tasks(void)
+{
+    async_task_t *node = async_task_list;
+    while (node != NULL) {
+        if (node->active) {
+            node->active = false;
+            printf("[async] stopped task '%s'\n", node->name);
+        }
+        node = node->next;
+    }
+    remove_inactive_tasks();
+}
+
 
 void async_scheduler_tick(void)
 {

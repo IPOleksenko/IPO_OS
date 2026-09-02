@@ -334,20 +334,22 @@ class DiskImage:
         size = inode['size']
         if size == 0:
             return
-        buf = bytearray()
-        for b in range((size + BLOCK_SIZE - 1) // BLOCK_SIZE):
-            phys = self.get_block_for_inode(inode, b)
-            if phys < 0:
-                break
-            buf += self.read_block(phys)
-        for i in range(size // DIRENTRY_SIZE):
-            off = i * DIRENTRY_SIZE
+        entries_count = size // DIRENTRY_SIZE
+        per_block = BLOCK_SIZE // DIRENTRY_SIZE
+        for e in range(entries_count):
+            bidx = e // per_block
+            inblock = e % per_block
+            phys = self.get_block_for_inode(inode, bidx)
+            if phys <= 0:
+                continue
+            buf = self.read_block(phys)
+            off = inblock * DIRENTRY_SIZE
             inode_no, typ, namelen, _, name = struct.unpack(
                 DIRENTRY_FMT, buf[off:off + DIRENTRY_SIZE]
             )
             if inode_no:
                 yield {'inode': inode_no, 'type': typ,
-                       'name': name[:namelen].decode()}
+                       'name': name[:namelen].decode(errors='replace')}
 
     def find_entry(self, dirino, name):
         din = self.read_inode(dirino)
@@ -362,14 +364,34 @@ class DiskImage:
             return False
         entry = struct.pack(DIRENTRY_FMT, ino, typ, len(name),
                             b'\x00\x00', name.encode().ljust(IPO_FS_MAX_NAME, b'\x00'))
-        off = din['size']
-        bidx = off // BLOCK_SIZE
-        rel = off % BLOCK_SIZE
+        per_block = BLOCK_SIZE // DIRENTRY_SIZE
+        entries_count = din['size'] // DIRENTRY_SIZE
+
+        # Check if there is an empty slot (inode_no == 0) in existing directory entries
+        for e in range(entries_count):
+            bidx = e // per_block
+            inblock = e % per_block
+            phys = self.get_block_for_inode(din, bidx, alloc=False)
+            if phys > 0:
+                buf = bytearray(self.read_block(phys))
+                off = inblock * DIRENTRY_SIZE
+                ino_no = struct.unpack('<I', buf[off:off + 4])[0]
+                if ino_no == 0:
+                    buf[off:off + DIRENTRY_SIZE] = entry
+                    self.write_block(phys, bytes(buf))
+                    return True
+
+        # Append at end
+        bidx = entries_count // per_block
+        inblock = entries_count % per_block
         phys = self.get_block_for_inode(din, bidx, alloc=True)
-        blk = bytearray(self.read_block(phys))
-        blk[rel:rel + DIRENTRY_SIZE] = entry
-        self.write_block(phys, bytes(blk))
-        din['size'] += DIRENTRY_SIZE
+        if phys < 0:
+            return False
+        buf = bytearray(self.read_block(phys))
+        off = inblock * DIRENTRY_SIZE
+        buf[off:off + DIRENTRY_SIZE] = entry
+        self.write_block(phys, bytes(buf))
+        din['size'] = (entries_count + 1) * DIRENTRY_SIZE
         self.write_inode(dirino, din)
         return True
 
@@ -378,46 +400,25 @@ class DiskImage:
         size = din['size']
         if size == 0:
             return False
-        nentries = size // DIRENTRY_SIZE
-        buf = bytearray()
-        blocks = (size + BLOCK_SIZE - 1) // BLOCK_SIZE
-        for bidx in range(blocks):
+        entries_count = size // DIRENTRY_SIZE
+        per_block = BLOCK_SIZE // DIRENTRY_SIZE
+        for e in range(entries_count):
+            bidx = e // per_block
+            inblock = e % per_block
             phys = self.get_block_for_inode(din, bidx, alloc=False)
-            if phys < 0:
-                return False
-            buf += self.read_block(phys)
-        found = False
-        newbuf = bytearray()
-        for i in range(nentries):
-            off = i * DIRENTRY_SIZE
-            chunk = buf[off:off + DIRENTRY_SIZE]
-            inode_no = struct.unpack('<I', chunk[:4])[0]
-            name_len = chunk[5]
-            name_bytes = chunk[8:8 + IPO_FS_MAX_NAME]
-            entryname = name_bytes[:name_len].decode('utf-8', errors='ignore')
-            if entryname == name:
-                found = True
+            if phys <= 0:
                 continue
-            newbuf += chunk
-        if not found:
-            return False
-        # write newbuf across blocks
-        new_size = len(newbuf)
-        blocks_needed = (new_size + BLOCK_SIZE - 1) // BLOCK_SIZE if new_size > 0 else 0
-        for bidx in range(blocks_needed):
-            phys = self.get_block_for_inode(din, bidx, alloc=True)
-            chunk = newbuf[bidx * BLOCK_SIZE:(bidx + 1) * BLOCK_SIZE]
-            if len(chunk) < BLOCK_SIZE:
-                chunk = chunk.ljust(BLOCK_SIZE, b'\x00')
-            self.write_block(phys, chunk)
-        # free extra blocks
-        for bidx in range(blocks_needed, blocks):
-            phys = self.get_block_for_inode(din, bidx, alloc=False)
-            if phys and phys >= self.sb['data_blocks_start']:
-                self.bitmap_set(self.sb['block_bitmap_start'], phys - self.sb['data_blocks_start'], 0)
-        din['size'] = new_size
-        self.write_inode(dirino, din)
-        return True
+            buf = bytearray(self.read_block(phys))
+            off = inblock * DIRENTRY_SIZE
+            inode_no, typ, namelen, _, name_bytes = struct.unpack(
+                DIRENTRY_FMT, buf[off:off + DIRENTRY_SIZE]
+            )
+            entryname = name_bytes[:namelen].decode('utf-8', errors='ignore')
+            if inode_no and entryname == name:
+                buf[off:off + DIRENTRY_SIZE] = b'\x00' * DIRENTRY_SIZE
+                self.write_block(phys, bytes(buf))
+                return True
+        return False
 
     # ================= USER COMMANDS =================
 
@@ -473,11 +474,11 @@ class DiskImage:
                               b'..'.ljust(IPO_FS_MAX_NAME, b'\x00'))
 
         buf = bytearray(BLOCK_SIZE)
-        buf[0:len(de_dot)] = de_dot
-        buf[len(de_dot):len(de_dot) + len(de_ddot)] = de_ddot
+        buf[0:DIRENTRY_SIZE] = de_dot
+        buf[DIRENTRY_SIZE:DIRENTRY_SIZE * 2] = de_ddot
         self.write_block(block, bytes(buf))
 
-        inode['size'] = len(de_dot) + len(de_ddot)
+        inode['size'] = DIRENTRY_SIZE * 2
         self.write_inode(ino, inode)
 
         if not self.dir_add_entry(parent, name, ino, 1):

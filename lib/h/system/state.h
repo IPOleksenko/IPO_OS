@@ -31,5 +31,12 @@ const char *system_state_to_string(system_state_t state);
  */
 bool system_is_input_state(void);
 
+/**
+ * Request instant global cancellation of active operation/queue (Ctrl+C)
+ */
+void system_request_interrupt(void);
+void system_clear_interrupt(void);
+bool system_is_interrupted(void);
+
 #endif
 

@@ -9,6 +9,7 @@
 #include <driver/input/keymap/keymap.h>
 #include <system/state.h>
 #include <system/timer.h>
+#include <vga.h>
 
 #define IPO_IDT_ENTRY_FLAGS 0xEEu
 #define IPO_KERNEL_CODE_SEG 0x08u
@@ -450,12 +451,97 @@ static uint32_t syscall_builtin_exec(uint32_t num,
         (char **)(uintptr_t)argv[2]);
 }
 
+static uint32_t syscall_builtin_terminal_input(uint32_t num,
+                                               uint32_t argc,
+                                               uint32_t *argv) {
+    (void)num;
+
+    if (argc < 2u || argv == NULL) {
+        return IPO_SYSCALL_ENOSYS;
+    }
+
+    const char *text = (const char *)(uintptr_t)argv[0];
+    int auto_exec = (int)argv[1];
+    terminal_inject_input(text, auto_exec != 0);
+    return IPO_SYSCALL_OK;
+}
+
+static size_t syscall_read_visual_offset(const char *buf, uint32_t len, uint32_t index) {
+    size_t vcol = 0;
+    for (uint32_t i = 0; i < index && i < len; i++) {
+        if (buf[i] == '\t') {
+            size_t tab_spaces = 4 - (vcol % 4);
+            if (tab_spaces == 0) tab_spaces = 4;
+            vcol += tab_spaces;
+        } else {
+            vcol += 1;
+        }
+    }
+    return vcol;
+}
+
+static void syscall_read_render(int32_t *start_cursor_ptr, int32_t start_origin, const char *buf, uint32_t len, uint32_t prev_len, uint32_t cursor_pos) {
+    (void)start_origin;
+    size_t vis_cursor = syscall_read_visual_offset(buf, len, cursor_pos);
+    size_t vis_len = syscall_read_visual_offset(buf, len, len);
+    size_t vis_prev = syscall_read_visual_offset(buf, len, prev_len);
+
+    /* If cursor or text tail exceeds bottom of screen, auto-scroll */
+    while (*start_cursor_ptr + (int32_t)vis_cursor >= VGA_WIDTH * VGA_HEIGHT) {
+        terminal_auto_scroll();
+        *start_cursor_ptr -= VGA_WIDTH;
+    }
+    while (*start_cursor_ptr + (int32_t)vis_len >= VGA_WIDTH * VGA_HEIGHT) {
+        terminal_auto_scroll();
+        *start_cursor_ptr -= VGA_WIDTH;
+    }
+
+    volatile uint16_t *vga = VGA_MEMORY;
+
+    /* Draw text: expand '\t' into visual tab spacing (no circle glyph) */
+    size_t vcol = 0;
+    for (uint32_t i = 0; i < len; i++) {
+        if (buf[i] == '\t') {
+            size_t tab_spaces = 4 - (vcol % 4);
+            if (tab_spaces == 0) tab_spaces = 4;
+            for (size_t s = 0; s < tab_spaces; s++) {
+                int32_t off = *start_cursor_ptr + (int32_t)(vcol + s);
+                if (off >= VGA_START_CURSOR_POSITION && off < VGA_WIDTH * VGA_HEIGHT) {
+                    vga[off] = vga_entry(' ', VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                }
+            }
+            vcol += tab_spaces;
+        } else {
+            int32_t off = *start_cursor_ptr + (int32_t)vcol;
+            if (off >= VGA_START_CURSOR_POSITION && off < VGA_WIDTH * VGA_HEIGHT) {
+                vga[off] = vga_entry((unsigned char)buf[i], VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+            }
+            vcol += 1;
+        }
+    }
+
+    /* Erase old tail with spaces */
+    for (size_t i = vcol; i < vis_prev; i++) {
+        int32_t off = *start_cursor_ptr + (int32_t)i;
+        if (off >= VGA_START_CURSOR_POSITION && off < VGA_WIDTH * VGA_HEIGHT) {
+            vga[off] = vga_entry(' ', VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+        }
+    }
+
+    /* Position cursor */
+    int32_t cur = *start_cursor_ptr + (int32_t)vis_cursor;
+    if (cur < VGA_START_CURSOR_POSITION) cur = VGA_START_CURSOR_POSITION;
+    if (cur >= VGA_WIDTH * VGA_HEIGHT) cur = VGA_WIDTH * VGA_HEIGHT - 1;
+    vga_set_cursor((uint16_t)cur);
+    vga_show_cursor();
+}
+
 static uint32_t syscall_builtin_read(uint32_t num,
                                      uint32_t argc,
                                      uint32_t *argv) {
     (void)num;
 
-    if (argc < 2u || argv == NULL) {
+    if (argc < 1u || argv == NULL) {
         return IPO_SYSCALL_ENOSYS;
     }
 
@@ -492,6 +578,14 @@ static uint32_t syscall_builtin_read(uint32_t num,
     serial_printf("[syscall_read] started: pid=%u max_len=%u (state=TEXT_INPUT)\n", pid, max_len);
 
     uint32_t len = 0u;
+    uint32_t cursor_pos = 0u;
+    int32_t start_origin = (int32_t)vga_get_cursor_position();
+    if (start_origin < VGA_START_CURSOR_POSITION || start_origin >= VGA_WIDTH * VGA_HEIGHT) {
+        start_origin = VGA_START_CURSOR_POSITION;
+        vga_set_cursor((uint16_t)start_origin);
+    }
+    int32_t start_cursor = start_origin;
+    buffer[0] = '\0';
 
     for (;;) {
         uint8_t scancode = keyboard_wait_scancode();
@@ -501,43 +595,213 @@ static uint32_t syscall_builtin_read(uint32_t num,
         }
 
         update_hot_key_state(scancode);
-        hot_key_handler(scancode);
+
+        /* 1. Dispatch application hotkeys (highest priority) and system hotkeys */
+        if (keyboard_dispatch_hotkey(scancode)) {
+            continue;
+        }
 
         if (scancode & 0x80u) {
             continue;
         }
 
-        char ch = get_char(scancode);
+        /* 2. Default Ctrl+C: cancel active line input */
+        if (keyboard_is_ctrl_pressed() && scancode == 0x2E) {
+            while (terminal_get_bottom_buffer_count() > 0) {
+                terminal_scroll_down();
+                start_cursor -= VGA_WIDTH;
+            }
+            size_t vis_len = syscall_read_visual_offset(buffer, len, len);
+            int32_t cur = start_cursor + (int32_t)vis_len;
+            if (cur < VGA_START_CURSOR_POSITION) cur = VGA_START_CURSOR_POSITION;
+            if (cur >= VGA_WIDTH * VGA_HEIGHT) cur = VGA_WIDTH * VGA_HEIGHT - 1;
+            vga_set_cursor((uint16_t)cur);
+            printf("^C\n");
+            /* Signal interrupt to kernel and return special code */
+            system_request_interrupt();
+            keyboard_set_app_input_mode(false);
+            system_set_state(proc ? SYSTEM_STATE_PROCESS_RUNNING : prev_state);
+            if (max_len == 0u && out_ptr != NULL) {
+                kfree(buffer);
+                *out_ptr = NULL;
+            }
+            return (uint32_t)(-2); /* IPO_SYSCALL_EINTR */
+        }
 
-        if (ch == 0x00) {
+        /* Navigation and Scrolling keys */
+        if (scancode == 0x49) { /* Page Up */
+            for (int i = 0; i < 5 && terminal_get_top_buffer_count() > 0; i++) {
+                terminal_scroll_up();
+                start_cursor += VGA_WIDTH;
+            }
+            continue;
+        }
+        if (scancode == 0x51) { /* Page Down */
+            for (int i = 0; i < 5 && terminal_get_bottom_buffer_count() > 0; i++) {
+                terminal_scroll_down();
+                start_cursor -= VGA_WIDTH;
+            }
+            continue;
+        }
+        if (scancode == 0x48) { /* Up arrow */
+            if (terminal_get_bottom_buffer_count() > 0) {
+                terminal_scroll_up();
+                start_cursor += VGA_WIDTH;
+                continue;
+            }
+            if (cursor_pos >= VGA_WIDTH) {
+                cursor_pos -= VGA_WIDTH;
+                syscall_read_render(&start_cursor, start_origin, buffer, len, len, cursor_pos);
+            } else if (cursor_pos > 0) {
+                cursor_pos = 0u;
+                syscall_read_render(&start_cursor, start_origin, buffer, len, len, cursor_pos);
+            }
+            continue;
+        }
+        if (scancode == 0x50) { /* Down arrow */
+            if (terminal_get_bottom_buffer_count() > 0) {
+                terminal_scroll_down();
+                start_cursor -= VGA_WIDTH;
+                continue;
+            }
+            if (cursor_pos + VGA_WIDTH <= len) {
+                cursor_pos += VGA_WIDTH;
+                syscall_read_render(&start_cursor, start_origin, buffer, len, len, cursor_pos);
+            } else if (cursor_pos < len) {
+                cursor_pos = len;
+                syscall_read_render(&start_cursor, start_origin, buffer, len, len, cursor_pos);
+            }
+            continue;
+        }
+        if (scancode == 0x4B) { /* Left arrow */
+            while (terminal_get_bottom_buffer_count() > 0) {
+                terminal_scroll_down();
+                start_cursor -= VGA_WIDTH;
+            }
+            if (cursor_pos > 0u) {
+                cursor_pos--;
+                syscall_read_render(&start_cursor, start_origin, buffer, len, len, cursor_pos);
+            }
+            continue;
+        }
+        if (scancode == 0x4D) { /* Right arrow */
+            while (terminal_get_bottom_buffer_count() > 0) {
+                terminal_scroll_down();
+                start_cursor -= VGA_WIDTH;
+            }
+            if (cursor_pos < len) {
+                cursor_pos++;
+                syscall_read_render(&start_cursor, start_origin, buffer, len, len, cursor_pos);
+            }
+            continue;
+        }
+        if (scancode == 0x47) { /* Home */
+            while (terminal_get_bottom_buffer_count() > 0) {
+                terminal_scroll_down();
+                start_cursor -= VGA_WIDTH;
+            }
+            cursor_pos = 0u;
+            syscall_read_render(&start_cursor, start_origin, buffer, len, len, cursor_pos);
+            continue;
+        }
+        if (scancode == 0x4F) { /* End */
+            while (terminal_get_bottom_buffer_count() > 0) {
+                terminal_scroll_down();
+                start_cursor -= VGA_WIDTH;
+            }
+            cursor_pos = len;
+            syscall_read_render(&start_cursor, start_origin, buffer, len, len, cursor_pos);
+            continue;
+        }
+        if (scancode == 0x53) { /* Delete */
+            while (terminal_get_bottom_buffer_count() > 0) {
+                terminal_scroll_down();
+                start_cursor -= VGA_WIDTH;
+            }
+            if (cursor_pos < len) {
+                uint32_t old_len = len;
+                memmove(&buffer[cursor_pos], &buffer[cursor_pos + 1], len - cursor_pos);
+                len--;
+                buffer[len] = '\0';
+                syscall_read_render(&start_cursor, start_origin, buffer, len, old_len, cursor_pos);
+            }
             continue;
         }
 
+        char ch = get_char(scancode);
+
         if (ch == '\r' || ch == '\n') {
+            while (terminal_get_bottom_buffer_count() > 0) {
+                terminal_scroll_down();
+                start_cursor -= VGA_WIDTH;
+            }
+            size_t vis_len = syscall_read_visual_offset(buffer, len, len);
+            int32_t cur = start_cursor + (int32_t)vis_len;
+            if (cur < VGA_START_CURSOR_POSITION) cur = VGA_START_CURSOR_POSITION;
+            if (cur >= VGA_WIDTH * VGA_HEIGHT) cur = VGA_WIDTH * VGA_HEIGHT - 1;
+            vga_set_cursor((uint16_t)cur);
             putchar('\n');
             buffer[len] = '\0';
             break;
         }
 
         if (ch == '\b' || ch == 127) {
-            if (len > 0u) {
+            while (terminal_get_bottom_buffer_count() > 0) {
+                terminal_scroll_down();
+                start_cursor -= VGA_WIDTH;
+            }
+            if (cursor_pos > 0u) {
+                uint32_t old_len = len;
+                memmove(&buffer[cursor_pos - 1], &buffer[cursor_pos], len - cursor_pos + 1);
+                cursor_pos--;
                 len--;
                 buffer[len] = '\0';
-                putchar('\b');
-                putchar(' ');
-                putchar('\b');
+                syscall_read_render(&start_cursor, start_origin, buffer, len, old_len, cursor_pos);
+            }
+            continue;
+        }
+
+        if (ch == '\t') {
+            while (terminal_get_bottom_buffer_count() > 0) {
+                terminal_scroll_down();
+                start_cursor -= VGA_WIDTH;
+            }
+            if (max_len == 0u) {
+                if (len + 1u >= capacity) {
+                    uint32_t new_cap = (capacity + 16u) * 2u;
+                    char *new_buf = (char *)kmalloc(new_cap);
+                    if (new_buf != NULL) {
+                        memcpy(new_buf, buffer, len + 1);
+                        kfree(buffer);
+                        buffer = new_buf;
+                        capacity = new_cap;
+                    }
+                }
+            } else {
+                if (len + 1u >= capacity) continue;
             }
 
+            uint32_t old_len = len;
+            memmove(&buffer[cursor_pos + 1], &buffer[cursor_pos], len - cursor_pos + 1);
+            buffer[cursor_pos] = '\t';
+            cursor_pos++;
+            len++;
+            buffer[len] = '\0';
+            syscall_read_render(&start_cursor, start_origin, buffer, len, old_len, cursor_pos);
             continue;
         }
 
         if (ch >= 32 && ch < 127) {
+            while (terminal_get_bottom_buffer_count() > 0) {
+                terminal_scroll_down();
+                start_cursor -= VGA_WIDTH;
+            }
             if (max_len == 0u) {
                 if (len + 1u >= capacity) {
                     uint32_t new_cap = capacity * 2u;
                     char *new_buf = (char *)kmalloc(new_cap);
                     if (new_buf != NULL) {
-                        memcpy(new_buf, buffer, len);
+                        memcpy(new_buf, buffer, len + 1);
                         kfree(buffer);
                         buffer = new_buf;
                         capacity = new_cap;
@@ -545,13 +809,17 @@ static uint32_t syscall_builtin_read(uint32_t num,
                 }
             } else {
                 if (len + 1u >= capacity) {
-                    break;
+                    continue;
                 }
             }
 
-            buffer[len++] = ch;
+            uint32_t old_len = len;
+            memmove(&buffer[cursor_pos + 1], &buffer[cursor_pos], len - cursor_pos + 1);
+            buffer[cursor_pos] = ch;
+            cursor_pos++;
+            len++;
             buffer[len] = '\0';
-            putchar(ch);
+            syscall_read_render(&start_cursor, start_origin, buffer, len, old_len, cursor_pos);
         }
     }
 
@@ -818,6 +1086,10 @@ void syscall_init(void) {
     ipo_register_syscall(
         IPO_SYSCALL_READ,
         syscall_builtin_read);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_TERMINAL_INPUT,
+        syscall_builtin_terminal_input);
 
     ipo_register_syscall(
         IPO_SYSCALL_ASYNC_START,

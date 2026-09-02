@@ -37,6 +37,8 @@
 
 #define IPO_SYSCALL_READ         0x1021u
 
+#define IPO_SYSCALL_TERMINAL_INPUT 0x1022u
+
 #define IPO_SYSCALL_ASYNC_START  0x1030u
 
 #define IPO_SYSCALL_ASYNC_STOP   0x1031u
@@ -59,9 +61,22 @@ void syscall_init(void);
 
 void ipo_register_syscall(uint32_t num, ipo_syscall_handler_t handler);
 
-uint32_t syscall_dispatch(uint32_t num, uint32_t argc, uint32_t *argv);
-
 int ipo_syscall(uint32_t num, uint32_t argc, uint32_t *argv);
+
+static inline int ipo_exec(const char *path, int argc, char **argv) {
+    uint32_t args[3];
+    args[0] = (uint32_t)(uintptr_t)path;
+    args[1] = (uint32_t)argc;
+    args[2] = (uint32_t)(uintptr_t)argv;
+    return ipo_syscall(IPO_SYSCALL_EXEC, 3u, args);
+}
+
+static inline int ipo_terminal_input(const char *text, int auto_execute) {
+    uint32_t args[2];
+    args[0] = (uint32_t)(uintptr_t)text;
+    args[1] = (uint32_t)auto_execute;
+    return ipo_syscall(IPO_SYSCALL_TERMINAL_INPUT, 2u, args);
+}
 
 static inline int ipo_var_set(const char *name, const void *value, uint32_t value_size) {
     uint32_t args[3];

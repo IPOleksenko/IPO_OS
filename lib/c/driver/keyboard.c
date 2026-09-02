@@ -73,10 +73,6 @@ void keyboard_flush_app_queue(void) {
 
 void keyboard_set_app_input_mode(bool enabled) {
     keyboard_app_input_mode = enabled;
-    if (enabled) {
-        keyboard_flush_hardware();
-        keyboard_flush_app_queue();
-    }
     serial_printf("[keyboard] app_input_mode = %d\n", enabled ? 1 : 0);
 }
 

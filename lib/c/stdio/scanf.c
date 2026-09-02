@@ -2,6 +2,7 @@
 #include <syscall.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <memory/kmalloc.h>
 
 static const char *skip_spaces(const char *text) {
@@ -9,6 +10,17 @@ static const char *skip_spaces(const char *text) {
         text++;
     }
     return text;
+}
+
+static bool has_more_conversions(const char *p) {
+    while (*p != '\0') {
+        if (*p == '%') {
+            if (*(p + 1) != '%') return true;
+            p++;
+        }
+        p++;
+    }
+    return false;
 }
 
 int scanf(const char *format, ...) {
@@ -30,6 +42,14 @@ int scanf(const char *format, ...) {
         2u,
         syscall_args
     );
+
+    if (bytes_read == (uint32_t)(-2u)) {
+        /* Ctrl+C — read was interrupted, propagate without printing anything */
+        if (input != NULL) {
+            kfree(input);
+        }
+        return -1;
+    }
 
     if (bytes_read < 0 || input == NULL) {
         serial_printf("[scanf] syscall read failed (error %d)\n", bytes_read);
@@ -65,7 +85,9 @@ int scanf(const char *format, ...) {
                 break;
             }
 
-            text = skip_spaces(text);
+            if (*pattern != 'c' && *pattern != '[') {
+                text = skip_spaces(text);
+            }
 
             if (*pattern == 'd') {
                 int sign = 1;
@@ -154,17 +176,32 @@ int scanf(const char *format, ...) {
             } else if (*pattern == 's') {
                 char *output = va_arg(args, char *);
                 size_t copied = 0u;
+                bool more = has_more_conversions(pattern + 1);
 
-                while (*text != '\0' &&
-                       *text != ' ' &&
-                       *text != '\t' &&
-                       *text != '\n' &&
-                       *text != '\r') {
-                    if (output != NULL) {
-                        output[copied] = *text;
+                if (more) {
+                    /* If more specifiers follow, read one token delimited by whitespace */
+                    while (*text != '\0' &&
+                           *text != ' ' &&
+                           *text != '\t' &&
+                           *text != '\n' &&
+                           *text != '\r') {
+                        if (output != NULL) {
+                            output[copied] = *text;
+                        }
+                        copied++;
+                        text++;
                     }
-                    copied++;
-                    text++;
+                } else {
+                    /* Last/only specifier: read entire line including words, spaces, tabs */
+                    while (*text != '\0' &&
+                           *text != '\n' &&
+                           *text != '\r') {
+                        if (output != NULL) {
+                            output[copied] = *text;
+                        }
+                        copied++;
+                        text++;
+                    }
                 }
 
                 if (copied == 0u) {
@@ -187,6 +224,38 @@ int scanf(const char *format, ...) {
                     assigned++;
                 }
                 text++;
+            } else if (*pattern == '[') {
+                pattern++;
+                bool invert = false;
+                if (*pattern == '^') {
+                    invert = true;
+                    pattern++;
+                }
+                char set_chars[256] = {0};
+                while (*pattern != ']' && *pattern != '\0') {
+                    set_chars[(unsigned char)*pattern] = 1;
+                    pattern++;
+                }
+                char *output = va_arg(args, char *);
+                size_t copied = 0u;
+                while (*text != '\0' && *text != '\n' && *text != '\r') {
+                    bool in_set = (set_chars[(unsigned char)*text] != 0);
+                    if (invert ? in_set : !in_set) {
+                        break;
+                    }
+                    if (output != NULL) {
+                        output[copied] = *text;
+                    }
+                    copied++;
+                    text++;
+                }
+                if (copied == 0u) {
+                    break;
+                }
+                if (output != NULL) {
+                    output[copied] = '\0';
+                    assigned++;
+                }
             } else {
                 break;
             }

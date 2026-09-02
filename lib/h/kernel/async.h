@@ -16,6 +16,10 @@ int async_start_task(
 
 int async_stop_task(const char *name);
 
+struct process;
+void async_stop_tasks_by_owner(struct process *owner);
+void async_stop_all_tasks(void);
+
 void async_scheduler_tick(void);
 
 #endif /* KERNEL_ASYNC_H */

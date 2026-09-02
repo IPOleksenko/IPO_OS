@@ -18,23 +18,24 @@
 #define SC_UNPRESS_ALT          0xB8
 
 #define NUM_KEYS 128
-static bool key_state[NUM_KEYS];
+extern bool key_state[NUM_KEYS];
 
-struct keyboard_struct {
-    const char* name;
-    const char* keymap;
-    const char* shift_keymap;
-};
+#define KBD_MOD_NONE   0x00
+#define KBD_MOD_CTRL   0x01
+#define KBD_MOD_SHIFT  0x02
+#define KBD_MOD_ALT    0x04
 
-extern struct keyboard_struct available_keyboards[];
-extern const size_t keyboards_count;
-extern size_t current_index;
+uint8_t keyboard_get_modifiers(void);
+bool keyboard_is_ctrl_pressed(void);
+bool keyboard_is_shift_pressed(void);
+bool keyboard_is_alt_pressed(void);
+void keyboard_clear_key_state(void);
+bool keyboard_dispatch_hotkey(uint8_t scancode);
+
 extern bool shift_mode;
-extern struct keyboard_struct* current_keyboard;
 
 char* get_keymap(void);
 char get_char(uint8_t scancode);
-void switch_to_next_keyboard(void);
 void hot_key_handler(uint8_t scancode);
 void update_hot_key_state(uint8_t scancode);
 

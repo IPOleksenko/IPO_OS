@@ -1,19 +1,34 @@
 #include <driver/input/keymap/keymap.h>
+#include <string.h>
 
-struct keyboard_struct available_keyboards[] = { 
-    { "English", keymap_english, keymap_english_shift }
-};
-const size_t keyboards_count = sizeof(available_keyboards)/sizeof(available_keyboards[0]);
-size_t current_index = 0;
-
+bool key_state[NUM_KEYS] = {false};
 bool shift_mode = false;
-struct keyboard_struct* current_keyboard = &available_keyboards[0];
+
+bool keyboard_is_ctrl_pressed(void) {
+    return key_state[SC_PRESS_CTRL];
+}
+
+bool keyboard_is_shift_pressed(void) {
+    return (key_state[SC_PRESS_LEFT_SHIFT] || key_state[SC_PRESS_RIGHT_SHIFT]);
+}
+
+bool keyboard_is_alt_pressed(void) {
+    return key_state[SC_PRESS_ALT];
+}
+
+uint8_t keyboard_get_modifiers(void) {
+    uint8_t mod = KBD_MOD_NONE;
+    if (keyboard_is_ctrl_pressed())  mod |= KBD_MOD_CTRL;
+    if (keyboard_is_shift_pressed()) mod |= KBD_MOD_SHIFT;
+    if (keyboard_is_alt_pressed())   mod |= KBD_MOD_ALT;
+    return mod;
+}
 
 char* get_keymap(void) {
     if (shift_mode) {
-        return (char*)current_keyboard->shift_keymap;
+        return (char*)keymap_english_shift;
     } else {
-        return (char*)current_keyboard->keymap;
+        return (char*)keymap_english;
     }
 }
 
@@ -25,49 +40,31 @@ char get_char(uint8_t scancode) {
     return keymap[scancode];
 }
 
-void switch_to_next_keyboard(void) {
-    current_index++;
-    if (current_index >= keyboards_count) {
-        current_index = 0;
-    }
-    current_keyboard = &available_keyboards[current_index];
+void hot_key_handler(uint8_t scancode) {
+    (void)scancode;
+    shift_mode = keyboard_is_shift_pressed();
 }
 
+bool keyboard_dispatch_hotkey(uint8_t scancode) {
+    (void)scancode;
+    return false;
+}
 
-void hot_key_handler(uint8_t scancode) {
-    shift_mode = (key_state[SC_PRESS_LEFT_SHIFT] || key_state[SC_PRESS_RIGHT_SHIFT]);
-
-    if (key_state[SC_PRESS_CTRL] && (key_state[SC_PRESS_LEFT_SHIFT] || key_state[SC_PRESS_RIGHT_SHIFT])) {
-        switch_to_next_keyboard();
+void keyboard_clear_key_state(void) {
+    for (size_t i = 0; i < NUM_KEYS; i++) {
+        key_state[i] = false;
     }
+    shift_mode = false;
 }
 
 void update_hot_key_state(uint8_t scancode) {
-    if (scancode == SC_PRESS_LEFT_SHIFT) {
-        key_state[SC_PRESS_LEFT_SHIFT] = true;
+    if (scancode == 0x00u) return;
+
+    if (scancode < (uint8_t)NUM_KEYS) {
+        key_state[scancode] = true;
+    } else if (scancode >= 0x80u && (scancode & 0x7Fu) < (uint8_t)NUM_KEYS) {
+        key_state[scancode & 0x7Fu] = false;
     }
-    if (scancode == SC_UNPRESS_LEFT_SHIFT) {
-        key_state[SC_PRESS_LEFT_SHIFT] = false;
-    }
-    
-    if (scancode == SC_PRESS_RIGHT_SHIFT) {
-        key_state[SC_PRESS_RIGHT_SHIFT] = true;
-    }
-    if (scancode == SC_UNPRESS_RIGHT_SHIFT) {
-        key_state[SC_PRESS_RIGHT_SHIFT] = false;
-    }
-    
-    if (scancode == SC_PRESS_CTRL) {
-        key_state[SC_PRESS_CTRL] = true;
-    }
-    if (scancode == SC_UNPRESS_CTRL) {
-        key_state[SC_PRESS_CTRL] = false;
-    }
-    
-    if (scancode == SC_PRESS_ALT) {
-        key_state[SC_PRESS_ALT] = true;
-    }
-    if (scancode == SC_UNPRESS_ALT) {
-        key_state[SC_PRESS_ALT] = false;
-    }
+
+    shift_mode = keyboard_is_shift_pressed();
 }
