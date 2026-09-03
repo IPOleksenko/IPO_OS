@@ -79,6 +79,16 @@ def main():
         print(f"Uploading {app.relative_to(project_root)} -> {target}")
         run_disk_editor(args, ["-i", str(image), "-s", str(args.start_lba), "put", str(app), target])
 
+    # Upload font database if present
+    font_file = project_root / "build" / "system" / "fonts.bin"
+    if font_file.exists():
+        try:
+            run_disk_editor(args, ["-i", str(image), "-s", str(args.start_lba), "mkdir", "/system"])
+        except SystemExit:
+            pass
+        print(f"Uploading {font_file.relative_to(project_root)} -> /system/fonts.bin")
+        run_disk_editor(args, ["-i", str(image), "-s", str(args.start_lba), "put", str(font_file), "/system/fonts.bin"])
+
     print(f"Done. {len(matches)} app(s) loaded into /app on {image}")
     return 0
 

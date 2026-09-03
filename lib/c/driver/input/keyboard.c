@@ -1,5 +1,4 @@
-#include <driver/keyboard.h>
-
+#include <driver/input/keyboard.h>
 #include <vga.h>
 #include <ioport.h>
 #include <driver/input/keymap/keymap.h>

@@ -53,6 +53,17 @@
 
 #define IPO_SYSCALL_VAR_DELETE   0x1044u
 
+#define IPO_SYSCALL_KEYMAP_SET      0x1050u
+#define IPO_SYSCALL_KEYMAP_GET      0x1051u
+#define IPO_SYSCALL_FONT_LOAD       0x1052u
+#define IPO_SYSCALL_KEYMAP_DISABLE  0x1053u
+#define IPO_SYSCALL_KEYMAP_ENABLE   0x1054u
+#define IPO_SYSCALL_KEYMAP_REMOVE   0x1055u
+
+#define IPO_SYSCALL_DRIVER_REGISTER   0x1060u
+#define IPO_SYSCALL_DRIVER_UNREGISTER 0x1061u
+#define IPO_SYSCALL_DRIVER_LIST       0x1062u
+
 #define IPO_SYSCALL_EXIT         0xFFFFu
 
 typedef uint32_t (*ipo_syscall_handler_t)(uint32_t, uint32_t, uint32_t *);
@@ -152,5 +163,80 @@ static inline int ipo_var_get_str(const char *name, char *buffer, uint32_t buffe
 
 #define IPO_VAR_SET_STR(name, value) ipo_var_set_str((name), (value))
 #define IPO_VAR_GET_STR(name, buffer, buffer_size) ipo_var_get_str((name), (buffer), (buffer_size))
+
+static inline int ipo_keymap_set_with_font(const char *name,
+                                           const void *entries,
+                                           uint32_t count,
+                                           const void *glyphs,
+                                           uint32_t glyph_count) {
+    uint32_t args[5];
+    args[0] = (uint32_t)(uintptr_t)name;
+    args[1] = (uint32_t)(uintptr_t)entries;
+    args[2] = count;
+    args[3] = (uint32_t)(uintptr_t)glyphs;
+    args[4] = glyph_count;
+    return ipo_syscall(IPO_SYSCALL_KEYMAP_SET, 5u, args);
+}
+
+static inline int ipo_keymap_set(const char *name, const void *entries, uint32_t count) {
+    return ipo_keymap_set_with_font(name, entries, count, NULL, 0u);
+}
+
+static inline int ipo_open(const char *path) {
+    uint32_t args[1];
+    args[0] = (uint32_t)(uintptr_t)path;
+    return ipo_syscall(IPO_SYSCALL_FS_OPEN, 1u, args);
+}
+
+static inline int ipo_read(int fd, void *buf, uint32_t offset, uint32_t count) {
+    uint32_t args[4];
+    args[0] = (uint32_t)fd;
+    args[1] = (uint32_t)(uintptr_t)buf;
+    args[2] = offset;
+    args[3] = count;
+    return ipo_syscall(IPO_SYSCALL_FS_READ, 4u, args);
+}
+
+static inline int ipo_font_load_cyrillic(const char *path) {
+    if (path != NULL) {
+        uint32_t args[1];
+        args[0] = (uint32_t)(uintptr_t)path;
+        return ipo_syscall(IPO_SYSCALL_FONT_LOAD, 1u, args);
+    }
+    return ipo_syscall(IPO_SYSCALL_FONT_LOAD, 0u, NULL);
+}
+
+static inline int ipo_keymap_disable(const char *name) {
+    if (name == NULL) return -1;
+    uint32_t args[1];
+    args[0] = (uint32_t)(uintptr_t)name;
+    return ipo_syscall(IPO_SYSCALL_KEYMAP_DISABLE, 1u, args);
+}
+
+static inline int ipo_keymap_enable(const char *name) {
+    if (name == NULL) return -1;
+    uint32_t args[1];
+    args[0] = (uint32_t)(uintptr_t)name;
+    return ipo_syscall(IPO_SYSCALL_KEYMAP_ENABLE, 1u, args);
+}
+
+static inline int ipo_keymap_remove(const char *name) {
+    if (name == NULL) return -1;
+    uint32_t args[1];
+    args[0] = (uint32_t)(uintptr_t)name;
+    return ipo_syscall(IPO_SYSCALL_KEYMAP_REMOVE, 1u, args);
+}
+
+static inline int ipo_driver_register(void *drv) {
+    uint32_t args[1];
+    args[0] = (uint32_t)(uintptr_t)drv;
+    return ipo_syscall(IPO_SYSCALL_DRIVER_REGISTER, 1u, args);
+}
+
+static inline int ipo_driver_unregister(const char *name) {
+    uint32_t args[1];
+    args[0] = (uint32_t)(uintptr_t)name;
+    return ipo_syscall(IPO_SYSCALL_DRIVER_UNREGISTER, 1u, args);
+}
 
 #endif

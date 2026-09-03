@@ -246,3 +246,166 @@ bool ata_write_sectors_lba28(uint32_t lba, uint8_t count, const void *buf) {
 
     return true;
 }
+
+bool ata_read_sectors_lba48(uint64_t lba, uint16_t count, void *buf) {
+    if (count == 0 || buf == NULL) return false;
+    if (ata_device_count == 0) return false;
+
+    uint16_t base = ATA_PRIMARY_BASE;
+    uint8_t drive_bit = (ata_device_count > 1) ? 0x10 : 0x00;
+
+    outb(base + ATA_REG_HDDEVSEL, 0x40 | drive_bit);
+    ata_io_wait();
+
+    /* Write high bytes first */
+    outb(base + ATA_REG_SECCOUNT0, (uint8_t)((count >> 8) & 0xFF));
+    outb(base + ATA_REG_LBA0, (uint8_t)((lba >> 24) & 0xFF));
+    outb(base + ATA_REG_LBA1, (uint8_t)((lba >> 32) & 0xFF));
+    outb(base + ATA_REG_LBA2, (uint8_t)((lba >> 40) & 0xFF));
+
+    /* Write low bytes second */
+    outb(base + ATA_REG_SECCOUNT0, (uint8_t)(count & 0xFF));
+    outb(base + ATA_REG_LBA0, (uint8_t)(lba & 0xFF));
+    outb(base + ATA_REG_LBA1, (uint8_t)((lba >> 8) & 0xFF));
+    outb(base + ATA_REG_LBA2, (uint8_t)((lba >> 16) & 0xFF));
+
+    if (!ata_wait_bsy_clear(base)) return false;
+
+    /* READ SECTORS EXT */
+    outb(base + ATA_REG_COMMAND, 0x24);
+
+    uint16_t *wptr = (uint16_t *)buf;
+    for (int s = 0; s < count; s++) {
+        if (!ata_wait_drq(base)) return false;
+        for (int i = 0; i < 256; i++) {
+            wptr[i] = inw(base + ATA_REG_DATA);
+        }
+        wptr += 256;
+    }
+
+    return true;
+}
+
+bool ata_write_sectors_lba48(uint64_t lba, uint16_t count, const void *buf) {
+    if (count == 0 || buf == NULL) return false;
+    if (ata_device_count == 0) return false;
+
+    uint16_t base = ATA_PRIMARY_BASE;
+    uint8_t drive_bit = (ata_device_count > 1) ? 0x10 : 0x00;
+
+    outb(base + ATA_REG_HDDEVSEL, 0x40 | drive_bit);
+    ata_io_wait();
+
+    /* Write high bytes first */
+    outb(base + ATA_REG_SECCOUNT0, (uint8_t)((count >> 8) & 0xFF));
+    outb(base + ATA_REG_LBA0, (uint8_t)((lba >> 24) & 0xFF));
+    outb(base + ATA_REG_LBA1, (uint8_t)((lba >> 32) & 0xFF));
+    outb(base + ATA_REG_LBA2, (uint8_t)((lba >> 40) & 0xFF));
+
+    /* Write low bytes second */
+    outb(base + ATA_REG_SECCOUNT0, (uint8_t)(count & 0xFF));
+    outb(base + ATA_REG_LBA0, (uint8_t)(lba & 0xFF));
+    outb(base + ATA_REG_LBA1, (uint8_t)((lba >> 8) & 0xFF));
+    outb(base + ATA_REG_LBA2, (uint8_t)((lba >> 16) & 0xFF));
+
+    if (!ata_wait_bsy_clear(base)) return false;
+
+    /* WRITE SECTORS EXT */
+    outb(base + ATA_REG_COMMAND, 0x34);
+
+    const uint16_t *wptr = (const uint16_t *)buf;
+    for (int s = 0; s < count; s++) {
+        if (!ata_wait_drq(base)) {
+            int retry = 0;
+            while (retry < 5 && !ata_wait_drq(base)) { ata_io_wait(); retry++; }
+            if (retry == 5) return false;
+        }
+        for (int i = 0; i < 256; i++) {
+            outw(base + ATA_REG_DATA, wptr[i]);
+        }
+        wptr += 256;
+        ata_io_wait();
+    }
+
+    /* FLUSH CACHE EXT */
+    outb(base + ATA_REG_COMMAND, 0xEA);
+    ata_io_wait();
+    if (!ata_wait_bsy_clear(base)) return false;
+
+    return true;
+}
+
+bool ata_read_sectors(uint64_t lba, uint16_t count, void *buf) {
+    if (lba + count < 0x10000000ULL && count <= 256) {
+        return ata_read_sectors_lba28((uint32_t)lba, (uint8_t)count, buf);
+    }
+    return ata_read_sectors_lba48(lba, count, buf);
+}
+
+bool ata_write_sectors(uint64_t lba, uint16_t count, const void *buf) {
+    if (lba + count < 0x10000000ULL && count <= 256) {
+        return ata_write_sectors_lba28((uint32_t)lba, (uint8_t)count, buf);
+    }
+    return ata_write_sectors_lba48(lba, count, buf);
+}
+
+uint64_t ata_get_pool_capacity(void) {
+    uint8_t start_dev = (ata_device_count > 1) ? 1 : 0;
+    uint64_t total = 0;
+    for (uint8_t d = start_dev; d < ata_device_count; d++) {
+        if (ata_devices[d].present) {
+            total += ata_devices[d].capacity_sectors;
+        }
+    }
+    return total;
+}
+
+bool ata_pool_read_sectors(uint64_t pool_lba, uint16_t count, void *buf) {
+    if (count == 0 || buf == NULL) return false;
+    uint8_t start_dev = (ata_device_count > 1) ? 1 : 0;
+    uint64_t curr_lba = pool_lba;
+    uint8_t *curr_buf = (uint8_t *)buf;
+    uint16_t remaining = count;
+
+    for (uint8_t d = start_dev; d < ata_device_count && remaining > 0; d++) {
+        ata_device_t *dev = &ata_devices[d];
+        if (!dev->present || dev->capacity_sectors == 0) continue;
+
+        if (curr_lba < dev->capacity_sectors) {
+            uint64_t dev_avail = dev->capacity_sectors - curr_lba;
+            uint16_t chunk = (remaining < dev_avail) ? remaining : (uint16_t)dev_avail;
+            if (!ata_read_sectors(curr_lba, chunk, curr_buf)) return false;
+            curr_lba = 0;
+            curr_buf += (chunk * 512u);
+            remaining -= chunk;
+        } else {
+            curr_lba -= dev->capacity_sectors;
+        }
+    }
+    return (remaining == 0);
+}
+
+bool ata_pool_write_sectors(uint64_t pool_lba, uint16_t count, const void *buf) {
+    if (count == 0 || buf == NULL) return false;
+    uint8_t start_dev = (ata_device_count > 1) ? 1 : 0;
+    uint64_t curr_lba = pool_lba;
+    const uint8_t *curr_buf = (const uint8_t *)buf;
+    uint16_t remaining = count;
+
+    for (uint8_t d = start_dev; d < ata_device_count && remaining > 0; d++) {
+        ata_device_t *dev = &ata_devices[d];
+        if (!dev->present || dev->capacity_sectors == 0) continue;
+
+        if (curr_lba < dev->capacity_sectors) {
+            uint64_t dev_avail = dev->capacity_sectors - curr_lba;
+            uint16_t chunk = (remaining < dev_avail) ? remaining : (uint16_t)dev_avail;
+            if (!ata_write_sectors(curr_lba, chunk, curr_buf)) return false;
+            curr_lba = 0;
+            curr_buf += (chunk * 512u);
+            remaining -= chunk;
+        } else {
+            curr_lba -= dev->capacity_sectors;
+        }
+    }
+    return (remaining == 0);
+}

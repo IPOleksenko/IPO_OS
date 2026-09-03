@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 enum vga_color {
     VGA_COLOR_BLACK = 0,
@@ -52,5 +53,17 @@ uint16_t vga_get_cursor_position(void);
 uint16_t vga_increment_cursor_position(void);
 
 uint16_t vga_decrement_cursor_position(void);
+
+typedef struct {
+    uint32_t codepoint;    /* Unicode codepoint (e.g. 0x0410, 0x4E2D, 0x03B1) */
+    uint8_t  bitmap[16];   /* 8x16 1-bit font bitmap */
+} dynamic_glyph_def_t;
+
+void vga_load_font(uint8_t start_code, uint32_t count, const uint8_t *glyphs);
+int vga_load_cyrillic_font(const char *path);
+void vga_font_clear_registry(void);
+int vga_font_register_glyph(uint32_t codepoint, const uint8_t *bitmap);
+void vga_font_apply_glyphs(const dynamic_glyph_def_t *glyphs, uint32_t count);
+uint8_t utf8_to_vga_glyph(const char *str, size_t str_len, size_t *out_bytes);
 
 #endif

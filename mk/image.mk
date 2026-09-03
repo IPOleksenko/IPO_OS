@@ -7,11 +7,11 @@ $(OS_IMAGE): $(BOOT_BIN) $(KERNEL_BIN)
 	padded=$$(( ($$size + 511) / 512 * 512 )); \
 	truncate -s $$padded $@
 
-# Create a 10MB IMG disk (raw format)
+# Create a 32MB IMG disk (raw format)
 build/disk.img:
 	mkdir -p build
-	dd if=/dev/zero of=$@ bs=1M count=10
-	@echo "Created 10MB virtual disk: $@"
+	dd if=/dev/zero of=$@ bs=1M count=32
+	@echo "Created 32MB virtual disk: $@"
 
 # Create a 5MB ISO disk (for testing)
 build/disk.iso:
@@ -19,8 +19,11 @@ build/disk.iso:
 	dd if=/dev/zero of=$@ bs=1M count=5
 	@echo "Created 5MB ISO disk: $@"
 
+build/system/fonts.bin: tools/build_font_db.py
+	python3 tools/build_font_db.py
+
 .PHONY: disks
-disks: build/disk.img build/disk.iso
+disks: build/disk.img build/disk.iso build/system/fonts.bin
 
 .PHONY: clean-disks
 clean-disks:

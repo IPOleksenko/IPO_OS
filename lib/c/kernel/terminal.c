@@ -1,8 +1,10 @@
 #include <kernel/terminal.h>
 
 #include <vga.h>
-#include <driver/keyboard.h>
+#include <driver/input/keyboard.h>
 #include <driver/input/keymap/keymap.h>
+#include <driver/input/keymap/dynamic_keymap.h>
+#include <kernel/driver.h>
 #include <file_system/ipo_fs.h>
 #include <kernel/process.h>
 #include <memory/kmalloc.h>
@@ -10,6 +12,7 @@
 #include <kernel/async.h>
 #include <system/state.h>
 #include <driver/sound.h>
+#include <driver/ata/ata.h>
 #include <ioport.h>
 
 #include <stdint.h>
@@ -141,6 +144,100 @@ void print_header(void) {
     for (uint8_t i = 0; i < created_by_length; i++) {
         vga[VGA_WIDTH - created_by_length + i] = vga_entry(created_by[i], VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
     }
+
+    terminal_render_language_bar();
+}
+
+static uint32_t lang_bar_offset = 0;
+static uint32_t lang_bar_last_tick_ms = 0;
+
+static void render_bar_string_to_vga(uint16_t row_start, const char *str, size_t str_len) {
+    volatile uint16_t *vga = VGA_MEMORY;
+    size_t col = 0;
+    size_t i = 0;
+    while (i < str_len && col < (size_t)VGA_WIDTH) {
+        size_t bytes = 1;
+        uint8_t glyph = utf8_to_vga_glyph(&str[i], str_len - i, &bytes);
+        vga[row_start + col] = vga_entry(glyph, VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+        col++;
+        i += bytes;
+    }
+    while (col < (size_t)VGA_WIDTH) {
+        vga[row_start + col] = vga_entry(' ', VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+        col++;
+    }
+}
+
+void terminal_render_language_bar(void) {
+    uint32_t count = dynamic_keymap_get_enabled_count();
+    uint16_t row1_start = VGA_WIDTH;
+
+    /* Display language bar only if there are more than 1 enabled layouts in the system */
+    if (count <= 1) {
+        volatile uint16_t *vga = VGA_MEMORY;
+        for (size_t col = 0; col < (size_t)VGA_WIDTH; col++) {
+            vga[row1_start + col] = vga_entry(' ', VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+        }
+        return;
+    }
+
+    const char *lang_name = dynamic_keymap_get_name();
+    if (lang_name == NULL) {
+        lang_name = "English (US)";
+    }
+    size_t len = strlen(lang_name);
+
+    if (len + 12 <= (size_t)VGA_WIDTH) {
+        /* Fits in 80 columns: display formatted cleanly */
+        char bar_text[128];
+        int prefix_len = snprintf(bar_text, sizeof(bar_text), "Keyboard Layout: %s", lang_name);
+        if (prefix_len < 0) prefix_len = 0;
+        render_bar_string_to_vga(row1_start, bar_text, (size_t)prefix_len);
+    } else {
+        /* Longer than 80 characters: infinite circular marquee! */
+        const char sep[] = "   ***   ";
+        size_t sep_len = strlen(sep);
+        size_t loop_len = len + sep_len;
+
+        char marquee_buf[128];
+        size_t col = 0;
+        for (col = 0; col < (size_t)VGA_WIDTH; col++) {
+            size_t idx = (lang_bar_offset + col) % loop_len;
+            if (idx < len) {
+                marquee_buf[col] = lang_name[idx];
+            } else {
+                marquee_buf[col] = sep[idx - len];
+            }
+        }
+        marquee_buf[col] = '\0';
+        render_bar_string_to_vga(row1_start, marquee_buf, col);
+    }
+}
+
+void terminal_language_bar_tick(void) {
+    if (dynamic_keymap_get_enabled_count() <= 1) {
+        return;
+    }
+
+    const char *lang_name = dynamic_keymap_get_name();
+    if (lang_name == NULL) return;
+    size_t len = strlen(lang_name);
+
+    if (len + 12 <= (size_t)VGA_WIDTH) {
+        return;
+    }
+
+    uint32_t now = timer_millis();
+    if (now - lang_bar_last_tick_ms < 180u) {
+        return;
+    }
+    lang_bar_last_tick_ms = now;
+
+    const char sep[] = "   ***   ";
+    size_t loop_len = len + strlen(sep);
+    lang_bar_offset = (lang_bar_offset + 1u) % (uint32_t)loop_len;
+
+    terminal_render_language_bar();
 }
 
 /* Read a line from VGA screen */
@@ -168,6 +265,10 @@ static size_t previous_rendered_vis_len = 0;
 static size_t terminal_visual_offset(size_t index) {
     size_t vcol = 0;
     for (size_t i = 0; i < index && i < input_len; i++) {
+        unsigned char uc = (unsigned char)input_buf[i];
+        if ((uc & 0xC0) == 0x80) {
+            continue; /* Skip UTF-8 continuation bytes */
+        }
         if (input_buf[i] == '\t') {
             size_t tab_spaces = 4 - (vcol % 4);
             if (tab_spaces == 0) tab_spaces = 4;
@@ -213,9 +314,10 @@ static void render_input_line(size_t previous_len) {
         vga[p_cur] = vga_entry(' ', PROMPT_FG, VGA_COLOR_BLACK);
     }
 
-    /* Draw text: expand '\t' into visual tab spacing (no circle glyph) */
+    /* Draw text */
     size_t vcol = 0;
-    for (size_t i = 0; i < input_len; i++) {
+    size_t i = 0;
+    while (i < input_len) {
         if (input_buf[i] == '\t') {
             size_t tab_spaces = 4 - (vcol % 4);
             if (tab_spaces == 0) tab_spaces = 4;
@@ -226,12 +328,18 @@ static void render_input_line(size_t previous_len) {
                 }
             }
             vcol += tab_spaces;
+            i++;
         } else {
+            unsigned char b1 = (unsigned char)input_buf[i];
+            size_t bytes = 1;
+            uint8_t glyph = utf8_to_vga_glyph(&input_buf[i], input_len - i, &bytes);
+
             int32_t offset = input_start_cursor + (int32_t)vcol;
             if (offset >= VGA_START_CURSOR_POSITION && offset < VGA_WIDTH * VGA_HEIGHT) {
-                vga[offset] = vga_entry((unsigned char)input_buf[i], INPUT_FG, VGA_COLOR_BLACK);
+                vga[offset] = vga_entry(glyph, INPUT_FG, VGA_COLOR_BLACK);
             }
             vcol += 1;
+            i += bytes;
         }
     }
 
@@ -630,7 +738,7 @@ static void builtin_help(void) {
     printf("    mv <src> <dst> | move <src> <dst> | rename <src> <dst>\n");
     printf("      - Move or rename a file or directory.\n");
     printf("    stat <path...>\n");
-    printf("      - Display inode number, type, size, protection and links count.\n");
+    printf("      - Display inode number, type, size, protection and extents info.\n");
     printf("\n");
     printf("  [Process & Task Management]\n");
     printf("    ps | tasks | procs\n");
@@ -644,6 +752,10 @@ static void builtin_help(void) {
     printf("    echo [text] [> file | >> file]\n");
     printf("      - Print text to stdout, overwrite to file (>), or append (>>).\n");
     printf("\n");
+    printf("  [External Drivers Subsystem]\n");
+    printf("    driver | drivers | lsmod\n");
+    printf("      - List registered external device drivers and active hooks.\n");
+    printf("\n");
     printf("  [System & Power Controls]\n");
     printf("    clear | cls\n");
     printf("      - Clear terminal screen and reset VGA scrollback buffer.\n");
@@ -656,27 +768,39 @@ static void builtin_help(void) {
     printf("\n");
     printf("  [Disk & Memory Info]\n");
     printf("    df | diskinfo\n");
-    printf("      - Show filesystem space: total, used, free blocks, inodes, FS metadata.\n");
+    printf("      - Show storage pool capacity: total, used, free blocks, inodes, drives.\n");
     printf("    meminfo | free\n");
     printf("      - Show kernel heap stats: total, used, free, block count, overhead.\n");
+    printf("    keymap [list | on <id/name> | off <id/name> | rm <id/name>] | layout\n");
+    printf("      - Manage keyboard layouts: list registered layouts, enable (on), disable (off), or remove (rm).\n");
     printf("\n");
     printf("2. APPLICATION EXECUTION (Launch Methods & Resolution)\n");
-    printf("  IPO_OS executes Position Independent Executables (.bin) via four methods:\n");
+    printf("  IPO_OS executes Position Independent Executables (.bin) via three methods:\n");
     printf("  [Method 1: Direct Name (Automatic PATH Resolution)]\n");
-    printf("    Syntax: <command> [arguments...]\n");
+    printf("    Syntax: <command> [arguments...] [&]\n");
     printf("    - Searches current directory, /app directory, then root directory.\n");
     printf("  [Method 2: Explicit Relative or Absolute Path]\n");
-    printf("    Syntax: <path/to/binary> [arguments...]\n");
+    printf("    Syntax: <path/to/binary> [arguments...] [&]\n");
     printf("    - Resolves absolute paths starting with '/' or relative paths.\n");
     printf("  [Method 3: Batch Startup Script]\n");
     printf("    - Reads commands line-by-line from '/autorun' during kernel boot.\n");
     printf("\n");
     printf("3. TERMINAL SHORTCUTS & KEYBOARD CONTROLS\n");
+    printf("    - Ctrl + Left Shift   : Cycle active keyboard layout backwards (previous).\n");
+    printf("    - Ctrl + Right Shift  : Cycle active keyboard layout forwards (next).\n");
+    printf("    - Alt + Left/Right Shift: Cycle active keyboard layout backwards / forwards.\n");
     printf("    - Ctrl + C            : Instant cancel/abort of active task or queue.\n");
-    printf("    - Page Up / Page Down : Scroll terminal output 5 lines up / down.\n");
-    printf("    - Up / Down Arrows    : Command history navigation or line scroll.\n");
+    printf("    - Page Up / Page Down : Scroll terminal output up / down.\n");
+    printf("    - Up / Down Arrows    : Command history navigation.\n");
     printf("    - Left / Right Arrows : Move cursor across current line.\n");
     printf("    - Home / End          : Move cursor to beginning / end of line.\n");
+    printf("\n");
+    printf("4. SYSTEM STATUS & LANGUAGE BAR\n");
+    printf("  [Top Language Bar Operation]\n");
+    printf("    - Status bar displays currently active keyboard layout below system header.\n");
+    printf("    - Automatically hidden when only one layout is enabled in the system.\n");
+    printf("    - Automatically visible when two or more layouts are enabled.\n");
+    printf("    - Updates dynamically in real time upon switching or enabling/disabling layouts.\n");
     printf("============================================================================\n");
 }
 
@@ -1167,18 +1291,81 @@ static void builtin_df(void) {
     uint32_t total_kb = (blk_total * bs) / 1024;
     uint32_t used_pct = blk_total ? (blk_used * 100u) / blk_total : 0;
 
-    printf("Filesystem : IPO_FS\n");
-    printf("Block size : %u bytes\n", bs);
-    printf("Blocks     : %u total, %u used, %u free\n",
+    uint64_t pool_cap = ata_get_pool_capacity();
+    uint8_t dev_cnt = ata_get_device_count();
+
+    printf("Storage Pool : %u physical ATA drive(s), %u sectors pool capacity\n",
+           dev_cnt, (uint32_t)pool_cap);
+    printf("Filesystem   : IPO_FS (64-bit Linked Extents, Unlimited Architecture)\n");
+    printf("Block size   : %u bytes\n", bs);
+    printf("Blocks       : %u total, %u used, %u free\n",
            blk_total, blk_used, blk_free);
-    printf("Space      : %u KB total, %u KB used, %u KB free  (%u%% used)\n",
+    printf("Space        : %u KB total, %u KB used, %u KB free  (%u%% used)\n",
            total_kb, used_kb, free_kb, used_pct);
-    printf("Inodes     : %u total, %u used, %u free\n",
+    printf("Inodes       : %u total, %u used, %u free\n",
            ino_total, ino_used,
            (ino_total >= ino_used) ? ino_total - ino_used : 0);
-    printf("FS size    : %u blocks (%u KB)\n",
-           sb.fs_size_blocks, (sb.fs_size_blocks * bs) / 1024);
-    printf("Start LBA  : %u\n", fs_start_lba);
+    printf("Partition    : Start LBA %u, Total %u blocks (%u KB)\n",
+           (uint32_t)fs_start_lba, (uint32_t)sb.fs_size_blocks, (uint32_t)((sb.fs_size_blocks * bs) / 1024));
+}
+
+static void builtin_driver(int argc, char **argv) {
+    (void)argc; (void)argv;
+    driver_print_list();
+}
+
+static void builtin_keymap(int argc, char **argv) {
+    if (argc < 2 || strcmp(argv[1], "list") == 0 || strcmp(argv[1], "дшые") == 0) {
+        uint32_t total = dynamic_keymap_get_count();
+        uint32_t active = dynamic_keymap_get_active_index();
+        printf("=== Registered Keyboard Layouts (%u) ===\n", total);
+        for (uint32_t i = 0; i < total; i++) {
+            const char *name = dynamic_keymap_get_slot_name(i);
+            bool en = dynamic_keymap_is_slot_enabled(i);
+            bool is_act = (i == active);
+            printf("  [%u] %s [%s]%s\n",
+                   i,
+                   name ? name : "Unknown",
+                   en ? "enabled" : "disabled",
+                   is_act ? " (active)" : "");
+        }
+        return;
+    }
+
+    const char *action = argv[1];
+    if (argc < 3) {
+        printf("Usage: keymap [list | on <id/name> | off <id/name> | rm <id/name>]\n");
+        return;
+    }
+
+    const char *target = argv[2];
+    if (strcmp(action, "off") == 0 || strcmp(action, "disable") == 0 ||
+        strcmp(action, "щаа") == 0 || strcmp(action, "выкл") == 0 || strcmp(action, "откл") == 0) {
+        int res = dynamic_keymap_disable(target);
+        if (res == 0) {
+            printf("Layout '%s' disabled.\n", target);
+        } else {
+            printf("Failed to disable layout '%s' (not found).\n", target);
+        }
+    } else if (strcmp(action, "on") == 0 || strcmp(action, "enable") == 0 ||
+               strcmp(action, "щт") == 0 || strcmp(action, "вкл") == 0) {
+        int res = dynamic_keymap_enable(target);
+        if (res == 0) {
+            printf("Layout '%s' enabled.\n", target);
+        } else {
+            printf("Failed to enable layout '%s' (not found).\n", target);
+        }
+    } else if (strcmp(action, "rm") == 0 || strcmp(action, "del") == 0 || strcmp(action, "remove") == 0 ||
+               strcmp(action, "кь") == 0 || strcmp(action, "уд") == 0) {
+        int res = dynamic_keymap_remove(target);
+        if (res == 0) {
+            printf("Layout '%s' removed.\n", target);
+        } else {
+            printf("Failed to remove layout '%s' (not found or base layout).\n", target);
+        }
+    } else {
+        printf("Unknown action '%s'. Usage: keymap [list | on | off | rm] <target>\n", action);
+    }
 }
 
 static void builtin_meminfo(void) {
@@ -1528,6 +1715,16 @@ int try_execute_command(const char *cmdline) {
     } else if (strcmp(name, "meminfo") == 0 || strcmp(name, "free") == 0) {
         builtin_meminfo();
         builtin_handled = 1;
+    } else if (strcmp(name, "driver") == 0 || strcmp(name, "drivers") == 0 || strcmp(name, "lsmod") == 0) {
+        builtin_driver(argc, argv);
+        builtin_handled = 1;
+    } else if (strcmp(name, "keymap") == 0 || strcmp(name, "layout") == 0 ||
+               strcmp(name, "keymaps") == 0 || strcmp(name, "луньфз") == 0 ||
+               strcmp(name, "дфнщге") == 0) {
+        builtin_keymap(argc, argv);
+        builtin_handled = 1;
+    } else if (driver_dispatch_command(name, argc, argv) == 0) {
+        builtin_handled = 1;
     }
 
     if (builtin_handled) {
@@ -1571,6 +1768,9 @@ void terminal_console(void){
         system_set_state(SYSTEM_STATE_TERMINAL_IDLE);
     }
 
+    terminal_language_bar_tick();
+    driver_dispatch_tick();
+
     uint8_t scancode = keyboard_get_scancode();
 
     if (!prompt_shown) print_prompt();
@@ -1579,12 +1779,17 @@ void terminal_console(void){
     if (scancode != 0x00) {
         update_hot_key_state(scancode);
 
-        /* 1. Dispatch application hotkeys (highest priority) and system hotkeys */
-        if (keyboard_dispatch_hotkey(scancode)) {
+        bool is_break_code = (scancode & 0x80) != 0;
+
+        /* Check external driver key filter first */
+        if (driver_dispatch_key(scancode, is_break_code)) {
             return;
         }
 
-        bool is_break_code = (scancode & 0x80) != 0;
+        /* Dispatch application hotkeys (highest priority) and system hotkeys */
+        if (keyboard_dispatch_hotkey(scancode)) {
+            return;
+        }
 
         uint32_t now = timer_millis();
         if (!is_break_code && scancode == last_terminal_scancode) {
@@ -1600,7 +1805,7 @@ void terminal_console(void){
             last_terminal_key_ms = now;
         }
 
-        /* 2. Default Ctrl + C: clear current command input and request interrupt */
+        /* Default Ctrl + C: clear current command input and request interrupt */
         if (!is_break_code && keyboard_is_ctrl_pressed() && scancode == 0x2E) {
             sound_stop();
             system_request_interrupt();
@@ -1633,10 +1838,7 @@ void terminal_console(void){
                 return;
             }
             if (scancode == SC_ARROW_UP) {
-                if (bottom_buffer_count > 0) {
-                    terminal_scroll_up();
-                    return;
-                }
+                terminal_return_to_present();
                 if (cursor_pos >= VGA_WIDTH) {
                     cursor_pos -= VGA_WIDTH;
                     render_input_line(input_len);
@@ -1648,8 +1850,6 @@ void terminal_console(void){
                         return;
                     }
                     last_history_action_ms = now;
-
-                    terminal_return_to_present();
 
                     if (command_history_index < 0) {
                         size_t snapshot_len = strlen(input_buf);
@@ -1679,10 +1879,7 @@ void terminal_console(void){
                 return;
             }
             if (scancode == SC_ARROW_DOWN) {
-                if (bottom_buffer_count > 0) {
-                    terminal_scroll_down();
-                    return;
-                }
+                terminal_return_to_present();
                 if (cursor_pos + VGA_WIDTH <= input_len) {
                     cursor_pos += VGA_WIDTH;
                     render_input_line(input_len);
@@ -1694,8 +1891,6 @@ void terminal_console(void){
                         return;
                     }
                     last_history_action_ms = now;
-
-                    terminal_return_to_present();
 
                     if (command_history_index < command_history_count - 1) {
                         command_history_index++;
@@ -1713,7 +1908,12 @@ void terminal_console(void){
             if (scancode == SC_ARROW_LEFT) {
                 terminal_return_to_present();
                 if (cursor_pos > 0) {
-                    cursor_pos--;
+                    size_t step = 1;
+                    while (cursor_pos >= step + 1u &&
+                           ((unsigned char)input_buf[cursor_pos - step] & 0xC0) == 0x80) {
+                        step++;
+                    }
+                    cursor_pos -= step;
                     render_input_line(input_len);
                 }
                 return;
@@ -1721,7 +1921,12 @@ void terminal_console(void){
             if (scancode == SC_ARROW_RIGHT) {
                 terminal_return_to_present();
                 if (cursor_pos < input_len) {
-                    cursor_pos++;
+                    size_t step = 1;
+                    while (cursor_pos + step < input_len &&
+                           ((unsigned char)input_buf[cursor_pos + step] & 0xC0) == 0x80) {
+                        step++;
+                    }
+                    cursor_pos += step;
                     render_input_line(input_len);
                 }
                 return;
@@ -1741,9 +1946,14 @@ void terminal_console(void){
             if (scancode == SC_DELETE) {
                 terminal_return_to_present();
                 if (cursor_pos < input_len) {
+                    size_t del_bytes = 1;
+                    while (cursor_pos + del_bytes < input_len &&
+                           ((unsigned char)input_buf[cursor_pos + del_bytes] & 0xC0) == 0x80) {
+                        del_bytes++;
+                    }
                     size_t old_len = input_len;
-                    memmove(&input_buf[cursor_pos], &input_buf[cursor_pos + 1], input_len - cursor_pos);
-                    input_len--;
+                    memmove(&input_buf[cursor_pos], &input_buf[cursor_pos + del_bytes], input_len - (cursor_pos + del_bytes) + 1);
+                    input_len -= del_bytes;
                     input_buf[input_len] = '\0';
                     render_input_line(old_len);
                 }
@@ -1752,15 +1962,16 @@ void terminal_console(void){
         }
 
         if (!is_break_code) {
-            char c = get_char(scancode);
-            if (c != 0x00) {
+            const char *out_str = keyboard_get_key_string(scancode);
+            if (out_str != NULL && out_str[0] != '\0') {
                 // Return to present when user starts typing
                 terminal_return_to_present();
                 
                 /* Handle newline / carriage return */
-                if (c == '\n' || c == '\r') {
+                if (out_str[0] == '\n' || out_str[0] == '\r') {
                     terminal_suppress_external_hook = true;
-                    uint16_t cur_end = input_start_cursor + (uint16_t)input_len;
+                    size_t vis_end = terminal_visual_offset(input_len);
+                    uint16_t cur_end = input_start_cursor + (uint16_t)vis_end;
                     if (cur_end >= VGA_WIDTH * VGA_HEIGHT) {
                         cur_end = VGA_WIDTH * VGA_HEIGHT - 1;
                     }
@@ -1794,18 +2005,24 @@ void terminal_console(void){
                     terminal_suppress_external_hook = false;
                     print_prompt();
                 }
-                /* Handle backspace */
-                else if (c == '\b' || c == 127) {
+                /* Handle backspace (UTF-8 aware) */
+                else if (out_str[0] == '\b' || out_str[0] == 127) {
                     if (cursor_pos > 0) {
+                        size_t del_bytes = 1;
+                        while (cursor_pos >= del_bytes + 1u &&
+                               ((unsigned char)input_buf[cursor_pos - del_bytes] & 0xC0) == 0x80) {
+                            del_bytes++;
+                        }
                         size_t old_len = input_len;
-                        memmove(&input_buf[cursor_pos - 1], &input_buf[cursor_pos], input_len - cursor_pos + 1);
-                        cursor_pos--;
-                        input_len--;
+                        memmove(&input_buf[cursor_pos - del_bytes], &input_buf[cursor_pos], input_len - cursor_pos + 1);
+                        cursor_pos -= del_bytes;
+                        input_len -= del_bytes;
                         input_buf[input_len] = '\0';
                         render_input_line(old_len);
                     }
                 }
-                else if (c == '\t') {
+                /* Handle tab */
+                else if (out_str[0] == '\t') {
                     ensure_input_buffer(input_len + 1u);
                     size_t old_len = input_len;
                     memmove(&input_buf[cursor_pos + 1], &input_buf[cursor_pos], input_len - cursor_pos + 1);
@@ -1815,14 +2032,15 @@ void terminal_console(void){
                     input_buf[input_len] = '\0';
                     render_input_line(old_len);
                 }
-                /* Printable characters */
-                else if (c >= 32 && c < 127) {
-                    ensure_input_buffer(input_len + 1u);
+                /* Printable string (arbitrary length: UTF-8 character, word, symbol, emoji) */
+                else {
+                    size_t slen = strlen(out_str);
+                    ensure_input_buffer(input_len + slen + 1u);
                     size_t old_len = input_len;
-                    memmove(&input_buf[cursor_pos + 1], &input_buf[cursor_pos], input_len - cursor_pos + 1);
-                    input_buf[cursor_pos] = c;
-                    cursor_pos++;
-                    input_len++;
+                    memmove(&input_buf[cursor_pos + slen], &input_buf[cursor_pos], input_len - cursor_pos + 1);
+                    memcpy(&input_buf[cursor_pos], out_str, slen);
+                    cursor_pos += slen;
+                    input_len += slen;
                     input_buf[input_len] = '\0';
                     render_input_line(old_len);
                 }

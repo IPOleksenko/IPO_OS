@@ -28,18 +28,24 @@ extern bool key_state[NUM_KEYS];
 uint8_t keyboard_get_modifiers(void);
 bool keyboard_is_ctrl_pressed(void);
 bool keyboard_is_shift_pressed(void);
+bool keyboard_is_left_shift_pressed(void);
+bool keyboard_is_right_shift_pressed(void);
 bool keyboard_is_alt_pressed(void);
 void keyboard_clear_key_state(void);
 bool keyboard_dispatch_hotkey(uint8_t scancode);
 
 extern bool shift_mode;
 
+#include <driver/input/keymap/dynamic_keymap.h>
+
 char* get_keymap(void);
 char get_char(uint8_t scancode);
+const char* keyboard_get_key_string(uint8_t scancode);
 void hot_key_handler(uint8_t scancode);
 void update_hot_key_state(uint8_t scancode);
 
-/* ENGLISH KEYMAPS */
+/* DEFAULT ENGLISH KEYMAP */
+extern const char default_keymap_name[];
 extern const char keymap_english[128];
 extern const char keymap_english_shift[128];
 

@@ -63,4 +63,15 @@ void ata_print_devices(void);
 bool ata_read_sectors_lba28(uint32_t lba, uint8_t count, void *buf);
 bool ata_write_sectors_lba28(uint32_t lba, uint8_t count, const void *buf);
 
+bool ata_read_sectors_lba48(uint64_t lba, uint16_t count, void *buf);
+bool ata_write_sectors_lba48(uint64_t lba, uint16_t count, const void *buf);
+
+bool ata_read_sectors(uint64_t lba, uint16_t count, void *buf);
+bool ata_write_sectors(uint64_t lba, uint16_t count, const void *buf);
+
+/* Multi-drive storage pool API */
+uint64_t ata_get_pool_capacity(void);
+bool ata_pool_read_sectors(uint64_t pool_lba, uint16_t count, void *buf);
+bool ata_pool_write_sectors(uint64_t pool_lba, uint16_t count, const void *buf);
+
 #endif /* _ATA_H */

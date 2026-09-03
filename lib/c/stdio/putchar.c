@@ -2,6 +2,7 @@
 #include <vga.h>
 #include <ioport.h>
 #include <kernel/terminal.h>
+#include <kernel/driver.h>
 
 // Simple spinlock to prevent race conditions during VGA output
 static volatile uint8_t output_lock = 0;
@@ -33,6 +34,48 @@ void putchar_color(char c, uint8_t fg, uint8_t bg) {
     uint16_t terminal_rows = VGA_HEIGHT - top_row;
     uint16_t terminal_bottom = (top_row + terminal_rows) * VGA_WIDTH;
     uint16_t last_line_start = (top_row + terminal_rows - 1) * VGA_WIDTH;
+
+    c = driver_dispatch_char_output(c);
+
+    static char utf8_buf[4];
+    static uint8_t utf8_len = 0;
+    static uint8_t utf8_expected = 0;
+
+    unsigned char uc = (unsigned char)c;
+
+    if (utf8_len > 0) {
+        /* Accumulate continuation byte */
+        utf8_buf[utf8_len++] = c;
+        if (utf8_len < utf8_expected) {
+            release_output_lock();
+            return;
+        }
+
+        /* Full UTF-8 sequence received */
+        size_t b = 0;
+        uint8_t glyph = utf8_to_vga_glyph(utf8_buf, utf8_len, &b);
+        utf8_len = 0;
+        utf8_expected = 0;
+        c = (char)glyph;
+    } else if ((uc & 0x80) != 0) {
+        /* Start of UTF-8 multi-byte sequence */
+        if ((uc & 0xE0) == 0xC0) {
+            utf8_expected = 2;
+        } else if ((uc & 0xF0) == 0xE0) {
+            utf8_expected = 3;
+        } else if ((uc & 0xF8) == 0xF0) {
+            utf8_expected = 4;
+        } else {
+            utf8_expected = 1;
+        }
+
+        if (utf8_expected > 1) {
+            utf8_buf[0] = c;
+            utf8_len = 1;
+            release_output_lock();
+            return;
+        }
+    }
 
     if (cursor < VGA_START_CURSOR_POSITION || cursor >= VGA_WIDTH * VGA_HEIGHT) {
         cursor = VGA_START_CURSOR_POSITION;

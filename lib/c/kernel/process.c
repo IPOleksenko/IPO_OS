@@ -5,8 +5,7 @@
 #include <file_system/ipo_fs.h>
 #include <memory/kmalloc.h>
 #include <driver/input/keymap/keymap.h>
-#include <driver/keyboard.h>
-#include <vga.h>
+#include <driver/input/keyboard.h>#include <vga.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>

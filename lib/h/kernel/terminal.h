@@ -37,4 +37,7 @@ char* resolve_command_path(const char *cmd);
 void terminal_inject_input(const char *text, bool auto_execute);
 void terminal_apply_pending_input(void);
 
+void terminal_render_language_bar(void);
+void terminal_language_bar_tick(void);
+
 #endif

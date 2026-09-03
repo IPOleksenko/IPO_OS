@@ -7,13 +7,18 @@ import sys
 
 BLOCK_SIZE = 512
 IPO_FS_MAX_NAME = 64
-IPO_FS_DIRECT_BLOCKS = 6
+IPO_INODE_EXTENTS = 4
+IPO_EXTENT_NODE_EXTENTS = 20
 IPO_INODE_TYPE_DIR = 0x1
 IPO_INODE_TYPE_FILE = 0x2
 
-SB_FMT = '<8sIIIIIII'
+SB_FMT = '<8sQIIQQQQQ'
 SB_SIZE = struct.calcsize(SB_FMT)
-INODE_FMT = '<III' + ('I' * IPO_FS_DIRECT_BLOCKS) + 'II32s'
+
+EXTENT_FMT = '<QQII'
+EXTENT_SIZE = struct.calcsize(EXTENT_FMT)
+
+INODE_FMT = '<IIQ' + ('QQII' * IPO_INODE_EXTENTS) + 'Q8s'
 INODE_SIZE = struct.calcsize(INODE_FMT)
 INODES_PER_BLOCK = BLOCK_SIZE // INODE_SIZE
 DIRENTRY_FMT = '<I B B 2s {}s'.format(IPO_FS_MAX_NAME)
@@ -73,14 +78,15 @@ class DiskImage:
         self.sb = {
             'fs_size_blocks': sb[1],
             'block_size': sb[2],
-            'inode_count': sb[3],
-            'inode_bitmap_start': sb[4],
-            'block_bitmap_start': sb[5],
-            'inode_table_start': sb[6],
-            'data_blocks_start': sb[7],
+            'flags': sb[3],
+            'inode_count': sb[4],
+            'inode_bitmap_start': sb[5],
+            'block_bitmap_start': sb[6],
+            'inode_table_start': sb[7],
+            'data_blocks_start': sb[8],
         }
 
-    def format_disk(self, total_inodes=256):
+    def format_disk(self, total_inodes=None):
         """Format disk with a new IPO_FS filesystem"""
         # Get disk size  
         self.f.seek(0, 2)  # seek to end
@@ -89,7 +95,9 @@ class DiskImage:
         
         if total_blocks < 100:
             raise DiskError("disk too small")
-        
+
+        if total_inodes is None:
+            total_inodes = max(1, total_blocks // 16)
         # Calculate layout
         inode_bitmap_blocks = (total_inodes + 4095) // 4096
         block_bitmap_blocks = (total_blocks + 4095) // 4096
@@ -104,6 +112,7 @@ class DiskImage:
         self.sb = {
             'fs_size_blocks': total_blocks,
             'block_size': BLOCK_SIZE,
+            'flags': 1,
             'inode_count': total_inodes,
             'inode_bitmap_start': inode_bitmap_start,
             'block_bitmap_start': block_bitmap_start,
@@ -117,6 +126,7 @@ class DiskImage:
             magic,
             self.sb['fs_size_blocks'],
             self.sb['block_size'],
+            1,
             self.sb['inode_count'],
             self.sb['inode_bitmap_start'],
             self.sb['block_bitmap_start'],
@@ -134,27 +144,50 @@ class DiskImage:
         
         # Allocate root inode and create root directory
         self.bitmap_set(inode_bitmap_start, 0, 1)  # inode 1 is root
-        root_inode = {
-            'mode': IPO_INODE_TYPE_DIR,
-            'size': 0,
-            'links_count': 1,
-            'direct': [0] * IPO_FS_DIRECT_BLOCKS,
-            'indirect': 0,
-            'double_indirect': 0,
+        root_block = self.allocate_block()
+        root_inode = self.empty_inode()
+        root_inode['mode'] = IPO_INODE_TYPE_DIR
+        root_inode['links_count'] = 2
+        root_inode['extents'][0] = {
+            'logical_block': 0,
+            'physical_block': root_block,
+            'block_count': 1,
+            'flags': 0,
         }
+        dots = bytearray(BLOCK_SIZE)
+        struct.pack_into(DIRENTRY_FMT, dots, 0, 1, IPO_INODE_TYPE_DIR, 1, b'\x00\x00', b'.'.ljust(IPO_FS_MAX_NAME, b'\x00'))
+        struct.pack_into(DIRENTRY_FMT, dots, DIRENTRY_SIZE, 1, IPO_INODE_TYPE_DIR, 2, b'\x00\x00', b'..'.ljust(IPO_FS_MAX_NAME, b'\x00'))
+        self.write_block(root_block, bytes(dots))
+        root_inode['size'] = DIRENTRY_SIZE * 2
         self.write_inode(1, root_inode)
         
         # Create /app directory
         self.bitmap_set(inode_bitmap_start, 1, 1)  # inode 2 is /app
-        app_inode = {
-            'mode': IPO_INODE_TYPE_DIR,
-            'size': 0,
-            'links_count': 1,
-            'direct': [0] * IPO_FS_DIRECT_BLOCKS,
-            'indirect': 0,
-            'double_indirect': 0,
+        app_block = self.allocate_block()
+        app_inode = self.empty_inode()
+        app_inode['mode'] = IPO_INODE_TYPE_DIR | 0x80000000
+        app_inode['links_count'] = 2
+        app_inode['extents'][0] = {
+            'logical_block': 0,
+            'physical_block': app_block,
+            'block_count': 1,
+            'flags': 0,
         }
+        dots = bytearray(BLOCK_SIZE)
+        struct.pack_into(DIRENTRY_FMT, dots, 0, 2, IPO_INODE_TYPE_DIR, 1, b'\x00\x00', b'.'.ljust(IPO_FS_MAX_NAME, b'\x00'))
+        struct.pack_into(DIRENTRY_FMT, dots, DIRENTRY_SIZE, 1, IPO_INODE_TYPE_DIR, 2, b'\x00\x00', b'..'.ljust(IPO_FS_MAX_NAME, b'\x00'))
+        self.write_block(app_block, bytes(dots))
+        app_inode['size'] = DIRENTRY_SIZE * 2
         self.write_inode(2, app_inode)
+        self.dir_add_entry(1, 'app', 2, IPO_INODE_TYPE_DIR)
+
+        # Create /autorun file (empty, protected)
+        self.bitmap_set(inode_bitmap_start, 2, 1)  # inode 3 is /autorun
+        ar_inode = self.empty_inode()
+        ar_inode['mode'] = IPO_INODE_TYPE_FILE | 0x80000000
+        ar_inode['links_count'] = 1
+        self.write_inode(3, ar_inode)
+        self.dir_add_entry(1, 'autorun', 3, IPO_INODE_TYPE_FILE)
         
         print("Disk formatted successfully")
     # ================= INODES =================
@@ -166,14 +199,24 @@ class DiskImage:
         block = self.sb['inode_table_start'] + idx // INODES_PER_BLOCK
         offset = (idx % INODES_PER_BLOCK) * INODE_SIZE
         raw = self.read_block(block)[offset:offset + INODE_SIZE]
-        t = struct.unpack(INODE_FMT, raw)
+        mode, links_count, size = struct.unpack_from('<IIQ', raw, 0)
+        extents = []
+        for i in range(IPO_INODE_EXTENTS):
+            e_off = 16 + i * 24
+            l_blk, p_blk, b_cnt, flg = struct.unpack_from('<QQII', raw, e_off)
+            extents.append({
+                'logical_block': l_blk,
+                'physical_block': p_blk,
+                'block_count': b_cnt,
+                'flags': flg,
+            })
+        next_extent_node = struct.unpack_from('<Q', raw, 16 + IPO_INODE_EXTENTS * 24)[0]
         return {
-            'mode': t[0],
-            'size': t[1],
-            'links_count': t[2],
-            'direct': list(t[3:3 + IPO_FS_DIRECT_BLOCKS]),
-            'indirect': t[3 + IPO_FS_DIRECT_BLOCKS],
-            'double_indirect': t[3 + IPO_FS_DIRECT_BLOCKS + 1],
+            'mode': mode,
+            'links_count': links_count,
+            'size': size,
+            'extents': extents,
+            'next_extent_node': next_extent_node,
         }
 
     def write_inode(self, ino, inode):
@@ -181,17 +224,47 @@ class DiskImage:
         block = self.sb['inode_table_start'] + idx // INODES_PER_BLOCK
         offset = (idx % INODES_PER_BLOCK) * INODE_SIZE
         buf = bytearray(self.read_block(block))
-        packed = struct.pack(
-            INODE_FMT,
-            inode['mode'], inode['size'], inode['links_count'],
-            *inode['direct'], inode['indirect'], inode['double_indirect'], b'\x00' * 32
-        )
+        packed = bytearray(INODE_SIZE)
+        struct.pack_into('<IIQ', packed, 0, inode['mode'], inode['links_count'], inode['size'])
+        for i in range(IPO_INODE_EXTENTS):
+            ext = inode['extents'][i] if i < len(inode['extents']) else {'logical_block': 0, 'physical_block': 0, 'block_count': 0, 'flags': 0}
+            struct.pack_into('<QQII', packed, 16 + i * 24, ext['logical_block'], ext['physical_block'], ext['block_count'], ext['flags'])
+        struct.pack_into('<Q8s', packed, 16 + IPO_INODE_EXTENTS * 24, inode.get('next_extent_node', 0), b'\x00' * 8)
         buf[offset:offset + INODE_SIZE] = packed
         self.write_block(block, bytes(buf))
 
     def empty_inode(self):
-        return {'mode': 0, 'size': 0, 'links_count': 0,
-                'direct': [0] * IPO_FS_DIRECT_BLOCKS, 'indirect': 0, 'double_indirect': 0}
+        return {
+            'mode': 0,
+            'links_count': 0,
+            'size': 0,
+            'extents': [{'logical_block': 0, 'physical_block': 0, 'block_count': 0, 'flags': 0} for _ in range(IPO_INODE_EXTENTS)],
+            'next_extent_node': 0,
+        }
+
+    def free_inode_blocks(self, inode):
+        # Free primary extents
+        for ext in inode.get('extents', []):
+            if ext['block_count'] > 0 and ext['physical_block'] > 0:
+                for b in range(ext['block_count']):
+                    self.bitmap_set(self.sb['block_bitmap_start'], (ext['physical_block'] + b) - self.sb['data_blocks_start'], 0)
+            ext['block_count'] = 0
+            ext['physical_block'] = 0
+            ext['logical_block'] = 0
+
+        # Free chained extent nodes
+        curr = inode.get('next_extent_node', 0)
+        while curr != 0:
+            raw = self.read_block(curr)
+            count, flags, next_node = struct.unpack_from('<IIQ', raw, 0)
+            for i in range(min(count, IPO_EXTENT_NODE_EXTENTS)):
+                e_off = 16 + i * 24
+                l_blk, p_blk, b_cnt, flg = struct.unpack_from('<QQII', raw, e_off)
+                for b in range(b_cnt):
+                    self.bitmap_set(self.sb['block_bitmap_start'], (p_blk + b) - self.sb['data_blocks_start'], 0)
+            self.bitmap_set(self.sb['block_bitmap_start'], curr - self.sb['data_blocks_start'], 0)
+            curr = next_node
+        inode['next_extent_node'] = 0
 
     # ================= BITMAPS =================
 
@@ -224,81 +297,108 @@ class DiskImage:
 
     def allocate_block(self):
         total = self.sb['fs_size_blocks'] - self.sb['data_blocks_start']
-        for i in range(total):
-            if not self.bitmap_get(self.sb['block_bitmap_start'], i):
-                self.bitmap_set(self.sb['block_bitmap_start'], i, 1)
-                self.write_block(self.sb['data_blocks_start'] + i, b'\x00' * BLOCK_SIZE)
-                return self.sb['data_blocks_start'] + i
+        num_bitmap_blocks = (total + BLOCK_SIZE * 8 - 1) // (BLOCK_SIZE * 8)
+        for b in range(num_bitmap_blocks):
+            blk_lba = self.sb['block_bitmap_start'] + b
+            raw = bytearray(self.read_block(blk_lba))
+            words = struct.unpack('<' + ('I' * (BLOCK_SIZE // 4)), raw)
+            for w_idx, w in enumerate(words):
+                if w != 0xFFFFFFFF:
+                    for bit in range(32):
+                        if not (w & (1 << bit)):
+                            bit_idx = (b * BLOCK_SIZE * 8) + (w_idx * 32) + bit
+                            if bit_idx >= total:
+                                return -1
+                            raw[w_idx * 4 + (bit // 8)] |= (1 << (bit % 8))
+                            self.write_block(blk_lba, bytes(raw))
+                            phys = self.sb['data_blocks_start'] + bit_idx
+                            self.write_block(phys, b'\x00' * BLOCK_SIZE)
+                            return phys
         return -1
 
-    # ================= BLOCKS FOR INODE =================
+    # ================= BLOCKS FOR INODE (LINKED EXTENTS) =================
 
     def get_block_for_inode(self, inode, logical, alloc=False):
-        if logical < IPO_FS_DIRECT_BLOCKS:
-            if inode['direct'][logical] == 0:
-                if not alloc:
-                    return -1
-                inode['direct'][logical] = self.allocate_block()
-            return inode['direct'][logical]
+        # 1. Search primary extents
+        for ext in inode['extents']:
+            if ext['block_count'] > 0:
+                if ext['logical_block'] <= logical < ext['logical_block'] + ext['block_count']:
+                    return ext['physical_block'] + (logical - ext['logical_block'])
 
-        idx = logical - IPO_FS_DIRECT_BLOCKS
-        per = BLOCK_SIZE // 4
-        
-        # Single indirect
-        if idx < per:
-            if inode['indirect'] == 0:
-                if not alloc:
-                    return -1
-                inode['indirect'] = self.allocate_block()
-                self.write_block(inode['indirect'], b'\x00' * BLOCK_SIZE)
+        # 2. Search chained extent nodes
+        curr = inode.get('next_extent_node', 0)
+        last_node_blk = 0
+        last_raw = None
+        while curr != 0:
+            raw = bytearray(self.read_block(curr))
+            count, flags, next_node = struct.unpack_from('<IIQ', raw, 0)
+            for i in range(min(count, IPO_EXTENT_NODE_EXTENTS)):
+                e_off = 16 + i * 24
+                l_blk, p_blk, b_cnt, flg = struct.unpack_from('<QQII', raw, e_off)
+                if b_cnt > 0 and l_blk <= logical < l_blk + b_cnt:
+                    return p_blk + (logical - l_blk)
+            last_node_blk = curr
+            last_raw = raw
+            curr = next_node
 
-            ibuf = bytearray(self.read_block(inode['indirect']))
-            ptr = struct.unpack('<I', ibuf[idx * 4:(idx + 1) * 4])[0]
-            if ptr == 0:
-                if not alloc:
-                    return -1
-                ptr = self.allocate_block()
-                ibuf[idx * 4:(idx + 1) * 4] = struct.pack('<I', ptr)
-                self.write_block(inode['indirect'], bytes(ibuf))
-            return ptr
-        
-        # Double indirect
-        idx -= per
-        if idx >= per * per:
-            return -1  # File too large
-        
-        if inode['double_indirect'] == 0:
-            if not alloc:
-                return -1
-            inode['double_indirect'] = self.allocate_block()
-            self.write_block(inode['double_indirect'], b'\x00' * BLOCK_SIZE)
-        
-        # Read double indirect block
-        dibuf = bytearray(self.read_block(inode['double_indirect']))
-        di_idx = idx // per      # index in double indirect block
-        si_idx = idx % per       # index in single indirect block
-        
-        # Get single indirect block pointer
-        si_ptr = struct.unpack('<I', dibuf[di_idx * 4:(di_idx + 1) * 4])[0]
-        if si_ptr == 0:
-            if not alloc:
-                return -1
-            si_ptr = self.allocate_block()
-            dibuf[di_idx * 4:(di_idx + 1) * 4] = struct.pack('<I', si_ptr)
-            self.write_block(inode['double_indirect'], bytes(dibuf))
-            self.write_block(si_ptr, b'\x00' * BLOCK_SIZE)
-        
-        # Read single indirect block
-        sibuf = bytearray(self.read_block(si_ptr))
-        ptr = struct.unpack('<I', sibuf[si_idx * 4:(si_idx + 1) * 4])[0]
-        if ptr == 0:
-            if not alloc:
-                return -1
-            ptr = self.allocate_block()
-            sibuf[si_idx * 4:(si_idx + 1) * 4] = struct.pack('<I', ptr)
-            self.write_block(si_ptr, bytes(sibuf))
-        
-        return ptr
+        if not alloc:
+            return -1
+
+        # 3. Allocate new block
+        blk = self.allocate_block()
+        if blk < 0:
+            raise DiskError("disk full: no free blocks")
+
+        # Check if we can extend the last primary extent
+        for ext in inode['extents']:
+            if ext['block_count'] > 0 and ext['logical_block'] + ext['block_count'] == logical and ext['physical_block'] + ext['block_count'] == blk:
+                ext['block_count'] += 1
+                return blk
+
+        # Check for free slot in primary extents
+        for ext in inode['extents']:
+            if ext['block_count'] == 0:
+                ext['logical_block'] = logical
+                ext['physical_block'] = blk
+                ext['block_count'] = 1
+                ext['flags'] = 0
+                return blk
+
+        # Check if last chained node can extend its last extent
+        if last_node_blk != 0 and last_raw is not None:
+            count, flags, next_node = struct.unpack_from('<IIQ', last_raw, 0)
+            if count > 0:
+                last_off = 16 + (count - 1) * 24
+                l_blk, p_blk, b_cnt, flg = struct.unpack_from('<QQII', last_raw, last_off)
+                if l_blk + b_cnt == logical and p_blk + b_cnt == blk:
+                    struct.pack_into('<QQII', last_raw, last_off, l_blk, p_blk, b_cnt + 1, flg)
+                    self.write_block(last_node_blk, bytes(last_raw))
+                    return blk
+
+            if count < IPO_EXTENT_NODE_EXTENTS:
+                new_off = 16 + count * 24
+                struct.pack_into('<QQII', last_raw, new_off, logical, blk, 1, 0)
+                struct.pack_into('<I', last_raw, 0, count + 1)
+                self.write_block(last_node_blk, bytes(last_raw))
+                return blk
+
+        # Need a new chained node block
+        new_node_blk = self.allocate_block()
+        if new_node_blk < 0:
+            raise DiskError("disk full: no free blocks")
+
+        node_buf = bytearray(BLOCK_SIZE)
+        struct.pack_into('<IIQ', node_buf, 0, 1, 0, 0)
+        struct.pack_into('<QQII', node_buf, 16, logical, blk, 1, 0)
+        self.write_block(new_node_blk, bytes(node_buf))
+
+        if last_node_blk != 0 and last_raw is not None:
+            struct.pack_into('<Q', last_raw, 8, new_node_blk)
+            self.write_block(last_node_blk, bytes(last_raw))
+        else:
+            inode['next_extent_node'] = new_node_blk
+
+        return blk
 
     # ================= PATH =================
 
@@ -465,7 +565,12 @@ class DiskImage:
         if block < 0:
             raise DiskError("no free block")
 
-        inode['direct'][0] = block
+        inode['extents'][0] = {
+            'logical_block': 0,
+            'physical_block': block,
+            'block_count': 1,
+            'flags': 0,
+        }
 
         # . and ..
         de_dot = struct.pack(DIRENTRY_FMT, ino, 1, 1, b'\x00\x00',
@@ -551,25 +656,7 @@ class DiskImage:
             target = ino
 
         inode = self.read_inode(target)
-
-        # free existing data blocks
-        nblocks = (inode['size'] + BLOCK_SIZE - 1) // BLOCK_SIZE if inode['size'] > 0 else 0
-        for i in range(min(IPO_FS_DIRECT_BLOCKS, nblocks)):
-            if inode['direct'][i]:
-                self.bitmap_set(self.sb['block_bitmap_start'], inode['direct'][i] - self.sb['data_blocks_start'], 0)
-                inode['direct'][i] = 0
-
-        # free indirect blocks
-        if inode['indirect']:
-            ibuf = self.read_block(inode['indirect'])
-            for j in range(0, BLOCK_SIZE, 4):
-                ptr = struct.unpack('<I', ibuf[j:j+4])[0]
-                if ptr:
-                    self.bitmap_set(self.sb['block_bitmap_start'], ptr - self.sb['data_blocks_start'], 0)
-            # free the indirect block itself
-            self.bitmap_set(self.sb['block_bitmap_start'], inode['indirect'] - self.sb['data_blocks_start'], 0)
-            inode['indirect'] = 0
-
+        self.free_inode_blocks(inode)
         inode['size'] = 0
         self.write_inode(target, inode)
 
@@ -608,41 +695,11 @@ class DiskImage:
         # remove dir entry from parent
         if not self.dir_remove_entry(parent, name):
             return False
-        # free direct blocks
-        nblocks = (inode['size'] + BLOCK_SIZE - 1) // BLOCK_SIZE if inode['size'] > 0 else 0
-        for i in range(min(IPO_FS_DIRECT_BLOCKS, nblocks)):
-            if inode['direct'][i]:
-                self.bitmap_set(self.sb['block_bitmap_start'], inode['direct'][i] - self.sb['data_blocks_start'], 0)
-                inode['direct'][i] = 0
-        # free indirect
-        if inode['indirect']:
-            ibuf = self.read_block(inode['indirect'])
-            for j in range(0, BLOCK_SIZE, 4):
-                ptr = struct.unpack('<I', ibuf[j:j+4])[0]
-                if ptr:
-                    self.bitmap_set(self.sb['block_bitmap_start'], ptr - self.sb['data_blocks_start'], 0)
-            # free the indirect block itself
-            self.bitmap_set(self.sb['block_bitmap_start'], inode['indirect'] - self.sb['data_blocks_start'], 0)
-            inode['indirect'] = 0
-        # free double indirect
-        if inode['double_indirect']:
-            dibuf = self.read_block(inode['double_indirect'])
-            for di in range(0, BLOCK_SIZE, 4):
-                si_ptr = struct.unpack('<I', dibuf[di:di+4])[0]
-                if si_ptr:
-                    # Free blocks in single indirect block
-                    sibuf = self.read_block(si_ptr)
-                    for si in range(0, BLOCK_SIZE, 4):
-                        ptr = struct.unpack('<I', sibuf[si:si+4])[0]
-                        if ptr:
-                            self.bitmap_set(self.sb['block_bitmap_start'], ptr - self.sb['data_blocks_start'], 0)
-                    # Free the single indirect block
-                    self.bitmap_set(self.sb['block_bitmap_start'], si_ptr - self.sb['data_blocks_start'], 0)
-            # Free the double indirect block itself
-            self.bitmap_set(self.sb['block_bitmap_start'], inode['double_indirect'] - self.sb['data_blocks_start'], 0)
-            inode['double_indirect'] = 0
+
+        # free blocks
+        self.free_inode_blocks(inode)
         # clear inode bitmap
-        self.bitmap_set(self.sb['inode_bitmap_start'], ino-1, 0)
+        self.bitmap_set(self.sb['inode_bitmap_start'], ino - 1, 0)
         # zero the inode on disk
         self.write_inode(ino, self.empty_inode())
         return True
@@ -680,7 +737,11 @@ def main():
     elif args.cmd == 'cat':
         sys.stdout.buffer.write(d.cat(args.path))
     elif args.cmd == 'mkdir':
-        d.mkdir(args.path)
+        try:
+            d.mkdir(args.path)
+        except DiskError as e:
+            if "already exists" not in str(e):
+                raise
     elif args.cmd == 'touch':
         if getattr(args, 'text', None) is None:
             d.write_text(args.path, '')

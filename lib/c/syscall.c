@@ -5,8 +5,10 @@
 #include <kernel/process.h>
 #include <memory/kmalloc.h>
 #include <kernel/terminal.h>
-#include <driver/keyboard.h>
+#include <driver/input/keyboard.h>
 #include <driver/input/keymap/keymap.h>
+#include <driver/input/keymap/dynamic_keymap.h>
+#include <kernel/driver.h>
 #include <system/state.h>
 #include <system/timer.h>
 #include <vga.h>
@@ -466,9 +468,106 @@ static uint32_t syscall_builtin_terminal_input(uint32_t num,
     return IPO_SYSCALL_OK;
 }
 
+static uint32_t syscall_builtin_keymap_set(uint32_t num,
+                                           uint32_t argc,
+                                           uint32_t *argv) {
+    (void)num;
+    if (argc < 3u || argv == NULL) {
+        return IPO_SYSCALL_ENOSYS;
+    }
+    const char *name = (const char *)(uintptr_t)argv[0];
+    const keymap_entry_t *entries = (const keymap_entry_t *)(uintptr_t)argv[1];
+    uint32_t count = argv[2];
+    const dynamic_glyph_def_t *glyphs = (argc >= 5) ? (const dynamic_glyph_def_t *)(uintptr_t)argv[3] : NULL;
+    uint32_t glyph_count = (argc >= 5) ? argv[4] : 0u;
+
+    int res = dynamic_keymap_register_with_font(name, entries, count, glyphs, glyph_count);
+    terminal_render_language_bar();
+    return (uint32_t)res;
+}
+
+static uint32_t syscall_builtin_keymap_get(uint32_t num,
+                                           uint32_t argc,
+                                           uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    return (uint32_t)(uintptr_t)dynamic_keymap_get_name();
+}
+
+static uint32_t syscall_builtin_font_load(uint32_t num,
+                                          uint32_t argc,
+                                          uint32_t *argv) {
+    (void)num;
+    const char *path = (argc >= 1u && argv != NULL) ? (const char *)(uintptr_t)argv[0] : NULL;
+    int res = vga_load_cyrillic_font(path);
+    return (res == 0) ? IPO_SYSCALL_OK : IPO_SYSCALL_ENOSYS;
+}
+
+static uint32_t syscall_builtin_keymap_disable(uint32_t num,
+                                              uint32_t argc,
+                                              uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || argv == NULL) return IPO_SYSCALL_ENOSYS;
+    const char *target = (const char *)(uintptr_t)argv[0];
+    return (uint32_t)dynamic_keymap_disable(target);
+}
+
+static uint32_t syscall_builtin_keymap_enable(uint32_t num,
+                                             uint32_t argc,
+                                             uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || argv == NULL) return IPO_SYSCALL_ENOSYS;
+    const char *target = (const char *)(uintptr_t)argv[0];
+    return (uint32_t)dynamic_keymap_enable(target);
+}
+
+static uint32_t syscall_builtin_keymap_remove(uint32_t num,
+                                             uint32_t argc,
+                                             uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || argv == NULL) return IPO_SYSCALL_ENOSYS;
+    const char *target = (const char *)(uintptr_t)argv[0];
+    return (uint32_t)dynamic_keymap_remove(target);
+}
+
+static uint32_t syscall_builtin_driver_register(uint32_t num,
+                                                uint32_t argc,
+                                                uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || argv == NULL) {
+        return IPO_SYSCALL_ENOSYS;
+    }
+    driver_t *drv = (driver_t *)(uintptr_t)argv[0];
+    int res = driver_register(drv);
+    return (uint32_t)res;
+}
+
+static uint32_t syscall_builtin_driver_unregister(uint32_t num,
+                                                  uint32_t argc,
+                                                  uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || argv == NULL) {
+        return IPO_SYSCALL_ENOSYS;
+    }
+    const char *name = (const char *)(uintptr_t)argv[0];
+    int res = driver_unregister(name);
+    return (uint32_t)res;
+}
+
+static uint32_t syscall_builtin_driver_list(uint32_t num,
+                                            uint32_t argc,
+                                            uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    driver_print_list();
+    return IPO_SYSCALL_OK;
+}
+
 static size_t syscall_read_visual_offset(const char *buf, uint32_t len, uint32_t index) {
     size_t vcol = 0;
     for (uint32_t i = 0; i < index && i < len; i++) {
+        unsigned char uc = (unsigned char)buf[i];
+        if ((uc & 0xC0) == 0x80) {
+            continue; /* Skip UTF-8 continuation bytes */
+        }
         if (buf[i] == '\t') {
             size_t tab_spaces = 4 - (vcol % 4);
             if (tab_spaces == 0) tab_spaces = 4;
@@ -498,9 +597,10 @@ static void syscall_read_render(int32_t *start_cursor_ptr, int32_t start_origin,
 
     volatile uint16_t *vga = VGA_MEMORY;
 
-    /* Draw text: expand '\t' into visual tab spacing (no circle glyph) */
+    /* Draw text */
     size_t vcol = 0;
-    for (uint32_t i = 0; i < len; i++) {
+    size_t i = 0;
+    while (i < len) {
         if (buf[i] == '\t') {
             size_t tab_spaces = 4 - (vcol % 4);
             if (tab_spaces == 0) tab_spaces = 4;
@@ -511,12 +611,17 @@ static void syscall_read_render(int32_t *start_cursor_ptr, int32_t start_origin,
                 }
             }
             vcol += tab_spaces;
+            i++;
         } else {
+            size_t bytes = 1;
+            uint8_t glyph = utf8_to_vga_glyph(&buf[i], len - i, &bytes);
+
             int32_t off = *start_cursor_ptr + (int32_t)vcol;
             if (off >= VGA_START_CURSOR_POSITION && off < VGA_WIDTH * VGA_HEIGHT) {
-                vga[off] = vga_entry((unsigned char)buf[i], VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                vga[off] = vga_entry(glyph, VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
             }
             vcol += 1;
+            i += bytes;
         }
     }
 
@@ -751,10 +856,15 @@ static uint32_t syscall_builtin_read(uint32_t num,
                 start_cursor -= VGA_WIDTH;
             }
             if (cursor_pos > 0u) {
+                uint32_t del_bytes = 1;
+                while (cursor_pos >= del_bytes + 1u &&
+                       ((unsigned char)buffer[cursor_pos - del_bytes] & 0xC0) == 0x80) {
+                    del_bytes++;
+                }
                 uint32_t old_len = len;
-                memmove(&buffer[cursor_pos - 1], &buffer[cursor_pos], len - cursor_pos + 1);
-                cursor_pos--;
-                len--;
+                memmove(&buffer[cursor_pos - del_bytes], &buffer[cursor_pos], len - cursor_pos + 1);
+                cursor_pos -= del_bytes;
+                len -= del_bytes;
                 buffer[len] = '\0';
                 syscall_read_render(&start_cursor, start_origin, buffer, len, old_len, cursor_pos);
             }
@@ -791,14 +901,16 @@ static uint32_t syscall_builtin_read(uint32_t num,
             continue;
         }
 
-        if (ch >= 32 && ch < 127) {
+        const char *out_str = keyboard_get_key_string(scancode);
+        if (out_str != NULL && out_str[0] != '\0') {
+            size_t slen = strlen(out_str);
             while (terminal_get_bottom_buffer_count() > 0) {
                 terminal_scroll_down();
                 start_cursor -= VGA_WIDTH;
             }
             if (max_len == 0u) {
-                if (len + 1u >= capacity) {
-                    uint32_t new_cap = capacity * 2u;
+                if (len + slen >= capacity) {
+                    uint32_t new_cap = (capacity + slen + 32u) * 2u;
                     char *new_buf = (char *)kmalloc(new_cap);
                     if (new_buf != NULL) {
                         memcpy(new_buf, buffer, len + 1);
@@ -808,16 +920,16 @@ static uint32_t syscall_builtin_read(uint32_t num,
                     }
                 }
             } else {
-                if (len + 1u >= capacity) {
+                if (len + slen >= capacity) {
                     continue;
                 }
             }
 
             uint32_t old_len = len;
-            memmove(&buffer[cursor_pos + 1], &buffer[cursor_pos], len - cursor_pos + 1);
-            buffer[cursor_pos] = ch;
-            cursor_pos++;
-            len++;
+            memmove(&buffer[cursor_pos + slen], &buffer[cursor_pos], len - cursor_pos + 1);
+            memcpy(&buffer[cursor_pos], out_str, slen);
+            cursor_pos += (uint32_t)slen;
+            len += (uint32_t)slen;
             buffer[len] = '\0';
             syscall_read_render(&start_cursor, start_origin, buffer, len, old_len, cursor_pos);
         }
@@ -1118,6 +1230,42 @@ void syscall_init(void) {
     ipo_register_syscall(
         IPO_SYSCALL_VAR_DELETE,
         syscall_builtin_var_delete);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_KEYMAP_SET,
+        syscall_builtin_keymap_set);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_KEYMAP_GET,
+        syscall_builtin_keymap_get);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_KEYMAP_DISABLE,
+        syscall_builtin_keymap_disable);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_KEYMAP_ENABLE,
+        syscall_builtin_keymap_enable);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_KEYMAP_REMOVE,
+        syscall_builtin_keymap_remove);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_FONT_LOAD,
+        syscall_builtin_font_load);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_DRIVER_REGISTER,
+        syscall_builtin_driver_register);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_DRIVER_UNREGISTER,
+        syscall_builtin_driver_unregister);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_DRIVER_LIST,
+        syscall_builtin_driver_list);
 
     ipo_idt_set_gate(
         0x80,

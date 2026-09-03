@@ -2,7 +2,7 @@
 #include <string.h>
 
 struct ipo_superblock sb;
-uint32_t fs_start_lba = 0;
+uint64_t fs_start_lba = 0;
 bool fs_mounted = false;
 struct ipo_fd fds[IPO_MAX_FDS];
 
