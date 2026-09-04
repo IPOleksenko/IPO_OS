@@ -10,6 +10,18 @@
 #include <kernel/terminal.h>
 #include <memory/kmalloc.h>
 #include <string.h>
+#include <syscall.h>
+#include <vga.h>
+
+static bool dynamic_keymap_app_mode = false;
+
+void dynamic_keymap_set_app_mode(bool is_app) {
+    dynamic_keymap_app_mode = is_app;
+}
+
+static inline bool should_use_keymap_syscalls(void) {
+    return dynamic_keymap_app_mode;
+}
 
 #define MAX_KEYMAPS 8
 
@@ -139,6 +151,15 @@ int dynamic_keymap_set(const char *name, const keymap_entry_t *entries, uint32_t
     return 0;
 }
 
+void dynamic_keymap_reapply_fonts(void) {
+    init_storage_if_needed();
+    vga_font_reapply_active();
+    if (active_storage_index < keymap_storage_count) {
+        register_slot_fonts(&keymap_storage[active_storage_index]);
+    }
+    terminal_render_language_bar();
+}
+
 int dynamic_keymap_register_with_font(const char *name,
                                       const keymap_entry_t *entries,
                                       uint32_t count,
@@ -148,7 +169,7 @@ int dynamic_keymap_register_with_font(const char *name,
     return dynamic_keymap_set(name, entries, count);
 }
 
-const char* dynamic_keymap_get_name(void) {
+const char* dynamic_keymap_get_name_local(void) {
     init_storage_if_needed();
     if (keymap_storage[active_storage_index].name != NULL) {
         return keymap_storage[active_storage_index].name;
@@ -156,7 +177,15 @@ const char* dynamic_keymap_get_name(void) {
     return default_keymap_name;
 }
 
-const char* dynamic_keymap_translate(uint8_t scancode, bool shift) {
+const char* dynamic_keymap_get_name(void) {
+    if (should_use_keymap_syscalls()) {
+        const char *name = (const char *)(uintptr_t)ipo_syscall(IPO_SYSCALL_KEYMAP_GET_NAME, 0u, NULL);
+        if (name != NULL) return name;
+    }
+    return dynamic_keymap_get_name_local();
+}
+
+const char* dynamic_keymap_translate_local(uint8_t scancode, bool shift) {
     init_storage_if_needed();
 
     keymap_slot_t *active = &keymap_storage[active_storage_index];
@@ -191,9 +220,26 @@ const char* dynamic_keymap_translate(uint8_t scancode, bool shift) {
     return NULL;
 }
 
-bool dynamic_keymap_is_active(void) {
+const char* dynamic_keymap_translate(uint8_t scancode, bool shift) {
+    if (should_use_keymap_syscalls()) {
+        uint32_t args[2];
+        args[0] = (uint32_t)scancode;
+        args[1] = (uint32_t)shift;
+        return (const char *)(uintptr_t)ipo_syscall(IPO_SYSCALL_KEYMAP_TRANSLATE, 2u, args);
+    }
+    return dynamic_keymap_translate_local(scancode, shift);
+}
+
+bool dynamic_keymap_is_active_local(void) {
     init_storage_if_needed();
     return (keymap_storage[active_storage_index].is_custom && keymap_storage[active_storage_index].enabled);
+}
+
+bool dynamic_keymap_is_active(void) {
+    if (should_use_keymap_syscalls()) {
+        return (bool)ipo_syscall(IPO_SYSCALL_KEYMAP_IS_ACTIVE, 0u, NULL);
+    }
+    return dynamic_keymap_is_active_local();
 }
 
 static void apply_active_font(void) {
@@ -318,7 +364,7 @@ const char* dynamic_keymap_get_slot_name(uint32_t index) {
     return "Unknown";
 }
 
-void dynamic_keymap_cycle_next(void) {
+void dynamic_keymap_cycle_next_local(void) {
     init_storage_if_needed();
     if (dynamic_keymap_get_enabled_count() <= 1) {
         return;
@@ -335,7 +381,15 @@ void dynamic_keymap_cycle_next(void) {
     }
 }
 
-void dynamic_keymap_cycle_prev(void) {
+void dynamic_keymap_cycle_next(void) {
+    if (should_use_keymap_syscalls()) {
+        ipo_syscall(IPO_SYSCALL_KEYMAP_CYCLE_NEXT, 0u, NULL);
+        return;
+    }
+    dynamic_keymap_cycle_next_local();
+}
+
+void dynamic_keymap_cycle_prev_local(void) {
     init_storage_if_needed();
     if (dynamic_keymap_get_enabled_count() <= 1) {
         return;
@@ -350,6 +404,14 @@ void dynamic_keymap_cycle_prev(void) {
             return;
         }
     }
+}
+
+void dynamic_keymap_cycle_prev(void) {
+    if (should_use_keymap_syscalls()) {
+        ipo_syscall(IPO_SYSCALL_KEYMAP_CYCLE_PREV, 0u, NULL);
+        return;
+    }
+    dynamic_keymap_cycle_prev_local();
 }
 
 uint32_t dynamic_keymap_get_count(void) {

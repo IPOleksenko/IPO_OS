@@ -1,51 +1,103 @@
 #include <file_system/ipo_fs.h>
 #include <string.h>
 #include <stdio.h>
+#include <memory/kmalloc.h>
 
-#define DIR_ENTRY_SIZE sizeof(struct ipo_dir_entry)
-#define DIR_ENTRIES_PER_BLOCK (IPO_FS_BLOCK_SIZE / DIR_ENTRY_SIZE)
+int inode_read_bytes(struct ipo_inode *inode, void *buffer, uint32_t size, uint64_t offset) {
+    if (!inode || !buffer || size == 0) return 0;
+    if (offset >= inode->size) return 0;
+    if (offset + size > inode->size) size = (uint32_t)(inode->size - offset);
 
-int dir_find_entry(uint32_t dir_inode_no, const char *name, struct ipo_dir_entry *out_entry, uint64_t *out_block, uint32_t *out_block_off) {
-    struct ipo_inode din;
-    if (!read_inode(dir_inode_no, &din)) return -1;
-    if ((din.mode & IPO_INODE_TYPE_DIR) == 0) return -1;
-    uint32_t entries = (din.size) / DIR_ENTRY_SIZE;
-    uint8_t buf[IPO_FS_BLOCK_SIZE];
-    for (uint32_t e = 0; e < entries; e++) {
-        uint32_t block_idx = e / DIR_ENTRIES_PER_BLOCK;
-        uint32_t inblock = e % DIR_ENTRIES_PER_BLOCK;
-        int64_t phys = get_data_block_for_inode(&din, block_idx, false);
-        if (phys < 0) continue;
-        if (!block_read((uint64_t)phys, buf)) return -1;
-        struct ipo_dir_entry *de = (struct ipo_dir_entry *)buf + inblock;
-        if (de->inode != 0) {
-            size_t dn = de->name_len ? de->name_len : strlen(de->name);
-            size_t nn = strlen(name);
-            if (dn == nn && dn > 0 && strncmp(de->name, name, dn) == 0) {
-                if (out_entry) memcpy(out_entry, de, sizeof(*de));
-                if (out_block) *out_block = (uint64_t)phys;
-                if (out_block_off) *out_block_off = inblock;
-                return 0;
-            }
+    uint64_t first_block = offset / IPO_FS_BLOCK_SIZE;
+    uint64_t last_block = (offset + size - 1) / IPO_FS_BLOCK_SIZE;
+    uint8_t tmp[IPO_FS_BLOCK_SIZE];
+    uint32_t copied = 0;
+
+    for (uint64_t b = first_block; b <= last_block; b++) {
+        int64_t phys = get_data_block_for_inode(inode, b, false);
+        if (phys < 0) break;
+        if (!block_read((uint64_t)phys, tmp)) break;
+        uint32_t block_offset = (b == first_block) ? (uint32_t)(offset % IPO_FS_BLOCK_SIZE) : 0u;
+        uint32_t tocopy = IPO_FS_BLOCK_SIZE - block_offset;
+        if (tocopy > size - copied) tocopy = size - copied;
+        memcpy((uint8_t*)buffer + copied, tmp + block_offset, tocopy);
+        copied += tocopy;
+    }
+    return (int)copied;
+}
+
+int inode_write_bytes(uint32_t inode_no, struct ipo_inode *inode, const void *buffer, uint32_t size, uint64_t offset) {
+    if (!inode || !buffer || size == 0) return 0;
+
+    uint64_t first_block = offset / IPO_FS_BLOCK_SIZE;
+    uint64_t last_block = (offset + size - 1) / IPO_FS_BLOCK_SIZE;
+    uint8_t tmp[IPO_FS_BLOCK_SIZE];
+    uint32_t written = 0;
+
+    for (uint64_t b = first_block; b <= last_block; b++) {
+        int64_t phys = get_data_block_for_inode(inode, b, true);
+        if (phys < 0) break;
+        uint32_t block_offset = (b == first_block) ? (uint32_t)(offset % IPO_FS_BLOCK_SIZE) : 0u;
+        uint32_t towrite = IPO_FS_BLOCK_SIZE - block_offset;
+        if (towrite > size - written) towrite = size - written;
+
+        if (block_offset != 0 || towrite < IPO_FS_BLOCK_SIZE) {
+            if (!block_read((uint64_t)phys, tmp)) memset(tmp, 0, sizeof(tmp));
+        }
+        memcpy(tmp + block_offset, (const uint8_t*)buffer + written, towrite);
+        if (!block_write((uint64_t)phys, tmp)) break;
+        written += towrite;
+    }
+
+    if (offset + written > inode->size) {
+        inode->size = offset + written;
+        if (inode_no > 0) {
+            write_inode(inode_no, inode);
         }
     }
-    return -1;
+    return (int)written;
 }
 
 bool is_valid_filename(const char *name) {
     if (!name || name[0] == '\0') return false;
-    size_t len = strlen(name);
-    if (len == 0 || len >= IPO_FS_MAX_NAME) return false;
-    for (size_t i = 0; i < len; i++) {
-        char c = name[i];
-        if (c >= 'A' && c <= 'Z') continue;
-        if (c >= 'a' && c <= 'z') continue;
-        if (c >= '0' && c <= '9') continue;
-        if (c == '_' || c == '-' || c == '.') continue;
-        return false;
+    for (size_t i = 0; name[i] != '\0'; i++) {
+        if (name[i] == '/') return false;
     }
     if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return false;
     return true;
+}
+
+int dir_find_entry(uint32_t dir_inode_no, const char *name, struct ipo_dir_entry *out_entry, uint64_t *out_offset) {
+    struct ipo_inode din;
+    if (!read_inode(dir_inode_no, &din)) return -1;
+    if ((din.mode & IPO_INODE_TYPE_DIR) == 0) return -1;
+
+    size_t target_len = strlen(name);
+    uint64_t offset = 0;
+
+    while (offset < din.size) {
+        struct ipo_dir_entry hdr;
+        if (inode_read_bytes(&din, &hdr, sizeof(hdr), offset) != (int)sizeof(hdr)) break;
+        if (hdr.rec_len < sizeof(hdr)) break;
+
+        if (hdr.inode != 0 && hdr.name_len == target_len) {
+            char stack_buf[128];
+            char *name_buf = (target_len < sizeof(stack_buf)) ? stack_buf : (char *)kmalloc(target_len + 1);
+            if (name_buf) {
+                if (inode_read_bytes(&din, name_buf, (uint32_t)target_len, offset + sizeof(hdr)) == (int)target_len) {
+                    if (memcmp(name_buf, name, target_len) == 0) {
+                        if (name_buf != stack_buf) kfree(name_buf);
+                        if (out_entry) *out_entry = hdr;
+                        if (out_offset) *out_offset = offset;
+                        return 0;
+                    }
+                }
+                if (name_buf != stack_buf) kfree(name_buf);
+            }
+        }
+        offset += hdr.rec_len;
+    }
+    return -1;
 }
 
 bool dir_add_entry(uint32_t dir_inode_no, const char *name, uint32_t inode_no, uint8_t type) {
@@ -53,58 +105,78 @@ bool dir_add_entry(uint32_t dir_inode_no, const char *name, uint32_t inode_no, u
     if (!read_inode(dir_inode_no, &din)) return false;
     if ((din.mode & IPO_INODE_TYPE_DIR) == 0) return false;
     if (!is_valid_filename(name)) return false;
-    struct ipo_dir_entry tmpde;
-    if (dir_find_entry(dir_inode_no, name, &tmpde, NULL, NULL) == 0) return false;
+    if (dir_find_entry(dir_inode_no, name, NULL, NULL) == 0) return false;
 
-    uint32_t entries = (din.size) / DIR_ENTRY_SIZE;
-    uint32_t block_idx = entries / DIR_ENTRIES_PER_BLOCK;
-    uint32_t inblock = entries % DIR_ENTRIES_PER_BLOCK;
-    int64_t phys = get_data_block_for_inode(&din, block_idx, true);
-    if (phys < 0) return false;
-    uint8_t buf[IPO_FS_BLOCK_SIZE];
-    if (!block_read((uint64_t)phys, buf)) return false;
-    struct ipo_dir_entry *de = (struct ipo_dir_entry *)buf + inblock;
-    de->inode = inode_no;
-    de->type = type;
-    size_t nl = strlen(name);
-    if (nl > IPO_FS_MAX_NAME - 1) nl = IPO_FS_MAX_NAME - 1;
-    de->name_len = (uint8_t)nl;
-    memset(de->reserved,0,sizeof(de->reserved));
-    memset(de->name,0,sizeof(de->name));
-    memcpy(de->name, name, de->name_len);
-    de->name[de->name_len] = '\0';
-    if (!block_write((uint64_t)phys, buf)) return false;
-    din.size += DIR_ENTRY_SIZE;
-    write_inode(dir_inode_no, &din);
+    size_t name_len = strlen(name);
+    uint32_t needed_rec_len = (uint32_t)((sizeof(struct ipo_dir_entry) + name_len + 1 + 3) & ~3);
+
+    uint64_t offset = 0;
+    uint64_t target_offset = din.size;
+    uint32_t actual_rec_len = needed_rec_len;
+
+    while (offset < din.size) {
+        struct ipo_dir_entry hdr;
+        if (inode_read_bytes(&din, &hdr, sizeof(hdr), offset) != (int)sizeof(hdr)) break;
+        if (hdr.rec_len < sizeof(hdr)) break;
+        if (hdr.inode == 0 && hdr.rec_len >= needed_rec_len) {
+            target_offset = offset;
+            actual_rec_len = hdr.rec_len;
+            break;
+        }
+        offset += hdr.rec_len;
+    }
+
+    struct ipo_dir_entry hdr;
+    hdr.inode = inode_no;
+    hdr.rec_len = actual_rec_len;
+    hdr.name_len = (uint32_t)name_len;
+    hdr.type = type;
+    memset(hdr.reserved, 0, sizeof(hdr.reserved));
+
+    if (inode_write_bytes(dir_inode_no, &din, &hdr, sizeof(hdr), target_offset) != (int)sizeof(hdr)) {
+        return false;
+    }
+    if (inode_write_bytes(dir_inode_no, &din, name, (uint32_t)(name_len + 1), target_offset + sizeof(hdr)) != (int)(name_len + 1)) {
+        return false;
+    }
+
+    uint32_t used_bytes = (uint32_t)(sizeof(hdr) + name_len + 1);
+    if (actual_rec_len > used_bytes) {
+        uint32_t pad_len = actual_rec_len - used_bytes;
+        uint8_t zeros[16] = {0};
+        while (pad_len > 0) {
+            uint32_t step = pad_len < sizeof(zeros) ? pad_len : (uint32_t)sizeof(zeros);
+            inode_write_bytes(dir_inode_no, &din, zeros, step, target_offset + used_bytes);
+            used_bytes += step;
+            pad_len -= step;
+        }
+    }
+
+    if (target_offset + actual_rec_len > din.size) {
+        din.size = target_offset + actual_rec_len;
+        write_inode(dir_inode_no, &din);
+    }
     return true;
 }
 
 bool dir_remove_entry(uint32_t dir_inode_no, const char *name) {
+    uint64_t offset;
+    struct ipo_dir_entry hdr;
+    if (dir_find_entry(dir_inode_no, name, &hdr, &offset) != 0) return false;
+
+    struct ipo_inode target_inode;
+    if (read_inode(hdr.inode, &target_inode)) {
+        if (target_inode.mode & IPO_INODE_FLAG_PROTECTED) return false;
+    }
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return false;
+
+    hdr.inode = 0;
     struct ipo_inode din;
     if (!read_inode(dir_inode_no, &din)) return false;
-    uint32_t entries = (din.size) / DIR_ENTRY_SIZE;
-    uint8_t buf[IPO_FS_BLOCK_SIZE];
-    for (uint32_t e = 0; e < entries; e++) {
-        uint32_t block_idx = e / DIR_ENTRIES_PER_BLOCK;
-        uint32_t inblock = e % DIR_ENTRIES_PER_BLOCK;
-        int64_t phys = get_data_block_for_inode(&din, block_idx, false);
-        if (phys < 0) continue;
-        if (!block_read((uint64_t)phys, buf)) return false;
-        struct ipo_dir_entry *de = (struct ipo_dir_entry *)buf + inblock;
-        if (de->inode != 0 && strncmp(de->name, name, IPO_FS_MAX_NAME) == 0) {
-            struct ipo_inode target_inode;
-            if (read_inode(de->inode, &target_inode)) {
-                if (target_inode.mode & IPO_INODE_FLAG_PROTECTED) return false;
-            }
-            if (strcmp(de->name, ".") == 0 || strcmp(de->name, "..") == 0) return false;
-            de->inode = 0;
-            de->name[0] = '\0';
-            de->name_len = 0;
-            if (!block_write((uint64_t)phys, buf)) return false;
-            return true;
-        }
+    if (inode_write_bytes(dir_inode_no, &din, &hdr, sizeof(hdr), offset) != (int)sizeof(hdr)) {
+        return false;
     }
-    return false;
+    return true;
 }
 
 int ipo_fs_list_dir(const char *path, char *out, int out_size) {
@@ -113,24 +185,23 @@ int ipo_fs_list_dir(const char *path, char *out, int out_size) {
     struct ipo_inode din;
     if (!read_inode(ino, &din)) return -1;
     if ((din.mode & IPO_INODE_TYPE_DIR) == 0) return -1;
-    uint32_t entries = din.size / DIR_ENTRY_SIZE;
-    uint8_t buf[IPO_FS_BLOCK_SIZE];
+
+    uint64_t offset = 0;
     int pos = 0;
-    for (uint32_t e = 0; e < entries; e++) {
-        uint32_t block_idx = e / DIR_ENTRIES_PER_BLOCK;
-        uint32_t inblock = e % DIR_ENTRIES_PER_BLOCK;
-        int64_t phys = get_data_block_for_inode(&din, block_idx, false);
-        if (phys < 0) continue;
-        if (!block_read((uint64_t)phys, buf)) return -1;
-        struct ipo_dir_entry *de = (struct ipo_dir_entry *)buf + inblock;
-        if (de->inode == 0 || de->name_len == 0) continue;
-        int l = de->name_len;
-        if (pos + l + 3 >= out_size) break;
-        memcpy(out + pos, de->name, l);
-        pos += l;
-        if (de->type == IPO_INODE_TYPE_DIR) out[pos++] = '/';
-        out[pos++] = '\n';
+    while (offset < din.size) {
+        struct ipo_dir_entry hdr;
+        if (inode_read_bytes(&din, &hdr, sizeof(hdr), offset) != (int)sizeof(hdr)) break;
+        if (hdr.rec_len < sizeof(hdr)) break;
+
+        if (hdr.inode != 0 && hdr.name_len > 0) {
+            if (pos + (int)hdr.name_len + 3 >= out_size) break;
+            inode_read_bytes(&din, out + pos, hdr.name_len, offset + sizeof(hdr));
+            pos += hdr.name_len;
+            if (hdr.type == IPO_INODE_TYPE_DIR) out[pos++] = '/';
+            out[pos++] = '\n';
+        }
+        offset += hdr.rec_len;
     }
-    if (pos < out_size) out[pos] = '\0'; else out[out_size-1] = '\0';
+    if (pos < out_size) out[pos] = '\0'; else out[out_size - 1] = '\0';
     return pos;
 }

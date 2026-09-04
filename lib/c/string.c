@@ -37,6 +37,7 @@ char *strchr(const char *s, int c) {
         if (*s == cc) return (char *)s;
         s++;
     }
+    if (cc == '\0') return (char *)s;
     return NULL;
 }
 
@@ -119,4 +120,22 @@ int memcmp(const void *a, const void *b, size_t n) {
         if (pa[i] != pb[i]) return (int)pa[i] - (int)pb[i];
     }
     return 0;
+}
+
+__attribute__((weak)) int atoi(const char *str) {
+    if (!str) return 0;
+    while (*str == ' ' || *str == '\t') str++;
+    int sign = 1;
+    if (*str == '-') {
+        sign = -1;
+        str++;
+    } else if (*str == '+') {
+        str++;
+    }
+    int res = 0;
+    while (*str >= '0' && *str <= '9') {
+        res = res * 10 + (*str - '0');
+        str++;
+    }
+    return res * sign;
 }

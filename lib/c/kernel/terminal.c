@@ -75,9 +75,8 @@ static uint8_t last_terminal_scancode = 0;
 static uint32_t last_terminal_key_ms = 0;
 static uint32_t last_history_action_ms = 0;
 
-static char terminal_cwd[256] = "/";
-
-#define SCROLL_HISTORY_SIZE 1024
+static char terminal_cwd[1024] = "/";
+#define SCROLL_HISTORY_SIZE 128
 #define SCROLL_HISTORY_CLEAR_THRESHOLD (SCROLL_HISTORY_SIZE * 3 / 4)
 #define SCROLL_HISTORY_KEEP_SIZE (SCROLL_HISTORY_SIZE / 2)
 static uint16_t terminal_top_buffer[SCROLL_HISTORY_SIZE][VGA_WIDTH];
@@ -373,7 +372,8 @@ void terminal_on_external_output(void) {
     uint16_t blank = vga_entry(0x00, VGA_COLOR_WHITE, VGA_COLOR_BLACK);
 
     int32_t start_clear = prompt_start_cursor >= VGA_START_CURSOR_POSITION ? prompt_start_cursor : VGA_START_CURSOR_POSITION;
-    int32_t end_clear = input_start_cursor + (int32_t)input_len;
+    int32_t vis_extra = (int32_t)(previous_rendered_vis_len > input_len ? previous_rendered_vis_len : input_len);
+    int32_t end_clear = input_start_cursor + vis_extra + 1;
     for (int32_t p = start_clear; p <= end_clear && p < VGA_WIDTH * VGA_HEIGHT; p++) {
         vga[p] = blank;
     }
@@ -396,6 +396,7 @@ static void ensure_input_buffer(size_t needed) {
         if (new_buf == NULL) {
             return;
         }
+        memset(new_buf, 0, new_capacity);
         if (input_buf != NULL) {
             memcpy(new_buf, input_buf, input_len + 1u);
             kfree(input_buf);
@@ -773,14 +774,16 @@ static void builtin_help(void) {
     printf("      - Show kernel heap stats: total, used, free, block count, overhead.\n");
     printf("    keymap [list | on <id/name> | off <id/name> | rm <id/name>] | layout\n");
     printf("      - Manage keyboard layouts: list registered layouts, enable (on), disable (off), or remove (rm).\n");
+    printf("    return | retval | show_return [on | off]\n");
+    printf("      - Toggle display of process exit return value (Return value: X).\n");
     printf("\n");
     printf("2. APPLICATION EXECUTION (Launch Methods & Resolution)\n");
-    printf("  IPO_OS executes Position Independent Executables (.bin) via three methods:\n");
+    printf("  IPO_OS executes Position Independent Executables via three methods:\n");
     printf("  [Method 1: Direct Name (Automatic PATH Resolution)]\n");
-    printf("    Syntax: <command> [arguments...] [&]\n");
+    printf("    Syntax: <command> [arguments...]\n");
     printf("    - Searches current directory, /app directory, then root directory.\n");
     printf("  [Method 2: Explicit Relative or Absolute Path]\n");
-    printf("    Syntax: <path/to/binary> [arguments...] [&]\n");
+    printf("    Syntax: <path/to/binary> [arguments...]\n");
     printf("    - Resolves absolute paths starting with '/' or relative paths.\n");
     printf("  [Method 3: Batch Startup Script]\n");
     printf("    - Reads commands line-by-line from '/autorun' during kernel boot.\n");
@@ -829,9 +832,8 @@ static void builtin_cd(int argc, char **argv) {
         strcpy(terminal_cwd, "/");
         return;
     }
-    char target[256];
+    char target[1024];
     make_abs_path(argv[1], target, sizeof(target));
-
     struct ipo_inode stat;
     if (!ipo_fs_stat(target, &stat)) {
         printf("cd: %s: No such directory\n", argv[1]);
@@ -846,7 +848,7 @@ static void builtin_cd(int argc, char **argv) {
 }
 
 static void builtin_ls(int argc, char **argv) {
-    char target[256];
+    char target[1024];
     if (argc >= 2) {
         make_abs_path(argv[1], target, sizeof(target));
     } else {
@@ -869,29 +871,31 @@ static void builtin_ls(int argc, char **argv) {
         return;
     }
 
-    uint32_t entries = din.size / sizeof(struct ipo_dir_entry);
-    uint8_t buf[IPO_FS_BLOCK_SIZE];
-
-    for (uint32_t e = 0; e < entries; e++) {
-        uint32_t block_idx = e / (IPO_FS_BLOCK_SIZE / sizeof(struct ipo_dir_entry));
-        uint32_t inblock = e % (IPO_FS_BLOCK_SIZE / sizeof(struct ipo_dir_entry));
-        int phys = get_data_block_for_inode(&din, block_idx, false);
-        if (phys < 0) continue;
-        if (!block_read(phys, buf)) continue;
-        struct ipo_dir_entry *de = (struct ipo_dir_entry *)buf + inblock;
-        if (de->inode == 0 || de->name_len == 0) continue;
-
-        struct ipo_inode ein;
-        uint32_t fsize = 0;
-        if (read_inode(de->inode, &ein)) {
-            fsize = ein.size;
+    uint64_t offset = 0;
+    while (offset < din.size) {
+        struct ipo_dir_entry hdr;
+        if (inode_read_bytes(&din, &hdr, sizeof(hdr), offset) != (int)sizeof(hdr)) break;
+        if (hdr.rec_len < sizeof(hdr)) break;
+        if (hdr.inode != 0) {
+            char *name = (char *)kmalloc(hdr.name_len + 1);
+            if (name) {
+                if (inode_read_bytes(&din, name, hdr.name_len, offset + sizeof(hdr)) == (int)hdr.name_len) {
+                    name[hdr.name_len] = '\0';
+                    struct ipo_inode ein;
+                    uint32_t fsize = 0;
+                    if (read_inode(hdr.inode, &ein)) {
+                        fsize = (uint32_t)ein.size;
+                    }
+                    if (hdr.type == IPO_INODE_TYPE_DIR) {
+                        printf("  [DIR]  %s/\n", name);
+                    } else {
+                        printf("  [FILE] %s  (%u B)\n", name, fsize);
+                    }
+                }
+                kfree(name);
+            }
         }
-
-        if (de->type == IPO_INODE_TYPE_DIR) {
-            printf("  [DIR]  %s/\n", de->name);
-        } else {
-            printf("  [FILE] %s  (%u B)\n", de->name, fsize);
-        }
+        offset += hdr.rec_len;
     }
 }
 
@@ -901,7 +905,7 @@ static void builtin_cat(int argc, char **argv) {
         return;
     }
     for (int a = 1; a < argc; a++) {
-        char target[256];
+        char target[1024];
         make_abs_path(argv[a], target, sizeof(target));
 
         struct ipo_inode stat;
@@ -945,7 +949,7 @@ static void builtin_touch(int argc, char **argv) {
         return;
     }
     for (int a = 1; a < argc; a++) {
-        char target[256];
+        char target[1024];
         make_abs_path(argv[a], target, sizeof(target));
 
         struct ipo_inode stat;
@@ -966,12 +970,11 @@ static void builtin_mkdir(int argc, char **argv) {
         return;
     }
     for (int a = 1; a < argc; a++) {
-        char target[256];
+        char target[1024];
         make_abs_path(argv[a], target, sizeof(target));
 
         int ino = ipo_fs_create(target, IPO_INODE_TYPE_DIR);
         if (ino < 0) {
-            printf("mkdir: cannot create directory '%s'\n", argv[a]);
         }
     }
 }
@@ -982,7 +985,7 @@ static void builtin_rm(int argc, char **argv) {
         return;
     }
     for (int a = 1; a < argc; a++) {
-        char target[256];
+        char target[1024];
         make_abs_path(argv[a], target, sizeof(target));
 
         struct ipo_inode stat;
@@ -1002,15 +1005,14 @@ static void builtin_cp(int argc, char **argv) {
         printf("Usage: cp <source> <dest>\n");
         return;
     }
-    char src[256];
-    char dst[256];
+    char src[1024];
+    char dst[1024];
     make_abs_path(argv[1], src, sizeof(src));
     make_abs_path(argv[2], dst, sizeof(dst));
 
     struct ipo_inode src_stat;
     if (!ipo_fs_stat(src, &src_stat)) {
         printf("cp: cannot stat '%s': No such file\n", argv[1]);
-        return;
     }
     if ((src_stat.mode & IPO_INODE_TYPE_DIR) != 0) {
         printf("cp: copying directories is not supported\n");
@@ -1032,8 +1034,6 @@ static void builtin_cp(int argc, char **argv) {
 
     int src_fd = ipo_fs_open(src);
     if (src_fd < 0) {
-        printf("cp: cannot open source '%s'\n", argv[1]);
-        return;
     }
 
     if (ipo_fs_stat(dst, &dst_stat)) {
@@ -1082,8 +1082,8 @@ static void builtin_mv(int argc, char **argv) {
         printf("Usage: mv <source> <dest>\n");
         return;
     }
-    char src[256];
-    char dst[256];
+    char src[1024];
+    char dst[1024];
     make_abs_path(argv[1], src, sizeof(src));
     make_abs_path(argv[2], dst, sizeof(dst));
 
@@ -1098,7 +1098,7 @@ static void builtin_stat(int argc, char **argv) {
         return;
     }
     for (int a = 1; a < argc; a++) {
-        char target[256];
+        char target[1024];
         make_abs_path(argv[a], target, sizeof(target));
 
         uint32_t inode_num = 0;
@@ -1114,8 +1114,6 @@ static void builtin_stat(int argc, char **argv) {
         }
 
         printf("  Path:      %s\n", target);
-        printf("  Inode:     %u\n", inode_num);
-        printf("  Type:      %s\n", (st.mode & IPO_INODE_TYPE_DIR) ? "Directory" : "Regular File");
         printf("  Protected: %s\n", (st.mode & IPO_INODE_FLAG_PROTECTED) ? "Yes" : "No");
         printf("  Size:      %u bytes\n", st.size);
         printf("  Links:     %u\n", st.links_count);
@@ -1130,8 +1128,8 @@ static void builtin_echo(int argc, char **argv, const char *cmdline) {
         const char *file_part = append ? (write_pos + 2) : (write_pos + 1);
         while (*file_part == ' ' || *file_part == '\t') file_part++;
         if (*file_part) {
-            char target[256];
             char fn[256];
+            char target[1024];
             int fnp = 0;
             while (*file_part && *file_part != ' ' && *file_part != '\t' && *file_part != '\n' && fnp < 255) {
                 fn[fnp++] = *file_part++;
@@ -1401,7 +1399,26 @@ static void builtin_meminfo(void) {
     printf("Block hdr  : %u bytes\n", (uint32_t)st.block_header);
 }
 
+static bool terminal_show_return_value = true;
+
+static void builtin_show_return(int argc, char **argv) {
+    if (argc >= 2) {
+        if (strcmp(argv[1], "on") == 0 || strcmp(argv[1], "1") == 0 || strcmp(argv[1], "enable") == 0) {
+            terminal_show_return_value = true;
+        } else if (strcmp(argv[1], "off") == 0 || strcmp(argv[1], "0") == 0 || strcmp(argv[1], "disable") == 0) {
+            terminal_show_return_value = false;
+        } else {
+            terminal_show_return_value = !terminal_show_return_value;
+        }
+    } else {
+        terminal_show_return_value = !terminal_show_return_value;
+    }
+    printf("Return value display: %s\n", terminal_show_return_value ? "ON" : "OFF");
+}
+
 void terminal_initialize(void) {
+    vga_init_font_cache();
+
     vga_clear(
         VGA_COLOR_WHITE,
         VGA_COLOR_BLACK,
@@ -1450,6 +1467,14 @@ void terminal_initialize(void) {
 /* Print the command prompt */
 static void print_prompt(void) {
     terminal_suppress_external_hook = true;
+    vga_hide_cursor();
+
+    uint16_t cur_pos = vga_get_cursor_position();
+    if ((cur_pos % VGA_WIDTH) != 0) {
+        /* External output didn't end with a newline; start prompt on next line */
+        putchar('\n');
+    }
+
     prompt_origin = (int32_t)vga_get_cursor_position();
     if (prompt_origin < VGA_START_CURSOR_POSITION || prompt_origin >= VGA_WIDTH * VGA_HEIGHT) {
         prompt_origin = VGA_START_CURSOR_POSITION;
@@ -1463,11 +1488,29 @@ static void print_prompt(void) {
     putchar(' ');
     prompt_shown = true;
     input_start_cursor = (int32_t)vga_get_cursor_position();
-    input_len = 0;
-    cursor_pos = 0;
     previous_rendered_vis_len = 0;
-    if (input_buf != NULL) {
-        input_buf[0] = '\0';
+
+    /* Clear the remainder of the prompt line to avoid leftover artifacts from previous screen content */
+    volatile uint16_t *vga = VGA_MEMORY;
+    int32_t line_end = ((input_start_cursor / VGA_WIDTH) + 1) * VGA_WIDTH;
+    if (line_end > VGA_WIDTH * VGA_HEIGHT) {
+        line_end = VGA_WIDTH * VGA_HEIGHT;
+    }
+    for (int32_t off = input_start_cursor; off < line_end; off++) {
+        vga[off] = vga_entry(' ', INPUT_FG, VGA_COLOR_BLACK);
+    }
+
+    if (input_buf != NULL && input_len > 0) {
+        /* Restore existing user input on the new line! */
+        render_input_line(0);
+    } else {
+        input_len = 0;
+        cursor_pos = 0;
+        if (input_buf != NULL) {
+            input_buf[0] = '\0';
+        }
+        vga_set_cursor((uint16_t)input_start_cursor);
+        vga_show_cursor();
     }
     terminal_suppress_external_hook = false;
     terminal_apply_pending_input();
@@ -1514,17 +1557,21 @@ void terminal_apply_pending_input(void) {
                 cur_end = VGA_WIDTH * VGA_HEIGHT - 1;
             }
             vga_set_cursor(cur_end);
+            vga_hide_cursor();
             putchar('\n');
 
             push_command_history(input_buf);
             int exec = try_execute_command(input_buf);
             if (exec == 0) {
+                serial_printf("[DEBUG] line 1523: Command not found: '%s'\n", input_buf);
                 printf("Command not found: %s\n", input_buf);
             } else if (exec < 0) {
                 printf("Execution failed (error %d): %s\n", exec, input_buf);
             } else if (exec != 1000) {
                 int ret = process_get_exit_code();
-                printf("Return value: %d\n", ret);
+                if (terminal_show_return_value) {
+                    printf("Return value: %d\n", ret);
+                }
             }
 
             input_len = 0;
@@ -1722,6 +1769,12 @@ int try_execute_command(const char *cmdline) {
                strcmp(name, "keymaps") == 0 || strcmp(name, "луньфз") == 0 ||
                strcmp(name, "дфнщге") == 0) {
         builtin_keymap(argc, argv);
+        builtin_handled = 1;
+    } else if (strcmp(name, "return") == 0 || strcmp(name, "retval") == 0 ||
+               strcmp(name, "show_return") == 0 || strcmp(name, "return_val") == 0 ||
+               strcmp(name, "ret") == 0 || strcmp(name, "куегкт") == 0 ||
+               strcmp(name, "куе") == 0) {
+        builtin_show_return(argc, argv);
         builtin_handled = 1;
     } else if (driver_dispatch_command(name, argc, argv) == 0) {
         builtin_handled = 1;
@@ -1976,6 +2029,7 @@ void terminal_console(void){
                         cur_end = VGA_WIDTH * VGA_HEIGHT - 1;
                     }
                     vga_set_cursor(cur_end);
+                    vga_hide_cursor();
                     putchar('\n');
 
                     input_buf[input_len] = '\0';
@@ -1984,12 +2038,15 @@ void terminal_console(void){
                         push_command_history(input_buf);
                         int exec = try_execute_command(input_buf);
                         if (exec == 0) {
+                            serial_printf("[DEBUG] line 1987: Command not found: '%s'\n", input_buf);
                             printf("Command not found: %s\n", input_buf);
                         } else if (exec < 0) {
                             printf("Execution failed (error %d): %s\n", exec, input_buf);
                         } else if (exec != 1000) {
                             int ret = process_get_exit_code();
-                            printf("Return value: %d\n", ret);
+                            if (terminal_show_return_value) {
+                                printf("Return value: %d\n", ret);
+                            }
                         }
                     }
 

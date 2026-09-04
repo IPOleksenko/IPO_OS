@@ -2,16 +2,33 @@
 #include <driver/ata/ata.h>
 #include <string.h>
 #include <stdio.h>
+#include <memory/kmalloc.h>
 
 /* helpers */
 static void write_dir_dots(uint32_t inode_no, uint32_t parent, uint64_t block) {
-    struct ipo_dir_entry de;
-    memset(&de,0,sizeof(de));
-    de.inode = inode_no; de.type = IPO_INODE_TYPE_DIR; strncpy(de.name, ".", IPO_FS_MAX_NAME-1); de.name_len = 1;
-    uint8_t buf[IPO_FS_BLOCK_SIZE]; memset(buf,0,sizeof(buf));
-    memcpy(buf, &de, sizeof(de));
-    de.inode = parent; de.type = IPO_INODE_TYPE_DIR; strncpy(de.name, "..", IPO_FS_MAX_NAME-1); de.name_len = 2;
-    memcpy(buf + sizeof(de), &de, sizeof(de));
+    uint8_t buf[IPO_FS_BLOCK_SIZE];
+    memset(buf, 0, sizeof(buf));
+
+    // . -> rec_len = 20, name_len = 1
+    struct ipo_dir_entry d1;
+    d1.inode = inode_no;
+    d1.rec_len = 20;
+    d1.name_len = 1;
+    d1.type = IPO_INODE_TYPE_DIR;
+    memset(d1.reserved, 0, sizeof(d1.reserved));
+    memcpy(buf, &d1, sizeof(d1));
+    memcpy(buf + sizeof(d1), ".\0\0\0", 4);
+
+    // .. -> rec_len = 20, name_len = 2
+    struct ipo_dir_entry d2;
+    d2.inode = parent;
+    d2.rec_len = 20;
+    d2.name_len = 2;
+    d2.type = IPO_INODE_TYPE_DIR;
+    memset(d2.reserved, 0, sizeof(d2.reserved));
+    memcpy(buf + 20, &d2, sizeof(d2));
+    memcpy(buf + 20 + sizeof(d2), "..\0\0", 4);
+
     block_write(block, buf);
 }
 
@@ -78,7 +95,7 @@ bool ipo_fs_format(uint64_t disk_start_lba, uint64_t total_blocks, uint64_t tota
     root.extents[0].physical_block = (uint64_t)root_block;
     root.extents[0].block_count = 1;
     write_dir_dots(1, 1, (uint64_t)root_block);
-    root.size = sizeof(struct ipo_dir_entry) * 2;
+    root.size = 40;
     write_inode(1, &root);
 
     /* create /app directory (protected) */
@@ -96,7 +113,7 @@ bool ipo_fs_format(uint64_t disk_start_lba, uint64_t total_blocks, uint64_t tota
     app_inode.extents[0].physical_block = (uint64_t)app_block;
     app_inode.extents[0].block_count = 1;
     write_dir_dots(app_ino, 1, (uint64_t)app_block);
-    app_inode.size = sizeof(struct ipo_dir_entry) * 2;
+    app_inode.size = 40;
     write_inode(app_ino, &app_inode);
     if (!dir_add_entry(1, "app", app_ino, IPO_INODE_TYPE_DIR)) { printf("ipo_fs_format: dir_add_entry failed for /app\n"); return false; }
 
@@ -129,23 +146,55 @@ bool ipo_fs_mount(uint64_t disk_start_lba) {
 
 int ipo_fs_create(const char *path, uint8_t type) {
     if (!fs_mounted) return -1;
-    char name[IPO_FS_MAX_NAME]; uint32_t parent;
-    if (path_resolve_parent(path, &parent, name) < 0) return -1;
-    if (!is_valid_filename(name)) return -1;
+    size_t plen = strlen(path);
+    char *name = (char *)kmalloc(plen + 16);
+    if (!name) return -1;
+    uint32_t parent;
+    if (path_resolve_parent(path, &parent, name) < 0) {
+        kfree(name);
+        return -1;
+    }
+    if (!is_valid_filename(name)) {
+        kfree(name);
+        return -1;
+    }
     struct ipo_dir_entry de;
-    if (dir_find_entry(parent, name, &de, NULL, NULL) == 0) return -1;
+    if (dir_find_entry(parent, name, &de, NULL) == 0) {
+        kfree(name);
+        return -1;
+    }
     int ino = allocate_inode();
-    if (ino < 0) return -1;
+    if (ino < 0) {
+        kfree(name);
+        return -1;
+    }
     struct ipo_inode inode;
-    memset(&inode,0,sizeof(inode));
+    memset(&inode, 0, sizeof(inode));
     inode.mode = type;
     inode.size = 0;
-    inode.links_count = 1;
+    inode.links_count = (type == IPO_INODE_TYPE_DIR) ? 2 : 1;
+
+    if (type == IPO_INODE_TYPE_DIR) {
+        int64_t blk = allocate_block();
+        if (blk < 0) {
+            free_inode(ino);
+            kfree(name);
+            return -1;
+        }
+        inode.extents[0].logical_block = 0;
+        inode.extents[0].physical_block = (uint64_t)blk;
+        inode.extents[0].block_count = 1;
+        write_dir_dots((uint32_t)ino, parent, (uint64_t)blk);
+        inode.size = 40;
+    }
+
     write_inode(ino, &inode);
     if (!dir_add_entry(parent, name, ino, type)) {
         free_inode(ino);
+        kfree(name);
         return -1;
     }
+    kfree(name);
     return ino;
 }
 
@@ -183,23 +232,7 @@ int ipo_fs_read(int fd, void *buffer, uint32_t size, uint32_t offset) {
     if (!fds[fd].used) return -1;
     struct ipo_inode inode;
     if (!read_inode(fds[fd].inode, &inode)) return -1;
-    if (offset >= inode.size) return 0;
-    if (offset + size > inode.size) size = (uint32_t)(inode.size - offset);
-    uint64_t first_block = offset / IPO_FS_BLOCK_SIZE;
-    uint64_t last_block = (offset + size - 1) / IPO_FS_BLOCK_SIZE;
-    uint8_t tmp[IPO_FS_BLOCK_SIZE];
-    uint32_t copied = 0;
-    for (uint64_t b = first_block; b <= last_block; b++) {
-        int64_t phys = get_data_block_for_inode(&inode, b, false);
-        if (phys < 0) break;
-        block_read((uint64_t)phys, tmp);
-        uint32_t block_offset = (b == first_block) ? (offset % IPO_FS_BLOCK_SIZE) : 0;
-        uint32_t tocopy = IPO_FS_BLOCK_SIZE - block_offset;
-        if (tocopy > size - copied) tocopy = size - copied;
-        memcpy((uint8_t*)buffer + copied, tmp + block_offset, tocopy);
-        copied += tocopy;
-    }
-    return copied;
+    return inode_read_bytes(&inode, buffer, size, offset);
 }
 
 int ipo_fs_write(int fd, const void *buffer, uint32_t size, uint32_t offset) {
@@ -207,42 +240,60 @@ int ipo_fs_write(int fd, const void *buffer, uint32_t size, uint32_t offset) {
     if (!fds[fd].used) return -1;
     struct ipo_inode inode;
     if (!read_inode(fds[fd].inode, &inode)) return -1;
-    uint64_t first_block = offset / IPO_FS_BLOCK_SIZE;
-    uint64_t last_block = (offset + size - 1) / IPO_FS_BLOCK_SIZE;
-    uint8_t tmp[IPO_FS_BLOCK_SIZE];
-    uint32_t written = 0;
-    for (uint64_t b = first_block; b <= last_block; b++) {
-        int64_t phys = get_data_block_for_inode(&inode, b, true);
-        if (phys < 0) break;
-        block_read((uint64_t)phys, tmp);
-        uint32_t block_offset = (b == first_block) ? (offset % IPO_FS_BLOCK_SIZE) : 0;
-        uint32_t towrite = IPO_FS_BLOCK_SIZE - block_offset;
-        if (towrite > size - written) towrite = size - written;
-        memcpy(tmp + block_offset, (uint8_t*)buffer + written, towrite);
-        block_write((uint64_t)phys, tmp);
-        written += towrite;
-    }
-    if ((uint64_t)offset + written > inode.size) inode.size = (uint64_t)offset + written;
-    write_inode(fds[fd].inode, &inode);
-    return written;
+    return inode_write_bytes(fds[fd].inode, &inode, buffer, size, offset);
 }
 
 bool ipo_fs_delete(const char *path) {
     if (!fs_mounted) return false;
-    char name[IPO_FS_MAX_NAME]; uint32_t parent;
-    if (path_resolve_parent(path, &parent, name) < 0) return false;
+    size_t plen = strlen(path);
+    char *name = (char *)kmalloc(plen + 16);
+    if (!name) return false;
+    uint32_t parent;
+    if (path_resolve_parent(path, &parent, name) < 0) {
+        kfree(name);
+        return false;
+    }
     struct ipo_dir_entry de;
-    if (dir_find_entry(parent, name, &de, NULL, NULL) < 0) return false;
+    if (dir_find_entry(parent, name, &de, NULL) < 0) {
+        kfree(name);
+        return false;
+    }
     struct ipo_inode target_inode;
-    if (!read_inode(de.inode, &target_inode)) return false;
-    if (target_inode.mode & IPO_INODE_FLAG_PROTECTED) return false;
+    if (!read_inode(de.inode, &target_inode)) {
+        kfree(name);
+        return false;
+    }
+    if (target_inode.mode & IPO_INODE_FLAG_PROTECTED) {
+        kfree(name);
+        return false;
+    }
     if (de.type == IPO_INODE_TYPE_DIR) {
         struct ipo_inode din;
         read_inode(de.inode, &din);
-        if (din.size > sizeof(struct ipo_dir_entry) * 2) return false;
+        uint64_t offset = 0;
+        while (offset < din.size) {
+            struct ipo_dir_entry hdr;
+            if (inode_read_bytes(&din, &hdr, sizeof(hdr), offset) != (int)sizeof(hdr)) break;
+            if (hdr.rec_len < sizeof(hdr)) break;
+            if (hdr.inode != 0 && hdr.name_len > 0) {
+                char nbuf[8] = {0};
+                uint32_t rlen = hdr.name_len < 7 ? hdr.name_len : 7;
+                inode_read_bytes(&din, nbuf, rlen, offset + sizeof(hdr));
+                nbuf[rlen] = '\0';
+                if (strcmp(nbuf, ".") != 0 && strcmp(nbuf, "..") != 0) {
+                    kfree(name);
+                    return false; /* Directory not empty */
+                }
+            }
+            offset += hdr.rec_len;
+        }
     }
-    if (!dir_remove_entry(parent, name)) return false;
+    if (!dir_remove_entry(parent, name)) {
+        kfree(name);
+        return false;
+    }
     free_inode(de.inode);
+    kfree(name);
     return true;
 }
 
@@ -262,7 +313,7 @@ bool ipo_fs_write_text(const char *path, const char *text, bool append) {
     struct ipo_inode inode;
     if (!ipo_fs_stat(path, &inode)) { printf("ipo_fs_write_text: stat failed for %s\n", path); return false; }
     if ((inode.mode & IPO_INODE_TYPE_DIR) != 0) { printf("ipo_fs_write_text: target is a directory %s\n", path); return false; }
-    uint32_t offset = append ? inode.size : 0;
+    uint32_t offset = append ? (uint32_t)inode.size : 0;
     int fd = ipo_fs_open(path);
     if (fd < 0) { printf("ipo_fs_write_text: failed to open %s\n", path); return false; }
     int len = strlen(text);
@@ -279,11 +330,9 @@ static bool is_descendant(uint32_t ancestor, uint32_t node) {
         struct ipo_inode din;
         if (!read_inode(cur, &din)) break;
         if ((din.mode & IPO_INODE_TYPE_DIR) == 0) break;
-        int64_t b0 = get_data_block_for_inode(&din, 0, false);
-        if (b0 < 0) break;
-        uint8_t buf[IPO_FS_BLOCK_SIZE]; if (!block_read((uint64_t)b0, buf)) break;
-        struct ipo_dir_entry *entries = (struct ipo_dir_entry *)buf;
-        uint32_t parent = entries[1].inode;
+        struct ipo_dir_entry dotdot_hdr;
+        if (inode_read_bytes(&din, &dotdot_hdr, sizeof(dotdot_hdr), 20) != (int)sizeof(dotdot_hdr)) break;
+        uint32_t parent = dotdot_hdr.inode;
         if (parent == cur) break;
         cur = parent;
     }
@@ -298,49 +347,113 @@ bool ipo_fs_rename(const char *oldpath, const char *newpath) {
     bool new_resolved = (path_resolve(newpath, &new_ino) == 0);
     if (old_resolved && new_resolved && old_ino == new_ino) { return true; }
 
-    char oldname[IPO_FS_MAX_NAME]; uint32_t old_parent;
-    if (path_resolve_parent(oldpath, &old_parent, oldname) < 0) { printf("ipo_fs_rename: path_resolve_parent failed for %s\n", oldpath); return false; }
+    size_t old_len = strlen(oldpath);
+    char *oldname = (char *)kmalloc(old_len + 16);
+    if (!oldname) return false;
+    uint32_t old_parent;
+    if (path_resolve_parent(oldpath, &old_parent, oldname) < 0) {
+        kfree(oldname);
+        printf("ipo_fs_rename: path_resolve_parent failed for %s\n", oldpath);
+        return false;
+    }
     struct ipo_dir_entry de;
-    if (dir_find_entry(old_parent, oldname, &de, NULL, NULL) < 0) { printf("ipo_fs_rename: dir_find_entry failed for %s\n", oldpath); return false; }
+    if (dir_find_entry(old_parent, oldname, &de, NULL) < 0) {
+        kfree(oldname);
+        printf("ipo_fs_rename: dir_find_entry failed for %s\n", oldpath);
+        return false;
+    }
     struct ipo_inode tin;
-    if (!read_inode(de.inode, &tin)) { printf("ipo_fs_rename: read_inode failed for inode %u\n", de.inode); return false; }
-    if (tin.mode & IPO_INODE_FLAG_PROTECTED) { printf("ipo_fs_rename: target is protected, abort %s\n", oldpath); return false; }
+    if (!read_inode(de.inode, &tin)) {
+        kfree(oldname);
+        printf("ipo_fs_rename: read_inode failed for inode %u\n", de.inode);
+        return false;
+    }
+    if (tin.mode & IPO_INODE_FLAG_PROTECTED) {
+        kfree(oldname);
+        printf("ipo_fs_rename: target is protected, abort %s\n", oldpath);
+        return false;
+    }
 
-    char newname[IPO_FS_MAX_NAME]; uint32_t new_parent;
+    size_t new_len = strlen(newpath);
+    size_t name_buf_size = (new_len > old_len ? new_len : old_len) + 32;
+    char *newname = (char *)kmalloc(name_buf_size);
+    if (!newname) {
+        kfree(oldname);
+        return false;
+    }
+    uint32_t new_parent;
     uint32_t maybe_dir_inode;
     if (path_resolve(newpath, &maybe_dir_inode) == 0) {
         struct ipo_inode td;
-        if (!read_inode(maybe_dir_inode, &td)) { printf("ipo_fs_rename: read_inode failed for maybe_dir %u\n", maybe_dir_inode); return false; }
+        if (!read_inode(maybe_dir_inode, &td)) {
+            kfree(oldname); kfree(newname);
+            printf("ipo_fs_rename: read_inode failed for maybe_dir %u\n", maybe_dir_inode);
+            return false;
+        }
         if ((td.mode & IPO_INODE_TYPE_DIR) != 0) {
             new_parent = maybe_dir_inode;
-            if (de.type == IPO_INODE_TYPE_DIR && is_descendant(de.inode, new_parent)) { printf("ipo_fs_rename: cannot move directory into its own descendant\n"); return false; }
-            strncpy(newname, oldname, IPO_FS_MAX_NAME-1); newname[IPO_FS_MAX_NAME-1] = '\0';
+            if (de.type == IPO_INODE_TYPE_DIR && is_descendant(de.inode, new_parent)) {
+                kfree(oldname); kfree(newname);
+                printf("ipo_fs_rename: cannot move directory into its own descendant\n");
+                return false;
+            }
+            strcpy(newname, oldname);
         } else {
-            if (path_resolve_parent(newpath, &new_parent, newname) < 0) { printf("ipo_fs_rename: path_resolve_parent failed for newpath %s\n", newpath); return false; }
+            if (path_resolve_parent(newpath, &new_parent, newname) < 0) {
+                kfree(oldname); kfree(newname);
+                printf("ipo_fs_rename: path_resolve_parent failed for newpath %s\n", newpath);
+                return false;
+            }
         }
     } else {
-        if (path_resolve_parent(newpath, &new_parent, newname) < 0) { printf("ipo_fs_rename: path_resolve_parent failed for newpath %s\n", newpath); return false; }
-    }
-    if (!is_valid_filename(newname)) { printf("ipo_fs_rename: invalid target name '%s'\n", newname); return false; }
-    struct ipo_dir_entry tmp;
-    if (dir_find_entry(new_parent, newname, &tmp, NULL, NULL) == 0) {
-        if (tmp.inode == de.inode) { return true; }
-        printf("ipo_fs_rename: target already exists %s/%s\n", "(parent)", newname);
-        return false;
-    }
-    if (!dir_add_entry(new_parent, newname, de.inode, de.type)) { printf("ipo_fs_rename: dir_add_entry failed for %s -> %s\n", oldpath, newpath); return false; }
-    if (de.type == IPO_INODE_TYPE_DIR) {
-        struct ipo_inode moved;
-        if (!read_inode(de.inode, &moved)) { printf("ipo_fs_rename: read_inode failed for moved dir inode %u\n", de.inode); return false; }
-        int64_t b0 = get_data_block_for_inode(&moved, 0, false);
-        if (b0 >= 0) {
-            uint8_t buf[IPO_FS_BLOCK_SIZE];
-            if (!block_read((uint64_t)b0, buf)) { printf("ipo_fs_rename: block_read failed for dir block\n"); return false; }
-            struct ipo_dir_entry *entries = (struct ipo_dir_entry *)buf;
-            entries[1].inode = new_parent;
-            if (!block_write((uint64_t)b0, buf)) { printf("ipo_fs_rename: block_write failed updating '..'\n"); return false; }
+        if (path_resolve_parent(newpath, &new_parent, newname) < 0) {
+            kfree(oldname); kfree(newname);
+            printf("ipo_fs_rename: path_resolve_parent failed for newpath %s\n", newpath);
+            return false;
         }
     }
-    if (!dir_remove_entry(old_parent, oldname)) { printf("ipo_fs_rename: dir_remove_entry failed for old %s\n", oldpath); return false; }
+
+    if (!is_valid_filename(newname)) {
+        kfree(oldname); kfree(newname);
+        printf("ipo_fs_rename: invalid target name '%s'\n", newname);
+        return false;
+    }
+
+    struct ipo_dir_entry tmp;
+    if (dir_find_entry(new_parent, newname, &tmp, NULL) == 0) {
+        if (tmp.inode == de.inode) {
+            kfree(oldname); kfree(newname);
+            return true;
+        }
+        printf("ipo_fs_rename: target already exists %s/%s\n", "(parent)", newname);
+        kfree(oldname); kfree(newname);
+        return false;
+    }
+
+    if (!dir_add_entry(new_parent, newname, de.inode, de.type)) {
+        kfree(oldname); kfree(newname);
+        printf("ipo_fs_rename: dir_add_entry failed for %s -> %s\n", oldpath, newpath);
+        return false;
+    }
+
+    if (de.type == IPO_INODE_TYPE_DIR) {
+        struct ipo_inode moved;
+        if (read_inode(de.inode, &moved)) {
+            struct ipo_dir_entry dotdot_hdr;
+            if (inode_read_bytes(&moved, &dotdot_hdr, sizeof(dotdot_hdr), 20) == (int)sizeof(dotdot_hdr)) {
+                dotdot_hdr.inode = new_parent;
+                inode_write_bytes(de.inode, &moved, &dotdot_hdr, sizeof(dotdot_hdr), 20);
+            }
+        }
+    }
+
+    if (!dir_remove_entry(old_parent, oldname)) {
+        printf("ipo_fs_rename: dir_remove_entry failed for old %s\n", oldpath);
+        kfree(oldname); kfree(newname);
+        return false;
+    }
+
+    kfree(oldname);
+    kfree(newname);
     return true;
 }

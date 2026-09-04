@@ -106,4 +106,5 @@ QEMU_FLAGS := 	-m 512M \
 				-drive format=raw,file=$(OS_IMAGE),if=ide,index=0 \
               	-drive format=raw,file=build/disk.img,if=ide,index=1 \
               	-cdrom build/disk.iso \
-              	-audiodev pa,id=pa -machine pcspk-audiodev=pa
+              	-audiodev pa,id=pa -machine pcspk-audiodev=pa \
+              	-netdev user,id=net0 -device rtl8139,netdev=net0

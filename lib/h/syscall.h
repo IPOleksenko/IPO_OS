@@ -33,6 +33,8 @@
 
 #define IPO_SYSCALL_FS_RENAME    0x1017u
 
+#define IPO_SYSCALL_FS_CLOSE     0x1018u
+
 #define IPO_SYSCALL_EXEC         0x1020u
 
 #define IPO_SYSCALL_READ         0x1021u
@@ -59,6 +61,13 @@
 #define IPO_SYSCALL_KEYMAP_DISABLE  0x1053u
 #define IPO_SYSCALL_KEYMAP_ENABLE   0x1054u
 #define IPO_SYSCALL_KEYMAP_REMOVE   0x1055u
+#define IPO_SYSCALL_KEYMAP_TRANSLATE 0x1056u
+#define IPO_SYSCALL_KEYMAP_IS_ACTIVE 0x1057u
+#define IPO_SYSCALL_KEYMAP_CYCLE_NEXT 0x1058u
+#define IPO_SYSCALL_KEYMAP_CYCLE_PREV 0x1059u
+#define IPO_SYSCALL_KEYMAP_GET_NAME  0x105Au
+#define IPO_SYSCALL_FONT_GET_INFO    0x105Bu
+#define IPO_SYSCALL_VGA_GLYPH        0x105Cu
 
 #define IPO_SYSCALL_DRIVER_REGISTER   0x1060u
 #define IPO_SYSCALL_DRIVER_UNREGISTER 0x1061u
@@ -188,22 +197,84 @@ static inline int ipo_open(const char *path) {
     return ipo_syscall(IPO_SYSCALL_FS_OPEN, 1u, args);
 }
 
-static inline int ipo_read(int fd, void *buf, uint32_t offset, uint32_t count) {
+static inline int ipo_close(int fd) {
+    uint32_t args[1];
+    args[0] = (uint32_t)fd;
+    return ipo_syscall(IPO_SYSCALL_FS_CLOSE, 1u, args);
+}
+
+static inline int ipo_read(int fd, void *buf, uint32_t count, uint32_t offset) {
     uint32_t args[4];
     args[0] = (uint32_t)fd;
     args[1] = (uint32_t)(uintptr_t)buf;
-    args[2] = offset;
-    args[3] = count;
+    args[2] = count;
+    args[3] = offset;
     return ipo_syscall(IPO_SYSCALL_FS_READ, 4u, args);
 }
 
-static inline int ipo_font_load_cyrillic(const char *path) {
+static inline int ipo_create(const char *path, uint8_t type) {
+    uint32_t args[2];
+    args[0] = (uint32_t)(uintptr_t)path;
+    args[1] = (uint32_t)type;
+    return ipo_syscall(IPO_SYSCALL_FS_CREATE, 2u, args);
+}
+
+static inline int ipo_write(int fd, const void *buf, uint32_t count, uint32_t offset) {
+    uint32_t args[4];
+    args[0] = (uint32_t)fd;
+    args[1] = (uint32_t)(uintptr_t)buf;
+    args[2] = count;
+    args[3] = offset;
+    return ipo_syscall(IPO_SYSCALL_FS_WRITE, 4u, args);
+}
+
+static inline int ipo_delete(const char *path) {
+    uint32_t args[1];
+    args[0] = (uint32_t)(uintptr_t)path;
+    return ipo_syscall(IPO_SYSCALL_FS_DELETE, 1u, args);
+}
+
+struct ipo_inode;
+static inline int ipo_stat(const char *path, struct ipo_inode *st) {
+    uint32_t args[2];
+    args[0] = (uint32_t)(uintptr_t)path;
+    args[1] = (uint32_t)(uintptr_t)st;
+    return ipo_syscall(IPO_SYSCALL_FS_STAT, 2u, args);
+}
+
+static inline int ipo_read_line(char *buf, uint32_t max_len) {
+    if (buf == NULL || max_len == 0u) return -1;
+    uint32_t args[2];
+    args[0] = (uint32_t)(uintptr_t)buf;
+    args[1] = max_len;
+    return ipo_syscall(IPO_SYSCALL_READ, 2u, args);
+}
+
+static inline int ipo_font_load(const char *path) {
     if (path != NULL) {
         uint32_t args[1];
         args[0] = (uint32_t)(uintptr_t)path;
         return ipo_syscall(IPO_SYSCALL_FONT_LOAD, 1u, args);
     }
     return ipo_syscall(IPO_SYSCALL_FONT_LOAD, 0u, NULL);
+}
+
+static inline int ipo_font_get_info(char *name_buf, uint32_t max_name_len, uint32_t *out_glyph_count) {
+    uint32_t args[3];
+    args[0] = (uint32_t)(uintptr_t)name_buf;
+    args[1] = max_name_len;
+    args[2] = (uint32_t)(uintptr_t)out_glyph_count;
+    return ipo_syscall(IPO_SYSCALL_FONT_GET_INFO, 3u, args);
+}
+
+static inline int ipo_vga_glyph(uint32_t codepoint) {
+    uint32_t args[1];
+    args[0] = codepoint;
+    return ipo_syscall(IPO_SYSCALL_VGA_GLYPH, 1u, args);
+}
+
+static inline int ipo_font_load_cyrillic(const char *path) {
+    return ipo_font_load(path);
 }
 
 static inline int ipo_keymap_disable(const char *name) {

@@ -24,6 +24,7 @@ build/system/fonts.bin: tools/build_font_db.py
 
 .PHONY: disks
 disks: build/disk.img build/disk.iso build/system/fonts.bin
+	python3 load_apps.py
 
 .PHONY: clean-disks
 clean-disks:

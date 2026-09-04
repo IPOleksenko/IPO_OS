@@ -10,6 +10,8 @@
 #include <syscall.h>
 #include <system/timer.h>
 #include <kernel/driver.h>
+#include <driver/input/mouse.h>
+#include <net/net.h>
 #include <stdio.h>
 
 #define FS_START_LBA (uint32_t)2048
@@ -69,7 +71,7 @@ static void play_note_smooth(uint16_t freq, uint16_t duration_ms) {
     }
 
     for (volatile uint32_t i = 0; i < duration_ms * 10000; i++) {
-        io_wait(); // busy-wait loop
+        io_wait();
     }
 
     sound_stop();
@@ -113,19 +115,26 @@ void kmain(void) {
 
     ensure_fs_mounted();
 
+    vga_load_cyrillic_font("/system/fonts.bin");
+
     play_startup_sound();
 
-    autorun_init();
-
     terminal_initialize();
+
+    mouse_init();
+
+    net_init();
 
     printf("Type \"help\" or \"?\" on the keyboard to view commands, shortcuts, and OS features.\n\n");
 
     system_set_state(SYSTEM_STATE_TERMINAL_IDLE);
+
+    autorun_init();
     
     for (;;) {
         timer_tick();
         async_scheduler_tick();
+        net_poll();
         terminal_console();
     }
 }

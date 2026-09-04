@@ -9,7 +9,7 @@ static volatile uint32_t timer_ms = 0;
 static volatile uint32_t timer_ticks = 0;
 static uint64_t last_tsc_value = 0ULL;
 
-static uint64_t read_tsc(void) {
+uint64_t read_tsc(void) {
     uint32_t lo;
     uint32_t hi;
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
@@ -42,17 +42,21 @@ void timer_tick(void) {
 }
 
 uint32_t timer_millis(void) {
+    timer_tick();
     return timer_ms;
 }
 
 uint32_t timer_seconds(void) {
+    timer_tick();
     return timer_ms / 1000u;
 }
 
 uint32_t timer_elapsed_ms(uint32_t start_ms) {
+    timer_tick();
     return timer_ms - start_ms;
 }
 
 int timer_after(uint32_t start_ms, uint32_t delay_ms) {
+    timer_tick();
     return (int)(timer_ms - start_ms >= delay_ms);
 }

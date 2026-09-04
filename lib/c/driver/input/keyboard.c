@@ -1,4 +1,5 @@
 #include <driver/input/keyboard.h>
+#include <driver/input/mouse.h>
 #include <vga.h>
 #include <ioport.h>
 #include <driver/input/keymap/keymap.h>
@@ -42,9 +43,22 @@ static uint8_t keyboard_queue_pop(struct keyboard_queue *queue) {
 }
 
 void keyboard_poll(void) {
-    while (inb(KBD_STATUS_PORT) & KBD_STATUS_OUTPUT_BUFFER) {
-        uint8_t scancode = inb(KBD_DATA_PORT);
-        if (scancode != 0x00u) {
+    vga_cursor_blink_tick();
+    while (1) {
+        uint8_t status = inb(KBD_STATUS_PORT);
+        if (!(status & KBD_STATUS_OUTPUT_BUFFER)) {
+            break;
+        }
+        uint8_t data = inb(KBD_DATA_PORT);
+
+        if (status & 0x20) {
+            /* Auxiliary / Mouse byte (0x00 is valid for dx, dy, dz!) */
+            mouse_handle_byte(data);
+        } else {
+            /* Keyboard scancode (0x00 is invalid / null scancode) */
+            if (data == 0x00u) continue;
+            uint8_t scancode = data;
+            vga_cursor_reset_blink();
             if (keyboard_app_input_mode) {
                 keyboard_queue_push(&app_queue, scancode);
             } else {

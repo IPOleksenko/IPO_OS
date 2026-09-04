@@ -203,9 +203,7 @@ pmode_entry:
     mov ss, ax
     mov fs, ax
     mov gs, ax
-    mov esp, 0x90000
-
-    ; Jump to kernel at linear 0x00010000
+    mov esp, 0x500000
     jmp 0x00010000
 
 [BITS 16]

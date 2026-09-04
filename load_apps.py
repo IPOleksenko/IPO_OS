@@ -79,7 +79,17 @@ def main():
         print(f"Uploading {app.relative_to(project_root)} -> {target}")
         run_disk_editor(args, ["-i", str(image), "-s", str(args.start_lba), "put", str(app), target])
 
-    # Upload font database if present
+    # Upload font databases and font collection
+    fonts_dir = project_root / "build" / "fonts"
+    if fonts_dir.exists():
+        try:
+            run_disk_editor(args, ["-i", str(image), "-s", str(args.start_lba), "mkdir", "/fonts"])
+        except SystemExit:
+            pass
+        for f in fonts_dir.glob("*.fnt"):
+            print(f"Uploading {f.relative_to(project_root)} -> /fonts/{f.name}")
+            run_disk_editor(args, ["-i", str(image), "-s", str(args.start_lba), "put", str(f), f"/fonts/{f.name}"])
+
     font_file = project_root / "build" / "system" / "fonts.bin"
     if font_file.exists():
         try:
@@ -88,6 +98,43 @@ def main():
             pass
         print(f"Uploading {font_file.relative_to(project_root)} -> /system/fonts.bin")
         run_disk_editor(args, ["-i", str(image), "-s", str(args.start_lba), "put", str(font_file), "/system/fonts.bin"])
+
+    # Upload standard C headers to /include
+    include_dir = project_root / "apps" / "tcc" / "include"
+    if include_dir.exists():
+        try:
+            run_disk_editor(args, ["-i", str(image), "-s", str(args.start_lba), "mkdir", "/include"])
+        except SystemExit:
+            pass
+        try:
+            run_disk_editor(args, ["-i", str(image), "-s", str(args.start_lba), "mkdir", "/include/sys"])
+        except SystemExit:
+            pass
+
+        for hfile in include_dir.glob("*.h"):
+            target = f"/include/{hfile.name}"
+            run_disk_editor(args, ["-i", str(image), "-s", str(args.start_lba), "put", str(hfile), target])
+
+        sys_include = include_dir / "sys"
+        if sys_include.exists():
+            for hfile in sys_include.glob("*.h"):
+                target = f"/include/sys/{hfile.name}"
+                run_disk_editor(args, ["-i", str(image), "-s", str(args.start_lba), "put", str(hfile), target])
+        print("Uploaded standard C headers to /include")
+
+    # Upload C runtime and libraries to /lib
+    lib_dir = project_root / "build" / "lib"
+    if lib_dir.exists():
+        try:
+            run_disk_editor(args, ["-i", str(image), "-s", str(args.start_lba), "mkdir", "/lib"])
+        except SystemExit:
+            pass
+        for fname in ["crt1.o", "crti.o", "crtn.o", "libc.a", "libtcc1.a"]:
+            fpath = lib_dir / fname
+            if fpath.exists():
+                target = f"/lib/{fname}"
+                run_disk_editor(args, ["-i", str(image), "-s", str(args.start_lba), "put", str(fpath), target])
+        print("Uploaded C runtime and libraries to /lib")
 
     print(f"Done. {len(matches)} app(s) loaded into /app on {image}")
     return 0
