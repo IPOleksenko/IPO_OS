@@ -6,7 +6,6 @@ import struct
 import sys
 
 BLOCK_SIZE = 512
-IPO_FS_MAX_NAME = 64
 IPO_INODE_EXTENTS = 4
 IPO_EXTENT_NODE_EXTENTS = 20
 IPO_INODE_TYPE_DIR = 0x1
@@ -21,8 +20,8 @@ EXTENT_SIZE = struct.calcsize(EXTENT_FMT)
 INODE_FMT = '<IIQ' + ('QQII' * IPO_INODE_EXTENTS) + 'Q8s'
 INODE_SIZE = struct.calcsize(INODE_FMT)
 INODES_PER_BLOCK = BLOCK_SIZE // INODE_SIZE
-DIRENTRY_FMT = '<I B B 2s {}s'.format(IPO_FS_MAX_NAME)
-DIRENTRY_SIZE = struct.calcsize(DIRENTRY_FMT)
+DIRENTRY_HDR_FMT = '<III B 3s'
+DIRENTRY_HDR_SIZE = struct.calcsize(DIRENTRY_HDR_FMT)
 
 
 class DiskError(Exception):
@@ -155,10 +154,9 @@ class DiskImage:
             'flags': 0,
         }
         dots = bytearray(BLOCK_SIZE)
-        struct.pack_into(DIRENTRY_FMT, dots, 0, 1, IPO_INODE_TYPE_DIR, 1, b'\x00\x00', b'.'.ljust(IPO_FS_MAX_NAME, b'\x00'))
-        struct.pack_into(DIRENTRY_FMT, dots, DIRENTRY_SIZE, 1, IPO_INODE_TYPE_DIR, 2, b'\x00\x00', b'..'.ljust(IPO_FS_MAX_NAME, b'\x00'))
+        dots[:40] = self.pack_dir_dots(1, 1)
         self.write_block(root_block, bytes(dots))
-        root_inode['size'] = DIRENTRY_SIZE * 2
+        root_inode['size'] = 40
         self.write_inode(1, root_inode)
         
         # Create /app directory
@@ -174,10 +172,9 @@ class DiskImage:
             'flags': 0,
         }
         dots = bytearray(BLOCK_SIZE)
-        struct.pack_into(DIRENTRY_FMT, dots, 0, 2, IPO_INODE_TYPE_DIR, 1, b'\x00\x00', b'.'.ljust(IPO_FS_MAX_NAME, b'\x00'))
-        struct.pack_into(DIRENTRY_FMT, dots, DIRENTRY_SIZE, 1, IPO_INODE_TYPE_DIR, 2, b'\x00\x00', b'..'.ljust(IPO_FS_MAX_NAME, b'\x00'))
+        dots[:40] = self.pack_dir_dots(2, 1)
         self.write_block(app_block, bytes(dots))
-        app_inode['size'] = DIRENTRY_SIZE * 2
+        app_inode['size'] = 40
         self.write_inode(2, app_inode)
         self.dir_add_entry(1, 'app', 2, IPO_INODE_TYPE_DIR)
 
@@ -428,28 +425,73 @@ class DiskImage:
         parent = '/' + '/'.join(parts[:-1]) if len(parts) > 1 else '/'
         return self.path_resolve(parent), name
 
+    def read_inode_bytes(self, inode, size, offset):
+        if offset >= inode['size']:
+            return b''
+        if offset + size > inode['size']:
+            size = inode['size'] - offset
+        first_block = offset // BLOCK_SIZE
+        last_block = (offset + size - 1) // BLOCK_SIZE
+        result = bytearray()
+        copied = 0
+        for b in range(first_block, last_block + 1):
+            phys = self.get_block_for_inode(inode, b, alloc=False)
+            if phys <= 0:
+                break
+            block_data = self.read_block(phys)
+            block_offset = offset % BLOCK_SIZE if b == first_block else 0
+            tocopy = min(BLOCK_SIZE - block_offset, size - copied)
+            result.extend(block_data[block_offset:block_offset + tocopy])
+            copied += tocopy
+        return bytes(result)
+
+    def write_inode_bytes(self, ino, inode, data, offset):
+        size = len(data)
+        if size == 0:
+            return 0
+        first_block = offset // BLOCK_SIZE
+        last_block = (offset + size - 1) // BLOCK_SIZE
+        written = 0
+        for b in range(first_block, last_block + 1):
+            phys = self.get_block_for_inode(inode, b, alloc=True)
+            if phys <= 0:
+                break
+            block_data = bytearray(self.read_block(phys))
+            block_offset = offset % BLOCK_SIZE if b == first_block else 0
+            towrite = min(BLOCK_SIZE - block_offset, size - written)
+            block_data[block_offset:block_offset + towrite] = data[written:written + towrite]
+            self.write_block(phys, bytes(block_data))
+            written += towrite
+        if offset + written > inode['size']:
+            inode['size'] = offset + written
+            if ino > 0:
+                self.write_inode(ino, inode)
+        return written
+
+    def pack_dir_dots(self, self_ino, parent_ino):
+        # . -> rec_len = 20, name_len = 1
+        d1 = struct.pack(DIRENTRY_HDR_FMT, self_ino, 20, 1, IPO_INODE_TYPE_DIR, b'\x00\x00\x00') + b'.\x00\x00\x00'
+        # .. -> rec_len = 20, name_len = 2
+        d2 = struct.pack(DIRENTRY_HDR_FMT, parent_ino, 20, 2, IPO_INODE_TYPE_DIR, b'\x00\x00\x00') + b'..\x00\x00'
+        return d1 + d2
+
     # ================= DIRECTORY =================
 
     def dir_entries(self, inode):
         size = inode['size']
-        if size == 0:
-            return
-        entries_count = size // DIRENTRY_SIZE
-        per_block = BLOCK_SIZE // DIRENTRY_SIZE
-        for e in range(entries_count):
-            bidx = e // per_block
-            inblock = e % per_block
-            phys = self.get_block_for_inode(inode, bidx)
-            if phys <= 0:
-                continue
-            buf = self.read_block(phys)
-            off = inblock * DIRENTRY_SIZE
-            inode_no, typ, namelen, _, name = struct.unpack(
-                DIRENTRY_FMT, buf[off:off + DIRENTRY_SIZE]
-            )
-            if inode_no:
-                yield {'inode': inode_no, 'type': typ,
-                       'name': name[:namelen].decode(errors='replace')}
+        offset = 0
+        while offset + DIRENTRY_HDR_SIZE <= size:
+            raw_hdr = self.read_inode_bytes(inode, DIRENTRY_HDR_SIZE, offset)
+            if len(raw_hdr) < DIRENTRY_HDR_SIZE:
+                break
+            ino, rec_len, name_len, typ, _ = struct.unpack(DIRENTRY_HDR_FMT, raw_hdr)
+            if rec_len < DIRENTRY_HDR_SIZE:
+                break
+            if ino != 0 and name_len > 0:
+                raw_name = self.read_inode_bytes(inode, name_len, offset + DIRENTRY_HDR_SIZE)
+                name = raw_name.decode('utf-8', errors='replace')
+                yield {'inode': ino, 'type': typ, 'name': name, 'offset': offset, 'rec_len': rec_len}
+            offset += rec_len
 
     def find_entry(self, dirino, name):
         din = self.read_inode(dirino)
@@ -462,63 +504,42 @@ class DiskImage:
         din = self.read_inode(dirino)
         if self.find_entry(dirino, name):
             return False
-        entry = struct.pack(DIRENTRY_FMT, ino, typ, len(name),
-                            b'\x00\x00', name.encode().ljust(IPO_FS_MAX_NAME, b'\x00'))
-        per_block = BLOCK_SIZE // DIRENTRY_SIZE
-        entries_count = din['size'] // DIRENTRY_SIZE
+        name_bytes = name.encode('utf-8')
+        name_len = len(name_bytes)
+        needed_rec_len = (DIRENTRY_HDR_SIZE + name_len + 1 + 3) & ~3
 
-        # Check if there is an empty slot (inode_no == 0) in existing directory entries
-        for e in range(entries_count):
-            bidx = e // per_block
-            inblock = e % per_block
-            phys = self.get_block_for_inode(din, bidx, alloc=False)
-            if phys > 0:
-                buf = bytearray(self.read_block(phys))
-                off = inblock * DIRENTRY_SIZE
-                ino_no = struct.unpack('<I', buf[off:off + 4])[0]
-                if ino_no == 0:
-                    buf[off:off + DIRENTRY_SIZE] = entry
-                    self.write_block(phys, bytes(buf))
-                    return True
+        # Search for a deleted slot (inode == 0) with rec_len >= needed_rec_len
+        offset = 0
+        target_offset = din['size']
+        actual_rec_len = needed_rec_len
+        while offset + DIRENTRY_HDR_SIZE <= din['size']:
+            raw_hdr = self.read_inode_bytes(din, DIRENTRY_HDR_SIZE, offset)
+            if len(raw_hdr) < DIRENTRY_HDR_SIZE:
+                break
+            slot_ino, slot_rec_len, _, _, _ = struct.unpack(DIRENTRY_HDR_FMT, raw_hdr)
+            if slot_rec_len < DIRENTRY_HDR_SIZE:
+                break
+            if slot_ino == 0 and slot_rec_len >= needed_rec_len:
+                target_offset = offset
+                actual_rec_len = slot_rec_len
+                break
+            offset += slot_rec_len
 
-        # Append at end
-        bidx = entries_count // per_block
-        inblock = entries_count % per_block
-        phys = self.get_block_for_inode(din, bidx, alloc=True)
-        if phys < 0:
-            return False
-        buf = bytearray(self.read_block(phys))
-        off = inblock * DIRENTRY_SIZE
-        buf[off:off + DIRENTRY_SIZE] = entry
-        self.write_block(phys, bytes(buf))
-        din['size'] = (entries_count + 1) * DIRENTRY_SIZE
-        self.write_inode(dirino, din)
+        entry_data = struct.pack(DIRENTRY_HDR_FMT, ino, actual_rec_len, name_len, typ, b'\x00\x00\x00') + name_bytes + b'\x00'
+        if len(entry_data) < actual_rec_len:
+            entry_data += b'\x00' * (actual_rec_len - len(entry_data))
+
+        self.write_inode_bytes(dirino, din, entry_data, target_offset)
         return True
 
     def dir_remove_entry(self, dirino, name):
         din = self.read_inode(dirino)
-        size = din['size']
-        if size == 0:
+        ent = self.find_entry(dirino, name)
+        if not ent:
             return False
-        entries_count = size // DIRENTRY_SIZE
-        per_block = BLOCK_SIZE // DIRENTRY_SIZE
-        for e in range(entries_count):
-            bidx = e // per_block
-            inblock = e % per_block
-            phys = self.get_block_for_inode(din, bidx, alloc=False)
-            if phys <= 0:
-                continue
-            buf = bytearray(self.read_block(phys))
-            off = inblock * DIRENTRY_SIZE
-            inode_no, typ, namelen, _, name_bytes = struct.unpack(
-                DIRENTRY_FMT, buf[off:off + DIRENTRY_SIZE]
-            )
-            entryname = name_bytes[:namelen].decode('utf-8', errors='ignore')
-            if inode_no and entryname == name:
-                buf[off:off + DIRENTRY_SIZE] = b'\x00' * DIRENTRY_SIZE
-                self.write_block(phys, bytes(buf))
-                return True
-        return False
+        hdr = struct.pack('<I', 0)
+        self.write_inode_bytes(dirino, din, hdr, ent['offset'])
+        return True
 
     # ================= USER COMMANDS =================
 
@@ -573,17 +594,11 @@ class DiskImage:
         }
 
         # . and ..
-        de_dot = struct.pack(DIRENTRY_FMT, ino, 1, 1, b'\x00\x00',
-                             b'.'.ljust(IPO_FS_MAX_NAME, b'\x00'))
-        de_ddot = struct.pack(DIRENTRY_FMT, parent, 1, 2, b'\x00\x00',
-                              b'..'.ljust(IPO_FS_MAX_NAME, b'\x00'))
+        dots = bytearray(BLOCK_SIZE)
+        dots[:40] = self.pack_dir_dots(ino, parent)
+        self.write_block(block, bytes(dots))
 
-        buf = bytearray(BLOCK_SIZE)
-        buf[0:DIRENTRY_SIZE] = de_dot
-        buf[DIRENTRY_SIZE:DIRENTRY_SIZE * 2] = de_ddot
-        self.write_block(block, bytes(buf))
-
-        inode['size'] = DIRENTRY_SIZE * 2
+        inode['size'] = 40
         self.write_inode(ino, inode)
 
         if not self.dir_add_entry(parent, name, ino, 1):
@@ -690,8 +705,9 @@ class DiskImage:
             return False
         # directory: allow only empty (only '.' and '..')
         if inode['mode'] & 1:
-            if inode['size'] > (DIRENTRY_SIZE * 2):
-                return False
+            for e in self.dir_entries(inode):
+                if e['name'] not in ('.', '..'):
+                    return False
         # remove dir entry from parent
         if not self.dir_remove_entry(parent, name):
             return False

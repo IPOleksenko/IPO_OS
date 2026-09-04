@@ -1,2 +1,2 @@
 run:
-	$(QEMU) $(QEMU_FLAGS) -serial stdio
+	$(QEMU) $(QEMU_FLAGS)

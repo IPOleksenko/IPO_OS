@@ -48,11 +48,24 @@ void vga_hide_cursor(void);
 // Clears the VGA screen with specified foreground and background colors and cursor settings
 void vga_clear(enum vga_color fg, enum vga_color bg, bool show_cursor, int cursor_position);
 
+#define VGA_CURSOR_GLYPH_SLOT 0x1F
+
 uint16_t vga_get_cursor_position(void);
+bool vga_is_cursor_visible(void);
 
 uint16_t vga_increment_cursor_position(void);
 
 uint16_t vga_decrement_cursor_position(void);
+
+void vga_cursor_blink_tick(void);
+
+void vga_cursor_reset_blink(void);
+
+void vga_cursor_reset(void);
+
+extern const uint8_t vga_default_font_data[256][16];
+const uint8_t* vga_font_get_cached_glyph(uint8_t char_code);
+void vga_init_font_cache(void);
 
 typedef struct {
     uint32_t codepoint;    /* Unicode codepoint (e.g. 0x0410, 0x4E2D, 0x03B1) */
@@ -64,6 +77,13 @@ int vga_load_cyrillic_font(const char *path);
 void vga_font_clear_registry(void);
 int vga_font_register_glyph(uint32_t codepoint, const uint8_t *bitmap);
 void vga_font_apply_glyphs(const dynamic_glyph_def_t *glyphs, uint32_t count);
+void vga_font_set_app_mode(bool is_app);
+void vga_font_reapply_active(void);
+void vga_font_reset_registry(void);
 uint8_t utf8_to_vga_glyph(const char *str, size_t str_len, size_t *out_bytes);
+int vga_font_get_info(char *name_buf, size_t name_size, uint32_t *out_count);
+const char* vga_font_get_current_name(void);
+const char* vga_font_get_current_path(void);
+uint32_t vga_font_get_glyph_count(void);
 
 #endif

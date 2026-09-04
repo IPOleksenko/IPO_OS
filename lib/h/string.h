@@ -58,6 +58,11 @@ char *strrchr(const char *s, int c);
  */
 char *strstr(const char *haystack, const char *needle);
 
+/**
+ * Convert string to integer
+ */
+int atoi(const char *str);
+
 /* Compare memory areas */
 int memcmp(const void *a, const void *b, size_t n);
 

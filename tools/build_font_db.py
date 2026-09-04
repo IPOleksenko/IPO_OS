@@ -79,44 +79,55 @@ def extract_pcf_hanzi(path):
 
     return hanzi_8x16
 
-def main():
-    out_dir = Path("build/system")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_file = out_dir / "fonts.bin"
-
-    print("Extracting Cyrillic console font...")
-    cyr = extract_psf1("/usr/share/consolefonts/FullCyrSlav-Fixed16.psf.gz")
-    print(f"Loaded {len(cyr)} Cyrillic/Slavic glyphs")
-
-    print("Extracting Chinese Hanzi font...")
-    hanzi = extract_pcf_hanzi("/usr/share/fonts/X11/misc/gb16fs.pcf.gz")
-    print(f"Loaded {len(hanzi)} Chinese Hanzi glyphs")
-
-    # Combine into single map
-    combined = {}
-    for cp, bmp in cyr.items():
-        if cp >= 0x80: # Skip standard ASCII to save space
-            combined[cp] = bmp
-
-    for cp, bmp in hanzi.items():
-        combined[cp] = bmp
-
-    sorted_records = sorted(combined.items(), key=lambda x: x[0])
+def write_ifnt(out_path, records_dict):
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    sorted_records = sorted(records_dict.items(), key=lambda x: x[0])
     count = len(sorted_records)
-    print(f"Total packed font records: {count}")
-
-    # File format:
-    # Magic: "IFNT" (4 bytes)
-    # Count: uint32 (4 bytes)
-    # Records: count * (codepoint: uint32, bitmap: 16 bytes)
-    with open(out_file, "wb") as f:
+    with open(out_path, "wb") as f:
         f.write(b"IFNT")
         f.write(struct.pack("<I", count))
         for cp, bmp in sorted_records:
             f.write(struct.pack("<I", cp))
             f.write(bmp[:16])
+    print(f"Generated {out_path} ({count} glyphs, {out_path.stat().st_size} bytes)")
 
-    print(f"Generated {out_file} ({out_file.stat().st_size} bytes)")
+def main():
+    fonts_dir = Path("build/fonts")
+    system_dir = Path("build/system")
+    fonts_dir.mkdir(parents=True, exist_ok=True)
+    system_dir.mkdir(parents=True, exist_ok=True)
+
+    print("Extracting Cyrillic console font (Fixed16)...")
+    cyr_fixed = extract_psf1("/usr/share/consolefonts/FullCyrSlav-Fixed16.psf.gz")
+    print(f"Loaded {len(cyr_fixed)} glyphs from Fixed16")
+
+    print("Extracting Chinese Hanzi font...")
+    try:
+        hanzi = extract_pcf_hanzi("/usr/share/fonts/X11/misc/gb16fs.pcf.gz")
+        print(f"Loaded {len(hanzi)} Chinese Hanzi glyphs")
+    except Exception as e:
+        print(f"Warning: could not load Hanzi: {e}")
+        hanzi = {}
+
+    # 1. Default font: Fixed16 (including ASCII) + Hanzi
+    default_records = dict(cyr_fixed)
+    default_records.update(hanzi)
+    write_ifnt(fonts_dir / "default.fnt", default_records)
+    write_ifnt(system_dir / "fonts.bin", default_records)
+
+    # 2. Terminus font: FullCyrSlav-Terminus16 (including ASCII)
+    print("Extracting Terminus console font...")
+    term_psf = "/usr/share/consolefonts/FullCyrSlav-Terminus16.psf.gz"
+    if Path(term_psf).exists():
+        cyr_term = extract_psf1(term_psf)
+        write_ifnt(fonts_dir / "terminus.fnt", cyr_term)
+
+    # 3. Bold font: FullCyrSlav-TerminusBoldVGA16 (including ASCII)
+    print("Extracting Terminus Bold console font...")
+    bold_psf = "/usr/share/consolefonts/FullCyrSlav-TerminusBoldVGA16.psf.gz"
+    if Path(bold_psf).exists():
+        cyr_bold = extract_psf1(bold_psf)
+        write_ifnt(fonts_dir / "bold.fnt", cyr_bold)
 
 if __name__ == "__main__":
     main()

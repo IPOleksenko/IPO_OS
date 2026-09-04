@@ -17,7 +17,7 @@
 #define IPO_INODE_TYPE_FILE 0x2
 #define IPO_INODE_FLAG_PROTECTED 0x80000000u
 
-#define IPO_MAX_FDS 4096
+#define IPO_MAX_FDS 256
 
 struct ipo_superblock {
     char magic[8];             /* "IPO_FS\0\0" */
@@ -57,10 +57,10 @@ struct ipo_extent_node {
 
 struct ipo_dir_entry {
     uint32_t inode;
+    uint32_t rec_len;
+    uint32_t name_len;
     uint8_t type;
-    uint8_t name_len;
-    uint8_t reserved[2];
-    char name[IPO_FS_MAX_NAME];
+    uint8_t reserved[3];
 };
 
 /* file descriptor */
@@ -93,9 +93,11 @@ bool free_inode(uint32_t inode_no);
 int64_t allocate_block(void);
 bool free_block(uint64_t phys_block);
 int64_t get_data_block_for_inode(struct ipo_inode *inode, uint64_t logical_index, bool alloc);
+int inode_read_bytes(struct ipo_inode *inode, void *buffer, uint32_t size, uint64_t offset);
+int inode_write_bytes(uint32_t inode_no, struct ipo_inode *inode, const void *buffer, uint32_t size, uint64_t offset);
 
 /* Directory / path */
-int dir_find_entry(uint32_t dir_inode_no, const char *name, struct ipo_dir_entry *out_entry, uint64_t *out_block, uint32_t *out_block_off);
+int dir_find_entry(uint32_t dir_inode_no, const char *name, struct ipo_dir_entry *out_entry, uint64_t *out_offset);
 bool is_valid_filename(const char *name);
 bool dir_add_entry(uint32_t dir_inode_no, const char *name, uint32_t inode_no, uint8_t type);
 bool dir_remove_entry(uint32_t dir_inode_no, const char *name);

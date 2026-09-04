@@ -5,10 +5,13 @@
 #include <file_system/ipo_fs.h>
 #include <memory/kmalloc.h>
 #include <driver/input/keymap/keymap.h>
-#include <driver/input/keyboard.h>#include <vga.h>
+#include <driver/input/keymap/dynamic_keymap.h>
+#include <driver/input/keyboard.h>
+#include <vga.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <kernel/elf.h>
 
 /**
  * IPO_BINARY Application Header (20 bytes)
@@ -35,7 +38,25 @@ typedef struct {
 static int last_exit_code = 0;
 static process_t *current_process = NULL;
 static process_t *process_list = NULL;
-static uint32_t next_pid = 1;
+
+static uint32_t allocate_pid(void) {
+    uint32_t candidate = 1;
+    while (1) {
+        bool in_use = false;
+        process_t *curr = process_list;
+        while (curr) {
+            if (curr->pid == candidate) {
+                in_use = true;
+                break;
+            }
+            curr = curr->next;
+        }
+        if (!in_use) {
+            return candidate;
+        }
+        candidate++;
+    }
+}
 
 // Memory allocation tracking
 static memory_block_t *allocated_blocks = NULL;
@@ -204,6 +225,46 @@ static void *allocate_process_memory(process_t *proc, uint32_t size, uint32_t pr
     return addr;
 }
 
+static void coalesce_free_blocks(void) {
+    bool merged = true;
+    while (merged) {
+        merged = false;
+        for (int i = 0; i < block_count; i++) {
+            if (allocated_blocks[i].pid != 0) continue;
+            uint8_t *end_i = (uint8_t *)allocated_blocks[i].base + allocated_blocks[i].size;
+
+            for (int j = 0; j < block_count; j++) {
+                if (i == j || allocated_blocks[j].pid != 0) continue;
+                if (end_i == (uint8_t *)allocated_blocks[j].base) {
+                    allocated_blocks[i].size += allocated_blocks[j].size;
+                    for (int k = j; k < block_count - 1; k++) {
+                        allocated_blocks[k] = allocated_blocks[k + 1];
+                    }
+                    block_count--;
+                    merged = true;
+                    break;
+                }
+            }
+            if (merged) break;
+        }
+    }
+
+    // Shrink heap usage if free blocks exist at the top of heap
+    for (int i = 0; i < block_count; i++) {
+        if (allocated_blocks[i].pid == 0) {
+            uint32_t block_top = (uint32_t)allocated_blocks[i].base + allocated_blocks[i].size;
+            if (block_top == PROCESS_HEAP_START + (uint32_t)global_process_heap_used) {
+                global_process_heap_used -= allocated_blocks[i].size;
+                for (int k = i; k < block_count - 1; k++) {
+                    allocated_blocks[k] = allocated_blocks[k + 1];
+                }
+                block_count--;
+                i--;
+            }
+        }
+    }
+}
+
 /**
  * free_process_memory - Frees up process memory
  * Marks block as free (pid=0) so it can be reused
@@ -218,6 +279,7 @@ static void free_process_memory(process_t *proc, void *addr, uint32_t size) {
             allocated_blocks[i].pid = 0;  // Mark as free
             serial_printf("Marked memory as free: base=0x%x, size=%u\n", 
                          (uint32_t)addr, allocated_blocks[i].size);
+            coalesce_free_blocks();
             return;
         }
     }
@@ -380,9 +442,9 @@ static int load_ipob_file(const char *path, ipob_header_t *header_out, void **da
         return -1;  // Path is a directory
     }
     
-    if (stat.size < IPOB_HEADER_SIZE) {
-        printf("File too small: %s (%d bytes)\n", path, stat.size);
-        return -1;  // File too small for header
+    if (stat.size == 0) {
+        printf("File is empty: %s\n", path);
+        return -1;
     }
     
     serial_printf("Loading file: %s, size: %d bytes\n", path, stat.size);
@@ -427,34 +489,32 @@ static int load_ipob_file(const char *path, ipob_header_t *header_out, void **da
 
     ipo_fs_close(fd);
     
-    // Parse and check the header
+    // Check if binary has legacy IPO_B header or is a pure flat binary
     ipob_header_t *header = (ipob_header_t *)binary_image;
+    bool has_header = (stat.size >= IPOB_HEADER_SIZE &&
+                       memcmp(header->magic, "IPO_B\x00\x00\x00", 8) == 0);
     
-    if (memcmp(header->magic, "IPO_B\x00\x00\x00", 8) != 0) {
-        kfree(binary_image);
-        printf("Invalid magic in file: %s\n", path);
-        return -2;  // Invalid executable format
-    }
-    
-    uint32_t payload_size = stat.size - IPOB_HEADER_SIZE;
-    if (header->entry_offset >= payload_size) {
-        kfree(binary_image);
-        printf("Entry offset out of bounds: %d >= %d\n", header->entry_offset, payload_size);
-        return -2;  // Entry offset out of bounds
-    }
-    
-    if (header->total_size < stat.size) {
-        printf("Warning: header total_size (%d) < actual size (%d)\n", 
-               header->total_size, stat.size);
-    }
-    
-    // Success: Copy the title and return
-    if (header_out != NULL) {
-        memcpy(header_out, header, IPOB_HEADER_SIZE);
+    if (has_header) {
+        uint32_t payload_size = stat.size - IPOB_HEADER_SIZE;
+        if (header->entry_offset >= payload_size) {
+            kfree(binary_image);
+            printf("Entry offset out of bounds: %d >= %d\n", header->entry_offset, payload_size);
+            return -2;
+        }
+        if (header_out != NULL) {
+            memcpy(header_out, header, IPOB_HEADER_SIZE);
+        }
+    } else {
+        // Pure flat binary: no mandatory superblock/header, starts at offset 0
+        if (header_out != NULL) {
+            memset(header_out, 0, sizeof(ipob_header_t));
+            header_out->entry_offset = 0;
+            header_out->total_size = stat.size;
+        }
     }
     
     *data_out = binary_image;
-    serial_printf("File loaded successfully\n");
+    serial_printf("File loaded successfully (has_header=%d)\n", has_header ? 1 : 0);
     return stat.size;
 }
 
@@ -529,6 +589,12 @@ void process_cleanup(process_t *proc) {
     }
     
     kfree(proc);
+
+    if (process_list == NULL) {
+        global_process_heap_used = 0;
+        block_count = 0;
+        serial_printf("[process] All processes terminated, heap reset to 0\n");
+    }
 }
 
 /**
@@ -548,6 +614,11 @@ int process_exec(const char *path, int argc, char **argv) {
         }
     }
 
+    if (process_list == NULL) {
+        global_process_heap_used = 0;
+        block_count = 0;
+    }
+
     serial_printf("process_exec: %s (actual=%s), argc=%d\n", path, actual_path, argc);
     log_process_heap_state("before exec");
 
@@ -560,7 +631,7 @@ int process_exec(const char *path, int argc, char **argv) {
     }
     
     memset(proc, 0, sizeof(process_t));
-    proc->pid = next_pid++;
+    proc->pid = allocate_pid();
     proc->is_running = 1;
     
     // Store process name
@@ -585,42 +656,114 @@ int process_exec(const char *path, int argc, char **argv) {
     serial_printf("File loaded, entry offset: 0x%x, total size: %d\n", 
            header.entry_offset, header.total_size);
     
-    // Allocating memory dynamically for the binary
-    void *target_addr = allocate_process_memory(proc, size,
-                                               PROT_READ | PROT_WRITE | PROT_EXEC);
-    
-    if (!target_addr) {
-        printf("Failed to allocate memory for process (need %d bytes)\n", size);
+    bool is_elf = (size >= (int)sizeof(Elf32_Ehdr) &&
+                   memcmp(binary_image, ELF_MAGIC, 4) == 0);
+
+    if (is_elf) {
+        const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)binary_image;
+        if (ehdr->e_ident[4] != 1 || ehdr->e_ident[5] != 1 ||
+            ehdr->e_machine != EM_386 || ehdr->e_phoff == 0 || ehdr->e_phnum == 0) {
+            printf("Invalid ELF32 binary (requires x86 32-bit)\n");
+            kfree(binary_image);
+            process_cleanup(proc);
+            if (resolved != NULL) kfree(resolved);
+            return -5;
+        }
+
+        const Elf32_Phdr *phdrs = (const Elf32_Phdr *)((const uint8_t *)binary_image + ehdr->e_phoff);
+        uint32_t min_vaddr = 0xFFFFFFFF;
+        uint32_t max_vaddr = 0;
+        for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+            if (phdrs[i].p_type == PT_LOAD && phdrs[i].p_memsz > 0) {
+                if (phdrs[i].p_vaddr < min_vaddr) min_vaddr = phdrs[i].p_vaddr;
+                uint32_t seg_end = phdrs[i].p_vaddr + phdrs[i].p_memsz;
+                if (seg_end > max_vaddr) max_vaddr = seg_end;
+            }
+        }
+
+        if (min_vaddr >= max_vaddr) {
+            printf("No LOAD segments in ELF binary\n");
+            kfree(binary_image);
+            process_cleanup(proc);
+            if (resolved != NULL) kfree(resolved);
+            return -5;
+        }
+
+        uint32_t total_span = max_vaddr - min_vaddr;
+        void *target_addr = allocate_process_memory(proc, total_span,
+                                                   PROT_READ | PROT_WRITE | PROT_EXEC);
+        if (!target_addr) {
+            printf("Failed to allocate %u bytes for ELF binary\n", total_span);
+            kfree(binary_image);
+            process_cleanup(proc);
+            if (resolved != NULL) kfree(resolved);
+            return -5;
+        }
+
+        memset(target_addr, 0, total_span);
+        uint32_t delta = (uint32_t)target_addr - min_vaddr;
+
+        for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+            if (phdrs[i].p_type == PT_LOAD && phdrs[i].p_memsz > 0) {
+                uint8_t *seg_dest = (uint8_t *)phdrs[i].p_vaddr + delta;
+                if (phdrs[i].p_filesz > 0) {
+                    memcpy(seg_dest, (const uint8_t *)binary_image + phdrs[i].p_offset, phdrs[i].p_filesz);
+                }
+                if (phdrs[i].p_memsz > phdrs[i].p_filesz) {
+                    memset(seg_dest + phdrs[i].p_filesz, 0, phdrs[i].p_memsz - phdrs[i].p_filesz);
+                }
+            }
+        }
+
         kfree(binary_image);
-        process_cleanup(proc);
         if (resolved != NULL) kfree(resolved);
-        return -5;
-    }
-    
-    memset(target_addr, 0, size - IPOB_HEADER_SIZE);
-    memcpy(target_addr, (uint8_t *)binary_image + IPOB_HEADER_SIZE,
-           size - IPOB_HEADER_SIZE);
-    
-    // Relocate if necessary.
-    uint32_t load_address = (uint32_t)target_addr;
-    if (relocate_binary(target_addr, load_address, size) < 0) {
-        printf("Relocation failed\n");
-        free_process_memory(proc, target_addr, size);
+
+        proc->binary_base = target_addr;
+        proc->binary_size = total_span;
+        proc->entry_point = ehdr->e_entry + delta;
+        serial_printf("ELF32 loaded: span=%u, entry=0x%x\n", total_span, proc->entry_point);
+    } else {
+        bool has_header = (size >= IPOB_HEADER_SIZE &&
+                           memcmp(((ipob_header_t *)binary_image)->magic, "IPO_B\x00\x00\x00", 8) == 0);
+        uint32_t header_size = has_header ? IPOB_HEADER_SIZE : 0;
+        uint32_t payload_size = size - header_size;
+
+        // Allocating memory dynamically for the binary
+        void *target_addr = allocate_process_memory(proc, payload_size,
+                                                   PROT_READ | PROT_WRITE | PROT_EXEC);
+        
+        if (!target_addr) {
+            printf("Failed to allocate memory for process (need %d bytes)\n", payload_size);
+            kfree(binary_image);
+            process_cleanup(proc);
+            if (resolved != NULL) kfree(resolved);
+            return -5;
+        }
+        
+        memset(target_addr, 0, payload_size);
+        memcpy(target_addr, (uint8_t *)binary_image + header_size, payload_size);
+        
+        // Relocate if necessary.
+        uint32_t load_address = (uint32_t)target_addr;
+        if (relocate_binary(target_addr, load_address, payload_size) < 0) {
+            printf("Relocation failed\n");
+            free_process_memory(proc, target_addr, payload_size);
+            kfree(binary_image);
+            process_cleanup(proc);
+            if (resolved != NULL) kfree(resolved);
+            return -6;
+        }
+        
+        // Freeing up the temporary buffer
         kfree(binary_image);
-        process_cleanup(proc);
         if (resolved != NULL) kfree(resolved);
-        return -6;
+        
+        // Saving information about the process
+        proc->binary_base = target_addr;
+        proc->binary_size = payload_size;
+        // Entry point is relative to where we actually loaded the binary in memory
+        proc->entry_point = (uint32_t)target_addr + header.entry_offset;
     }
-    
-    // Freeing up the temporary buffer
-    kfree(binary_image);
-    if (resolved != NULL) kfree(resolved);
-    
-    // Saving information about the process
-    proc->binary_base = target_addr;
-    proc->binary_size = size - IPOB_HEADER_SIZE;
-    // Entry point is relative to where we actually loaded the binary in memory
-    proc->entry_point = (uint32_t)target_addr + header.entry_offset;
     
     // Setting up arguments - argv is allocated in kernel memory
     uint32_t argv_addr = 0;
@@ -683,6 +826,9 @@ int process_exec(const char *path, int argc, char **argv) {
     keyboard_clear_key_state();
     terminal_unlock_input();
     system_set_state(SYSTEM_STATE_TERMINAL_IDLE);
+    vga_font_set_app_mode(false);
+    dynamic_keymap_reapply_fonts();
+    vga_cursor_reset();
 
     /* If Ctrl+C was used to stop the process, print a clean message */
     if (system_is_interrupted()) {
@@ -702,11 +848,13 @@ int process_exec(const char *path, int argc, char **argv) {
         return proc->pid;
     }
     
+    uint32_t finished_pid = proc->pid;
+
     // Cleaning resources
     process_cleanup(proc);
     log_process_heap_state("after cleanup");
     
-    return proc->pid;
+    return finished_pid ? (int)finished_pid : 1;
 }
 
 /**

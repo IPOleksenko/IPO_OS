@@ -14,6 +14,23 @@ int serial_printf(const char *format, ...) {
         if (*format == '%' && *(format + 1)) {
             format++;
 
+            /* Flags */
+            int left_align = 0;
+            int zero_pad = 0;
+            while (*format == '-' || *format == '0' || *format == ' ' || *format == '+') {
+                if (*format == '-') left_align = 1;
+                else if (*format == '0') zero_pad = 1;
+                format++;
+            }
+            if (left_align) zero_pad = 0;
+
+            /* Width */
+            int width = 0;
+            while (*format >= '0' && *format <= '9') {
+                width = width * 10 + (*format - '0');
+                format++;
+            }
+
             /* length modifier */
             int is_long = 0;
             if (*format == 'l' && *(format + 1) == 'l') {
@@ -27,44 +44,66 @@ int serial_printf(const char *format, ...) {
             if (!*format) break;
 
             switch (*format) {
+                case 'i':
                 case 'd': {
                     int val = va_arg(args, int);
                     char buf[32];
                     int len;
+                    int is_neg = (val < 0);
 
-                    if (val < 0) {
-                        serial_putc('-');
-                        count++;
+                    if (is_neg) {
                         unsigned int abs_val = (unsigned int)(-(long)val);
                         len = itoa(abs_val, buf, 10);
                     } else {
                         len = itoa((unsigned int)val, buf, 10);
                     }
 
-                    for (int i = 0; i < len && i < 32; i++) {
+                    int total_len = len + (is_neg ? 1 : 0);
+                    int pad = (width > total_len) ? (width - total_len) : 0;
+
+                    if (!left_align && !zero_pad) {
+                        for (int p = 0; p < pad; p++) { serial_putc(' '); count++; }
+                    }
+                    if (is_neg) {
+                        serial_putc('-');
+                        count++;
+                    }
+                    if (!left_align && zero_pad) {
+                        for (int p = 0; p < pad; p++) { serial_putc('0'); count++; }
+                    }
+                    for (int i = 0; i < len; i++) {
                         serial_putc(buf[i]);
                         count++;
+                    }
+                    if (left_align) {
+                        for (int p = 0; p < pad; p++) { serial_putc(' '); count++; }
                     }
                     break;
                 }
 
                 case 'u': {
+                    char buf[64];
+                    int len;
                     if (is_long) {
                         uint64_t val = va_arg(args, uint64_t);
-                        char buf[64];
-                        int len = itoa64(val, buf, 10);
-                        for (int i = 0; i < len; i++) {
-                            serial_putc(buf[i]);
-                            count++;
-                        }
+                        len = itoa64(val, buf, 10);
                     } else {
                         unsigned int val = va_arg(args, unsigned int);
-                        char buf[32];
-                        int len = itoa(val, buf, 10);
-                        for (int i = 0; i < len; i++) {
-                            serial_putc(buf[i]);
-                            count++;
-                        }
+                        len = itoa(val, buf, 10);
+                    }
+
+                    int pad = (width > len) ? (width - len) : 0;
+                    char pad_char = zero_pad ? '0' : ' ';
+
+                    if (!left_align) {
+                        for (int p = 0; p < pad; p++) { serial_putc(pad_char); count++; }
+                    }
+                    for (int i = 0; i < len; i++) {
+                        serial_putc(buf[i]);
+                        count++;
+                    }
+                    if (left_align) {
+                        for (int p = 0; p < pad; p++) { serial_putc(' '); count++; }
                     }
                     break;
                 }
@@ -112,13 +151,28 @@ int serial_printf(const char *format, ...) {
                     break;
                 }
 
+                case 'X':
                 case 'x': {
                     unsigned int val = va_arg(args, unsigned int);
                     char buf[32];
                     int len = itoa(val, buf, 16);
+                    if (*format == 'X') {
+                        for (int j = 0; j < len; j++) {
+                            if (buf[j] >= 'a' && buf[j] <= 'f') buf[j] -= 32;
+                        }
+                    }
+                    int pad = (width > len) ? (width - len) : 0;
+                    char pad_char = zero_pad ? '0' : ' ';
+
+                    if (!left_align) {
+                        for (int p = 0; p < pad; p++) { serial_putc(pad_char); count++; }
+                    }
                     for (int i = 0; i < len; i++) {
                         serial_putc(buf[i]);
                         count++;
+                    }
+                    if (left_align) {
+                        for (int p = 0; p < pad; p++) { serial_putc(' '); count++; }
                     }
                     break;
                 }
@@ -132,11 +186,20 @@ int serial_printf(const char *format, ...) {
 
                 case 's': {
                     const char *str = va_arg(args, const char *);
-                    if (str) {
-                        while (*str) {
-                            serial_putc(*str++);
-                            count++;
-                        }
+                    if (!str) str = "(null)";
+                    int len = 0;
+                    while (str[len]) len++;
+
+                    int pad = (width > len) ? (width - len) : 0;
+                    if (!left_align) {
+                        for (int p = 0; p < pad; p++) { serial_putc(' '); count++; }
+                    }
+                    for (int i = 0; i < len; i++) {
+                        serial_putc(str[i]);
+                        count++;
+                    }
+                    if (left_align) {
+                        for (int p = 0; p < pad; p++) { serial_putc(' '); count++; }
                     }
                     break;
                 }

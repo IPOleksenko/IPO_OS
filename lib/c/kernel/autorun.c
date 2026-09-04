@@ -38,42 +38,42 @@ static const char* skip_line(const char *line) {
  * Execute autorun file
  */
 void autorun_init(void) {
-    printf("[autorun] Starting autorun system\n");
+    serial_printf("[autorun] Starting autorun system\n");
     
     struct ipo_inode stat;
     if (!ipo_fs_stat(AUTORUN_PATH, &stat)) {
-        printf("[autorun] /autorun not found, skipping\n");
+        serial_printf("[autorun] /autorun not found, skipping\n");
         return;
     }
     
     if ((stat.mode & IPO_INODE_TYPE_DIR) != 0) {
-        printf("[autorun] /autorun is a directory, skipping\n");
+        serial_printf("[autorun] /autorun is a directory, skipping\n");
         return;
     }
     
     if (stat.size > AUTORUN_BUF_SIZE) {
-        printf("[autorun] /autorun too large (max %d bytes)\n", AUTORUN_BUF_SIZE);
+        serial_printf("[autorun] /autorun too large (max %d bytes)\n", AUTORUN_BUF_SIZE);
         return;
     }
     
     // Allocate buffer for autorun file
     char *autorun_buf = kmalloc(stat.size + 1);
     if (!autorun_buf) {
-        printf("[autorun] Memory allocation failed\n");
+        serial_printf("[autorun] Memory allocation failed\n");
         return;
     }
     
     // Read autorun file
     int fd = ipo_fs_open(AUTORUN_PATH);
     if (fd < 0) {
-        printf("[autorun] Failed to open /autorun\n");
+        serial_printf("[autorun] Failed to open /autorun\n");
         kfree(autorun_buf);
         return;
     }
     
     int bytes_read = ipo_fs_read(fd, autorun_buf, stat.size, 0);
     if (bytes_read < (int)stat.size) {
-        printf("[autorun] Failed to read /autorun (read %d of %d bytes)\n", bytes_read, stat.size);
+        serial_printf("[autorun] Failed to read /autorun (read %d of %d bytes)\n", bytes_read, stat.size);
         kfree(autorun_buf);
         return;
     }
@@ -133,17 +133,17 @@ void autorun_init(void) {
             cmd_name[sizeof(cmd_name) - 1] = '\0';
         }
         
-        printf("[autorun] Line %d: executing '%s'\n", line_num, cmd_name);
+        serial_printf("[autorun] Line %d: executing '%s'\n", line_num, cmd_name);
         
         // Try to execute with full line (including arguments)
         int exec_result = try_execute_command(full_line);
         if (exec_result == 0) {
-            printf("[autorun] Command '%s' not found\n", cmd_name);
+            serial_printf("[autorun] Command '%s' not found\n", cmd_name);
         } else if (exec_result < 0) {
-            printf("[autorun] Command '%s' execution failed (error %d)\n", cmd_name, exec_result);
+            serial_printf("[autorun] Command '%s' execution failed (error %d)\n", cmd_name, exec_result);
         }
     }
     
     kfree(autorun_buf);
-    printf("[autorun] Autorun complete\n");
+    serial_printf("[autorun] Autorun complete\n");
 }

@@ -1,4 +1,4 @@
-ENTRY(main)
+ENTRY(_start)
 
 PHDRS
 {
@@ -8,24 +8,27 @@ PHDRS
 
 SECTIONS
 {
-    . = 0;
+    . = 0x800000;
 
-    .text : ALIGN(4096)
+    .text : ALIGN(4)
     {
+        *(.entry)
+        *(.text.startup)
+        *(.text.main)
         *(.text*)
     } :text
 
-    .rodata : ALIGN(4096)
+    .rodata : ALIGN(4)
     {
         *(.rodata*)
     } :text
 
-    .data : ALIGN(4096)
+    .data : ALIGN(4)
     {
         *(.data*)
     } :data
 
-    .bss : ALIGN(4096)
+    .bss : ALIGN(4)
     {
         *(COMMON)
         *(.bss*)

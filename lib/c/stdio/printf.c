@@ -34,6 +34,23 @@ int printf(const char *format, ...) {
         if (*format == '%' && *(format + 1)) {
             format++;
 
+            /* Flags */
+            int left_align = 0;
+            int zero_pad = 0;
+            while (*format == '-' || *format == '0' || *format == ' ' || *format == '+') {
+                if (*format == '-') left_align = 1;
+                else if (*format == '0') zero_pad = 1;
+                format++;
+            }
+            if (left_align) zero_pad = 0;
+
+            /* Width */
+            int width = 0;
+            while (*format >= '0' && *format <= '9') {
+                width = width * 10 + (*format - '0');
+                format++;
+            }
+
             /* Check for 'l' length modifier */
             int is_long = 0;
 
@@ -50,59 +67,68 @@ int printf(const char *format, ...) {
             }
 
             switch (*format) {
+                case 'i':
                 case 'd': {
                     /* Signed integer */
                     int val = va_arg(args, int);
                     char buf[32];
                     int len = 0;
+                    int is_neg = (val < 0);
 
-                    if (val < 0) {
-                        putchar('-');
-                        count++;
-
-                        /* Convert to absolute value safely */
-                        /* For INT_MIN, we use (unsigned int)(-(long)val) to avoid overflow */
-                        unsigned int abs_val =
-                            (unsigned int)(-(long)val);
-
+                    if (is_neg) {
+                        unsigned int abs_val = (unsigned int)(-(long)val);
                         len = itoa(abs_val, buf, 10);
                     } else {
                         len = itoa((unsigned int)val, buf, 10);
                     }
 
-                    for (int i = 0; i < len && i < 32; i++) {
+                    int total_len = len + (is_neg ? 1 : 0);
+                    int pad = (width > total_len) ? (width - total_len) : 0;
+
+                    if (!left_align && !zero_pad) {
+                        for (int p = 0; p < pad; p++) { putchar(' '); count++; }
+                    }
+                    if (is_neg) {
+                        putchar('-');
+                        count++;
+                    }
+                    if (!left_align && zero_pad) {
+                        for (int p = 0; p < pad; p++) { putchar('0'); count++; }
+                    }
+                    for (int i = 0; i < len; i++) {
                         putchar(buf[i]);
                         count++;
                     }
-
+                    if (left_align) {
+                        for (int p = 0; p < pad; p++) { putchar(' '); count++; }
+                    }
                     break;
                 }
 
                 case 'u': {
+                    char buf[64];
+                    int len = 0;
                     if (is_long) {
-                        /* Unsigned long long */
                         uint64_t val = va_arg(args, uint64_t);
-                        char buf[64];
-                        int len = itoa64(val, buf, 10);
-
-                        for (int i = 0; i < len; i++) {
-                            putchar(buf[i]);
-                            count++;
-                        }
+                        len = itoa64(val, buf, 10);
                     } else {
-                        /* Unsigned integer */
-                        unsigned int val =
-                            va_arg(args, unsigned int);
-
-                        char buf[32];
-                        int len = itoa(val, buf, 10);
-
-                        for (int i = 0; i < len; i++) {
-                            putchar(buf[i]);
-                            count++;
-                        }
+                        unsigned int val = va_arg(args, unsigned int);
+                        len = itoa(val, buf, 10);
                     }
 
+                    int pad = (width > len) ? (width - len) : 0;
+                    char pad_char = zero_pad ? '0' : ' ';
+
+                    if (!left_align) {
+                        for (int p = 0; p < pad; p++) { putchar(pad_char); count++; }
+                    }
+                    for (int i = 0; i < len; i++) {
+                        putchar(buf[i]);
+                        count++;
+                    }
+                    if (left_align) {
+                        for (int p = 0; p < pad; p++) { putchar(' '); count++; }
+                    }
                     break;
                 }
 
@@ -151,19 +177,31 @@ int printf(const char *format, ...) {
                     break;
                 }
 
+                case 'X':
                 case 'x': {
                     /* Hexadecimal */
-                    unsigned int val =
-                        va_arg(args, unsigned int);
-
+                    unsigned int val = va_arg(args, unsigned int);
                     char buf[32];
                     int len = itoa(val, buf, 16);
+                    if (*format == 'X') {
+                        for (int j = 0; j < len; j++) {
+                            if (buf[j] >= 'a' && buf[j] <= 'f') buf[j] -= 32;
+                        }
+                    }
 
+                    int pad = (width > len) ? (width - len) : 0;
+                    char pad_char = zero_pad ? '0' : ' ';
+
+                    if (!left_align) {
+                        for (int p = 0; p < pad; p++) { putchar(pad_char); count++; }
+                    }
                     for (int i = 0; i < len; i++) {
                         putchar(buf[i]);
                         count++;
                     }
-
+                    if (left_align) {
+                        for (int p = 0; p < pad; p++) { putchar(' '); count++; }
+                    }
                     break;
                 }
 
@@ -179,16 +217,22 @@ int printf(const char *format, ...) {
 
                 case 's': {
                     /* String */
-                    const char *str =
-                        va_arg(args, const char *);
+                    const char *str = va_arg(args, const char *);
+                    if (!str) str = "(null)";
+                    int len = 0;
+                    while (str[len]) len++;
 
-                    if (str) {
-                        while (*str) {
-                            putchar(*str++);
-                            count++;
-                        }
+                    int pad = (width > len) ? (width - len) : 0;
+                    if (!left_align) {
+                        for (int p = 0; p < pad; p++) { putchar(' '); count++; }
                     }
-
+                    for (int i = 0; i < len; i++) {
+                        putchar(str[i]);
+                        count++;
+                    }
+                    if (left_align) {
+                        for (int p = 0; p < pad; p++) { putchar(' '); count++; }
+                    }
                     break;
                 }
 

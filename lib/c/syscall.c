@@ -310,6 +310,7 @@ static uint32_t syscall_builtin_write(uint32_t num,
 
     while (text[count] != '\0') {
         putchar(text[count]);
+        serial_putc(text[count]);
         count++;
     }
 
@@ -341,6 +342,18 @@ static uint32_t syscall_builtin_fs_open(uint32_t num,
 
     return (uint32_t)ipo_fs_open(
         (const char *)(uintptr_t)argv[0]);
+}
+
+static uint32_t syscall_builtin_fs_close(uint32_t num,
+                                          uint32_t argc,
+                                          uint32_t *argv) {
+    (void)num;
+
+    if (argc < 1u || argv == NULL) {
+        return IPO_SYSCALL_ENOSYS;
+    }
+
+    return (uint32_t)ipo_fs_close((int)argv[0]);
 }
 
 static uint32_t syscall_builtin_fs_read(uint32_t num,
@@ -502,6 +515,26 @@ static uint32_t syscall_builtin_font_load(uint32_t num,
     return (res == 0) ? IPO_SYSCALL_OK : IPO_SYSCALL_ENOSYS;
 }
 
+static uint32_t syscall_builtin_font_get_info(uint32_t num,
+                                              uint32_t argc,
+                                              uint32_t *argv) {
+    (void)num;
+    char *name_buf = (argc >= 1u && argv != NULL) ? (char *)(uintptr_t)argv[0] : NULL;
+    uint32_t max_len = (argc >= 2u && argv != NULL) ? argv[1] : 0;
+    uint32_t *out_count = (argc >= 3u && argv != NULL) ? (uint32_t *)(uintptr_t)argv[2] : NULL;
+    return (uint32_t)vga_font_get_info(name_buf, max_len, out_count);
+}
+
+static uint32_t syscall_builtin_vga_glyph(uint32_t num,
+                                         uint32_t argc,
+                                         uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || argv == NULL) return (uint32_t)-1;
+    uint32_t codepoint = argv[0];
+    int slot = vga_font_register_glyph(codepoint, NULL);
+    return (uint32_t)slot;
+}
+
 static uint32_t syscall_builtin_keymap_disable(uint32_t num,
                                               uint32_t argc,
                                               uint32_t *argv) {
@@ -527,6 +560,47 @@ static uint32_t syscall_builtin_keymap_remove(uint32_t num,
     if (argc < 1u || argv == NULL) return IPO_SYSCALL_ENOSYS;
     const char *target = (const char *)(uintptr_t)argv[0];
     return (uint32_t)dynamic_keymap_remove(target);
+}
+
+static uint32_t syscall_builtin_keymap_translate(uint32_t num,
+                                                uint32_t argc,
+                                                uint32_t *argv) {
+    (void)num;
+    if (argc < 2u || argv == NULL) return 0;
+    uint8_t scancode = (uint8_t)argv[0];
+    bool shift = (bool)argv[1];
+    const char *s = dynamic_keymap_translate(scancode, shift);
+    return (uint32_t)(uintptr_t)s;
+}
+
+static uint32_t syscall_builtin_keymap_is_active(uint32_t num,
+                                                uint32_t argc,
+                                                uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    return (uint32_t)dynamic_keymap_is_active();
+}
+
+static uint32_t syscall_builtin_keymap_cycle_next(uint32_t num,
+                                                 uint32_t argc,
+                                                 uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    dynamic_keymap_cycle_next();
+    return 0;
+}
+
+static uint32_t syscall_builtin_keymap_cycle_prev(uint32_t num,
+                                                 uint32_t argc,
+                                                 uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    dynamic_keymap_cycle_prev();
+    return 0;
+}
+
+static uint32_t syscall_builtin_keymap_get_name(uint32_t num,
+                                               uint32_t argc,
+                                               uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    return (uint32_t)(uintptr_t)dynamic_keymap_get_name();
 }
 
 static uint32_t syscall_builtin_driver_register(uint32_t num,
@@ -1168,6 +1242,10 @@ void syscall_init(void) {
         syscall_builtin_fs_open);
 
     ipo_register_syscall(
+        IPO_SYSCALL_FS_CLOSE,
+        syscall_builtin_fs_close);
+
+    ipo_register_syscall(
         IPO_SYSCALL_FS_READ,
         syscall_builtin_fs_read);
 
@@ -1252,8 +1330,36 @@ void syscall_init(void) {
         syscall_builtin_keymap_remove);
 
     ipo_register_syscall(
+        IPO_SYSCALL_KEYMAP_TRANSLATE,
+        syscall_builtin_keymap_translate);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_KEYMAP_IS_ACTIVE,
+        syscall_builtin_keymap_is_active);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_KEYMAP_CYCLE_NEXT,
+        syscall_builtin_keymap_cycle_next);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_KEYMAP_CYCLE_PREV,
+        syscall_builtin_keymap_cycle_prev);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_KEYMAP_GET_NAME,
+        syscall_builtin_keymap_get_name);
+
+    ipo_register_syscall(
         IPO_SYSCALL_FONT_LOAD,
         syscall_builtin_font_load);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_FONT_GET_INFO,
+        syscall_builtin_font_get_info);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_VGA_GLYPH,
+        syscall_builtin_vga_glyph);
 
     ipo_register_syscall(
         IPO_SYSCALL_DRIVER_REGISTER,
@@ -1288,14 +1394,7 @@ uint32_t syscall_dispatch(uint32_t num,
                           uint32_t argc,
                           uint32_t *argv)
 {
-    if (ipo_syscall_table == NULL ||
-        num >= ipo_syscall_table_size) {
-        return IPO_SYSCALL_ENOSYS;
-    }
-
-    ipo_syscall_handler_t fn =
-        ipo_syscall_table[num];
-
+    ipo_syscall_handler_t fn = (ipo_syscall_table && num < ipo_syscall_table_size) ? ipo_syscall_table[num] : NULL;
     if (fn == NULL) {
         return IPO_SYSCALL_ENOSYS;
     }

@@ -97,6 +97,7 @@ int dynamic_keymap_set(const char *name, const keymap_entry_t *entries, uint32_t
  * Get current active language name.
  */
 const char* dynamic_keymap_get_name(void);
+void dynamic_keymap_reapply_fonts(void);
 
 /**
  * Translate a scancode using the dynamic keymap.
@@ -177,5 +178,10 @@ const char* dynamic_keymap_get_slot_name(uint32_t index);
  * Reset back to default system keymap (English QWERTY).
  */
 void dynamic_keymap_reset(void);
+
+/**
+ * Configure dynamic keymap app mode.
+ */
+void dynamic_keymap_set_app_mode(bool is_app);
 
 #endif /* DYNAMIC_KEYMAP_H */

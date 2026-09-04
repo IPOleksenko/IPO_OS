@@ -51,6 +51,7 @@ int scanf(const char *format, ...);
  * @return Number of characters written (excluding null terminator)
  */
 int snprintf(char *buf, size_t size, const char *format, ...);
+int vsnprintf(char *buf, size_t size, const char *format, va_list args);
 
 /**
  * Convert unsigned integer to string (internal use)
