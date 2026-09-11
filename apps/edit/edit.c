@@ -20,11 +20,15 @@
 #include <string.h>
 #include <syscall.h>
 #include <vga.h>
+#include <vga_gfx.h>
 #include <ioport.h>
 #include <memory/kmalloc.h>
 #include <file_system/ipo_fs.h>
 #include <driver/input/keyboard.h>
 #include <driver/input/keymap/keymap.h>
+#include <system/timer.h>
+#include <system/state.h>
+#include <kernel/process.h>
 
 #define MAX_LINES 2048
 #define MAX_LINE_LEN 256
@@ -560,9 +564,11 @@ static void render(void) {
 
         const char *lang_name = dynamic_keymap_get_name();
         const char *lang_tag = "EN";
-        if (strstr(lang_name, "Russian") != NULL) lang_tag = "RU";
-        else if (strstr(lang_name, "Ukrainian") != NULL) lang_tag = "UA";
-        else if (strstr(lang_name, "Chinese") != NULL) lang_tag = "ZH";
+        if (lang_name) {
+            if (strstr(lang_name, "Russian") != NULL) lang_tag = "RU";
+            else if (strstr(lang_name, "Ukrainian") != NULL) lang_tag = "UA";
+            else if (strstr(lang_name, "Chinese") != NULL) lang_tag = "ZH";
+        }
 
         int cur_screen_col = get_screen_col(lines[cur_line], cur_col);
         char right_part[48];
@@ -814,15 +820,15 @@ static bool execute_command(void) {
     char *cmd = cmd_buf;
     while (*cmd == ' ') cmd++;
 
-    if (strcmp(cmd, "q") == 0 || strcmp(cmd, "й") == 0) {
+    if (strcmp(cmd, "q") == 0 || strcmp(cmd, "Q") == 0 || strcmp(cmd, "й") == 0 || strcmp(cmd, "Й") == 0) {
         if (is_modified) {
             snprintf(status_msg, sizeof(status_msg), "No write since last change (add ! to override)");
             return false;
         }
         return true; /* Exit editor */
-    } else if (strcmp(cmd, "q!") == 0 || strcmp(cmd, "й!") == 0) {
+    } else if (strcmp(cmd, "q!") == 0 || strcmp(cmd, "Q!") == 0 || strcmp(cmd, "й!") == 0 || strcmp(cmd, "Й!") == 0) {
         return true; /* Force exit */
-    } else if (strcmp(cmd, "w") == 0 || strcmp(cmd, "ц") == 0) {
+    } else if (strcmp(cmd, "w") == 0 || strcmp(cmd, "W") == 0 || strcmp(cmd, "ц") == 0 || strcmp(cmd, "Ц") == 0) {
         if (current_file[0] == '\0') {
             snprintf(status_msg, sizeof(status_msg), "Error: No file name");
         } else {
@@ -835,9 +841,9 @@ static bool execute_command(void) {
             strncpy(current_file, new_path, sizeof(current_file) - 1);
             save_file(current_file);
         }
-    } else if (strcmp(cmd, "wq") == 0 || strcmp(cmd, "цй") == 0 ||
-               strcmp(cmd, "wq!") == 0 || strcmp(cmd, "цй!") == 0 ||
-               strcmp(cmd, "x") == 0 || strcmp(cmd, "ч") == 0) {
+    } else if (strcmp(cmd, "wq") == 0 || strcmp(cmd, "WQ") == 0 || strcmp(cmd, "цй") == 0 ||
+               strcmp(cmd, "wq!") == 0 || strcmp(cmd, "WQ!") == 0 || strcmp(cmd, "цй!") == 0 ||
+               strcmp(cmd, "x") == 0 || strcmp(cmd, "X") == 0 || strcmp(cmd, "ч") == 0) {
         if (current_file[0] == '\0') {
             snprintf(status_msg, sizeof(status_msg), "Error: No file name");
         } else {
@@ -940,13 +946,36 @@ int main(int argc, char **argv) {
         current_file[sizeof(current_file) - 1] = '\0';
     }
 
+    /* If running in a batch behind another process, wait until we become foreground */
+    while (!process_is_foreground()) {
+        process_yield();
+        if (system_is_interrupted()) {
+            return 0;
+        }
+    }
+
+    /* Ensure text mode is set (in case previous app was in Mode 13h) */
+    vga_set_mode_text();
+
     /* Save previous screen to restore cleanly upon exit */
     vga_hide_cursor();
-    memcpy(saved_screen, (const void *)VGA_MEMORY, sizeof(saved_screen));
-    saved_cursor = vga_get_cursor_position();
-    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
-        if ((saved_screen[i] & 0xFF) == VGA_CURSOR_GLYPH_SLOT) {
-            saved_screen[i] = (saved_screen[i] & 0xFF00) | ' ';
+    if (vga_is_graphics_mode()) {
+        for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
+            saved_screen[i] = 0x0720;
+        }
+        saved_cursor = 0;
+    } else {
+        memcpy(saved_screen, (const void *)VGA_MEMORY, sizeof(saved_screen));
+        saved_cursor = vga_get_cursor_position();
+        for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
+            uint16_t ent = saved_screen[i];
+            uint8_t ch = (uint8_t)(ent & 0xFF);
+            uint8_t attr = (uint8_t)(ent >> 8);
+            if (ch == VGA_CURSOR_GLYPH_SLOT) {
+                saved_screen[i] = (ent & 0xFF00) | ' ';
+            } else if (ent == 0xFFFF || attr == 0xFF || attr == 0x20) {
+                saved_screen[i] = 0x0720;
+            }
         }
     }
 
@@ -964,14 +993,20 @@ int main(int argc, char **argv) {
     dynamic_keymap_set_app_mode(true);
     keyboard_flush_hardware();
     keyboard_flush_app_queue();
-    keyboard_set_app_input_mode(true);
-
     bool running = true;
     while (running) {
+        if (system_is_interrupted()) {
+            break;
+        }
+
         render();
 
         /* Fetch scancode safely via keyboard driver (prevents mouse packets from leaking into edit) */
         uint8_t sc = keyboard_wait_scancode();
+
+        if (system_is_interrupted()) {
+            break;
+        }
 
         update_hot_key_state(sc);
         bool is_break = (sc & 0x80) != 0;
@@ -987,8 +1022,26 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        /* Ctrl+C: Global interrupt and exit */
+        if (keyboard_is_ctrl_pressed() && (sc == 0x2E || sc == 0xAE)) {
+            system_request_interrupt();
+            running = false;
+            break;
+        }
+
         /* Ctrl+Q: Exit editor cleanly */
         if (keyboard_is_ctrl_pressed() && (sc == 0x10 || sc == 0x90)) {
+            uint32_t t0 = timer_millis();
+            while (timer_elapsed_ms(t0) < 150u) {
+                while (inb(0x64) & 0x01) {
+                    (void)inb(0x60);
+                }
+                io_wait();
+            }
+            keyboard_flush_hardware();
+            keyboard_flush_queue();
+            keyboard_flush_app_queue();
+            keyboard_clear_key_state();
             running = false;
             break;
         }
@@ -1233,6 +1286,13 @@ int main(int argc, char **argv) {
 
     /* Restore screen & cursor on exit */
     vga_hide_cursor();
+    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
+        uint16_t ent = saved_screen[i];
+        uint8_t attr = (uint8_t)(ent >> 8);
+        if (ent == 0xFFFF || attr == 0xFF || attr == 0x20) {
+            saved_screen[i] = 0x0720;
+        }
+    }
     memcpy((void *)VGA_MEMORY, saved_screen, sizeof(saved_screen));
     vga_set_cursor(saved_cursor);
     vga_font_set_app_mode(false);

@@ -8,10 +8,15 @@
 #include <driver/input/keymap/dynamic_keymap.h>
 #include <driver/input/keyboard.h>
 #include <vga.h>
+#include <vga_gfx.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <kernel/elf.h>
+#include <wm.h>
+#include <syscall.h>
+#include <driver/input/mouse.h>
+#include <ioport.h>
 
 /**
  * IPO_BINARY Application Header (20 bytes)
@@ -38,6 +43,152 @@ typedef struct {
 static int last_exit_code = 0;
 static process_t *current_process = NULL;
 static process_t *process_list = NULL;
+
+/* Cooperative multitasking scheduler state */
+static process_t **batch_procs = NULL;
+static int batch_proc_count = 0;
+static int batch_current_idx = 0;
+static uint32_t scheduler_esp = 0;
+static bool batch_active = false;
+static process_t *currently_mapped_app = NULL;
+
+void process_map_app(process_t *proc) {
+    if (currently_mapped_app == proc) {
+        return;
+    }
+
+    if (currently_mapped_app != NULL && currently_mapped_app->binary_storage != NULL) {
+        // Save previous app's modified data/bss from 0x800000
+        memcpy(currently_mapped_app->binary_storage, (void *)PROCESS_HEAP_START, currently_mapped_app->binary_size);
+    }
+
+    if (proc != NULL && proc->binary_storage != NULL) {
+        // Load this app's code/data/bss into 0x800000
+        memcpy((void *)PROCESS_HEAP_START, proc->binary_storage, proc->binary_size);
+    }
+
+    currently_mapped_app = proc;
+}
+
+process_t *process_get_mapped_app(void) {
+    return currently_mapped_app;
+}
+
+__attribute__((naked)) static void process_switch_context(uint32_t *old_esp, uint32_t new_esp) {
+    __asm__ volatile(
+        "pushl %ebp\n\t"
+        "pushl %ebx\n\t"
+        "pushl %esi\n\t"
+        "pushl %edi\n\t"
+        "pushfl\n\t"
+        "movl 24(%esp), %eax\n\t"
+        "movl 28(%esp), %edx\n\t"
+        "movl %esp, (%eax)\n\t"
+        "movl %edx, %esp\n\t"
+        "popfl\n\t"
+        "popl %edi\n\t"
+        "popl %esi\n\t"
+        "popl %ebx\n\t"
+        "popl %ebp\n\t"
+        "ret\n\t"
+    );
+}
+
+static bool in_process_context = false;
+
+bool process_in_process_context(void) {
+    return in_process_context;
+}
+
+void process_yield_kernel(void) {
+    if (!batch_active || !in_process_context || !current_process) {
+        return;
+    }
+
+    process_t *fg = process_get_foreground();
+    int running = 0;
+    for (int i = 0; i < batch_proc_count; i++) {
+        if (batch_procs[i] && batch_procs[i]->is_running) {
+            if (batch_procs[i]->waiting_for_input && batch_procs[i] != fg) {
+                continue;
+            }
+            running++;
+        }
+    }
+
+    if (current_process == fg && running <= 1) {
+        return;
+    }
+
+    in_process_context = false;
+    process_switch_context(&current_process->stack_ptr, scheduler_esp);
+    in_process_context = true;
+}
+
+process_t *process_get_foreground(void) {
+    if (!batch_active) {
+        return current_process;
+    }
+    for (int i = batch_proc_count - 1; i >= 0; i--) {
+        if (batch_procs && batch_procs[i] && batch_procs[i]->is_running) {
+            return batch_procs[i];
+        }
+    }
+    return NULL;
+}
+
+bool process_is_foreground(void) {
+    if (batch_active) {
+        bool is_fg = (process_get_foreground() == current_process);
+        if (!is_fg && current_process) {
+            current_process->waiting_for_input = true;
+        }
+        return is_fg;
+    }
+    int res = ipo_syscall(IPO_SYSCALL_PROCESS_IS_FOREGROUND, 0, NULL);
+    if (res == (int)IPO_SYSCALL_ENOSYS) {
+        return true;
+    }
+    return res != 0;
+}
+
+void process_yield(void) {
+    if (batch_active) {
+        process_yield_kernel();
+        return;
+    }
+    ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
+}
+
+static void process_trampoline(void) {
+    process_t *proc = current_process;
+    typedef int (*entry_func_t)(int, char**);
+    entry_func_t entry = (entry_func_t)proc->entry_point;
+    char **argv = (char**)proc->argv_kernel;
+
+    serial_printf("[process] pid=%u start trampoline\n", proc->pid);
+
+    int exit_code = 0;
+    if (entry != NULL) {
+        exit_code = entry(proc->argc, argv);
+    }
+
+    proc->is_running = 0;
+    proc->exit_code = exit_code;
+    last_exit_code = exit_code;
+
+    if (!vga_is_graphics_mode()) {
+        vga_sanitize_text_vram();
+    }
+
+    serial_printf("[process] pid=%u trampoline exit_code=%d\n", proc->pid, exit_code);
+
+    process_yield();
+
+    while (1) {
+        process_yield();
+    }
+}
 
 static uint32_t allocate_pid(void) {
     uint32_t candidate = 1;
@@ -337,8 +488,7 @@ static int setup_arguments(process_t *proc, int argc, char **argv, uint32_t *arg
 static uint32_t setup_stack(process_t *proc) {
     const uint32_t stack_size = 256u * 1024u;
 
-    proc->stack_base = allocate_process_memory(proc, stack_size,
-                                              PROT_READ | PROT_WRITE);
+    proc->stack_base = kmalloc(stack_size);
     if (proc->stack_base == NULL) {
         return 0;
     }
@@ -538,19 +688,21 @@ void process_cleanup(process_t *proc) {
         return;
     }
     
-    // Keep the binary resident if it owns background async tasks.
-    // The callback function pointer remains valid only while the code stays in memory.
+    if (currently_mapped_app == proc) {
+        currently_mapped_app = NULL;
+    }
+
+    if (proc->binary_storage) {
+        kfree(proc->binary_storage);
+        proc->binary_storage = NULL;
+    }
+
     if (proc->binary_base) {
-        free_process_memory(proc, proc->binary_base, proc->binary_size);
         proc->binary_base = NULL;
     }
 
     if (proc->stack_base) {
-        if ((uintptr_t)proc->stack_base >= PROCESS_HEAP_START) {
-            free_process_memory(proc, proc->stack_base, proc->stack_size);
-        } else {
-            kfree(proc->stack_base);
-        }
+        kfree(proc->stack_base);
         proc->stack_base = NULL;
     }
     
@@ -593,16 +745,18 @@ void process_cleanup(process_t *proc) {
     if (process_list == NULL) {
         global_process_heap_used = 0;
         block_count = 0;
+        keyboard_set_app_input_mode(false);
+        terminal_unlock_input();
         serial_printf("[process] All processes terminated, heap reset to 0\n");
     }
 }
 
 /**
- * process_exec - The main function for executing a process with arguments
+ * process_spawn - Creates, loads, and initializes a process ready to run
  */
-int process_exec(const char *path, int argc, char **argv) {
+process_t *process_spawn(const char *path, int argc, char **argv) {
     if (path == NULL) {
-        return -1;
+        return NULL;
     }
 
     char *resolved = NULL;
@@ -619,43 +773,44 @@ int process_exec(const char *path, int argc, char **argv) {
         block_count = 0;
     }
 
-    serial_printf("process_exec: %s (actual=%s), argc=%d\n", path, actual_path, argc);
-    log_process_heap_state("before exec");
+    serial_printf("process_spawn: %s (actual=%s), argc=%d\n", path, actual_path, argc);
+    log_process_heap_state("before spawn");
 
     // Creating a process structure
     process_t *proc = kmalloc(sizeof(process_t));
     if (!proc) {
         printf("Failed to allocate process structure\n");
         if (resolved != NULL) kfree(resolved);
-        return -2;
+        return NULL;
     }
-    
+
     memset(proc, 0, sizeof(process_t));
     proc->pid = allocate_pid();
     proc->is_running = 1;
-    
+
     // Store process name
     strncpy(proc->name, actual_path, sizeof(proc->name) - 1);
-    
+    proc->wants_graphics = false;
+
     // Add to the list of processes
     proc->next = process_list;
     process_list = proc;
-    
+
     // Uploading the file
     ipob_header_t header;
-    void *binary_image;
-    
+    void *binary_image = NULL;
+
     int size = load_ipob_file(actual_path, &header, &binary_image);
     if (size < 0) {
         printf("Failed to load file: error %d\n", size);
         process_cleanup(proc);
         if (resolved != NULL) kfree(resolved);
-        return size;
+        return NULL;
     }
-    
-    serial_printf("File loaded, entry offset: 0x%x, total size: %d\n", 
+
+    serial_printf("File loaded, entry offset: 0x%x, total size: %d\n",
            header.entry_offset, header.total_size);
-    
+
     bool is_elf = (size >= (int)sizeof(Elf32_Ehdr) &&
                    memcmp(binary_image, ELF_MAGIC, 4) == 0);
 
@@ -667,7 +822,7 @@ int process_exec(const char *path, int argc, char **argv) {
             kfree(binary_image);
             process_cleanup(proc);
             if (resolved != NULL) kfree(resolved);
-            return -5;
+            return NULL;
         }
 
         const Elf32_Phdr *phdrs = (const Elf32_Phdr *)((const uint8_t *)binary_image + ehdr->e_phoff);
@@ -686,26 +841,23 @@ int process_exec(const char *path, int argc, char **argv) {
             kfree(binary_image);
             process_cleanup(proc);
             if (resolved != NULL) kfree(resolved);
-            return -5;
+            return NULL;
         }
 
         uint32_t total_span = max_vaddr - min_vaddr;
-        void *target_addr = allocate_process_memory(proc, total_span,
-                                                   PROT_READ | PROT_WRITE | PROT_EXEC);
-        if (!target_addr) {
+        proc->binary_storage = kmalloc(total_span);
+        if (!proc->binary_storage) {
             printf("Failed to allocate %u bytes for ELF binary\n", total_span);
             kfree(binary_image);
             process_cleanup(proc);
             if (resolved != NULL) kfree(resolved);
-            return -5;
+            return NULL;
         }
 
-        memset(target_addr, 0, total_span);
-        uint32_t delta = (uint32_t)target_addr - min_vaddr;
-
+        memset(proc->binary_storage, 0, total_span);
         for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
             if (phdrs[i].p_type == PT_LOAD && phdrs[i].p_memsz > 0) {
-                uint8_t *seg_dest = (uint8_t *)phdrs[i].p_vaddr + delta;
+                uint8_t *seg_dest = (uint8_t *)proc->binary_storage + (phdrs[i].p_vaddr - min_vaddr);
                 if (phdrs[i].p_filesz > 0) {
                     memcpy(seg_dest, (const uint8_t *)binary_image + phdrs[i].p_offset, phdrs[i].p_filesz);
                 }
@@ -718,9 +870,9 @@ int process_exec(const char *path, int argc, char **argv) {
         kfree(binary_image);
         if (resolved != NULL) kfree(resolved);
 
-        proc->binary_base = target_addr;
+        proc->binary_base = (void *)PROCESS_HEAP_START;
         proc->binary_size = total_span;
-        proc->entry_point = ehdr->e_entry + delta;
+        proc->entry_point = PROCESS_HEAP_START + (ehdr->e_entry - min_vaddr);
         serial_printf("ELF32 loaded: span=%u, entry=0x%x\n", total_span, proc->entry_point);
     } else {
         bool has_header = (size >= IPOB_HEADER_SIZE &&
@@ -728,133 +880,323 @@ int process_exec(const char *path, int argc, char **argv) {
         uint32_t header_size = has_header ? IPOB_HEADER_SIZE : 0;
         uint32_t payload_size = size - header_size;
 
-        // Allocating memory dynamically for the binary
-        void *target_addr = allocate_process_memory(proc, payload_size,
-                                                   PROT_READ | PROT_WRITE | PROT_EXEC);
-        
-        if (!target_addr) {
+        proc->binary_storage = kmalloc(payload_size);
+        if (!proc->binary_storage) {
             printf("Failed to allocate memory for process (need %d bytes)\n", payload_size);
             kfree(binary_image);
             process_cleanup(proc);
             if (resolved != NULL) kfree(resolved);
-            return -5;
+            return NULL;
         }
-        
-        memset(target_addr, 0, payload_size);
-        memcpy(target_addr, (uint8_t *)binary_image + header_size, payload_size);
-        
-        // Relocate if necessary.
-        uint32_t load_address = (uint32_t)target_addr;
-        if (relocate_binary(target_addr, load_address, payload_size) < 0) {
-            printf("Relocation failed\n");
-            free_process_memory(proc, target_addr, payload_size);
-            kfree(binary_image);
-            process_cleanup(proc);
-            if (resolved != NULL) kfree(resolved);
-            return -6;
-        }
-        
-        // Freeing up the temporary buffer
+
+        memcpy(proc->binary_storage, (uint8_t *)binary_image + header_size, payload_size);
+
         kfree(binary_image);
         if (resolved != NULL) kfree(resolved);
-        
-        // Saving information about the process
-        proc->binary_base = target_addr;
+
+        proc->binary_base = (void *)PROCESS_HEAP_START;
         proc->binary_size = payload_size;
-        // Entry point is relative to where we actually loaded the binary in memory
-        proc->entry_point = (uint32_t)target_addr + header.entry_offset;
+        proc->entry_point = (uint32_t)PROCESS_HEAP_START + header.entry_offset;
     }
-    
+
     // Setting up arguments - argv is allocated in kernel memory
     uint32_t argv_addr = 0;
     if (setup_arguments(proc, argc, argv, &argv_addr) < 0) {
         printf("Failed to setup arguments\n");
         process_cleanup(proc);
-        return -7;
+        return NULL;
     }
-    
+
     // Setting up the stack for calling main()
     if (setup_stack(proc) == 0) {
         printf("Failed to allocate process stack\n");
         process_cleanup(proc);
-        return -7;
+        return NULL;
     }
-    
-    serial_printf("Process %d ready: entry=0x%x, argc=%d, argv=0x%x\n",
-           proc->pid, proc->entry_point, proc->argc, argv_addr);
-    
-    // Save the current process
-    process_t *old_process = current_process;
-    current_process = proc;
 
     // Defensive validation: a broken application must never crash the kernel.
     if (proc->binary_base == NULL || proc->binary_size == 0 ||
         proc->entry_point < PROCESS_HEAP_START) {
         printf("[process] pid=%u: invalid app image, closing process safely\n", proc->pid);
-        current_process = old_process;
         process_cleanup(proc);
-        return -9;
+        return NULL;
     }
-    
-    // Call the entry point with arguments
-    serial_printf("Calling entry point with argc=%d, argv at 0x%x...\n", proc->argc, argv_addr);
-    log_process_heap_state("during exec");
-    
-    // The entry point has a signature: int main(int argc, char **argv)
-    char **argv_ptr = (char**)argv_addr;
 
-    // If the executable is invalid or takes too long, the kernel must still recover.
-    typedef int (*entry_func_t)(int, char**);
-    entry_func_t entry_point = (entry_func_t)proc->entry_point;
-    if (entry_point == NULL) {
-        printf("[process] pid=%u: entry point is NULL, closing process\n", proc->pid);
-        current_process = old_process;
-        process_cleanup(proc);
-        return -10;
+    // Set up trampoline stack frame for cooperative multitasking
+    uint32_t *sp = (uint32_t *)proc->stack_ptr;
+    sp = (uint32_t *)((uint32_t)sp & ~15u);
+    sp[-1] = (uint32_t)process_trampoline;
+    sp[-2] = 0;       // ebp
+    sp[-3] = 0;       // ebx
+    sp[-4] = 0;       // esi
+    sp[-5] = 0;       // edi
+    sp[-6] = 0x02;    // eflags (reserved bit 1=1, IF=0)
+    proc->stack_ptr = (uint32_t)&sp[-6];
+
+    serial_printf("Process %d ready: entry=0x%x, argc=%d\n",
+           proc->pid, proc->entry_point, proc->argc);
+
+    return proc;
+}
+
+/**
+ * process_run_batch - Executes one or more processes concurrently using cooperative multitasking
+ */
+int process_run_batch(process_t **procs, int count) {
+    if (!procs || count <= 0) {
+        return -1;
+    }
+
+    process_t *old_process = current_process;
+    batch_procs = procs;
+    batch_proc_count = count;
+    batch_current_idx = 0;
+    batch_active = true;
+    bool had_graphics = false;
+    for (int i = 0; i < count; i++) {
+        if (procs[i] && procs[i]->wants_graphics) {
+            had_graphics = true;
+            break;
+        }
+    }
+    if (vga_is_graphics_mode() || wm_session_active()) {
+        had_graphics = true;
+    }
+
+    /* Capture pristine text screen and cursor before any batch process alters them */
+    uint16_t *batch_saved_screen = (uint16_t *)kmalloc(80 * 25 * sizeof(uint16_t));
+    uint16_t batch_saved_cursor = vga_get_cursor_position();
+    bool batch_saved_cursor_visible = vga_is_cursor_visible();
+    if (batch_saved_screen) {
+        if (vga_is_graphics_mode()) {
+            for (int i = 0; i < 80 * 25; i++) batch_saved_screen[i] = 0x0720;
+        } else {
+            memcpy(batch_saved_screen, (const void *)0xB8000, 80 * 25 * sizeof(uint16_t));
+            for (int i = 0; i < 80 * 25; i++) {
+                uint16_t ent = batch_saved_screen[i];
+                uint8_t attr = (uint8_t)(ent >> 8);
+                if (ent == 0xFFFF || attr == 0xFF || attr == 0x20) {
+                    batch_saved_screen[i] = 0x0720;
+                }
+            }
+        }
     }
 
     terminal_lock_input();
     system_set_state(SYSTEM_STATE_PROCESS_RUNNING);
-    serial_printf("[process] pid=%u start execution: %s\n", proc->pid, path);
+    keyboard_set_app_input_mode(true);
 
-    int exit_code = process_call_entry(entry_point, proc->argc, argv_ptr,
-                                       proc->stack_ptr);
-    last_exit_code = exit_code;
+    process_t *fg_init = process_get_foreground();
+    if (fg_init != NULL) {
+        for (int i = 0; i < count; i++) {
+            if (procs[i] == fg_init) {
+                batch_current_idx = i;
+                break;
+            }
+        }
+    }
 
-    serial_printf("[process] pid=%u returned, exit_code=%d\n", proc->pid, exit_code);
+    process_t *last_fg = NULL;
+
+    while (1) {
+        if (vga_is_graphics_mode() || wm_session_active()) {
+            had_graphics = true;
+        }
+
+        if (system_is_interrupted()) {
+            break;
+        }
+
+        process_t *fg = process_get_foreground();
+        if (fg && fg->wants_graphics) {
+            had_graphics = true;
+        }
+        if (fg != last_fg) {
+            keyboard_clear_key_state();
+            keyboard_flush_hardware();
+            keyboard_flush_queue();
+            keyboard_flush_app_queue();
+            if (fg == NULL) {
+                keyboard_set_app_input_mode(false);
+                if (wm_session_active()) {
+                    vga_set_mode_13h_hardware();
+                    vga_gfx_init_default_palette();
+                    mouse_set_bounds(VGA_GFX_WIDTH, VGA_GFX_HEIGHT);
+                    wm_invalidate_all();
+                } else {
+                    vga_set_mode_text_hardware();
+                }
+            } else {
+                fg->waiting_for_input = false;
+                keyboard_set_app_input_mode(true);
+                if (fg->wants_graphics) {
+                    vga_set_mode_13h_hardware();
+                    vga_gfx_init_default_palette();
+                } else {
+                    vga_set_mode_text_hardware();
+                }
+                for (int i = 0; i < count; i++) {
+                    if (procs[i] == fg) {
+                        batch_current_idx = i;
+                        break;
+                    }
+                }
+            }
+            last_fg = fg;
+        }
+
+        int running_count = 0;
+        for (int i = 0; i < count; i++) {
+            if (procs[i] && procs[i]->is_running) {
+                running_count++;
+            }
+        }
+        if (running_count == 0) {
+            if (wm_session_active()) {
+                async_scheduler_tick();
+                wm_compositor_tick();
+                io_wait();
+                continue;
+            }
+            break;
+        }
+
+        // Drive async tasks and WM compositor if active and no full-screen app is running
+        async_scheduler_tick();
+        if (wm_session_active() && fg == NULL) {
+            wm_compositor_tick();
+        }
+
+        // Find next runnable process
+        int found = -1;
+        for (int step = 0; step < count; step++) {
+            int idx = (batch_current_idx + step) % count;
+            process_t *p = procs[idx];
+            if (p && p->is_running) {
+                if (p->waiting_for_input && p != fg) {
+                    continue;
+                }
+                found = idx;
+                break;
+            }
+        }
+
+        if (found == -1) {
+            if (fg && fg->is_running) {
+                for (int i = 0; i < count; i++) {
+                    if (procs[i] == fg) {
+                        found = i;
+                        break;
+                    }
+                }
+            }
+            if (found == -1) {
+                io_wait();
+                continue;
+            }
+        }
+
+        batch_current_idx = (found + 1) % count;
+        current_process = procs[found];
+
+        // Map process binary to 0x800000
+        process_map_app(current_process);
+
+        in_process_context = true;
+        // Switch to process!
+        process_switch_context(&scheduler_esp, current_process->stack_ptr);
+        in_process_context = false;
+        // Process yields back here
+    }
+
+    process_map_app(NULL);
+    batch_active = false;
+    batch_procs = NULL;
+    batch_proc_count = 0;
+    current_process = old_process;
+
     keyboard_set_app_input_mode(false);
     keyboard_clear_key_state();
     terminal_unlock_input();
     system_set_state(SYSTEM_STATE_TERMINAL_IDLE);
-    vga_font_set_app_mode(false);
-    dynamic_keymap_reapply_fonts();
-    vga_cursor_reset();
 
-    /* If Ctrl+C was used to stop the process, print a clean message */
     if (system_is_interrupted()) {
+        if (wm_session_active()) {
+            wm_session_stop();
+        }
+        if (vga_is_graphics_mode()) {
+            vga_set_mode_text_hardware();
+        }
+        if (had_graphics && batch_saved_screen && !wm_session_active()) {
+            memcpy((void *)0xB8000, batch_saved_screen, 80 * 25 * sizeof(uint16_t));
+            vga_set_cursor(batch_saved_cursor);
+            if (batch_saved_cursor_visible) {
+                vga_show_cursor();
+            } else {
+                vga_hide_cursor();
+            }
+        }
+        vga_font_set_app_mode(false);
+        dynamic_keymap_reapply_fonts();
+        vga_cursor_reset();
+        vga_sanitize_text_vram();
+        vga_show_cursor();
         printf("Application stopped.\n");
         system_clear_interrupt();
+    } else if (!wm_session_active()) {
+        if (vga_is_graphics_mode()) {
+            vga_set_mode_text_hardware();
+        }
+        if (had_graphics && batch_saved_screen) {
+            memcpy((void *)0xB8000, batch_saved_screen, 80 * 25 * sizeof(uint16_t));
+            vga_set_cursor(batch_saved_cursor);
+            if (batch_saved_cursor_visible) {
+                vga_show_cursor();
+            } else {
+                vga_hide_cursor();
+            }
+        }
+        vga_font_set_app_mode(false);
+        dynamic_keymap_reapply_fonts();
+        vga_cursor_reset();
+        vga_sanitize_text_vram();
+        vga_show_cursor();
     }
 
-    // Restoring the old process
-    current_process = old_process;
-
-    if (proc->async_task_count > 0) {
-        proc->is_running = 0;
-        proc->exit_code = exit_code;
-        printf("[process] keeping process %u alive in background (owns %u async task(s))\n",
-               proc->pid, proc->async_task_count);
-        current_process = old_process;
-        return proc->pid;
+    if (batch_saved_screen) {
+        kfree(batch_saved_screen);
+        batch_saved_screen = NULL;
     }
-    
-    uint32_t finished_pid = proc->pid;
 
-    // Cleaning resources
-    process_cleanup(proc);
+    for (int i = 0; i < count; i++) {
+        process_t *proc = procs[i];
+        if (!proc) continue;
+        if (!process_is_valid(proc)) continue;
+        if (proc->async_task_count > 0) {
+            proc->is_running = 0;
+            serial_printf("[process] keeping process %u alive in background (owns %u async task(s))\n",
+                   proc->pid, proc->async_task_count);
+        } else {
+            process_cleanup(proc);
+        }
+    }
     log_process_heap_state("after cleanup");
-    
-    return finished_pid ? (int)finished_pid : 1;
+
+    return 0;
+}
+
+/**
+ * process_exec - The main function for executing a process with arguments
+ */
+int process_exec(const char *path, int argc, char **argv) {
+    process_t *proc = process_spawn(path, argc, argv);
+    if (!proc) {
+        return -1;
+    }
+    uint32_t pid = proc->pid;
+    process_t *batch[1] = { proc };
+    process_run_batch(batch, 1);
+    return (int)pid;
 }
 
 /**
@@ -869,6 +1211,20 @@ int process_get_exit_code(void) {
  */
 process_t *process_get_current(void) {
     return current_process;
+}
+
+void process_set_current(process_t *proc) {
+    current_process = proc;
+}
+
+bool process_is_valid(process_t *proc) {
+    if (!proc) return false;
+    process_t *curr = process_list;
+    while (curr != NULL) {
+        if (curr == proc) return true;
+        curr = curr->next;
+    }
+    return false;
 }
 
 /**
@@ -944,6 +1300,19 @@ int process_kill_by_pid(uint32_t pid) {
 
     printf("kill: no process found with PID %u\n", pid);
     return -1;
+}
+
+/**
+ * process_is_alive - Check if a process with @pid is still in the process list.
+ * Returns true if the process exists (even in background/keep-alive state).
+ */
+bool process_is_alive(uint32_t pid) {
+    process_t *curr = process_list;
+    while (curr != NULL) {
+        if (curr->pid == pid) return true;
+        curr = curr->next;
+    }
+    return false;
 }
 
 /**

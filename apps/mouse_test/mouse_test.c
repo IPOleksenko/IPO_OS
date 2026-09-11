@@ -32,9 +32,12 @@
 #include <string.h>
 #include <syscall.h>
 #include <vga.h>
+#include <vga_gfx.h>
 #include <ioport.h>
 #include <driver/input/keyboard.h>
 #include <driver/input/mouse.h>
+#include <system/state.h>
+#include <kernel/process.h>
 
 #define CANVAS_START_ROW 8
 #define CANVAS_ROWS      16
@@ -99,17 +102,43 @@ static const char *get_direction_name(int32_t dx, int32_t dy) {
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
 
+    /* If running in a batch behind another process, wait until we become foreground */
+    while (!process_is_foreground()) {
+        process_yield();
+        if (system_is_interrupted()) {
+            return 0;
+        }
+    }
+
+    /* Ensure text mode is active */
+    vga_set_mode_text();
+
     /* 1. Save original screen and cursor */
     vga_hide_cursor();
-    memcpy(saved_screen, (void *)VGA_MEMORY, sizeof(saved_screen));
-    saved_cursor = vga_get_cursor_position();
-    for (int i = 0; i < VGA_HEIGHT * VGA_WIDTH; i++) {
-        if ((saved_screen[i] & 0xFF) == VGA_CURSOR_GLYPH_SLOT) {
-            saved_screen[i] = (saved_screen[i] & 0xFF00) | ' ';
+    if (vga_is_graphics_mode()) {
+        for (int i = 0; i < VGA_HEIGHT * VGA_WIDTH; i++) {
+            saved_screen[i] = 0x0720;
+        }
+        saved_cursor = 0;
+    } else {
+        memcpy(saved_screen, (void *)VGA_MEMORY, sizeof(saved_screen));
+        saved_cursor = vga_get_cursor_position();
+        for (int i = 0; i < VGA_HEIGHT * VGA_WIDTH; i++) {
+            uint16_t ent = saved_screen[i];
+            uint8_t ch = (uint8_t)(ent & 0xFF);
+            uint8_t attr = (uint8_t)(ent >> 8);
+            if (ch == VGA_CURSOR_GLYPH_SLOT) {
+                saved_screen[i] = (ent & 0xFF00) | ' ';
+            } else if (ent == 0xFFFF || attr == 0xFF || attr == 0x20) {
+                saved_screen[i] = 0x0720;
+            }
         }
     }
 
     keyboard_set_app_input_mode(true);
+    keyboard_flush_hardware();
+    keyboard_flush_queue();
+    keyboard_flush_app_queue();
 
     mouse_init();
 
@@ -139,6 +168,19 @@ int main(int argc, char **argv) {
     bool running = true;
 
     while (running) {
+        if (system_is_interrupted()) {
+            break;
+        }
+
+        /* If we lose foreground in a batch, yield until we regain it */
+        if (!process_is_foreground()) {
+            process_yield();
+            if (system_is_interrupted()) {
+                break;
+            }
+            continue;
+        }
+
         /* Poll keyboard for exit or canvas clear */
         uint8_t sc;
         while ((sc = keyboard_get_scancode()) != 0) {
@@ -411,8 +453,16 @@ int main(int argc, char **argv) {
     /* Restore Original Screen & State on Exit                       */
     /* ------------------------------------------------------------- */
     vga_hide_cursor();
+    for (int i = 0; i < VGA_HEIGHT * VGA_WIDTH; i++) {
+        uint16_t ent = saved_screen[i];
+        uint8_t attr = (uint8_t)(ent >> 8);
+        if (ent == 0xFFFF || attr == 0xFF || attr == 0x20) {
+            saved_screen[i] = 0x0720;
+        }
+    }
     memcpy((void *)VGA_MEMORY, saved_screen, sizeof(saved_screen));
     vga_set_cursor(saved_cursor);
+    vga_show_cursor();
     keyboard_set_app_input_mode(false);
 
     return 0;

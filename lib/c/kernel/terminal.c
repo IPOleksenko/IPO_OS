@@ -14,6 +14,8 @@
 #include <driver/sound.h>
 #include <driver/ata/ata.h>
 #include <ioport.h>
+#include <system/run_cmd.h>
+#include <wm.h>
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -713,6 +715,27 @@ char* resolve_command_path(const char *cmd) {
     return NULL;
 }
 
+bool terminal_is_builtin(const char *name) {
+    if (!name || !*name) return false;
+    static const char * const builtins[] = {
+        "help", "?", "clear", "cls", "pwd", "cd", "ls", "dir",
+        "cat", "type", "touch", "mkdir", "rm", "del", "rmdir",
+        "cp", "copy", "mv", "move", "rename", "stat", "echo",
+        "reboot", "restart", "shutdown", "poweroff", "exit", "halt",
+        "ps", "tasks", "procs", "kill", "killall",
+        "df", "diskinfo", "meminfo", "free",
+        "driver", "drivers", "lsmod",
+        "keymap", "layout", "keymaps",
+        "return", "retval", "show_return", "return_val", "ret",
+        "startx", "stopx",
+        NULL
+    };
+    for (int i = 0; builtins[i] != NULL; i++) {
+        if (strcmp(name, builtins[i]) == 0) return true;
+    }
+    return false;
+}
+
 static void builtin_help(void) {
     printf("======================= IPO_OS SYSTEM HELP =======================\n");
     printf("\n");
@@ -748,6 +771,18 @@ static void builtin_help(void) {
     printf("      - Terminate a running or background process and free its resources.\n");
     printf("    killall\n");
     printf("      - Terminate all active processes and stop background async tasks.\n");
+    printf("    run <prog> [args] [OP <prog> [args] ...]\n");
+    printf("      - Multitasking process batch launcher for standalone executables (/app/...). Operators:\n");
+    printf("          &  parallel    — launch all; cooperative multitasking & background async tasks.\n");
+    printf("          ;  sequential  — wait for each (incl. async tasks) before next.\n");
+    printf("          |  pipe        — pass exit-code of left as argv[1] of right.\n");
+    printf("      - Program names/args support quoting ('...'/\"...\") and escaping (\\x).\n");
+    printf("    startx\n");
+    printf("      - Enter VGA Mode 13h (320x200) and start the window manager compositor\n");
+    printf("        as a background async task. Returns to the shell immediately.\n");
+    printf("        The [X Exit] button in the bottom-left of the screen always exits.\n");
+    printf("    stopx\n");
+    printf("      - Stop the WM compositor, destroy all windows, return to text mode.\n");
     printf("\n");
     printf("  [Output & Redirection]\n");
     printf("    echo [text] [> file | >> file]\n");
@@ -804,7 +839,6 @@ static void builtin_help(void) {
     printf("    - Automatically hidden when only one layout is enabled in the system.\n");
     printf("    - Automatically visible when two or more layouts are enabled.\n");
     printf("    - Updates dynamically in real time upon switching or enabling/disabling layouts.\n");
-    printf("============================================================================\n");
 }
 
 static void builtin_clear(void) {
@@ -1563,7 +1597,6 @@ void terminal_apply_pending_input(void) {
             push_command_history(input_buf);
             int exec = try_execute_command(input_buf);
             if (exec == 0) {
-                serial_printf("[DEBUG] line 1523: Command not found: '%s'\n", input_buf);
                 printf("Command not found: %s\n", input_buf);
             } else if (exec < 0) {
                 printf("Execution failed (error %d): %s\n", exec, input_buf);
@@ -1776,6 +1809,22 @@ int try_execute_command(const char *cmdline) {
                strcmp(name, "куе") == 0) {
         builtin_show_return(argc, argv);
         builtin_handled = 1;
+    } else if (strcmp(name, "run") == 0) {
+        /* Find the part of cmdline after "run " */
+        const char *run_args = cmdline;
+        while (*run_args == ' ' || *run_args == '\t') run_args++;
+        if (strncmp(run_args, "run", 3) == 0) run_args += 3;
+        while (*run_args == ' ' || *run_args == '\t') run_args++;
+        run_cmd_execute(run_args);
+        builtin_handled = 1;
+    } else if (strcmp(name, "startx") == 0) {
+        /* Start the WM video-mode session (returns immediately; async task composites) */
+        wm_session_start();
+        builtin_handled = 1;
+    } else if (strcmp(name, "stopx") == 0) {
+        /* Stop the WM session and return to text mode */
+        wm_session_stop();
+        builtin_handled = 1;
     } else if (driver_dispatch_command(name, argc, argv) == 0) {
         builtin_handled = 1;
     }
@@ -1811,7 +1860,7 @@ int try_execute_command(const char *cmdline) {
 }
 
 void terminal_console(void){
-    if (terminal_input_locked || system_is_input_state()) {
+    if (terminal_input_locked || system_is_input_state() || system_get_state() == SYSTEM_STATE_PROCESS_RUNNING) {
         return;
     }
 
@@ -1819,6 +1868,15 @@ void terminal_console(void){
         system_get_state() != SYSTEM_STATE_TERMINAL_IDLE &&
         system_get_state() != SYSTEM_STATE_BOOT) {
         system_set_state(SYSTEM_STATE_TERMINAL_IDLE);
+    }
+
+    /* When the WM session is active, run the compositor directly and return.
+       Must happen BEFORE driver_dispatch_tick() and terminal_language_bar_tick()
+       to prevent text-mode VGA writes (cursor blink, language bar rendering)
+       from corrupting the Mode 13h CRTC registers. */
+    if (wm_session_active()) {
+        wm_compositor_tick();
+        return;
     }
 
     terminal_language_bar_tick();
@@ -2036,9 +2094,12 @@ void terminal_console(void){
 
                     if (input_len > 0) {
                         push_command_history(input_buf);
+                        keyboard_flush_hardware();
+                        keyboard_flush_queue();
+                        keyboard_flush_app_queue();
+                        keyboard_clear_key_state();
                         int exec = try_execute_command(input_buf);
                         if (exec == 0) {
-                            serial_printf("[DEBUG] line 1987: Command not found: '%s'\n", input_buf);
                             printf("Command not found: %s\n", input_buf);
                         } else if (exec < 0) {
                             printf("Execution failed (error %d): %s\n", exec, input_buf);
@@ -2050,7 +2111,7 @@ void terminal_console(void){
                         }
                     }
 
-                    /* Reset buffer and show prompt */
+                    /* Reset buffer */
                     input_len = 0;
                     cursor_pos = 0;
                     input_buf[0] = '\0';
@@ -2060,7 +2121,10 @@ void terminal_console(void){
                     command_history_index = -1;
                     prompt_shown = false;
                     terminal_suppress_external_hook = false;
-                    print_prompt();
+                    /* Don't print the prompt if we just entered graphics mode */
+                    if (!wm_session_active()) {
+                        print_prompt();
+                    }
                 }
                 /* Handle backspace (UTF-8 aware) */
                 else if (out_str[0] == '\b' || out_str[0] == 127) {

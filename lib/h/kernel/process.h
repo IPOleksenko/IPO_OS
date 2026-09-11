@@ -2,6 +2,7 @@
 #define KERNEL_PROCESS_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 // Dynamic memory allocation for processes
 #define PROCESS_HEAP_START  0x00800000  // Start of process heap area
@@ -20,6 +21,7 @@ typedef struct process {
     void *binary_base;      // Base address of the loaded binary
     uint32_t binary_size;   // Binary size
     uint32_t entry_point;   // Absolute entry point address
+    void *binary_storage;   // Dedicated storage buffer when swapped out
     
     // Stack
     void *stack_base;       // Allocated process stack
@@ -35,6 +37,8 @@ typedef struct process {
     // State
     int exit_code;          // Exit code
     uint8_t is_running;     // Running flag
+    bool waiting_for_input; // Blocked waiting for user input
+    bool wants_graphics;    // Process requested VGA graphics mode (Mode 13h)
     uint32_t async_task_count; // number of active async tasks owned by this process
     
     // Debugging
@@ -58,5 +62,19 @@ void process_cleanup(process_t *proc);
 void process_list_print(void);
 int process_kill_by_pid(uint32_t pid);
 int process_kill_all(void);
+bool process_is_alive(uint32_t pid); /* true while PID is in the process list */
+
+/* Cooperative multitasking */
+void process_yield(void);
+void process_yield_kernel(void);
+process_t *process_spawn(const char *path, int argc, char **argv);
+int process_run_batch(process_t **procs, int count);
+process_t *process_get_foreground(void);
+bool process_is_foreground(void);
+bool process_in_process_context(void);
+void process_map_app(process_t *proc);
+process_t *process_get_mapped_app(void);
+void process_set_current(process_t *proc);
+bool process_is_valid(process_t *proc);
 
 #endif

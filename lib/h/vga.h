@@ -48,6 +48,9 @@ void vga_hide_cursor(void);
 // Clears the VGA screen with specified foreground and background colors and cursor settings
 void vga_clear(enum vga_color fg, enum vga_color bg, bool show_cursor, int cursor_position);
 
+// Sanitizes text VRAM at 0xB8000 to eliminate any leftover unmapped bus garbage or green artifacts
+void vga_sanitize_text_vram(void);
+
 #define VGA_CURSOR_GLYPH_SLOT 0x1F
 
 uint16_t vga_get_cursor_position(void);

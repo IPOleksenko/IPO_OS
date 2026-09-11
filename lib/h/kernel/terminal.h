@@ -32,6 +32,8 @@ int async_stop_task(const char *name);
 
 int try_execute_command(const char *cmd);
 
+bool terminal_is_builtin(const char *name);
+
 char* resolve_command_path(const char *cmd);
 
 void terminal_inject_input(const char *text, bool auto_execute);

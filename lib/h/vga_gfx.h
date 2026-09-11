@@ -11,7 +11,10 @@
 /* Mode switching */
 void vga_set_mode_13h(void);
 void vga_set_mode_text(void);
+void vga_set_mode_13h_hardware(void);
+void vga_set_mode_text_hardware(void);
 bool vga_is_graphics_mode(void);
+void vga_save_text_state(void);
 
 /* Palette */
 void vga_gfx_set_palette(uint8_t idx, uint8_t r, uint8_t g, uint8_t b);

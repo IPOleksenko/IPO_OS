@@ -97,6 +97,7 @@ int dynamic_keymap_set(const char *name, const keymap_entry_t *entries, uint32_t
  * Get current active language name.
  */
 const char* dynamic_keymap_get_name(void);
+const char* dynamic_keymap_get_name_local(void);
 void dynamic_keymap_reapply_fonts(void);
 
 /**
@@ -106,11 +107,13 @@ void dynamic_keymap_reapply_fonts(void);
  * @return Output string, or NULL if not mapped in dynamic dictionary
  */
 const char* dynamic_keymap_translate(uint8_t scancode, bool shift);
+const char* dynamic_keymap_translate_local(uint8_t scancode, bool shift);
 
 /**
  * Returns true if a custom dynamic keymap is currently active.
  */
 bool dynamic_keymap_is_active(void);
+bool dynamic_keymap_is_active_local(void);
 
 /**
  * Default fallback symbol for unmapped keys when a custom keymap is active.
@@ -124,7 +127,9 @@ const char* dynamic_keymap_get_default_symbol(void);
  * Cycle to next layout in the storage (English -> Russian -> Chinese -> ...).
  */
 void dynamic_keymap_cycle_next(void);
+void dynamic_keymap_cycle_next_local(void);
 void dynamic_keymap_cycle_prev(void);
+void dynamic_keymap_cycle_prev_local(void);
 
 /**
  * Get total number of registered keymaps.

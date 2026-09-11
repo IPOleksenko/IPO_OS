@@ -12,6 +12,8 @@
 #include <system/state.h>
 #include <system/timer.h>
 #include <vga.h>
+#include <vga_gfx.h>
+#include <wm.h>
 
 #define IPO_IDT_ENTRY_FLAGS 0xEEu
 #define IPO_KERNEL_CODE_SEG 0x08u
@@ -503,7 +505,7 @@ static uint32_t syscall_builtin_keymap_get(uint32_t num,
                                            uint32_t argc,
                                            uint32_t *argv) {
     (void)num; (void)argc; (void)argv;
-    return (uint32_t)(uintptr_t)dynamic_keymap_get_name();
+    return (uint32_t)(uintptr_t)dynamic_keymap_get_name_local();
 }
 
 static uint32_t syscall_builtin_font_load(uint32_t num,
@@ -569,7 +571,7 @@ static uint32_t syscall_builtin_keymap_translate(uint32_t num,
     if (argc < 2u || argv == NULL) return 0;
     uint8_t scancode = (uint8_t)argv[0];
     bool shift = (bool)argv[1];
-    const char *s = dynamic_keymap_translate(scancode, shift);
+    const char *s = dynamic_keymap_translate_local(scancode, shift);
     return (uint32_t)(uintptr_t)s;
 }
 
@@ -577,14 +579,14 @@ static uint32_t syscall_builtin_keymap_is_active(uint32_t num,
                                                 uint32_t argc,
                                                 uint32_t *argv) {
     (void)num; (void)argc; (void)argv;
-    return (uint32_t)dynamic_keymap_is_active();
+    return (uint32_t)dynamic_keymap_is_active_local();
 }
 
 static uint32_t syscall_builtin_keymap_cycle_next(uint32_t num,
                                                  uint32_t argc,
                                                  uint32_t *argv) {
     (void)num; (void)argc; (void)argv;
-    dynamic_keymap_cycle_next();
+    dynamic_keymap_cycle_next_local();
     return 0;
 }
 
@@ -592,15 +594,15 @@ static uint32_t syscall_builtin_keymap_cycle_prev(uint32_t num,
                                                  uint32_t argc,
                                                  uint32_t *argv) {
     (void)num; (void)argc; (void)argv;
-    dynamic_keymap_cycle_prev();
+    dynamic_keymap_cycle_prev_local();
     return 0;
 }
 
 static uint32_t syscall_builtin_keymap_get_name(uint32_t num,
-                                               uint32_t argc,
-                                               uint32_t *argv) {
+                                                uint32_t argc,
+                                                uint32_t *argv) {
     (void)num; (void)argc; (void)argv;
-    return (uint32_t)(uintptr_t)dynamic_keymap_get_name();
+    return (uint32_t)(uintptr_t)dynamic_keymap_get_name_local();
 }
 
 static uint32_t syscall_builtin_driver_register(uint32_t num,
@@ -657,7 +659,7 @@ static void syscall_read_render(int32_t *start_cursor_ptr, int32_t start_origin,
     (void)start_origin;
     size_t vis_cursor = syscall_read_visual_offset(buf, len, cursor_pos);
     size_t vis_len = syscall_read_visual_offset(buf, len, len);
-    size_t vis_prev = syscall_read_visual_offset(buf, len, prev_len);
+    size_t vis_prev = (prev_len > len) ? (vis_len + (prev_len - len)) : vis_len;
 
     /* If cursor or text tail exceeds bottom of screen, auto-scroll */
     while (*start_cursor_ptr + (int32_t)vis_cursor >= VGA_WIDTH * VGA_HEIGHT) {
@@ -749,6 +751,21 @@ static uint32_t syscall_builtin_read(uint32_t num,
 
     process_t *proc = process_get_current();
     uint32_t pid = proc ? proc->pid : 0u;
+
+    /* If this process is not foreground, wait until it gains foreground before reading from console */
+    while (!process_is_foreground()) {
+        if (proc) {
+            proc->waiting_for_input = true;
+        }
+        process_yield();
+        if (system_is_interrupted()) {
+            if (max_len == 0u && out_ptr != NULL) {
+                kfree(buffer);
+                *out_ptr = NULL;
+            }
+            return (uint32_t)(-2);
+        }
+    }
 
     system_state_t prev_state = system_get_state();
     system_set_state(SYSTEM_STATE_TEXT_INPUT);
@@ -1214,6 +1231,139 @@ static uint32_t syscall_builtin_stack_shrink(uint32_t num,
     return (uint32_t)result;
 }
 
+static uint32_t syscall_builtin_wm_create_window(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc;
+    if (!argv || !argv[0]) return 0;
+    const wm_window_options_t *opts = (const wm_window_options_t *)(uintptr_t)argv[0];
+    return (uint32_t)(uintptr_t)wm_create_window(opts);
+}
+
+static uint32_t syscall_builtin_wm_destroy_window(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc;
+    if (!argv || !argv[0]) return 0;
+    wm_destroy_window((wm_window_t *)(uintptr_t)argv[0]);
+    return 0;
+}
+
+static uint32_t syscall_builtin_wm_session_start(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    wm_session_start();
+    return 0;
+}
+
+static uint32_t syscall_builtin_wm_session_stop(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    wm_session_stop();
+    return 0;
+}
+
+static uint32_t syscall_builtin_wm_session_active(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    return (uint32_t)wm_session_active();
+}
+
+static uint32_t syscall_builtin_wm_get_count(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    return (uint32_t)wm_get_window_count();
+}
+
+static uint32_t syscall_builtin_wm_get_focused(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    return (uint32_t)(uintptr_t)wm_get_focused();
+}
+
+static uint32_t syscall_builtin_wm_set_focus(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc;
+    if (!argv || !argv[0]) return 0;
+    wm_set_focus((wm_window_t *)(uintptr_t)argv[0]);
+    return 0;
+}
+
+static uint32_t syscall_builtin_wm_focus_next(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    wm_focus_next();
+    return 0;
+}
+
+static uint32_t syscall_builtin_wm_focus_prev(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    wm_focus_prev();
+    return 0;
+}
+
+static uint32_t syscall_builtin_wm_invalidate(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc;
+    if (!argv || !argv[0]) return 0;
+    wm_invalidate((wm_window_t *)(uintptr_t)argv[0]);
+    return 0;
+}
+
+static uint32_t syscall_builtin_process_yield(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    process_t *cur = process_get_current();
+    if (cur && argc > 0 && argv) {
+        cur->waiting_for_input = (argv[0] != 0);
+    }
+    process_yield_kernel();
+    return 0;
+}
+
+static uint32_t syscall_builtin_process_is_foreground(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    if (!process_in_process_context()) {
+        return 1;
+    }
+    process_t *cur = process_get_current();
+    process_t *fg = process_get_foreground();
+    if (!fg || !cur) return 1;
+    bool is_fg = (cur == fg);
+    if (!is_fg) {
+        cur->waiting_for_input = true;
+    }
+    return is_fg ? 1 : 0;
+}
+
+static uint32_t syscall_builtin_vga_set_mode(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc == 0 || !argv) return 0;
+    process_t *cur = process_get_current();
+    process_t *fg = process_get_foreground();
+    if (argv[0] == 1) {
+        if (cur) cur->wants_graphics = true;
+        if (!fg || cur == fg) {
+            vga_set_mode_13h_hardware();
+        }
+    } else {
+        if (cur) cur->wants_graphics = false;
+        if (!fg || cur == fg) {
+            vga_set_mode_text_hardware();
+        }
+    }
+    return 0;
+}
+
+static uint32_t syscall_builtin_vga_get_mode(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    return vga_is_graphics_mode() ? 1 : 0;
+}
+
+static volatile bool kernel_system_interrupted = false;
+
+static uint32_t syscall_builtin_system_interrupt(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc > 0 && argv) {
+        if (argv[0] == 1) {
+            kernel_system_interrupted = true;
+            serial_printf("[syscall] system_interrupt requested\n");
+            return 1;
+        } else if (argv[0] == 0) {
+            kernel_system_interrupted = false;
+            return 0;
+        }
+    }
+    return kernel_system_interrupted ? 1 : 0;
+}
+
 void syscall_init(void) {
     memset(ipo_idt_table, 0, sizeof(ipo_idt_table));
 
@@ -1280,6 +1430,14 @@ void syscall_init(void) {
     ipo_register_syscall(
         IPO_SYSCALL_TERMINAL_INPUT,
         syscall_builtin_terminal_input);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_PROCESS_YIELD,
+        syscall_builtin_process_yield);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_PROCESS_IS_FOREGROUND,
+        syscall_builtin_process_is_foreground);
 
     ipo_register_syscall(
         IPO_SYSCALL_ASYNC_START,
@@ -1362,6 +1520,18 @@ void syscall_init(void) {
         syscall_builtin_vga_glyph);
 
     ipo_register_syscall(
+        IPO_SYSCALL_VGA_SET_MODE,
+        syscall_builtin_vga_set_mode);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_VGA_GET_MODE,
+        syscall_builtin_vga_get_mode);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_SYSTEM_INTERRUPT,
+        syscall_builtin_system_interrupt);
+
+    ipo_register_syscall(
         IPO_SYSCALL_DRIVER_REGISTER,
         syscall_builtin_driver_register);
 
@@ -1372,6 +1542,50 @@ void syscall_init(void) {
     ipo_register_syscall(
         IPO_SYSCALL_DRIVER_LIST,
         syscall_builtin_driver_list);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_WM_CREATE_WINDOW,
+        syscall_builtin_wm_create_window);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_WM_DESTROY_WINDOW,
+        syscall_builtin_wm_destroy_window);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_WM_SESSION_START,
+        syscall_builtin_wm_session_start);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_WM_SESSION_STOP,
+        syscall_builtin_wm_session_stop);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_WM_SESSION_ACTIVE,
+        syscall_builtin_wm_session_active);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_WM_GET_COUNT,
+        syscall_builtin_wm_get_count);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_WM_GET_FOCUSED,
+        syscall_builtin_wm_get_focused);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_WM_SET_FOCUS,
+        syscall_builtin_wm_set_focus);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_WM_FOCUS_NEXT,
+        syscall_builtin_wm_focus_next);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_WM_FOCUS_PREV,
+        syscall_builtin_wm_focus_prev);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_WM_INVALIDATE,
+        syscall_builtin_wm_invalidate);
 
     ipo_idt_set_gate(
         0x80,

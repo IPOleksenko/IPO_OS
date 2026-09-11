@@ -2,6 +2,7 @@
 #include <kernel/autorun.h>
 #include <system/state.h>
 #include <vga.h>
+#include <vga_gfx.h>
 #include <ioport.h>
 #include <driver/sound.h>
 #include <driver/ata/ata.h>
@@ -120,6 +121,7 @@ void kmain(void) {
     play_startup_sound();
 
     terminal_initialize();
+    vga_save_text_state();
 
     mouse_init();
 

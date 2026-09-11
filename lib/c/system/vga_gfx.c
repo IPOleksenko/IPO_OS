@@ -9,18 +9,189 @@
 #include <vga.h>
 #include <ioport.h>
 #include <string.h>
+#include <syscall.h>
+#include <memory/kmalloc.h>
 #include <driver/input/keymap/dynamic_keymap.h>
+#include <kernel/process.h>
 
 #define VGA_VRAM_ADDR 0xA0000
 
+static inline bool is_foreground_process(void) {
+    int res = ipo_syscall(IPO_SYSCALL_PROCESS_IS_FOREGROUND, 0, NULL);
+    if (res == (int)IPO_SYSCALL_ENOSYS) {
+        return true;
+    }
+    return res != 0;
+}
+
+typedef struct {
+    uint8_t *data;
+    size_t count;
+    size_t capacity;
+} vga_dynbuf8_t;
+
+typedef struct {
+    uint16_t *data;
+    size_t count;
+    size_t capacity;
+} vga_dynbuf16_t;
+
+typedef struct {
+    uint8_t (*data)[3];
+    size_t count;
+    size_t capacity;
+} vga_dyndac_t;
+
+static bool vga_dynbuf8_reserve(vga_dynbuf8_t *buf, size_t min_cap) {
+    if (buf->capacity >= min_cap) {
+        return true;
+    }
+    size_t new_cap = buf->capacity ? buf->capacity : 16;
+    while (new_cap < min_cap) {
+        new_cap = (new_cap * 3) / 2 + 8;
+    }
+    uint8_t *new_data = (uint8_t *)kmalloc(new_cap * sizeof(uint8_t));
+    if (!new_data) {
+        return false;
+    }
+    if (buf->data && buf->count > 0) {
+        memcpy(new_data, buf->data, buf->count * sizeof(uint8_t));
+    }
+    if (new_cap > buf->count) {
+        memset(new_data + buf->count, 0, (new_cap - buf->count) * sizeof(uint8_t));
+    }
+    if (buf->data) {
+        kfree(buf->data);
+    }
+    buf->data = new_data;
+    buf->capacity = new_cap;
+    return true;
+}
+
+static void vga_dynbuf8_set(vga_dynbuf8_t *buf, size_t index, uint8_t val) {
+    if (index >= buf->capacity) {
+        if (!vga_dynbuf8_reserve(buf, index + 1)) {
+            return;
+        }
+    }
+    buf->data[index] = val;
+    if (index + 1 > buf->count) {
+        buf->count = index + 1;
+    }
+}
+
+static uint8_t vga_dynbuf8_get(const vga_dynbuf8_t *buf, size_t index, uint8_t def_val) {
+    if (!buf->data || index >= buf->count) {
+        return def_val;
+    }
+    return buf->data[index];
+}
+
+static bool vga_dynbuf16_reserve(vga_dynbuf16_t *buf, size_t min_cap) {
+    if (buf->capacity >= min_cap) {
+        return true;
+    }
+    size_t new_cap = buf->capacity ? buf->capacity : 64;
+    while (new_cap < min_cap) {
+        new_cap = (new_cap * 3) / 2 + 16;
+    }
+    uint16_t *new_data = (uint16_t *)kmalloc(new_cap * sizeof(uint16_t));
+    if (!new_data) {
+        return false;
+    }
+    if (buf->data && buf->count > 0) {
+        memcpy(new_data, buf->data, buf->count * sizeof(uint16_t));
+    }
+    if (new_cap > buf->count) {
+        memset(new_data + buf->count, 0, (new_cap - buf->count) * sizeof(uint16_t));
+    }
+    if (buf->data) {
+        kfree(buf->data);
+    }
+    buf->data = new_data;
+    buf->capacity = new_cap;
+    return true;
+}
+
+static void vga_dynbuf16_set(vga_dynbuf16_t *buf, size_t index, uint16_t val) {
+    if (index >= buf->capacity) {
+        if (!vga_dynbuf16_reserve(buf, index + 1)) {
+            return;
+        }
+    }
+    buf->data[index] = val;
+    if (index + 1 > buf->count) {
+        buf->count = index + 1;
+    }
+}
+
+static uint16_t vga_dynbuf16_get(const vga_dynbuf16_t *buf, size_t index, uint16_t def_val) {
+    if (!buf->data || index >= buf->count) {
+        return def_val;
+    }
+    return buf->data[index];
+}
+
+static bool vga_dyndac_reserve(vga_dyndac_t *buf, size_t min_cap) {
+    if (buf->capacity >= min_cap) {
+        return true;
+    }
+    size_t new_cap = buf->capacity ? buf->capacity : 32;
+    while (new_cap < min_cap) {
+        new_cap = (new_cap * 3) / 2 + 16;
+    }
+    uint8_t (*new_data)[3] = (uint8_t (*)[3])kmalloc(new_cap * sizeof(uint8_t[3]));
+    if (!new_data) {
+        return false;
+    }
+    if (buf->data && buf->count > 0) {
+        memcpy(new_data, buf->data, buf->count * sizeof(uint8_t[3]));
+    }
+    if (new_cap > buf->count) {
+        memset(new_data + buf->count, 0, (new_cap - buf->count) * sizeof(uint8_t[3]));
+    }
+    if (buf->data) {
+        kfree(buf->data);
+    }
+    buf->data = new_data;
+    buf->capacity = new_cap;
+    return true;
+}
+
+static void vga_dyndac_set(vga_dyndac_t *buf, size_t index, uint8_t r, uint8_t g, uint8_t b) {
+    if (index >= buf->capacity) {
+        if (!vga_dyndac_reserve(buf, index + 1)) {
+            return;
+        }
+    }
+    buf->data[index][0] = r;
+    buf->data[index][1] = g;
+    buf->data[index][2] = b;
+    if (index + 1 > buf->count) {
+        buf->count = index + 1;
+    }
+}
+
+static void vga_dyndac_get(const vga_dyndac_t *buf, size_t index, uint8_t *r, uint8_t *g, uint8_t *b) {
+    if (!buf->data || index >= buf->count) {
+        if (r) *r = 0;
+        if (g) *g = 0;
+        if (b) *b = 0;
+        return;
+    }
+    if (r) *r = buf->data[index][0];
+    if (g) *g = buf->data[index][1];
+    if (b) *b = buf->data[index][2];
+}
+
 static uint8_t saved_misc = 0x67;
-static uint8_t saved_seq[5] = {0x03, 0x00, 0x03, 0x00, 0x02};
-static uint8_t saved_crtc[25];
-static uint8_t saved_gc[9];
-static uint8_t saved_ac[21];
-static uint8_t saved_dac[16][3];
-static uint8_t saved_font_plane2[8192];
-static uint16_t saved_text_vram[80 * 25];
+static vga_dynbuf8_t saved_seq = {0};
+static vga_dynbuf8_t saved_crtc = {0};
+static vga_dynbuf8_t saved_gc = {0};
+static vga_dynbuf8_t saved_ac = {0};
+static vga_dyndac_t saved_dac = {0};
+static vga_dynbuf8_t saved_font_plane2 = {0};
+static vga_dynbuf16_t saved_text_vram = {0};
 static uint16_t saved_cursor_pos = 0;
 static bool saved_cursor_visible = false;
 static bool has_saved_text_vram = false;
@@ -49,7 +220,11 @@ static inline void ac_write(uint8_t index, uint8_t val) {
 }
 
 void vga_save_text_state(void) {
-    if (text_state_saved) return;
+    /* If graphics mode is active or text VRAM was already saved, NEVER read 0xB8000!
+     * In Mode 13h, 0xB8000 is unmapped by hardware and reading it yields 0x2020 bus float. */
+    if (vga_is_graphics_mode() || has_saved_text_vram) {
+        return;
+    }
 
     /* Capture true hardware cursor position and visibility */
     saved_cursor_pos = vga_get_cursor_position();
@@ -65,9 +240,11 @@ void vga_save_text_state(void) {
         if ((entry & 0xFF) == VGA_CURSOR_GLYPH_SLOT) {
             entry = (entry & 0xFF00) | ' ';
         }
-        saved_text_vram[i] = entry;
+        vga_dynbuf16_set(&saved_text_vram, i, entry);
     }
     has_saved_text_vram = true;
+
+    if (text_state_saved) return;
 
     /* Misc Output */
     saved_misc = inb(0x3CC);
@@ -75,36 +252,37 @@ void vga_save_text_state(void) {
     /* Sequencer */
     for (uint8_t i = 0; i < 5; i++) {
         outb(0x3C4, i);
-        saved_seq[i] = inb(0x3C5);
+        vga_dynbuf8_set(&saved_seq, i, inb(0x3C5));
     }
 
     /* CRTC */
     for (uint8_t i = 0; i < 25; i++) {
         outb(0x3D4, i);
-        saved_crtc[i] = inb(0x3D5);
+        vga_dynbuf8_set(&saved_crtc, i, inb(0x3D5));
     }
 
     /* Graphics Controller */
     for (uint8_t i = 0; i < 9; i++) {
         outb(0x3CE, i);
-        saved_gc[i] = inb(0x3CF);
+        vga_dynbuf8_set(&saved_gc, i, inb(0x3CF));
     }
 
     /* Attribute Controller */
     for (uint8_t i = 0; i < 21; i++) {
         inb(0x3DA);
         outb(0x3C0, i);
-        saved_ac[i] = inb(0x3C1);
+        vga_dynbuf8_set(&saved_ac, i, inb(0x3C1));
     }
     inb(0x3DA);
     outb(0x3C0, 0x20);
 
-    /* DAC Palette (16 colors) */
-    for (int i = 0; i < 16; i++) {
+    /* DAC Palette (all 256 colors) */
+    for (int i = 0; i < 256; i++) {
         outb(0x3C7, (uint8_t)i);
-        saved_dac[i][0] = inb(0x3C9);
-        saved_dac[i][1] = inb(0x3C9);
-        saved_dac[i][2] = inb(0x3C9);
+        uint8_t r = inb(0x3C9);
+        uint8_t g = inb(0x3C9);
+        uint8_t b = inb(0x3C9);
+        vga_dyndac_set(&saved_dac, i, r, g, b);
     }
 
     /* Save Plane 2 Font (8KB: 256 glyphs * 32 bytes) */
@@ -123,7 +301,7 @@ void vga_save_text_state(void) {
 
     volatile uint8_t *font_vram = (volatile uint8_t *)0xA0000;
     for (int i = 0; i < 8192; i++) {
-        saved_font_plane2[i] = font_vram[i];
+        vga_dynbuf8_set(&saved_font_plane2, i, font_vram[i]);
     }
 
     /* Restore normal text mode operation (Plane 0 & 1, 0xB8000) */
@@ -142,7 +320,10 @@ void vga_save_text_state(void) {
     text_state_saved = true;
 }
 
-void vga_set_mode_13h(void) {
+void vga_set_mode_13h_hardware(void) {
+    if (vga_is_graphics_mode()) {
+        return;
+    }
     vga_save_text_state();
 
     /* Misc Output */
@@ -219,18 +400,20 @@ void vga_set_mode_13h(void) {
     is_gfx = true;
 }
 
-void vga_set_mode_text(void) {
+void vga_set_mode_text_hardware(void) {
+    if (!vga_is_graphics_mode()) {
+        return;
+    }
+
     /* Misc */
     outb(0x3C2, saved_misc ? saved_misc : 0x67);
 
     /* Sequencer */
-    for (uint8_t i = 0; i < 5; i++) {
-        outb(0x3C4, i);
-        uint8_t val = inb(0x3C5);
-        serial_printf("[vga_gfx] read seq[%d] = 0x%x\n", i, val);
-    }
-    for (uint8_t i = 0; i < 5; i++) {
-        seq_write(i, saved_seq[i]);
+    static const uint8_t default_seq[5] = {0x03, 0x00, 0x03, 0x00, 0x02};
+    size_t seq_count = saved_seq.count ? saved_seq.count : 5;
+    for (size_t i = 0; i < seq_count; i++) {
+        uint8_t def = (i < 5) ? default_seq[i] : 0;
+        seq_write((uint8_t)i, vga_dynbuf8_get(&saved_seq, i, def));
     }
 
     /* Unlock CRTC */
@@ -238,28 +421,34 @@ void vga_set_mode_text(void) {
     outb(0x3D5, inb(0x3D5) & ~0x80);
 
     /* CRTC */
-    for (uint8_t i = 0; i < 25; i++) {
-        crtc_write(i, saved_crtc[i]);
+    size_t crtc_count = saved_crtc.count ? saved_crtc.count : 25;
+    for (size_t i = 0; i < crtc_count; i++) {
+        crtc_write((uint8_t)i, vga_dynbuf8_get(&saved_crtc, i, 0));
     }
 
     /* GC */
-    for (uint8_t i = 0; i < 9; i++) {
-        gc_write(i, saved_gc[i]);
+    size_t gc_count = saved_gc.count ? saved_gc.count : 9;
+    for (size_t i = 0; i < gc_count; i++) {
+        gc_write((uint8_t)i, vga_dynbuf8_get(&saved_gc, i, 0));
     }
 
     /* AC */
-    for (uint8_t i = 0; i < 21; i++) {
-        ac_write(i, saved_ac[i]);
+    size_t ac_count = saved_ac.count ? saved_ac.count : 21;
+    for (size_t i = 0; i < ac_count; i++) {
+        ac_write((uint8_t)i, vga_dynbuf8_get(&saved_ac, i, 0));
     }
     inb(0x3DA);
     outb(0x3C0, 0x20);
 
-    /* DAC */
-    for (int i = 0; i < 16; i++) {
+    /* DAC (all 256 colors) */
+    size_t dac_count = saved_dac.count ? saved_dac.count : 256;
+    for (size_t i = 0; i < dac_count; i++) {
+        uint8_t r = 0, g = 0, b = 0;
+        vga_dyndac_get(&saved_dac, i, &r, &g, &b);
         outb(0x3C8, (uint8_t)i);
-        outb(0x3C9, saved_dac[i][0]);
-        outb(0x3C9, saved_dac[i][1]);
-        outb(0x3C9, saved_dac[i][2]);
+        outb(0x3C9, r);
+        outb(0x3C9, g);
+        outb(0x3C9, b);
     }
 
     /* Restore Plane 2 Font */
@@ -277,8 +466,9 @@ void vga_set_mode_text(void) {
     outb(0x3CE, 0x08); outb(0x3CF, 0xFF);
 
     volatile uint8_t *dest = (volatile uint8_t *)0xA0000;
-    for (int i = 0; i < 8192; i++) {
-        dest[i] = saved_font_plane2[i];
+    size_t font_count = saved_font_plane2.count ? saved_font_plane2.count : 8192;
+    for (size_t i = 0; i < font_count; i++) {
+        dest[i] = vga_dynbuf8_get(&saved_font_plane2, i, 0);
     }
 
     /* Restore normal text mode operation (Plane 0 & 1, 0xB8000) */
@@ -306,11 +496,18 @@ void vga_set_mode_text(void) {
 
     if (has_saved_text_vram) {
         volatile uint16_t *text_vram = (volatile uint16_t *)0xB8000;
-        for (int i = 0; i < 80 * 25; i++) {
-            if ((saved_text_vram[i] & 0xFF) == VGA_CURSOR_GLYPH_SLOT) {
-                saved_text_vram[i] = (saved_text_vram[i] & 0xFF00) | ' ';
+        size_t text_count = saved_text_vram.count ? saved_text_vram.count : (80 * 25);
+        for (size_t i = 0; i < text_count; i++) {
+            uint16_t entry = vga_dynbuf16_get(&saved_text_vram, i, 0x0720);
+            uint8_t bg = (uint8_t)((entry >> 12) & 0x07);
+            uint8_t ch = (uint8_t)(entry & 0xFF);
+            if (bg == 2 || ((ch == ' ' || ch == 0x00) && bg != 0)) {
+                entry = (entry & 0x0FFF) | 0x0000;
+                if (ch == 0x00) entry = 0x0720;
+            } else if (ch == VGA_CURSOR_GLYPH_SLOT) {
+                entry = (entry & 0xFF00) | ' ';
             }
-            text_vram[i] = saved_text_vram[i];
+            text_vram[i] = entry;
         }
         vga_set_cursor(saved_cursor_pos);
         if (saved_cursor_visible) {
@@ -323,15 +520,33 @@ void vga_set_mode_text(void) {
     }
 
     is_gfx = false;
-    text_state_saved = false;
     has_saved_text_vram = false;
+    vga_sanitize_text_vram();
 }
 
 bool vga_is_graphics_mode(void) {
-    return is_gfx;
+    outb(0x3CE, 0x06);
+    return (inb(0x3CF) & 0x01) != 0;
+}
+
+void vga_set_mode_13h(void) {
+    uint32_t arg = 1;
+    int res = ipo_syscall(IPO_SYSCALL_VGA_SET_MODE, 1, &arg);
+    if (res == (int)IPO_SYSCALL_ENOSYS) {
+        vga_set_mode_13h_hardware();
+    }
+}
+
+void vga_set_mode_text(void) {
+    uint32_t arg = 0;
+    int res = ipo_syscall(IPO_SYSCALL_VGA_SET_MODE, 1, &arg);
+    if (res == (int)IPO_SYSCALL_ENOSYS) {
+        vga_set_mode_text_hardware();
+    }
 }
 
 void vga_gfx_set_palette(uint8_t idx, uint8_t r, uint8_t g, uint8_t b) {
+    if (!is_foreground_process()) return;
     outb(0x3C8, idx);
     outb(0x3C9, r & 0x3F);
     outb(0x3C9, g & 0x3F);
@@ -495,6 +710,7 @@ void vga_gfx_buf_fill_rect(uint8_t *buf, int x, int y, int w, int h, uint8_t col
     if (y < 0) y = 0;
     if (x2 > VGA_GFX_WIDTH) x2 = VGA_GFX_WIDTH;
     if (y2 > VGA_GFX_HEIGHT) y2 = VGA_GFX_HEIGHT;
+    if (x2 <= x || y2 <= y) return;
 
     for (int cy = y; cy < y2; cy++) {
         memset(buf + (cy * VGA_GFX_WIDTH + x), color, (size_t)(x2 - x));
@@ -567,6 +783,9 @@ void vga_gfx_buf_fill_circle(uint8_t *buf, int xc, int yc, int r, uint8_t color)
 }
 
 void vga_gfx_flip(const uint8_t *buf) {
+    if (!is_foreground_process()) return;
+    if (!vga_is_graphics_mode()) return;
+
     volatile uint8_t *vram = (volatile uint8_t *)VGA_VRAM_ADDR;
     memcpy((void *)vram, buf, VGA_GFX_SIZE);
 }

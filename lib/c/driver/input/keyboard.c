@@ -3,6 +3,10 @@
 #include <vga.h>
 #include <ioport.h>
 #include <driver/input/keymap/keymap.h>
+#include <kernel/process.h>
+#include <syscall.h>
+#include <system/timer.h>
+#include <system/state.h>
 #include <stdio.h>
 
 #define KEYBOARD_QUEUE_SIZE 256
@@ -59,6 +63,10 @@ void keyboard_poll(void) {
             if (data == 0x00u) continue;
             uint8_t scancode = data;
             vga_cursor_reset_blink();
+            update_hot_key_state(scancode);
+            if (scancode == 0x2E && keyboard_is_ctrl_pressed()) {
+                system_request_interrupt();
+            }
             if (keyboard_app_input_mode) {
                 keyboard_queue_push(&app_queue, scancode);
             } else {
@@ -77,6 +85,8 @@ void keyboard_flush_hardware(void) {
 void keyboard_flush_queue(void) {
     shell_queue.head = 0;
     shell_queue.tail = 0;
+    app_queue.head = 0;
+    app_queue.tail = 0;
 }
 
 void keyboard_flush_app_queue(void) {
@@ -84,9 +94,20 @@ void keyboard_flush_app_queue(void) {
     app_queue.tail = 0;
 }
 
+static uint32_t app_input_mode_start_ms = 0;
+
 void keyboard_set_app_input_mode(bool enabled) {
+    if (keyboard_app_input_mode == enabled) {
+        return;
+    }
     keyboard_app_input_mode = enabled;
-    serial_printf("[keyboard] app_input_mode = %d\n", enabled ? 1 : 0);
+    if (enabled) {
+        app_input_mode_start_ms = timer_millis();
+        keyboard_flush_hardware();
+        keyboard_flush_queue();
+        keyboard_flush_app_queue();
+        keyboard_clear_key_state();
+    }
 }
 
 bool keyboard_is_app_input_mode(void) {
@@ -101,18 +122,58 @@ void keyboard_enqueue_scancode(uint8_t scancode) {
     keyboard_queue_push(&shell_queue, scancode);
 }
 
+static bool is_foreground_process(void) {
+    int res = ipo_syscall(IPO_SYSCALL_PROCESS_IS_FOREGROUND, 0, NULL);
+    if (res == (int)IPO_SYSCALL_ENOSYS) {
+        return true;
+    }
+    return res != 0;
+}
+
+static void yield_waiting(bool waiting) {
+    uint32_t arg = waiting ? 1 : 0;
+    ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 1, &arg);
+}
+
 uint8_t keyboard_get_scancode(void) {
+    if (!is_foreground_process()) {
+        yield_waiting(true);
+        return 0x00u;
+    }
+
     keyboard_poll();
     struct keyboard_queue *q = keyboard_app_input_mode ? &app_queue : &shell_queue;
-    return keyboard_queue_pop(q);
+    uint8_t sc = keyboard_queue_pop(q);
+    if (keyboard_app_input_mode && (sc == 0x1C || sc == 0x9C)) {
+        if (timer_elapsed_ms(app_input_mode_start_ms) < 250u) {
+            sc = 0x00u;
+        }
+    }
+    if (sc == 0x00u) {
+        yield_waiting(true);
+    } else {
+        yield_waiting(false);
+    }
+    return sc;
 }
 
 uint8_t keyboard_wait_scancode(void) {
+    keyboard_set_app_input_mode(true);
     while (1) {
+        if (system_is_interrupted()) {
+            return 0x00u;
+        }
+        if (!is_foreground_process()) {
+            yield_waiting(true);
+            continue;
+        }
+
         uint8_t scancode = keyboard_get_scancode();
         if (scancode != 0x00u) {
+            yield_waiting(false);
             return scancode;
         }
+        yield_waiting(true);
         io_wait();
     }
 }

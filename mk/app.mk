@@ -5,9 +5,10 @@ APPS_BUILD   := build/apps
 APPS_SRCS_RAW := $(shell find $(APPS_DIR) -maxdepth 2 -name "*.c" -type f)
 GENERIC_APP_SRCS := $(filter-out apps/tcc/%, $(APPS_SRCS_RAW))
 APPS_BINS    := $(patsubst $(APPS_DIR)/%.c, $(APPS_BUILD)/%.bin, $(GENERIC_APP_SRCS)) $(APPS_BUILD)/tcc/tcc.bin
-APP_ENTRY_OBJ  := $(APPS_BUILD)/entry.o
-APP_PRINTF_OBJ := $(APPS_BUILD)/app_printf.o
+APP_ENTRY_OBJ   := $(APPS_BUILD)/entry.o
+APP_PRINTF_OBJ  := $(APPS_BUILD)/app_printf.o
 APP_KMALLOC_OBJ := $(APPS_BUILD)/app_kmalloc.o
+APP_WM_OBJ      := $(APPS_BUILD)/app_wm.o
 
 # Applications are compiled as Position Independent Code (PIC).
 # This allows them to run from any memory address dynamically allocated
@@ -45,6 +46,10 @@ $(APP_KMALLOC_OBJ): lib/c/memory/kmalloc.c
 	@mkdir -p $(dir $@)
 	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS) -DIPO_APP
 
+$(APP_WM_OBJ): lib/c/system/wm.c
+	@mkdir -p $(dir $@)
+	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS) -DIPO_APP
+
 $(APPS_BUILD)/tcc/setjmp.o: apps/tcc/setjmp.s
 	@mkdir -p $(dir $@)
 	$(ASM) -f elf32 $< -o $@
@@ -74,13 +79,13 @@ $(APPS_BUILD)/%.o: $(APPS_DIR)/%.c
 	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS)
 
 # Rule: Create raw flat executable binary from object file
-$(APPS_BUILD)/%.bin: $(APPS_BUILD)/%.o $(APP_ENTRY_OBJ) $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) $(LIB_A)
+$(APPS_BUILD)/%.bin: $(APPS_BUILD)/%.o $(APP_ENTRY_OBJ) $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) $(APP_WM_OBJ) $(LIB_A)
 	@mkdir -p $(dir $@)
 	@echo "[apps] Building: $*.c → $@"
 	
 	@# Link entry point first so execution starts at offset 0
 	@$(CC) $(APPS_CFLAGS) -Wl,-T,apps/app.ld \
-		$(APP_ENTRY_OBJ) $< $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) -Wl,--start-group $(LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
+		$(APP_ENTRY_OBJ) $< $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) $(APP_WM_OBJ) -Wl,--start-group $(LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
 	
 	@# Extract program sections into flat binary
 	@$(OBJCOPY) --set-section-flags .bss=alloc,load,contents \

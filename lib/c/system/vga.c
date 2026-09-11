@@ -1,4 +1,5 @@
 #include <vga.h>
+#include <vga_gfx.h>
 #include <ioport.h>
 #include <stdio.h>
 #include <system/timer.h>
@@ -80,6 +81,11 @@ void vga_set_cursor(uint16_t offset) {
         offset = VGA_WIDTH * VGA_HEIGHT - 1;
     }
 
+    if (vga_is_graphics_mode()) {
+        cursor_hw_offset = offset;
+        return;
+    }
+
     // Write hardware cursor position registers
     outb(0x3D4, 0x0E);
     outb(0x3D5, (offset >> 8) & 0xFF);
@@ -107,6 +113,7 @@ void vga_set_cursor(uint16_t offset) {
 
 // Shows the cursor
 void vga_show_cursor(void) {
+    if (vga_is_graphics_mode()) { cursor_is_visible = true; return; }
     outb(0x3D4, 0x0A);
     uint8_t crtc_val = inb(0x3D5);
     outb(0x3D5, crtc_val | 0x20);
@@ -119,6 +126,7 @@ void vga_show_cursor(void) {
 
 // Hides the cursor
 void vga_hide_cursor(void) {
+    if (vga_is_graphics_mode()) { cursor_is_visible = false; return; }
     outb(0x3D4, 0x0A);
     uint8_t crtc_val = inb(0x3D5);
     outb(0x3D5, crtc_val | 0x20);
@@ -162,6 +170,8 @@ void vga_cursor_reset(void) {
 }
 
 void vga_cursor_blink_tick(void) {
+    /* Never touch text-mode VRAM or CRTC registers while in graphics mode */
+    if (vga_is_graphics_mode()) return;
     if (!cursor_is_visible) return;
 
     uint32_t now = timer_millis();
@@ -202,6 +212,9 @@ void vga_clear(enum vga_color fg, enum vga_color bg, bool show_cursor, int curso
 }
 
 uint16_t vga_get_cursor_position(void) {
+    if (vga_is_graphics_mode()) {
+        return cursor_hw_offset;
+    }
     outb(0x3D4, 0x0E);
     uint16_t pos = ((uint16_t)inb(0x3D5)) << 8;
     outb(0x3D4, 0x0F);
@@ -213,6 +226,9 @@ uint16_t vga_get_cursor_position(void) {
 }
 
 bool vga_is_cursor_visible(void) {
+    if (vga_is_graphics_mode()) {
+        return cursor_is_visible;
+    }
     outb(0x3D4, 0x0A);
     if (inb(0x3D5) & 0x20) {
         cursor_is_visible = false;
@@ -238,4 +254,17 @@ uint16_t vga_decrement_cursor_position(void) {
     }
     vga_set_cursor(cursor);
     return cursor;
+}
+
+void vga_sanitize_text_vram(void) {
+    volatile uint16_t *vga = VGA_MEMORY;
+    for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
+        uint16_t entry = vga[i];
+        uint8_t bg = (uint8_t)((entry >> 12) & 0x07);
+        uint8_t ch = (uint8_t)(entry & 0xFF);
+        uint8_t attr = (uint8_t)(entry >> 8);
+        if (entry == 0xFFFF || attr == 0xFF || attr == 0x20 || bg == 2 || ((ch == ' ' || ch == 0x00) && bg != 0)) {
+            vga[i] = 0x0720;
+        }
+    }
 }

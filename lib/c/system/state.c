@@ -1,5 +1,6 @@
 #include <system/state.h>
 #include <stdio.h>
+#include <syscall.h>
 
 static system_state_t current_system_state = SYSTEM_STATE_BOOT;
 
@@ -45,14 +46,23 @@ static volatile bool system_interrupted_flag = false;
 
 void system_request_interrupt(void) {
     system_interrupted_flag = true;
+    uint32_t arg = 1;
+    ipo_syscall(IPO_SYSCALL_SYSTEM_INTERRUPT, 1, &arg);
     serial_printf("[system_state] global interrupt (Ctrl+C) requested\n");
 }
 
 void system_clear_interrupt(void) {
     system_interrupted_flag = false;
+    uint32_t arg = 0;
+    ipo_syscall(IPO_SYSCALL_SYSTEM_INTERRUPT, 1, &arg);
 }
 
 bool system_is_interrupted(void) {
-    return system_interrupted_flag;
+    uint32_t arg = 2;
+    int res = ipo_syscall(IPO_SYSCALL_SYSTEM_INTERRUPT, 1, &arg);
+    if (res == (int)IPO_SYSCALL_ENOSYS) {
+        return system_interrupted_flag;
+    }
+    return (res != 0) || system_interrupted_flag;
 }
 

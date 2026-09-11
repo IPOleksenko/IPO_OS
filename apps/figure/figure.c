@@ -222,10 +222,7 @@ int main(int argc, char **argv) {
 
         /* 1. Process keyboard inputs */
         while (1) {
-            uint8_t sc = 0;
-            if (inb(0x64) & 0x01) {
-                sc = inb(0x60);
-            }
+            uint8_t sc = keyboard_get_scancode();
             if (sc == 0) break;
             update_hot_key_state(sc);
 
@@ -389,10 +386,12 @@ exit_figure:
     keyboard_clear_key_state();
     keyboard_flush_hardware();
     keyboard_flush_queue();
+    keyboard_flush_app_queue();
 
     /* Clean exit: Restore 80x25 text mode and previous screen */
     vga_set_mode_text();
     memcpy((void *)0xB8000, saved_screen, sizeof(saved_screen));
     vga_set_cursor(saved_cursor);
+    vga_show_cursor();
     return 0;
 }

@@ -302,6 +302,6 @@ void mouse_get_state(mouse_state_t *out_state) {
 void mouse_set_bounds(int32_t max_x, int32_t max_y) {
     if (max_x > 0) current_mouse_state.max_x = max_x;
     if (max_y > 0) current_mouse_state.max_y = max_y;
-    if (current_mouse_state.x >= current_mouse_state.max_x) current_mouse_state.x = current_mouse_state.max_x - 1;
-    if (current_mouse_state.y >= current_mouse_state.max_y) current_mouse_state.y = current_mouse_state.max_y - 1;
+    current_mouse_state.x = current_mouse_state.max_x / 2;
+    current_mouse_state.y = current_mouse_state.max_y / 2;
 }

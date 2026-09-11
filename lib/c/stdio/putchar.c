@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <vga.h>
+#include <vga_gfx.h>
 #include <ioport.h>
 #include <kernel/terminal.h>
 #include <kernel/driver.h>
@@ -25,6 +26,10 @@ void putchar(char c) {
 }
 
 void putchar_color(char c, uint8_t fg, uint8_t bg) {
+    if (vga_is_graphics_mode()) {
+        c = driver_dispatch_char_output(c);
+        return;
+    }
     terminal_on_external_output();
     acquire_output_lock();
 

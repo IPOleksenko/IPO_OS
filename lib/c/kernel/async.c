@@ -50,7 +50,33 @@ static void run_async_task(async_task_t *task) {
     if (task == NULL || task->fn == NULL) {
         return;
     }
+
+    process_t *owner = task->owner;
+    if (owner != NULL && !process_is_valid(owner)) {
+        task->active = false;
+        return;
+    }
+
+    process_t *prev_mapped = process_get_mapped_app();
+    process_t *prev_current = process_get_current();
+
+    if (owner != NULL) {
+        process_map_app(owner);
+        process_set_current(owner);
+    }
+
     task->fn();
+
+    if (owner != NULL) {
+        if (!process_is_valid(prev_mapped)) {
+            prev_mapped = NULL;
+        }
+        if (!process_is_valid(prev_current)) {
+            prev_current = NULL;
+        }
+        process_map_app(prev_mapped);
+        process_set_current(prev_current);
+    }
 }
 
 void async_scheduler_init(void)
