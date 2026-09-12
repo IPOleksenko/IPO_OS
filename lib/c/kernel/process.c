@@ -744,8 +744,7 @@ void process_crash_exit(void) {
             vga_sanitize_text_vram();
         }
 
-        serial_printf("[process] pid=%u terminated by CPU exception, cleaned up\n", proc->pid);
-        process_cleanup(proc);
+        serial_printf("[process] pid=%u terminated by CPU exception\n", proc->pid);
     }
 
     while (1) {
