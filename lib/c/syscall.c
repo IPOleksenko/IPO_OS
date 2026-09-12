@@ -46,6 +46,43 @@ static uint32_t ipo_shared_var_count = 0u;
 static uint32_t ipo_shared_var_capacity = 0u;
 
 extern void syscall_isr_entry(void);
+extern uint32_t isr_stub_table[32];
+
+static const char *exception_names[32] = {
+    "Divide-by-zero (#DE)", "Debug (#DB)", "Non-maskable Interrupt (#NMI)", "Breakpoint (#BP)",
+    "Overflow (#OF)", "Bound Range Exceeded (#BR)", "Invalid Opcode (#UD)", "Device Not Available (#NM)",
+    "Double Fault (#DF)", "Coprocessor Segment Overrun", "Invalid TSS (#TS)", "Segment Not Present (#NP)",
+    "Stack-Segment Fault (#SS)", "General Protection Fault (#GP)", "Page Fault (#PF)", "Reserved",
+    "x87 FPU Error (#MF)", "Alignment Check (#AC)", "Machine Check (#MC)", "SIMD Floating-Point (#XM)",
+    "Virtualization (#VE)", "Control Protection (#CP)", "Reserved", "Reserved",
+    "Reserved", "Reserved", "Reserved", "Reserved", "Hypervisor Injection", "VMM Communication",
+    "Security Exception", "Reserved"
+};
+
+void cpu_exception_handler(uint32_t *frame) {
+    uint32_t vector = frame[7];
+    uint32_t err_code = frame[8];
+    uint32_t eip = frame[9];
+    const char *name = (vector < 32) ? exception_names[vector] : "Unknown Exception";
+
+    process_t *proc = process_get_current();
+    if (proc != NULL) {
+        printf("\n[Process %u] Terminated: CPU Exception %u (%s) at 0x%08x (err=0x%x)\n",
+               proc->pid, vector, name, eip, err_code);
+        serial_printf("[cpu_exception] Process %u crashed: vec=%u (%s) eip=0x%08x err=0x%x\n",
+                      proc->pid, vector, name, eip, err_code);
+        frame[9] = (uint32_t)process_crash_exit;
+        return;
+    }
+
+    printf("\nKERNEL PANIC: CPU Exception %u (%s) at 0x%08x (err=0x%x)\n",
+           vector, name, eip, err_code);
+    serial_printf("KERNEL PANIC: CPU Exception %u (%s) at 0x%08x (err=0x%x)\n",
+                  vector, name, eip, err_code);
+    while (1) {
+        __asm__ volatile("cli; hlt");
+    }
+}
 
 static ipo_shared_var_t *find_shared_var_locked(const char *name) {
     if (name == NULL) {
@@ -309,11 +346,17 @@ static uint32_t syscall_builtin_write(uint32_t num,
     }
 
     uint32_t count = 0;
-
-    while (text[count] != '\0') {
-        putchar(text[count]);
-        serial_putc(text[count]);
-        count++;
+    if (argc >= 2u) {
+        uint32_t len = argv[1];
+        while (count < len) {
+            putchar(text[count]);
+            count++;
+        }
+    } else {
+        while (text[count] != '\0') {
+            putchar(text[count]);
+            count++;
+        }
     }
 
     return count;
@@ -342,8 +385,10 @@ static uint32_t syscall_builtin_fs_open(uint32_t num,
         return IPO_SYSCALL_ENOSYS;
     }
 
-    return (uint32_t)ipo_fs_open(
-        (const char *)(uintptr_t)argv[0]);
+    const char *path = (const char *)(uintptr_t)argv[0];
+    serial_printf("[fs_open] path='%s'\n", path ? path : "NULL");
+
+    return (uint32_t)ipo_fs_open(path);
 }
 
 static uint32_t syscall_builtin_fs_close(uint32_t num,
@@ -363,15 +408,27 @@ static uint32_t syscall_builtin_fs_read(uint32_t num,
                                         uint32_t *argv) {
     (void)num;
 
-    if (argc < 4u || argv == NULL) {
+    if (argc < 3u || argv == NULL) {
         return IPO_SYSCALL_ENOSYS;
     }
 
-    return (uint32_t)ipo_fs_read(
-        (int)argv[0],
-        (void *)(uintptr_t)argv[1],
-        (uint32_t)argv[2],
-        (uint32_t)argv[3]);
+    int fd = (int)argv[0];
+    void *buf = (void *)(uintptr_t)argv[1];
+    uint32_t count = argv[2];
+    uint32_t offset = 0;
+
+    if (argc >= 4u) {
+        offset = argv[3];
+    } else {
+        if (fd < 0 || fd >= IPO_MAX_FDS || !fds[fd].used) return (uint32_t)-1;
+        offset = fds[fd].offset;
+    }
+
+    int res = ipo_fs_read(fd, buf, count, offset);
+    if (res > 0 && argc < 4u) {
+        fds[fd].offset += (uint32_t)res;
+    }
+    return (uint32_t)res;
 }
 
 static uint32_t syscall_builtin_fs_write(uint32_t num,
@@ -379,15 +436,68 @@ static uint32_t syscall_builtin_fs_write(uint32_t num,
                                          uint32_t *argv) {
     (void)num;
 
-    if (argc < 4u || argv == NULL) {
+    if (argc < 3u || argv == NULL) {
         return IPO_SYSCALL_ENOSYS;
     }
 
-    return (uint32_t)ipo_fs_write(
-        (int)argv[0],
-        (const void *)(uintptr_t)argv[1],
-        (uint32_t)argv[2],
-        (uint32_t)argv[3]);
+    int fd = (int)argv[0];
+    const void *buf = (const void *)(uintptr_t)argv[1];
+    uint32_t count = argv[2];
+    uint32_t offset = 0;
+
+    if (argc >= 4u) {
+        offset = argv[3];
+    } else {
+        if (fd < 0 || fd >= IPO_MAX_FDS || !fds[fd].used) return (uint32_t)-1;
+        offset = fds[fd].offset;
+    }
+
+    int res = ipo_fs_write(fd, buf, count, offset);
+    if (res > 0 && argc < 4u) {
+        fds[fd].offset += (uint32_t)res;
+    }
+    return (uint32_t)res;
+}
+
+static uint32_t syscall_builtin_fs_seek(uint32_t num,
+                                        uint32_t argc,
+                                        uint32_t *argv) {
+    (void)num;
+
+    if (argc < 3u || argv == NULL) {
+        return (uint32_t)-1;
+    }
+
+    int fd = (int)argv[0];
+    int32_t offset = (int32_t)argv[1];
+    int whence = (int)argv[2];
+
+    if (fd < 0 || fd >= IPO_MAX_FDS || !fds[fd].used) {
+        return (uint32_t)-1;
+    }
+
+    struct ipo_inode inode;
+    if (!read_inode(fds[fd].inode, &inode)) {
+        return (uint32_t)-1;
+    }
+
+    int32_t new_pos = 0;
+    if (whence == 0) { // SEEK_SET
+        new_pos = offset;
+    } else if (whence == 1) { // SEEK_CUR
+        new_pos = (int32_t)fds[fd].offset + offset;
+    } else if (whence == 2) { // SEEK_END
+        new_pos = (int32_t)inode.size + offset;
+    } else {
+        return (uint32_t)-1;
+    }
+
+    if (new_pos < 0) {
+        return (uint32_t)-1;
+    }
+
+    fds[fd].offset = (uint32_t)new_pos;
+    return (uint32_t)new_pos;
 }
 
 static uint32_t syscall_builtin_fs_delete(uint32_t num,
@@ -419,8 +529,11 @@ static uint32_t syscall_builtin_fs_stat(uint32_t num,
         return IPO_SYSCALL_ENOSYS;
     }
 
-    return (uint32_t)(
-        ipo_fs_stat((const char *)(uintptr_t)argv[0], st) ? 0u : 1u);
+    const char *path = (const char *)(uintptr_t)argv[0];
+    bool res = ipo_fs_stat(path, st);
+    serial_printf("[fs_stat] path='%s' res=%d\n", path ? path : "NULL", res);
+
+    return (uint32_t)(res ? 0u : 1u);
 }
 
 static uint32_t syscall_builtin_fs_list(uint32_t num,
@@ -466,6 +579,31 @@ static uint32_t syscall_builtin_exec(uint32_t num,
         (const char *)(uintptr_t)argv[0],
         (int)argv[1],
         (char **)(uintptr_t)argv[2]);
+}
+
+static uint32_t syscall_builtin_getcwd(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 2u || argv == NULL) return (uint32_t)0;
+    char *buf = (char *)(uintptr_t)argv[0];
+    uint32_t size = argv[1];
+    if (!buf || size == 0) return (uint32_t)0;
+    const char *cwd = terminal_get_cwd();
+    if (!cwd) cwd = "/";
+    strncpy(buf, cwd, size - 1);
+    buf[size - 1] = '\0';
+    return (uint32_t)(uintptr_t)buf;
+}
+
+static uint32_t syscall_builtin_chdir(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || argv == NULL) return (uint32_t)-1;
+    const char *path = (const char *)(uintptr_t)argv[0];
+    return (uint32_t)terminal_set_cwd(path);
+}
+
+static uint32_t syscall_builtin_get_exit_code(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    return (uint32_t)process_get_exit_code();
 }
 
 static uint32_t syscall_builtin_terminal_input(uint32_t num,
@@ -787,6 +925,15 @@ static uint32_t syscall_builtin_read(uint32_t num,
         uint8_t scancode = keyboard_wait_scancode();
 
         if (scancode == 0x00u) {
+            if (system_is_interrupted()) {
+                keyboard_set_app_input_mode(false);
+                system_set_state(proc ? SYSTEM_STATE_PROCESS_RUNNING : prev_state);
+                if (max_len == 0u && out_ptr != NULL) {
+                    kfree(buffer);
+                    *out_ptr = NULL;
+                }
+                return (uint32_t)(-2);
+            }
             continue;
         }
 
@@ -822,6 +969,19 @@ static uint32_t syscall_builtin_read(uint32_t num,
                 *out_ptr = NULL;
             }
             return (uint32_t)(-2); /* IPO_SYSCALL_EINTR */
+        }
+
+        if (scancode == 0x20 && keyboard_is_ctrl_pressed()) {
+            /* Ctrl+D: EOF when at start of empty line */
+            if (len == 0u) {
+                keyboard_set_app_input_mode(false);
+                system_set_state(proc ? SYSTEM_STATE_PROCESS_RUNNING : prev_state);
+                if (max_len == 0u && out_ptr != NULL) {
+                    kfree(buffer);
+                    *out_ptr = NULL;
+                }
+                return (uint32_t)(-3); /* EOF */
+            }
         }
 
         /* Navigation and Scrolling keys */
@@ -1231,6 +1391,78 @@ static uint32_t syscall_builtin_stack_shrink(uint32_t num,
     return (uint32_t)result;
 }
 
+#define USER_HEAP_START 0x08000000u
+#define USER_HEAP_LIMIT 0x40000000u
+
+static uint32_t user_heap_break = USER_HEAP_START;
+
+static uint32_t syscall_builtin_sbrk(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    int32_t inc = 0;
+    if (argc >= 1u && argv != NULL) {
+        inc = (int32_t)argv[0];
+    }
+    uint32_t prev = user_heap_break;
+    if (inc == 0) {
+        return prev;
+    }
+    if (inc > 0) {
+        if (user_heap_break + (uint32_t)inc > USER_HEAP_LIMIT) {
+            return (uint32_t)-1;
+        }
+        user_heap_break += (uint32_t)inc;
+        return prev;
+    } else {
+        uint32_t dec = (uint32_t)(-inc);
+        if (user_heap_break - dec < USER_HEAP_START) {
+            return (uint32_t)-1;
+        }
+        user_heap_break -= dec;
+        return prev;
+    }
+}
+
+static uint32_t syscall_builtin_time(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    uint32_t secs = timer_seconds();
+    if (argc >= 1u && argv != NULL && argv[0] != 0u) {
+        uint32_t *out = (uint32_t *)(uintptr_t)argv[0];
+        *out = secs;
+    }
+    return secs;
+}
+
+static uint32_t syscall_builtin_free(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc >= 1u && argv != NULL && argv[0] != 0u) {
+        kfree((void *)(uintptr_t)argv[0]);
+    }
+    return 0;
+}
+
+static uint32_t syscall_builtin_exit(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    int code = 0;
+    if (argc > 0 && argv != NULL) {
+        code = (int)argv[0];
+    }
+    process_t *proc = process_get_current();
+    if (proc != NULL) {
+        proc->is_running = 0;
+        proc->exit_code = code;
+    }
+    process_set_last_exit_code(code);
+    process_yield_kernel();
+    while (1) {
+        process_yield_kernel();
+    }
+    return 0;
+}
+
+void syscall_reset_user_heap(void) {
+    user_heap_break = USER_HEAP_START;
+}
+
 static uint32_t syscall_builtin_wm_create_window(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num; (void)argc;
     if (!argv || !argv[0]) return 0;
@@ -1396,6 +1628,10 @@ void syscall_init(void) {
         syscall_builtin_fs_close);
 
     ipo_register_syscall(
+        IPO_SYSCALL_FS_SEEK,
+        syscall_builtin_fs_seek);
+
+    ipo_register_syscall(
         IPO_SYSCALL_FS_READ,
         syscall_builtin_fs_read);
 
@@ -1440,6 +1676,18 @@ void syscall_init(void) {
         syscall_builtin_process_is_foreground);
 
     ipo_register_syscall(
+        IPO_SYSCALL_GETCWD,
+        syscall_builtin_getcwd);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_CHDIR,
+        syscall_builtin_chdir);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_GET_EXIT_CODE,
+        syscall_builtin_get_exit_code);
+
+    ipo_register_syscall(
         IPO_SYSCALL_ASYNC_START,
         syscall_builtin_async_start);
 
@@ -1454,6 +1702,22 @@ void syscall_init(void) {
     ipo_register_syscall(
         IPO_SYSCALL_STACK_SHRINK,
         syscall_builtin_stack_shrink);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_SBRK,
+        syscall_builtin_sbrk);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_TIME,
+        syscall_builtin_time);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_FREE,
+        syscall_builtin_free);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_EXIT,
+        syscall_builtin_exit);
 
     ipo_register_syscall(
         IPO_SYSCALL_VAR_SET,
@@ -1586,6 +1850,14 @@ void syscall_init(void) {
     ipo_register_syscall(
         IPO_SYSCALL_WM_INVALIDATE,
         syscall_builtin_wm_invalidate);
+
+    for (int i = 0; i < 32; i++) {
+        ipo_idt_set_gate(
+            (uint8_t)i,
+            isr_stub_table[i],
+            IPO_KERNEL_CODE_SEG,
+            IPO_IDT_ENTRY_FLAGS);
+    }
 
     ipo_idt_set_gate(
         0x80,

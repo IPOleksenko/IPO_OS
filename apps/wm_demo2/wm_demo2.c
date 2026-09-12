@@ -31,7 +31,7 @@ static void draw_gradient(wm_window_t *win) {
     wm_buf_draw_string(fb, w, h,  4, 23, "wm_demo2 app.",   15);
     wm_buf_fill_rect  (fb, w, h,  0, 33, (int)w, 1, 0);
     wm_buf_draw_string(fb, w, h,  4, 37, "Tab: next win",   15);
-    wm_buf_draw_string(fb, w, h,  4, 45, "ESC/Q/[X]: exit", 15);
+    wm_buf_draw_string(fb, w, h,  4, 45, "[Exit] btn: exit", 15);
 }
 
 /* ── Window B — Status panel ────────────────────────────────────────────── */

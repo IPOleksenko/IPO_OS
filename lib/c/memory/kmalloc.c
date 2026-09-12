@@ -35,9 +35,49 @@ void kmalloc_init(void) {
 }
 
 /**
+ * Coalesce adjacent free blocks and shrink the heap tail
+ */
+static void kmalloc_coalesce_and_shrink(void) {
+    if (heap_start == NULL || heap_used == 0) return;
+
+    uint8_t *ptr = heap_start;
+    kmalloc_block_t *last_free = NULL;
+
+    while ((size_t)(ptr - heap_start) < heap_used) {
+        kmalloc_block_t *block = (kmalloc_block_t *)ptr;
+        if (block->magic != KMALLOC_MAGIC && block->magic != KMALLOC_FREED_MAGIC) {
+            break;  // Heap corruption guard
+        }
+        if (block->size < BLOCK_HEADER_SIZE) {
+            break;
+        }
+
+        if (block->is_free) {
+            if (last_free != NULL) {
+                // Merge current free block into last_free
+                last_free->size += block->size;
+            } else {
+                last_free = block;
+            }
+        } else {
+            last_free = NULL;
+        }
+
+        ptr += block->size;
+    }
+
+    // Shrink heap_used if trailing block(s) at the top of the heap are free
+    if (last_free != NULL && ((uint8_t *)last_free + last_free->size == heap_start + heap_used)) {
+        heap_used = (size_t)((uint8_t *)last_free - heap_start);
+    }
+}
+
+/**
  * Find or create a free block suitable for allocation
  */
 static kmalloc_block_t* find_free_block(size_t size) {
+    kmalloc_coalesce_and_shrink();
+
     uint8_t *ptr = heap_start;
 
     while ((size_t)(ptr - heap_start) < heap_used) {
@@ -156,6 +196,8 @@ void kfree(void* ptr) {
     // Mark as free
     block->is_free = 1;
     block->magic = KMALLOC_FREED_MAGIC;
+
+    kmalloc_coalesce_and_shrink();
 }
 
 /**

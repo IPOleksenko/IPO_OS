@@ -8,7 +8,6 @@
 
 #define AUTORUN_PATH "/autorun"
 #define AUTORUN_BUF_SIZE (10 * 1024 * 1024)  // 10 MB for autorun file
-#define AUTORUN_LINE_SIZE 512
 
 /**
  * Extract first token from line
@@ -107,41 +106,41 @@ void autorun_init(void) {
         }
         
         // Extract full line (command + arguments)
-        char full_line[AUTORUN_LINE_SIZE];
         const char *line_start = ptr;
-        int line_len = 0;
-        
-        // Copy until newline
-        while (*ptr && *ptr != '\n' && line_len < (int)sizeof(full_line) - 1) {
-            full_line[line_len++] = *ptr++;
+        while (*ptr && *ptr != '\n') {
+            ptr++;
         }
+        int line_len = (int)(ptr - line_start);
+        char *full_line = kmalloc(line_len + 1);
+        if (!full_line) {
+            if (*ptr == '\n') ptr++;
+            continue;
+        }
+        memcpy(full_line, line_start, line_len);
         full_line[line_len] = '\0';
         
         // Skip newline
         if (*ptr == '\n') ptr++;
         
         // Get just command name for logging
-        char cmd_name[AUTORUN_LINE_SIZE];
         const char *space = strchr(full_line, ' ');
-        if (space) {
-            int cmd_len = space - full_line;
-            if (cmd_len >= (int)sizeof(cmd_name)) cmd_len = sizeof(cmd_name) - 1;
+        int cmd_len = space ? (int)(space - full_line) : line_len;
+        char *cmd_name = kmalloc(cmd_len + 1);
+        if (cmd_name) {
             memcpy(cmd_name, full_line, cmd_len);
             cmd_name[cmd_len] = '\0';
-        } else {
-            strncpy(cmd_name, full_line, sizeof(cmd_name) - 1);
-            cmd_name[sizeof(cmd_name) - 1] = '\0';
+            serial_printf("[autorun] Line %d: executing '%s'\n", line_num, cmd_name);
+            kfree(cmd_name);
         }
-        
-        serial_printf("[autorun] Line %d: executing '%s'\n", line_num, cmd_name);
         
         // Try to execute with full line (including arguments)
         int exec_result = try_execute_command(full_line);
         if (exec_result == 0) {
-            serial_printf("[autorun] Command '%s' not found\n", cmd_name);
+            serial_printf("[autorun] Command not found\n");
         } else if (exec_result < 0) {
-            serial_printf("[autorun] Command '%s' execution failed (error %d)\n", cmd_name, exec_result);
+            serial_printf("[autorun] Command execution failed (error %d)\n", exec_result);
         }
+        kfree(full_line);
     }
     
     kfree(autorun_buf);

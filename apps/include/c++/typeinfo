@@ -1,0 +1,31 @@
+#ifndef _CPP_TYPEINFO_H
+#define _CPP_TYPEINFO_H
+
+#include <stddef.h>
+
+namespace std {
+
+class type_info {
+public:
+    virtual ~type_info();
+    bool operator==(const type_info& rhs) const noexcept {
+        return __name == rhs.__name;
+    }
+    bool operator!=(const type_info& rhs) const noexcept {
+        return __name != rhs.__name;
+    }
+    const char* name() const noexcept {
+        return __name;
+    }
+protected:
+    const char *__name;
+    explicit type_info(const char *n) : __name(n) {}
+private:
+    type_info(const type_info&) = delete;
+    type_info& operator=(const type_info&) = delete;
+};
+
+} // namespace std
+
+#endif
+

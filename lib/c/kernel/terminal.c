@@ -247,7 +247,11 @@ static void read_line_from_vga(uint16_t row, uint16_t *buffer) {
     uint16_t offset = row * VGA_WIDTH;
     
     for (uint16_t col = 0; col < VGA_WIDTH; col++) {
-        buffer[col] = vga[offset + col];  // Save full value with colors
+        uint16_t val = vga[offset + col];
+        if ((val & 0xFF) == VGA_CURSOR_GLYPH_SLOT) {
+            val = ((val >> 8) << 8) | ' ';
+        }
+        buffer[col] = val;
     }
 }
 
@@ -555,6 +559,8 @@ void terminal_scroll_down(void) {
 
     volatile uint16_t *vga = VGA_MEMORY;
 
+    vga_cursor_erase();
+
     uint16_t top = terminal_top_row();
     uint16_t rows = terminal_rows();
 
@@ -577,7 +583,11 @@ void terminal_scroll_down(void) {
         uint16_t dst_offset = (top + r) * VGA_WIDTH;
 
         for (uint16_t c = 0; c < VGA_WIDTH; c++) {
-            vga[dst_offset + c] = vga[src_offset + c];
+            uint16_t val = vga[src_offset + c];
+            if ((val & 0xFF) == VGA_CURSOR_GLYPH_SLOT) {
+                val = ((val >> 8) << 8) | ' ';
+            }
+            vga[dst_offset + c] = val;
         }
     }
 
@@ -613,6 +623,8 @@ void terminal_scroll_up(void) {
 
     volatile uint16_t *vga = VGA_MEMORY;
 
+    vga_cursor_erase();
+
     uint16_t top = terminal_top_row();
     uint16_t rows = terminal_rows();
 
@@ -637,7 +649,11 @@ void terminal_scroll_up(void) {
         uint16_t dst_offset = (top + r) * VGA_WIDTH;
 
         for (uint16_t c = 0; c < VGA_WIDTH; c++) {
-            vga[dst_offset + c] = vga[src_offset + c];
+            uint16_t val = vga[src_offset + c];
+            if ((val & 0xFF) == VGA_CURSOR_GLYPH_SLOT) {
+                val = ((val >> 8) << 8) | ' ';
+            }
+            vga[dst_offset + c] = val;
         }
     }
 
@@ -645,12 +661,30 @@ void terminal_scroll_up(void) {
     top_buffer_count--;
 }
 
+const char *terminal_get_cwd(void) {
+    return terminal_cwd;
+}
+
+int terminal_set_cwd(const char *path) {
+    if (!path || !*path) return -1;
+    char target[1024];
+    make_abs_path(path, target, sizeof(target));
+    uint32_t ino;
+    struct ipo_inode st;
+    if (path_resolve(target, &ino) < 0 || !ipo_fs_stat(target, &st) || (st.mode & IPO_INODE_TYPE_DIR) == 0) {
+        return -1;
+    }
+    strncpy(terminal_cwd, target, sizeof(terminal_cwd) - 1);
+    terminal_cwd[sizeof(terminal_cwd) - 1] = '\0';
+    return 0;
+}
+
 char* resolve_command_path(const char *cmd) {
     if (!cmd || !cmd[0]) return NULL;
 
     size_t cmd_len = strlen(cmd);
     size_t cwd_len = terminal_cwd ? strlen(terminal_cwd) : 0u;
-    size_t buf_size = cmd_len + cwd_len + 32u;
+    size_t buf_size = cmd_len + cwd_len + 64u;
     if (buf_size < 256u) {
         buf_size = 256u;
     }
@@ -673,13 +707,19 @@ char* resolve_command_path(const char *cmd) {
     if (cmd[0] == '/') {
         strncpy(to_check, cmd, buf_size - 1);
         to_check[buf_size - 1] = '\0';
+        fs_canonicalize(to_check, canonical, buf_size);
+        if (path_resolve(canonical, &inode) == 0 && 
+            ipo_fs_stat(canonical, &stat) && 
+            (stat.mode & IPO_INODE_TYPE_DIR) == 0) {
+            strncpy(path, canonical, buf_size - 1);
+            path[buf_size - 1] = '\0';
+            kfree(to_check);
+            kfree(canonical);
+            return path;
+        }
     } 
     // Relative path with ./ or ../ or subdirectories
     else if (cmd[0] == '.' || strchr(cmd, '/')) {
-        make_abs_path(cmd, to_check, buf_size);
-    }
-    // Simple command name: try in cwd first, then in /app/
-    else {
         make_abs_path(cmd, to_check, buf_size);
         fs_canonicalize(to_check, canonical, buf_size);
         if (path_resolve(canonical, &inode) == 0 && 
@@ -691,22 +731,35 @@ char* resolve_command_path(const char *cmd) {
             kfree(canonical);
             return path;
         }
-
-        snprintf(to_check, buf_size, "/app/%s", cmd);
     }
+    // Simple command name: search in order: cwd, /app
+    else {
+        static const char * const search_paths[] = {
+            NULL, /* indicates cwd */
+            "/app",
+            NULL
+        };
 
-    // Canonicalize to handle .., ., //, etc
-    fs_canonicalize(to_check, canonical, buf_size);
+        for (int i = 0; search_paths[i] != NULL || i == 0; i++) {
+            if (search_paths[i] == NULL && i == 0) {
+                make_abs_path(cmd, to_check, buf_size);
+            } else if (search_paths[i] != NULL) {
+                snprintf(to_check, buf_size, "%s/%s", search_paths[i], cmd);
+            } else {
+                break;
+            }
 
-    // Try to resolve and verify it's a file (not directory)
-    if (path_resolve(canonical, &inode) == 0 && 
-        ipo_fs_stat(canonical, &stat) && 
-        (stat.mode & IPO_INODE_TYPE_DIR) == 0) {
-        strncpy(path, canonical, buf_size - 1);
-        path[buf_size - 1] = '\0';
-        kfree(to_check);
-        kfree(canonical);
-        return path;
+            fs_canonicalize(to_check, canonical, buf_size);
+            if (path_resolve(canonical, &inode) == 0 && 
+                ipo_fs_stat(canonical, &stat) && 
+                (stat.mode & IPO_INODE_TYPE_DIR) == 0) {
+                strncpy(path, canonical, buf_size - 1);
+                path[buf_size - 1] = '\0';
+                kfree(to_check);
+                kfree(canonical);
+                return path;
+            }
+        }
     }
 
     kfree(to_check);
@@ -827,7 +880,7 @@ static void builtin_help(void) {
     printf("    - Ctrl + Left Shift   : Cycle active keyboard layout backwards (previous).\n");
     printf("    - Ctrl + Right Shift  : Cycle active keyboard layout forwards (next).\n");
     printf("    - Alt + Left/Right Shift: Cycle active keyboard layout backwards / forwards.\n");
-    printf("    - Ctrl + C            : Instant cancel/abort of active task or queue.\n");
+    printf("    - Ctrl + C            : Cancellation/interruption of most tasks or queues.\n");
     printf("    - Page Up / Page Down : Scroll terminal output up / down.\n");
     printf("    - Up / Down Arrows    : Command history navigation.\n");
     printf("    - Left / Right Arrows : Move cursor across current line.\n");
@@ -1450,6 +1503,10 @@ static void builtin_show_return(int argc, char **argv) {
     printf("Return value display: %s\n", terminal_show_return_value ? "ON" : "OFF");
 }
 
+bool terminal_get_show_return_value(void) {
+    return terminal_show_return_value;
+}
+
 void terminal_initialize(void) {
     vga_init_font_cache();
 
@@ -1622,6 +1679,110 @@ void terminal_apply_pending_input(void) {
     kfree(text);
 }
 
+static int terminal_try_execute_script(const char *path, int argc, char **argv) {
+    int fd = ipo_fs_open(path);
+    if (fd < 0) return -1;
+
+    char magic[2];
+    int read_bytes = ipo_fs_read(fd, magic, 2, 0);
+    if (read_bytes != 2 || magic[0] != '#' || magic[1] != '!') {
+        ipo_fs_close(fd);
+        return -1;
+    }
+
+    size_t cap = 128;
+    char *line = kmalloc(cap);
+    if (!line) {
+        ipo_fs_close(fd);
+        return -1;
+    }
+
+    size_t len = 0;
+    uint32_t offset = 2;
+    char ch;
+    while (ipo_fs_read(fd, &ch, 1, offset++) == 1) {
+        if (ch == '\r' || ch == '\n') break;
+        if (len + 2 >= cap) {
+            size_t new_cap = cap * 2;
+            char *expanded = kmalloc(new_cap);
+            if (!expanded) {
+                kfree(line);
+                ipo_fs_close(fd);
+                return -1;
+            }
+            memcpy(expanded, line, len);
+            kfree(line);
+            line = expanded;
+            cap = new_cap;
+        }
+        line[len++] = ch;
+    }
+    line[len] = '\0';
+    ipo_fs_close(fd);
+
+    char *p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '\0') {
+        kfree(line);
+        return -1;
+    }
+
+    char *interp = p;
+    char *interp_arg = NULL;
+    while (*p && *p != ' ' && *p != '\t') p++;
+    if (*p) {
+        *p++ = '\0';
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p) {
+            interp_arg = p;
+            char *end = interp_arg + strlen(interp_arg) - 1;
+            while (end >= interp_arg && (*end == ' ' || *end == '\t')) {
+                *end-- = '\0';
+            }
+        }
+    }
+
+    int new_cap = argc + 4;
+    char **new_argv = kmalloc((size_t)new_cap * sizeof(char *));
+    if (!new_argv) {
+        kfree(line);
+        return -1;
+    }
+
+    int new_argc = 0;
+    new_argv[new_argc++] = interp;
+    if (interp_arg && *interp_arg) {
+        new_argv[new_argc++] = interp_arg;
+    }
+    new_argv[new_argc++] = (char *)path;
+    for (int i = 1; i < argc; i++) {
+        if (new_argc + 1 >= new_cap) {
+            new_cap *= 2;
+            char **expanded = kmalloc((size_t)new_cap * sizeof(char *));
+            if (expanded) {
+                memcpy(expanded, new_argv, (size_t)new_argc * sizeof(char *));
+                kfree(new_argv);
+                new_argv = expanded;
+            }
+        }
+        new_argv[new_argc++] = argv[i];
+    }
+    new_argv[new_argc] = NULL;
+
+    char *interp_path = resolve_command_path(interp);
+    int res = -1;
+    if (interp_path) {
+        res = process_exec(interp_path, new_argc, new_argv);
+        kfree(interp_path);
+    } else {
+        printf("Interpreter '%s' not found for '%s'\n", interp, path);
+    }
+
+    kfree(new_argv);
+    kfree(line);
+    return res;
+}
+
 int try_execute_command(const char *cmdline) {
     if (!cmdline) return -1;
 
@@ -1629,6 +1790,7 @@ int try_execute_command(const char *cmdline) {
     const char *p = cmdline;
     while (*p == ' ' || *p == '\t') p++;
     if (*p == '\0') return 0;
+
 
     size_t name_cap = 256u;
     char *name = kmalloc(name_cap);
@@ -1654,12 +1816,79 @@ int try_execute_command(const char *cmdline) {
 
     while (*p && (*p == ' ' || *p == '\t')) p++;
 
-    char *arg_buf = kmalloc(256u);
+    size_t arg_cap = 256u;
+    char *arg_buf = kmalloc(arg_cap);
     size_t arg_pos = 0u;
     int in_arg = 0;
+    char in_quote = 0;
 
     while (*p) {
-        if (*p == ' ' || *p == '\t') {
+        char c = *p;
+
+        if (in_quote) {
+            if (c == in_quote) {
+                in_quote = 0;
+                p++;
+                continue;
+            }
+            if (in_quote == '"' && c == '\\' && (*(p + 1) == '"' || *(p + 1) == '\\')) {
+                p++;
+                c = *p;
+            }
+            if (arg_pos + 1u >= arg_cap) {
+                size_t new_cap = arg_cap + 256u;
+                char *extended = kmalloc(new_cap);
+                if (extended == NULL) {
+                    kfree(arg_buf);
+                    for (int j = 0; j < argc; j++) kfree(argv[j]);
+                    kfree(argv);
+                    return -1;
+                }
+                memcpy(extended, arg_buf, arg_pos);
+                kfree(arg_buf);
+                arg_buf = extended;
+                arg_cap = new_cap;
+            }
+            arg_buf[arg_pos++] = c;
+            p++;
+            in_arg = 1;
+            continue;
+        }
+
+        if (c == '\'' || c == '"') {
+            in_quote = c;
+            in_arg = 1;
+            p++;
+            continue;
+        }
+
+        if (c == '\\' && *(p + 1) != '\0') {
+            char next = *(p + 1);
+            if (next == ' ' || next == '\t' || next == '"' || next == '\'' || next == '\\') {
+                p++;
+                c = *p;
+            }
+            if (arg_pos + 1u >= arg_cap) {
+                size_t new_cap = arg_cap + 256u;
+                char *extended = kmalloc(new_cap);
+                if (extended == NULL) {
+                    kfree(arg_buf);
+                    for (int j = 0; j < argc; j++) kfree(argv[j]);
+                    kfree(argv);
+                    return -1;
+                }
+                memcpy(extended, arg_buf, arg_pos);
+                kfree(arg_buf);
+                arg_buf = extended;
+                arg_cap = new_cap;
+            }
+            arg_buf[arg_pos++] = c;
+            p++;
+            in_arg = 1;
+            continue;
+        }
+
+        if (c == ' ' || c == '\t') {
             if (in_arg) {
                 arg_buf[arg_pos] = '\0';
                 char *arg_copy = kmalloc(arg_pos + 1u);
@@ -1689,8 +1918,9 @@ int try_execute_command(const char *cmdline) {
             continue;
         }
 
-        if (arg_pos + 1u >= 256u) {
-            char *extended = kmalloc(arg_pos + 256u);
+        if (arg_pos + 1u >= arg_cap) {
+            size_t new_cap = arg_cap + 256u;
+            char *extended = kmalloc(new_cap);
             if (extended == NULL) {
                 kfree(arg_buf);
                 for (int j = 0; j < argc; j++) kfree(argv[j]);
@@ -1700,8 +1930,10 @@ int try_execute_command(const char *cmdline) {
             memcpy(extended, arg_buf, arg_pos);
             kfree(arg_buf);
             arg_buf = extended;
+            arg_cap = new_cap;
         }
-        arg_buf[arg_pos++] = *p++;
+        arg_buf[arg_pos++] = c;
+        p++;
         in_arg = 1;
     }
 
@@ -1815,8 +2047,12 @@ int try_execute_command(const char *cmdline) {
         while (*run_args == ' ' || *run_args == '\t') run_args++;
         if (strncmp(run_args, "run", 3) == 0) run_args += 3;
         while (*run_args == ' ' || *run_args == '\t') run_args++;
-        run_cmd_execute(run_args);
-        builtin_handled = 1;
+        int res = run_cmd_execute(run_args);
+        for (int j = 0; j < argc; j++) {
+            kfree(argv[j]);
+        }
+        kfree(argv);
+        return res;
     } else if (strcmp(name, "startx") == 0) {
         /* Start the WM video-mode session (returns immediately; async task composites) */
         wm_session_start();
@@ -1830,6 +2066,7 @@ int try_execute_command(const char *cmdline) {
     }
 
     if (builtin_handled) {
+        process_set_last_exit_code(0);
         for (int j = 0; j < argc; j++) {
             kfree(argv[j]);
         }
@@ -1847,8 +2084,15 @@ int try_execute_command(const char *cmdline) {
         return 0; // not found
     }
 
-    // Execute program with arguments
-    int result = process_exec(path, argc, argv);
+    // If the file is a script, terminal executes the interpreter
+    int script_res = terminal_try_execute_script(path, argc, argv);
+    int result;
+    if (script_res >= 0) {
+        result = script_res;
+    } else {
+        // Execute program with arguments
+        result = process_exec(path, argc, argv);
+    }
 
     // Free allocated argument copies
     for (int j = 0; j < argc; j++) {
@@ -1916,10 +2160,10 @@ void terminal_console(void){
             last_terminal_key_ms = now;
         }
 
-        /* Default Ctrl + C: clear current command input and request interrupt */
+        /* Default Ctrl + C: clear current command input */
         if (!is_break_code && keyboard_is_ctrl_pressed() && scancode == 0x2E) {
             sound_stop();
-            system_request_interrupt();
+            system_clear_interrupt();
             terminal_return_to_present();
             printf("^C\n");
             input_len = 0;
@@ -2174,6 +2418,8 @@ void terminal_console(void){
 void terminal_auto_scroll(void) {
     volatile uint16_t *vga = VGA_MEMORY;
 
+    vga_cursor_erase();
+
     if (prompt_shown) {
         prompt_start_cursor -= VGA_WIDTH;
         input_start_cursor -= VGA_WIDTH;
@@ -2194,7 +2440,11 @@ void terminal_auto_scroll(void) {
         uint16_t dst_offset = (top + r) * VGA_WIDTH;
 
         for (uint16_t c = 0; c < VGA_WIDTH; c++) {
-            vga[dst_offset + c] = vga[src_offset + c];
+            uint16_t val = vga[src_offset + c];
+            if ((val & 0xFF) == VGA_CURSOR_GLYPH_SLOT) {
+                val = ((val >> 8) << 8) | ' ';
+            }
+            vga[dst_offset + c] = val;
         }
     }
 

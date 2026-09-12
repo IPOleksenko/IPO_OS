@@ -9,5 +9,10 @@ struct ipo_fd fds[IPO_MAX_FDS];
 void ipo_fs_init(void) {
     memset(&sb, 0, sizeof(sb));
     fs_mounted = false;
-    for (int i = 0; i < IPO_MAX_FDS; i++) fds[i].used = 0;
+    for (int i = 0; i < IPO_MAX_FDS; i++) {
+        fds[i].used = (i < 3) ? 1 : 0;
+        fds[i].inode = 0;
+        fds[i].offset = 0;
+        fds[i].flags = 0;
+    }
 }

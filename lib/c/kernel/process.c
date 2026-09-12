@@ -12,23 +12,11 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
-#include <kernel/elf.h>
 #include <wm.h>
 #include <syscall.h>
 #include <driver/input/mouse.h>
 #include <ioport.h>
 
-/**
- * IPO_BINARY Application Header (20 bytes)
- */
-typedef struct {
-    uint8_t magic[8];
-    uint32_t entry_offset;
-    uint32_t total_size;
-    uint32_t reserved;
-} ipob_header_t;
-
-#define IPOB_HEADER_SIZE 20
 
 /**
  * Memory allocation tracker for process binaries
@@ -160,9 +148,18 @@ void process_yield(void) {
     ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
 }
 
+static char *default_envp[] = {
+    "PATH=/app",
+    "USER=root",
+    "HOME=/",
+    "SHELL=/app/term_ctl",
+    "TERM=xterm",
+    NULL
+};
+
 static void process_trampoline(void) {
     process_t *proc = current_process;
-    typedef int (*entry_func_t)(int, char**);
+    typedef int (*entry_func_t)(int, char**, char**);
     entry_func_t entry = (entry_func_t)proc->entry_point;
     char **argv = (char**)proc->argv_kernel;
 
@@ -170,7 +167,11 @@ static void process_trampoline(void) {
 
     int exit_code = 0;
     if (entry != NULL) {
-        exit_code = entry(proc->argc, argv);
+        uint32_t cur_esp;
+        __asm__ volatile("movl %%esp, %0" : "=r"(cur_esp));
+        serial_printf("[process] pid=%u calling entry=0x%x esp=0x%x first4=0x%x\n",
+                      proc->pid, (uint32_t)entry, cur_esp, *(uint32_t*)entry);
+        exit_code = entry(proc->argc, argv, default_envp);
     }
 
     proc->is_running = 0;
@@ -550,7 +551,7 @@ int process_adjust_stack_size(process_t *proc, int32_t delta) {
     return (int32_t)proc->stack_size;
 }
 
-static int process_call_entry(ipob_entry_t entry, int argc, char **argv,
+static int process_call_entry(process_entry_t entry, int argc, char **argv,
                               uint32_t stack_top) {
     int result;
     uint32_t old_stack;
@@ -571,9 +572,9 @@ static int process_call_entry(ipob_entry_t entry, int argc, char **argv,
 }
 
 /**
- * load_ipob_file - Downloads IPOB file with large file support
+ * load_binary_file - Reads an executable file image into memory
  */
-static int load_ipob_file(const char *path, ipob_header_t *header_out, void **data_out) {
+static int load_binary_file(const char *path, void **data_out) {
     if (data_out == NULL) {
         return -1;
     }
@@ -597,7 +598,7 @@ static int load_ipob_file(const char *path, ipob_header_t *header_out, void **da
         return -1;
     }
     
-    serial_printf("Loading file: %s, size: %d bytes\n", path, stat.size);
+    serial_printf("Loading binary file: %s, size: %d bytes\n", path, stat.size);
     
     // For large files, we use step-by-step loading.
     void *binary_image = kmalloc(stat.size);
@@ -638,34 +639,9 @@ static int load_ipob_file(const char *path, ipob_header_t *header_out, void **da
     }
 
     ipo_fs_close(fd);
-    
-    // Check if binary has legacy IPO_B header or is a pure flat binary
-    ipob_header_t *header = (ipob_header_t *)binary_image;
-    bool has_header = (stat.size >= IPOB_HEADER_SIZE &&
-                       memcmp(header->magic, "IPO_B\x00\x00\x00", 8) == 0);
-    
-    if (has_header) {
-        uint32_t payload_size = stat.size - IPOB_HEADER_SIZE;
-        if (header->entry_offset >= payload_size) {
-            kfree(binary_image);
-            printf("Entry offset out of bounds: %d >= %d\n", header->entry_offset, payload_size);
-            return -2;
-        }
-        if (header_out != NULL) {
-            memcpy(header_out, header, IPOB_HEADER_SIZE);
-        }
-    } else {
-        // Pure flat binary: no mandatory superblock/header, starts at offset 0
-        if (header_out != NULL) {
-            memset(header_out, 0, sizeof(ipob_header_t));
-            header_out->entry_offset = 0;
-            header_out->total_size = stat.size;
-        }
-    }
-    
     *data_out = binary_image;
-    serial_printf("File loaded successfully (has_header=%d)\n", has_header ? 1 : 0);
-    return stat.size;
+    serial_printf("File loaded successfully (%d bytes)\n", stat.size);
+    return (int)stat.size;
 }
 
 /**
@@ -704,6 +680,11 @@ void process_cleanup(process_t *proc) {
     if (proc->stack_base) {
         kfree(proc->stack_base);
         proc->stack_base = NULL;
+    }
+
+    if (proc->name) {
+        kfree(proc->name);
+        proc->name = NULL;
     }
     
     // Freeing arguments
@@ -745,10 +726,76 @@ void process_cleanup(process_t *proc) {
     if (process_list == NULL) {
         global_process_heap_used = 0;
         block_count = 0;
+        syscall_reset_user_heap();
         keyboard_set_app_input_mode(false);
         terminal_unlock_input();
         serial_printf("[process] All processes terminated, heap reset to 0\n");
     }
+}
+
+void process_crash_exit(void) {
+    process_t *proc = current_process;
+    if (proc != NULL) {
+        proc->is_running = 0;
+        proc->exit_code = 139;
+        last_exit_code = 139;
+
+        if (!vga_is_graphics_mode()) {
+            vga_sanitize_text_vram();
+        }
+
+        serial_printf("[process] pid=%u terminated by CPU exception, cleaned up\n", proc->pid);
+        process_cleanup(proc);
+    }
+
+    while (1) {
+        process_yield();
+    }
+}
+
+static char *kstrdup(const char *s) {
+    if (!s) return NULL;
+    size_t len = strlen(s);
+    char *copy = (char *)kmalloc(len + 1);
+    if (!copy) return NULL;
+    memcpy(copy, s, len + 1);
+    return copy;
+}
+
+/**
+ * universal_exec_load - Universally loads any file as an executable image.
+ *
+ * Every file is loaded and executed identically:
+ *   - No format checks (zero magic byte checks, zero ELF, zero IPOB, zero PE).
+ *   - Entire file image is loaded at PROCESS_HEAP_START (0x00800000).
+ *   - Entry point is uniformly PROCESS_HEAP_START.
+ */
+static int universal_exec_load(process_t *proc, const uint8_t *file_data, uint32_t file_size) {
+    if (!proc || !file_data || file_size == 0) {
+        return -1;
+    }
+
+    /* Integer overflow check against process address space */
+    if (file_size > UINT32_MAX - PROCESS_HEAP_START) {
+        return -1;
+    }
+
+    proc->binary_storage = kmalloc(file_size);
+    if (!proc->binary_storage) {
+        return -1;
+    }
+
+    memset(proc->binary_storage, 0, file_size);
+    memcpy(proc->binary_storage, file_data, file_size);
+
+    proc->binary_base = (void *)PROCESS_HEAP_START;
+    proc->binary_size = file_size;
+    proc->entry_point = (uint32_t)PROCESS_HEAP_START;
+
+    serial_printf("[universal_exec_load] Universally loaded: size=%u, entry=0x%x\n",
+                  file_size, proc->entry_point);
+
+    return 0;
 }
 
 /**
@@ -768,18 +815,28 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
         }
     }
 
+    serial_printf("process_spawn: %s (actual=%s), argc=%d\n", path, actual_path, argc);
+
+    // Read file contents into memory
+    void *binary_image = NULL;
+    int size = load_binary_file(actual_path, &binary_image);
+    if (size < 0) {
+        if (resolved != NULL) kfree(resolved);
+        return NULL;
+    }
+
     if (process_list == NULL) {
         global_process_heap_used = 0;
         block_count = 0;
     }
 
-    serial_printf("process_spawn: %s (actual=%s), argc=%d\n", path, actual_path, argc);
     log_process_heap_state("before spawn");
 
-    // Creating a process structure
+    // Creating process structure
     process_t *proc = kmalloc(sizeof(process_t));
     if (!proc) {
         printf("Failed to allocate process structure\n");
+        kfree(binary_image);
         if (resolved != NULL) kfree(resolved);
         return NULL;
     }
@@ -787,116 +844,21 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
     memset(proc, 0, sizeof(process_t));
     proc->pid = allocate_pid();
     proc->is_running = 1;
-
-    // Store process name
-    strncpy(proc->name, actual_path, sizeof(proc->name) - 1);
+    proc->name = kstrdup(actual_path);
     proc->wants_graphics = false;
 
-    // Add to the list of processes
     proc->next = process_list;
     process_list = proc;
 
-    // Uploading the file
-    ipob_header_t header;
-    void *binary_image = NULL;
+    // Load executable via the Universal Executable Loader
+    int load_res = universal_exec_load(proc, (const uint8_t *)binary_image, (uint32_t)size);
+    kfree(binary_image);
+    if (resolved != NULL) kfree(resolved);
 
-    int size = load_ipob_file(actual_path, &header, &binary_image);
-    if (size < 0) {
-        printf("Failed to load file: error %d\n", size);
+    if (load_res < 0) {
+        printf("Cannot execute '%s': failed to load image\n", actual_path);
         process_cleanup(proc);
-        if (resolved != NULL) kfree(resolved);
         return NULL;
-    }
-
-    serial_printf("File loaded, entry offset: 0x%x, total size: %d\n",
-           header.entry_offset, header.total_size);
-
-    bool is_elf = (size >= (int)sizeof(Elf32_Ehdr) &&
-                   memcmp(binary_image, ELF_MAGIC, 4) == 0);
-
-    if (is_elf) {
-        const Elf32_Ehdr *ehdr = (const Elf32_Ehdr *)binary_image;
-        if (ehdr->e_ident[4] != 1 || ehdr->e_ident[5] != 1 ||
-            ehdr->e_machine != EM_386 || ehdr->e_phoff == 0 || ehdr->e_phnum == 0) {
-            printf("Invalid ELF32 binary (requires x86 32-bit)\n");
-            kfree(binary_image);
-            process_cleanup(proc);
-            if (resolved != NULL) kfree(resolved);
-            return NULL;
-        }
-
-        const Elf32_Phdr *phdrs = (const Elf32_Phdr *)((const uint8_t *)binary_image + ehdr->e_phoff);
-        uint32_t min_vaddr = 0xFFFFFFFF;
-        uint32_t max_vaddr = 0;
-        for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
-            if (phdrs[i].p_type == PT_LOAD && phdrs[i].p_memsz > 0) {
-                if (phdrs[i].p_vaddr < min_vaddr) min_vaddr = phdrs[i].p_vaddr;
-                uint32_t seg_end = phdrs[i].p_vaddr + phdrs[i].p_memsz;
-                if (seg_end > max_vaddr) max_vaddr = seg_end;
-            }
-        }
-
-        if (min_vaddr >= max_vaddr) {
-            printf("No LOAD segments in ELF binary\n");
-            kfree(binary_image);
-            process_cleanup(proc);
-            if (resolved != NULL) kfree(resolved);
-            return NULL;
-        }
-
-        uint32_t total_span = max_vaddr - min_vaddr;
-        proc->binary_storage = kmalloc(total_span);
-        if (!proc->binary_storage) {
-            printf("Failed to allocate %u bytes for ELF binary\n", total_span);
-            kfree(binary_image);
-            process_cleanup(proc);
-            if (resolved != NULL) kfree(resolved);
-            return NULL;
-        }
-
-        memset(proc->binary_storage, 0, total_span);
-        for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
-            if (phdrs[i].p_type == PT_LOAD && phdrs[i].p_memsz > 0) {
-                uint8_t *seg_dest = (uint8_t *)proc->binary_storage + (phdrs[i].p_vaddr - min_vaddr);
-                if (phdrs[i].p_filesz > 0) {
-                    memcpy(seg_dest, (const uint8_t *)binary_image + phdrs[i].p_offset, phdrs[i].p_filesz);
-                }
-                if (phdrs[i].p_memsz > phdrs[i].p_filesz) {
-                    memset(seg_dest + phdrs[i].p_filesz, 0, phdrs[i].p_memsz - phdrs[i].p_filesz);
-                }
-            }
-        }
-
-        kfree(binary_image);
-        if (resolved != NULL) kfree(resolved);
-
-        proc->binary_base = (void *)PROCESS_HEAP_START;
-        proc->binary_size = total_span;
-        proc->entry_point = PROCESS_HEAP_START + (ehdr->e_entry - min_vaddr);
-        serial_printf("ELF32 loaded: span=%u, entry=0x%x\n", total_span, proc->entry_point);
-    } else {
-        bool has_header = (size >= IPOB_HEADER_SIZE &&
-                           memcmp(((ipob_header_t *)binary_image)->magic, "IPO_B\x00\x00\x00", 8) == 0);
-        uint32_t header_size = has_header ? IPOB_HEADER_SIZE : 0;
-        uint32_t payload_size = size - header_size;
-
-        proc->binary_storage = kmalloc(payload_size);
-        if (!proc->binary_storage) {
-            printf("Failed to allocate memory for process (need %d bytes)\n", payload_size);
-            kfree(binary_image);
-            process_cleanup(proc);
-            if (resolved != NULL) kfree(resolved);
-            return NULL;
-        }
-
-        memcpy(proc->binary_storage, (uint8_t *)binary_image + header_size, payload_size);
-
-        kfree(binary_image);
-        if (resolved != NULL) kfree(resolved);
-
-        proc->binary_base = (void *)PROCESS_HEAP_START;
-        proc->binary_size = payload_size;
-        proc->entry_point = (uint32_t)PROCESS_HEAP_START + header.entry_offset;
     }
 
     // Setting up arguments - argv is allocated in kernel memory
@@ -939,6 +901,16 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
     return proc;
 }
 
+static int last_batch_exit_codes[32];
+static int last_batch_count = 0;
+
+int process_get_batch_exit_code(int idx) {
+    if (idx >= 0 && idx < last_batch_count) {
+        return last_batch_exit_codes[idx];
+    }
+    return 0;
+}
+
 /**
  * process_run_batch - Executes one or more processes concurrently using cooperative multitasking
  */
@@ -948,6 +920,13 @@ int process_run_batch(process_t **procs, int count) {
     }
 
     process_t *old_process = current_process;
+    process_t **old_batch_procs = batch_procs;
+    int old_batch_proc_count = batch_proc_count;
+    int old_batch_current_idx = batch_current_idx;
+    bool old_batch_active = batch_active;
+    uint32_t old_scheduler_esp = scheduler_esp;
+    bool old_in_process_context = in_process_context;
+
     batch_procs = procs;
     batch_proc_count = count;
     batch_current_idx = 0;
@@ -997,6 +976,7 @@ int process_run_batch(process_t **procs, int count) {
     }
 
     process_t *last_fg = NULL;
+    system_clear_interrupt();
 
     while (1) {
         if (vga_is_graphics_mode() || wm_session_active()) {
@@ -1109,16 +1089,25 @@ int process_run_batch(process_t **procs, int count) {
         // Process yields back here
     }
 
-    process_map_app(NULL);
-    batch_active = false;
-    batch_procs = NULL;
-    batch_proc_count = 0;
+    if (old_process) {
+        process_map_app(old_process);
+    } else {
+        process_map_app(NULL);
+    }
+    batch_active = old_batch_active;
+    batch_procs = old_batch_procs;
+    batch_proc_count = old_batch_proc_count;
+    batch_current_idx = old_batch_current_idx;
+    scheduler_esp = old_scheduler_esp;
+    in_process_context = old_in_process_context;
     current_process = old_process;
 
-    keyboard_set_app_input_mode(false);
-    keyboard_clear_key_state();
-    terminal_unlock_input();
-    system_set_state(SYSTEM_STATE_TERMINAL_IDLE);
+    if (!old_batch_active) {
+        keyboard_set_app_input_mode(false);
+        keyboard_clear_key_state();
+        terminal_unlock_input();
+        system_set_state(SYSTEM_STATE_TERMINAL_IDLE);
+    }
 
     if (system_is_interrupted()) {
         if (wm_session_active()) {
@@ -1168,6 +1157,15 @@ int process_run_batch(process_t **procs, int count) {
         batch_saved_screen = NULL;
     }
 
+    last_batch_count = (count < 32) ? count : 32;
+    for (int i = 0; i < last_batch_count; i++) {
+        if (procs[i] && process_is_valid(procs[i])) {
+            last_batch_exit_codes[i] = procs[i]->exit_code;
+        } else {
+            last_batch_exit_codes[i] = 0;
+        }
+    }
+
     for (int i = 0; i < count; i++) {
         process_t *proc = procs[i];
         if (!proc) continue;
@@ -1204,6 +1202,10 @@ int process_exec(const char *path, int argc, char **argv) {
  */
 int process_get_exit_code(void) {
     return last_exit_code;
+}
+
+void process_set_last_exit_code(int code) {
+    last_exit_code = code;
 }
 
 /**
@@ -1266,7 +1268,7 @@ void process_list_print(void) {
         else if (mem_kb < 10000) printf("    ");
         else printf("   ");
 
-        printf("%s\n", curr->name[0] ? curr->name : "unnamed");
+        printf("%s\n", (curr->name && curr->name[0]) ? curr->name : "unnamed");
 
         count++;
         curr = curr->next;
@@ -1282,9 +1284,7 @@ int process_kill_by_pid(uint32_t pid) {
     process_t *curr = process_list;
     while (curr != NULL) {
         if (curr->pid == pid) {
-            char name_copy[256];
-            strncpy(name_copy, curr->name, sizeof(name_copy) - 1);
-            name_copy[sizeof(name_copy) - 1] = '\0';
+            char *name_copy = curr->name ? kstrdup(curr->name) : NULL;
 
             /* Stop all async tasks owned by this process */
             async_stop_tasks_by_owner(curr);
@@ -1292,7 +1292,9 @@ int process_kill_by_pid(uint32_t pid) {
 
             /* Cleanup memory and unlink from list */
             process_cleanup(curr);
-            printf("[process] pid=%u (%s) killed and memory freed.\n", pid, name_copy);
+            printf("[process] pid=%u (%s) killed and memory freed.\n",
+                   pid, name_copy ? name_copy : "unnamed");
+            if (name_copy) kfree(name_copy);
             return 0;
         }
         curr = curr->next;
@@ -1330,13 +1332,12 @@ int process_kill_all(void) {
     while (process_list != NULL) {
         process_t *proc = process_list;
         proc->async_task_count = 0;
-        char name_copy[256];
-        strncpy(name_copy, proc->name, sizeof(name_copy) - 1);
-        name_copy[sizeof(name_copy) - 1] = '\0';
+        char *name_copy = proc->name ? kstrdup(proc->name) : NULL;
         uint32_t pid = proc->pid;
 
         process_cleanup(proc);
-        printf("[process] killed pid=%u (%s)\n", pid, name_copy);
+        printf("[process] killed pid=%u (%s)\n", pid, name_copy ? name_copy : "unnamed");
+        if (name_copy) kfree(name_copy);
         killed++;
     }
 

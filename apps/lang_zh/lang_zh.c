@@ -40,7 +40,7 @@ int main(int argc, char **argv) {
             return res;
         }
     }
-    const char *font_path = (argc > 1 && argv && argv[1]) ? argv[1] : "/system/fonts.bin";
+    const char *font_path = (argc > 1 && argv && argv[1]) ? argv[1] : "/fonts/default.fnt";
     ipo_font_load_cyrillic(font_path);
     return ipo_keymap_set("Chinese (中文汉字)", zh_keymap, sizeof(zh_keymap) / sizeof(zh_keymap[0]));
 }

@@ -32,7 +32,7 @@ static void vga_update_cursor_glyph(uint8_t src_char) {
     vga_load_font(VGA_CURSOR_GLYPH_SLOT, 1, cursor_glyph);
 }
 
-static void vga_cursor_erase(void) {
+void vga_cursor_erase(void) {
     if (!cursor_is_rendered) return;
     volatile uint16_t *vga = VGA_MEMORY;
     if (cursor_rendered_offset < VGA_WIDTH * VGA_HEIGHT) {
@@ -265,6 +265,8 @@ void vga_sanitize_text_vram(void) {
         uint8_t attr = (uint8_t)(entry >> 8);
         if (entry == 0xFFFF || attr == 0xFF || attr == 0x20 || bg == 2 || ((ch == ' ' || ch == 0x00) && bg != 0)) {
             vga[i] = 0x0720;
+        } else if (ch == VGA_CURSOR_GLYPH_SLOT && (!cursor_is_rendered || i != cursor_rendered_offset)) {
+            vga[i] = ((uint16_t)attr << 8) | ' ';
         }
     }
 }

@@ -44,7 +44,7 @@ int main(int argc, char **argv) {
             return res;
         }
     }
-    const char *font_path = (argc > 1 && argv && argv[1]) ? argv[1] : "/system/fonts.bin";
+    const char *font_path = (argc > 1 && argv && argv[1]) ? argv[1] : "/fonts/default.fnt";
     ipo_font_load_cyrillic(font_path);
     return ipo_keymap_set("Russian (Русский)", ru_keymap, sizeof(ru_keymap) / sizeof(ru_keymap[0]));
 }

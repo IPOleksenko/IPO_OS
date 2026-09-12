@@ -41,7 +41,7 @@ static void draw_info(wm_window_t *win) {
     wm_buf_draw_string(fb, w, h,  4, 15, "Tab: next win",   7);
     wm_buf_draw_string(fb, w, h,  4, 23, "Ctrl+Arr: move",  7);
     wm_buf_draw_string(fb, w, h,  4, 31, "Click: focus",    7);
-    wm_buf_draw_string(fb, w, h,  4, 39, "ESC/Q/[X]: exit", 7);
+    wm_buf_draw_string(fb, w, h,  4, 39, "[Exit] btn: exit", 7);
     wm_buf_fill_rect  (fb, w, h,  0, 49, (int)w, 1, 10);
     wm_buf_draw_string(fb, w, h,  4, 53, "3 windows from",  14);
     wm_buf_draw_string(fb, w, h,  4, 61, "wm_demo app.",    14);

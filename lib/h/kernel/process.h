@@ -42,19 +42,20 @@ typedef struct process {
     uint32_t async_task_count; // number of active async tasks owned by this process
     
     // Debugging
-    char name[256];         // Process name
+    char *name;             // Process name (dynamically allocated)
     
     // Links
     struct process *next;   // For process list
 } process_t;
 
 // Entry point signature with arguments
-typedef int (*ipob_entry_t)(int argc, char **argv);
+typedef int (*process_entry_t)(int argc, char **argv);
 
 // Function prototypes
 void process_init(void);
 int process_exec(const char *path, int argc, char **argv);
 int process_get_exit_code(void);
+void process_set_last_exit_code(int code);
 process_t *process_get_current(void);
 int process_adjust_stack_size(process_t *proc, int32_t delta);
 void process_set_keep_alive(process_t *proc, int enabled);
@@ -69,6 +70,7 @@ void process_yield(void);
 void process_yield_kernel(void);
 process_t *process_spawn(const char *path, int argc, char **argv);
 int process_run_batch(process_t **procs, int count);
+int process_get_batch_exit_code(int idx);
 process_t *process_get_foreground(void);
 bool process_is_foreground(void);
 bool process_in_process_context(void);
@@ -76,5 +78,6 @@ void process_map_app(process_t *proc);
 process_t *process_get_mapped_app(void);
 void process_set_current(process_t *proc);
 bool process_is_valid(process_t *proc);
+void process_crash_exit(void);
 
 #endif

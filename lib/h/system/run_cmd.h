@@ -9,7 +9,8 @@
 #define RUN_ARGV_INIT_CAP 16
 
 /* Result codes returned by run_cmd_execute (mirrors try_execute_command). */
-#define RUN_OK          1000   /* builtin-style success (mirrors terminal.c) */
+#define RUN_OK          1000   /* success (programs print their own return; 'run' itself stays silent) */
+#define RUN_BUILTIN_OK  1000   /* builtin-style success */
 #define RUN_NOT_FOUND      0
 #define RUN_ERROR         -1
 

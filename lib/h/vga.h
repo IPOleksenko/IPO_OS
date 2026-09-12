@@ -60,6 +60,8 @@ uint16_t vga_increment_cursor_position(void);
 
 uint16_t vga_decrement_cursor_position(void);
 
+void vga_cursor_erase(void);
+
 void vga_cursor_blink_tick(void);
 
 void vga_cursor_reset_blink(void);

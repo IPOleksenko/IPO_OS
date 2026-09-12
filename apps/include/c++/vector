@@ -1,0 +1,61 @@
+#ifndef _CPP_VECTOR_H
+#define _CPP_VECTOR_H
+
+#include <stddef.h>
+#include <stdlib.h>
+#include <new>
+
+namespace std {
+
+template <typename T>
+class vector {
+private:
+    T *m_data;
+    size_t m_size;
+    size_t m_capacity;
+
+    void reallocate(size_t new_cap) {
+        T *new_data = (T *)malloc(new_cap * sizeof(T));
+        for (size_t i = 0; i < m_size; i++) {
+            new (&new_data[i]) T(m_data[i]);
+            m_data[i].~T();
+        }
+        if (m_data) free(m_data);
+        m_data = new_data;
+        m_capacity = new_cap;
+    }
+public:
+    vector() : m_data(nullptr), m_size(0), m_capacity(0) {}
+    ~vector() {
+        clear();
+        if (m_data) free(m_data);
+    }
+
+    void push_back(const T &val) {
+        if (m_size >= m_capacity) {
+            size_t new_cap = m_capacity == 0 ? 4 : m_capacity * 2;
+            reallocate(new_cap);
+        }
+        new (&m_data[m_size]) T(val);
+        m_size++;
+    }
+
+    void clear() {
+        for (size_t i = 0; i < m_size; i++) {
+            m_data[i].~T();
+        }
+        m_size = 0;
+    }
+
+    size_t size() const { return m_size; }
+    size_t capacity() const { return m_capacity; }
+    bool empty() const { return m_size == 0; }
+
+    T& operator[](size_t idx) { return m_data[idx]; }
+    const T& operator[](size_t idx) const { return m_data[idx]; }
+};
+
+} // namespace std
+
+#endif
+

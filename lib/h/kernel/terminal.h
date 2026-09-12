@@ -35,11 +35,14 @@ int try_execute_command(const char *cmd);
 bool terminal_is_builtin(const char *name);
 
 char* resolve_command_path(const char *cmd);
+const char *terminal_get_cwd(void);
+int terminal_set_cwd(const char *path);
 
 void terminal_inject_input(const char *text, bool auto_execute);
 void terminal_apply_pending_input(void);
 
 void terminal_render_language_bar(void);
 void terminal_language_bar_tick(void);
+bool terminal_get_show_return_value(void);
 
 #endif

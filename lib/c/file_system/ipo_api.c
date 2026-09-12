@@ -205,7 +205,7 @@ int ipo_fs_open(const char *path) {
     struct ipo_inode inode;
     if (!read_inode(ino, &inode)) return -1;
     if ((inode.mode & IPO_INODE_TYPE_DIR) != 0) return -1;
-    for (int i=0;i<IPO_MAX_FDS;i++) {
+    for (int i = 3; i < IPO_MAX_FDS; i++) {
         if (!fds[i].used) {
             fds[i].used = 1;
             fds[i].inode = ino;
@@ -217,7 +217,7 @@ int ipo_fs_open(const char *path) {
 }
 
 int ipo_fs_close(int fd) {
-    if (fd < 0 || fd >= IPO_MAX_FDS) return -1;
+    if (fd < 3 || fd >= IPO_MAX_FDS) return -1;
     if (!fds[fd].used) return -1;
 
     fds[fd].used = 0;

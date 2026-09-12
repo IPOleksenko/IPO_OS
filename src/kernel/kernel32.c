@@ -116,7 +116,7 @@ void kmain(void) {
 
     ensure_fs_mounted();
 
-    vga_load_cyrillic_font("/system/fonts.bin");
+    vga_load_cyrillic_font("/fonts/default.fnt");
 
     play_startup_sound();
 

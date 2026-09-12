@@ -78,23 +78,15 @@ $(APPS_BUILD)/%.o: $(APPS_DIR)/%.c
 	@mkdir -p $(dir $@)
 	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS)
 
-# Rule: Create raw flat executable binary from object file
+# Rule: Create executable binary from object file
 $(APPS_BUILD)/%.bin: $(APPS_BUILD)/%.o $(APP_ENTRY_OBJ) $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) $(APP_WM_OBJ) $(LIB_A)
 	@mkdir -p $(dir $@)
 	@echo "[apps] Building: $*.c → $@"
-	
-	@# Link entry point first so execution starts at offset 0
 	@$(CC) $(APPS_CFLAGS) -Wl,-T,apps/app.ld \
 		$(APP_ENTRY_OBJ) $< $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) $(APP_WM_OBJ) -Wl,--start-group $(LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
-	
-	@# Extract program sections into flat binary
 	@$(OBJCOPY) --set-section-flags .bss=alloc,load,contents \
 		-j .text -j .rodata -j .data -j .bss -O binary $@.elf $@
-	
-	@# Cleanup
 	@rm -f $@.elf
-	
-	@# Show result
 	@SIZE=$$(stat -c%s "$@" 2>/dev/null || stat -f%z "$@" 2>/dev/null); \
 	echo "[apps] ✓ Created: $@ ($$SIZE bytes)"
 

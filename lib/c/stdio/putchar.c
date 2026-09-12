@@ -26,6 +26,7 @@ void putchar(char c) {
 }
 
 void putchar_color(char c, uint8_t fg, uint8_t bg) {
+    serial_putc(c);
     if (vga_is_graphics_mode()) {
         c = driver_dispatch_char_output(c);
         return;
@@ -85,6 +86,8 @@ void putchar_color(char c, uint8_t fg, uint8_t bg) {
     if (cursor < VGA_START_CURSOR_POSITION || cursor >= VGA_WIDTH * VGA_HEIGHT) {
         cursor = VGA_START_CURSOR_POSITION;
     }
+
+    vga_cursor_erase();
 
     if (c == '\n') {
         uint16_t row = cursor / VGA_WIDTH;

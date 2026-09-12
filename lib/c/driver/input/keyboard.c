@@ -7,6 +7,7 @@
 #include <syscall.h>
 #include <system/timer.h>
 #include <system/state.h>
+#include <wm.h>
 #include <stdio.h>
 
 #define KEYBOARD_QUEUE_SIZE 256
@@ -62,9 +63,10 @@ void keyboard_poll(void) {
             /* Keyboard scancode (0x00 is invalid / null scancode) */
             if (data == 0x00u) continue;
             uint8_t scancode = data;
+            serial_printf("[kbd_poll] sc=0x%x app_mode=%d\n", scancode, keyboard_app_input_mode);
             vga_cursor_reset_blink();
             update_hot_key_state(scancode);
-            if (scancode == 0x2E && keyboard_is_ctrl_pressed()) {
+            if (scancode == 0x2E && keyboard_is_ctrl_pressed() && !wm_session_active()) {
                 system_request_interrupt();
             }
             if (keyboard_app_input_mode) {
@@ -137,6 +139,7 @@ static void yield_waiting(bool waiting) {
 
 uint8_t keyboard_get_scancode(void) {
     if (!is_foreground_process()) {
+        serial_printf("[kbd_get] not foreground!\n");
         yield_waiting(true);
         return 0x00u;
     }
@@ -144,6 +147,9 @@ uint8_t keyboard_get_scancode(void) {
     keyboard_poll();
     struct keyboard_queue *q = keyboard_app_input_mode ? &app_queue : &shell_queue;
     uint8_t sc = keyboard_queue_pop(q);
+    if (sc != 0x00u) {
+        serial_printf("[kbd_get] popped sc=0x%x\n", sc);
+    }
     if (keyboard_app_input_mode && (sc == 0x1C || sc == 0x9C)) {
         if (timer_elapsed_ms(app_input_mode_start_ms) < 250u) {
             sc = 0x00u;

@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <ioport.h>
 
 /* =========================================================================
  * Section 1: Lexer
@@ -91,7 +92,7 @@ static bool lex_cmdline(const char *src, token_list_t *out) {
         char c = *src++;
 
         if (in_double) {
-            if (c == '\\' && *src) { if (!cbuf_append(&cb, *src++)) goto oom; }
+            if (c == '\\' && *src && (*src == '"' || *src == '\\')) { if (!cbuf_append(&cb, *src++)) goto oom; }
             else if (c == '"') { in_double = false; }
             else { if (!cbuf_append(&cb, c)) goto oom; }
             have_content = true; continue;
@@ -103,7 +104,17 @@ static bool lex_cmdline(const char *src, token_list_t *out) {
             have_content = true; continue;
         }
 
-        if (c == '\\' && *src) { if (!cbuf_append(&cb, *src++)) goto oom; have_content = true; continue; }
+        if (c == '\\' && *src) {
+            char next = *src;
+            if (next == ' ' || next == '\t' || next == '"' || next == '\'' || next == '\\' || next == '&' || next == ';' || next == '|') {
+                if (!cbuf_append(&cb, *src++)) goto oom;
+                have_content = true;
+                continue;
+            }
+            if (!cbuf_append(&cb, '\\')) goto oom;
+            have_content = true;
+            continue;
+        }
         if (c == '"')  { in_double = true;  have_content = true; continue; }
         if (c == '\'') { in_single = true;  have_content = true; continue; }
 
@@ -134,81 +145,261 @@ oom:
 }
 
 /* =========================================================================
- * Section 2: Argv builder
+ * Section 2: AST / Execution Plan structures
  * ========================================================================= */
 
-typedef struct { char **argv; int argc, cap; } argvec_t;
+typedef struct {
+    char **argv;
+    int argc;
+    int cap;
+} run_cmd_t;
 
-static void argvec_init(argvec_t *av)  { av->argv = NULL; av->argc = 0; av->cap = 0; }
-static void argvec_reset(argvec_t *av) { if (av->argv) kfree(av->argv); av->argv = NULL; av->argc = 0; av->cap = 0; }
+static void cmd_init(run_cmd_t *c) {
+    c->argv = NULL;
+    c->argc = 0;
+    c->cap = 0;
+}
 
-static bool argvec_push(argvec_t *av, char *s) {
-    if (av->argc + 1 >= av->cap) {
-        int nc = av->cap ? av->cap * 2 : RUN_ARGV_INIT_CAP;
+static void cmd_free(run_cmd_t *c) {
+    if (c->argv) {
+        for (int i = 0; i < c->argc; i++) {
+            if (c->argv[i]) kfree(c->argv[i]);
+        }
+        kfree(c->argv);
+    }
+    c->argv = NULL;
+    c->argc = 0;
+    c->cap = 0;
+}
+
+static bool cmd_push(run_cmd_t *c, const char *arg) {
+    if (c->argc + 1 >= c->cap) {
+        int nc = c->cap ? c->cap * 2 : RUN_ARGV_INIT_CAP;
         char **nd = kmalloc((size_t)(nc + 1) * sizeof(char *));
         if (!nd) return false;
-        if (av->argv) { memcpy(nd, av->argv, (size_t)av->argc * sizeof(char *)); kfree(av->argv); }
-        av->argv = nd; av->cap = nc;
-    }
-    av->argv[av->argc++] = s;
-    av->argv[av->argc]   = NULL;
-    return true;
-}
-
-/* =========================================================================
- * Section 3: Program queue (for & and ;)
- * ========================================================================= */
-
-typedef struct prog_entry {
-    char           **argv;   /* deep copy, owned */
-    int              argc;
-    struct prog_entry *next;
-} prog_entry_t;
-
-typedef struct { prog_entry_t *head, *tail; int count; } prog_queue_t;
-
-static void pq_init(prog_queue_t *q) { q->head = q->tail = NULL; q->count = 0; }
-
-static void pq_free(prog_queue_t *q) {
-    prog_entry_t *e = q->head;
-    while (e) {
-        prog_entry_t *nx = e->next;
-        for (int i = 0; i < e->argc; i++) if (e->argv[i]) kfree(e->argv[i]);
-        kfree(e->argv); kfree(e);
-        e = nx;
-    }
-    q->head = q->tail = NULL; q->count = 0;
-}
-
-static bool pq_enqueue(prog_queue_t *q, const argvec_t *av) {
-    if (av->argc == 0) return true;
-    prog_entry_t *e = kmalloc(sizeof(prog_entry_t));
-    if (!e) return false;
-    e->next = NULL; e->argc = av->argc;
-    e->argv = kmalloc((size_t)(av->argc + 1) * sizeof(char *));
-    if (!e->argv) { kfree(e); return false; }
-    for (int i = 0; i < av->argc; i++) {
-        size_t sl = strlen(av->argv[i]);
-        e->argv[i] = kmalloc(sl + 1);
-        if (!e->argv[i]) {
-            for (int j = 0; j < i; j++) kfree(e->argv[j]);
-            kfree(e->argv); kfree(e); return false;
+        if (c->argv) {
+            memcpy(nd, c->argv, (size_t)c->argc * sizeof(char *));
+            kfree(c->argv);
         }
-        memcpy(e->argv[i], av->argv[i], sl + 1);
+        c->argv = nd;
+        c->cap = nc;
     }
-    e->argv[av->argc] = NULL;
-    if (q->tail) q->tail->next = e; else q->head = e;
-    q->tail = e; q->count++;
+    size_t len = strlen(arg);
+    char *copy = kmalloc(len + 1);
+    if (!copy) return false;
+    memcpy(copy, arg, len + 1);
+    c->argv[c->argc++] = copy;
+    c->argv[c->argc] = NULL;
     return true;
 }
 
+typedef struct {
+    run_cmd_t *cmds;
+    int count;
+    int cap;
+} run_pipeline_t;
+
+static void pipe_init(run_pipeline_t *p) {
+    p->cmds = NULL;
+    p->count = 0;
+    p->cap = 0;
+}
+
+static void pipe_free(run_pipeline_t *p) {
+    if (p->cmds) {
+        for (int i = 0; i < p->count; i++) {
+            cmd_free(&p->cmds[i]);
+        }
+        kfree(p->cmds);
+    }
+    p->cmds = NULL;
+    p->count = 0;
+    p->cap = 0;
+}
+
+static bool pipe_push(run_pipeline_t *p, run_cmd_t *c) {
+    if (p->count >= p->cap) {
+        int nc = p->cap ? p->cap * 2 : 4;
+        run_cmd_t *nd = kmalloc((size_t)nc * sizeof(run_cmd_t));
+        if (!nd) return false;
+        if (p->cmds) {
+            memcpy(nd, p->cmds, (size_t)p->count * sizeof(run_cmd_t));
+            kfree(p->cmds);
+        }
+        p->cmds = nd;
+        p->cap = nc;
+    }
+    p->cmds[p->count++] = *c;
+    return true;
+}
+
+typedef struct {
+    run_pipeline_t *pipes;
+    int count;
+    int cap;
+} run_stage_t;
+
+static void stage_init(run_stage_t *s) {
+    s->pipes = NULL;
+    s->count = 0;
+    s->cap = 0;
+}
+
+static void stage_free(run_stage_t *s) {
+    if (s->pipes) {
+        for (int i = 0; i < s->count; i++) {
+            pipe_free(&s->pipes[i]);
+        }
+        kfree(s->pipes);
+    }
+    s->pipes = NULL;
+    s->count = 0;
+    s->cap = 0;
+}
+
+static bool stage_push(run_stage_t *s, run_pipeline_t *p) {
+    if (s->count >= s->cap) {
+        int nc = s->cap ? s->cap * 2 : 4;
+        run_pipeline_t *nd = kmalloc((size_t)nc * sizeof(run_pipeline_t));
+        if (!nd) return false;
+        if (s->pipes) {
+            memcpy(nd, s->pipes, (size_t)s->count * sizeof(run_pipeline_t));
+            kfree(s->pipes);
+        }
+        s->pipes = nd;
+        s->cap = nc;
+    }
+    s->pipes[s->count++] = *p;
+    return true;
+}
+
+typedef struct {
+    run_stage_t *stages;
+    int count;
+    int cap;
+} run_plan_t;
+
+static void plan_init(run_plan_t *pl) {
+    pl->stages = NULL;
+    pl->count = 0;
+    pl->cap = 0;
+}
+
+static void plan_free(run_plan_t *pl) {
+    if (pl->stages) {
+        for (int i = 0; i < pl->count; i++) {
+            stage_free(&pl->stages[i]);
+        }
+        kfree(pl->stages);
+    }
+    pl->stages = NULL;
+    pl->count = 0;
+    pl->cap = 0;
+}
+
+static bool plan_push(run_plan_t *pl, run_stage_t *s) {
+    if (pl->count >= pl->cap) {
+        int nc = pl->cap ? pl->cap * 2 : 4;
+        run_stage_t *nd = kmalloc((size_t)nc * sizeof(run_stage_t));
+        if (!nd) return false;
+        if (pl->stages) {
+            memcpy(nd, pl->stages, (size_t)pl->count * sizeof(run_stage_t));
+            kfree(pl->stages);
+        }
+        pl->stages = nd;
+        pl->cap = nc;
+    }
+    pl->stages[pl->count++] = *s;
+    return true;
+}
+
+static bool build_run_plan(const token_list_t *tl, run_plan_t *plan) {
+    plan_init(plan);
+
+    run_stage_t cur_stage;
+    stage_init(&cur_stage);
+
+    run_pipeline_t cur_pipe;
+    pipe_init(&cur_pipe);
+
+    run_cmd_t cur_cmd;
+    cmd_init(&cur_cmd);
+
+    for (int i = 0; i < tl->len; i++) {
+        if (!tl->data[i].is_op) {
+            if (!cmd_push(&cur_cmd, tl->data[i].str)) goto oom;
+        } else {
+            char op = tl->data[i].str[0];
+            if (op == '|') {
+                if (cur_cmd.argc > 0) {
+                    if (!pipe_push(&cur_pipe, &cur_cmd)) goto oom;
+                    cmd_init(&cur_cmd);
+                }
+            } else if (op == '&') {
+                if (cur_cmd.argc > 0) {
+                    if (!pipe_push(&cur_pipe, &cur_cmd)) goto oom;
+                    cmd_init(&cur_cmd);
+                }
+                if (cur_pipe.count > 0) {
+                    if (!stage_push(&cur_stage, &cur_pipe)) goto oom;
+                    pipe_init(&cur_pipe);
+                }
+            } else if (op == ';') {
+                if (cur_cmd.argc > 0) {
+                    if (!pipe_push(&cur_pipe, &cur_cmd)) goto oom;
+                    cmd_init(&cur_cmd);
+                }
+                if (cur_pipe.count > 0) {
+                    if (!stage_push(&cur_stage, &cur_pipe)) goto oom;
+                    pipe_init(&cur_pipe);
+                }
+                if (cur_stage.count > 0) {
+                    if (!plan_push(plan, &cur_stage)) goto oom;
+                    stage_init(&cur_stage);
+                }
+            }
+        }
+    }
+
+    /* Flush trailing elements */
+    if (cur_cmd.argc > 0) {
+        if (!pipe_push(&cur_pipe, &cur_cmd)) goto oom;
+        cmd_init(&cur_cmd);
+    } else {
+        cmd_free(&cur_cmd);
+    }
+
+    if (cur_pipe.count > 0) {
+        if (!stage_push(&cur_stage, &cur_pipe)) goto oom;
+        pipe_init(&cur_pipe);
+    } else {
+        pipe_free(&cur_pipe);
+    }
+
+    if (cur_stage.count > 0) {
+        if (!plan_push(plan, &cur_stage)) goto oom;
+        stage_init(&cur_stage);
+    } else {
+        stage_free(&cur_stage);
+    }
+
+    return true;
+
+oom:
+    cmd_free(&cur_cmd);
+    pipe_free(&cur_pipe);
+    stage_free(&cur_stage);
+    plan_free(plan);
+    return false;
+}
+
 /* =========================================================================
- * Section 4: Execution helpers
+ * Section 3: Execution helpers
  * ========================================================================= */
 
 /**
  * exec_one_pid — execute a single program; return its PID (> 0) or error.
- * Sets last_exit_code via process_exec internals.
+ * Sets last_exit_code via process_exec internals or process_set_last_exit_code.
  */
 static int exec_one_pid(int argc, char **argv) {
     if (argc == 0 || !argv || !argv[0]) return RUN_NOT_FOUND;
@@ -231,6 +422,7 @@ static int exec_one_pid(int argc, char **argv) {
                 *dst = '\0';
                 int res = try_execute_command(reconstructed);
                 kfree(reconstructed);
+                process_set_last_exit_code(0);
                 return res;
             }
         }
@@ -243,39 +435,170 @@ static int exec_one_pid(int argc, char **argv) {
 }
 
 /**
- * wait_for_process — spin until the process with @pid is no longer alive.
- * Calls async_scheduler_tick() each iteration so background tasks progress.
- * Returns when the process has fully cleaned up (all async tasks done).
- * Aborts if Ctrl+C is pressed.
+ * wait_for_command — spin until the process with @pid is no longer alive,
+ * and if a window manager (WM) session is active, wait until the user exits
+ * the WM session (e.g. by clicking [Exit] on the taskbar).
+ *
+ * This ensures sequential operators (';' and '|') wait for the GUI / command
+ * to finish before launching subsequent commands, rather than executing them
+ * simultaneously.
  */
-static void wait_for_process(int pid) {
-    if (pid <= 0) return;
-    if (!process_is_alive((uint32_t)pid)) return; /* already done */
-
-    /* Drive the async scheduler until the process disappears */
-    uint32_t last_ms = timer_millis();
-    while (process_is_alive((uint32_t)pid)) {
+static void wait_for_command(int pid) {
+    while (pid > 0 && pid != 1000 && process_is_alive((uint32_t)pid)) {
         async_scheduler_tick();
-        /* Honour Ctrl+C */
+        if (wm_session_active()) {
+            wm_compositor_tick();
+        }
         if (system_is_interrupted()) break;
-        /* Small busy-wait so we don't hammer the scheduler */
-        uint32_t now = timer_millis();
-        (void)now; (void)last_ms;
-        last_ms = now;
+        io_wait();
+    }
+
+    while (wm_session_active()) {
+        async_scheduler_tick();
+        wm_compositor_tick();
+        if (system_is_interrupted()) break;
+        io_wait();
     }
 }
 
+static int exec_pipeline(const run_pipeline_t *pipe) {
+    if (pipe->count == 0) return RUN_OK;
+
+    int pipe_exit = 0;
+    for (int i = 0; i < pipe->count; i++) {
+        const run_cmd_t *cmd = &pipe->cmds[i];
+        if (cmd->argc == 0) continue;
+
+        int ret = 0;
+        if (i == 0) {
+            ret = exec_one_pid(cmd->argc, cmd->argv);
+            wait_for_command(ret);
+            pipe_exit = process_get_exit_code();
+            if (ret > 0 && ret != 1000 && terminal_get_show_return_value()) {
+                printf("Return value: %d\n", pipe_exit);
+            }
+        } else {
+            /* Prepend pipe_exit as argv[1] */
+            char code_str[24];
+            snprintf(code_str, sizeof(code_str), "%d", pipe_exit);
+            size_t sl = strlen(code_str);
+            char *code_arg = kmalloc(sl + 1);
+            if (!code_arg) {
+                ret = exec_one_pid(cmd->argc, cmd->argv);
+                wait_for_command(ret);
+                pipe_exit = process_get_exit_code();
+                if (ret > 0 && ret != 1000 && terminal_get_show_return_value()) {
+                    printf("Return value: %d\n", pipe_exit);
+                }
+            } else {
+                memcpy(code_arg, code_str, sl + 1);
+                int new_argc = cmd->argc + 1;
+                char **new_argv = kmalloc((size_t)(new_argc + 1) * sizeof(char *));
+                if (!new_argv) {
+                    kfree(code_arg);
+                    ret = exec_one_pid(cmd->argc, cmd->argv);
+                    wait_for_command(ret);
+                    pipe_exit = process_get_exit_code();
+                    if (ret > 0 && ret != 1000 && terminal_get_show_return_value()) {
+                        printf("Return value: %d\n", pipe_exit);
+                    }
+                } else {
+                    new_argv[0] = cmd->argv[0];
+                    new_argv[1] = code_arg;
+                    for (int j = 1; j < cmd->argc; j++) {
+                        new_argv[j + 1] = cmd->argv[j];
+                    }
+                    new_argv[new_argc] = NULL;
+                    ret = exec_one_pid(new_argc, new_argv);
+                    wait_for_command(ret);
+                    pipe_exit = process_get_exit_code();
+                    kfree(code_arg);
+                    kfree(new_argv);
+                    if (ret > 0 && ret != 1000 && terminal_get_show_return_value()) {
+                        printf("Return value: %d\n", pipe_exit);
+                    }
+                }
+            }
+        }
+
+        if (system_is_interrupted()) {
+            break;
+        }
+    }
+    return RUN_OK;
+}
+
+static int exec_stage(const run_stage_t *stage) {
+    if (stage->count == 0) return RUN_OK;
+
+    if (stage->count == 1) {
+        /* Single pipeline (sequential or single command) */
+        return exec_pipeline(&stage->pipes[0]);
+    }
+
+    /* Multiple pipelines in stage -> parallel batch execution (&) */
+    int total_procs = 0;
+    process_t **procs = kmalloc((size_t)stage->count * sizeof(process_t *));
+    if (!procs) return RUN_ERROR;
+
+    for (int p = 0; p < stage->count; p++) {
+        const run_pipeline_t *pipe = &stage->pipes[p];
+        if (pipe->count == 0) continue;
+
+        if (pipe->count == 1) {
+            const run_cmd_t *cmd = &pipe->cmds[0];
+            char *path = resolve_command_path(cmd->argv[0]);
+            if (!path) {
+                if (terminal_is_builtin(cmd->argv[0])) {
+                    exec_one_pid(cmd->argc, cmd->argv);
+                    continue;
+                }
+                printf("run: command not found: %s\n", cmd->argv[0]);
+                continue;
+            }
+            process_t *proc = process_spawn(path, cmd->argc, cmd->argv);
+            kfree(path);
+            if (proc) {
+                procs[total_procs++] = proc;
+            }
+        } else {
+            /* If a branch is a pipeline, execute it directly */
+            exec_pipeline(pipe);
+        }
+    }
+
+    if (total_procs > 0) {
+        process_run_batch(procs, total_procs);
+        if (terminal_get_show_return_value()) {
+            for (int i = 0; i < total_procs; i++) {
+                printf("Return value: %d\n", process_get_batch_exit_code(i));
+            }
+        }
+    } else {
+        /* If no external processes were spawned but WM session is active, wait until exit */
+        while (wm_session_active()) {
+            async_scheduler_tick();
+            wm_compositor_tick();
+            if (system_is_interrupted()) break;
+            io_wait();
+        }
+    }
+
+    kfree(procs);
+    return RUN_OK;
+}
+
 /* =========================================================================
- * Section 5: Main entry point
+ * Section 4: Main entry point
  * ========================================================================= */
 
 int run_cmd_execute(const char *cmdline) {
     if (!cmdline || !*cmdline) {
         printf("Usage: run <prog> [args] [OP <prog> [args] ...]\n");
-        printf("  &  parallel   — start all; async programs continue in background\n");
-        printf("  ;  sequential — wait for each (incl. async tasks) before next\n");
+        printf("  &  parallel   — start all in parallel batch; cooperative multitasking\n");
+        printf("  ;  sequential — wait for each batch/program before next stage\n");
         printf("  |  pipe       — pass exit-code of left as argv[1] of right\n");
-        return RUN_OK;
+        return RUN_BUILTIN_OK;
     }
 
     /* --- Lex --- */
@@ -284,156 +607,28 @@ int run_cmd_execute(const char *cmdline) {
         printf("run: out of memory during lexing\n");
         return RUN_ERROR;
     }
-    if (tl.len == 0) { token_list_free(&tl); return RUN_OK; }
-
-    /* --- Detect dominant operator --- */
-    char dom_op = '\0';
-    for (int i = 0; i < tl.len; i++) {
-        if (tl.data[i].is_op) { dom_op = tl.data[i].str[0]; break; }
-    }
-
-    /* ---- No operator: simple single execution ---- */
-    if (dom_op == '\0') {
-        argvec_t av; argvec_init(&av);
-        for (int i = 0; i < tl.len; i++) {
-            if (!tl.data[i].is_op) argvec_push(&av, tl.data[i].str);
-        }
-        int pid = exec_one_pid(av.argc, av.argv);
-        argvec_reset(&av);
+    if (tl.len == 0) {
         token_list_free(&tl);
-        return (pid == RUN_NOT_FOUND) ? RUN_NOT_FOUND : RUN_OK;
+        return RUN_BUILTIN_OK;
     }
 
-    /* ---- Pipe: exit-code flows left → right ---- */
-    if (dom_op == '|') {
-        int pipe_exit = 0;
-        bool first    = true;
-        argvec_t av;   argvec_init(&av);
-
-        for (int i = 0; i <= tl.len; i++) {
-            bool flush = (i == tl.len) || (tl.data[i].is_op && tl.data[i].str[0] == '|');
-            if (!flush) { if (!tl.data[i].is_op) argvec_push(&av, tl.data[i].str); continue; }
-
-            if (av.argc > 0) {
-                if (!first) {
-                    /* Insert pipe_exit as argv[1] */
-                    char code_str[24];
-                    snprintf(code_str, sizeof(code_str), "%d", pipe_exit);
-                    size_t sl = strlen(code_str);
-                    char *code_arg = kmalloc(sl + 1);
-                    if (code_arg) {
-                        memcpy(code_arg, code_str, sl + 1);
-                        int new_argc = av.argc + 1;
-                        char **new_argv = kmalloc((size_t)(new_argc + 1) * sizeof(char *));
-                        if (new_argv) {
-                            new_argv[0] = av.argv[0];
-                            new_argv[1] = code_arg;
-                            for (int j = 1; j < av.argc; j++) new_argv[j + 1] = av.argv[j];
-                            new_argv[new_argc] = NULL;
-                            int pid = exec_one_pid(new_argc, new_argv);
-                            wait_for_process(pid);
-                            pipe_exit = process_get_exit_code();
-                            kfree(new_argv);
-                        } else {
-                            int pid = exec_one_pid(av.argc, av.argv);
-                            wait_for_process(pid);
-                            pipe_exit = process_get_exit_code();
-                        }
-                        kfree(code_arg);
-                    } else {
-                        int pid = exec_one_pid(av.argc, av.argv);
-                        wait_for_process(pid);
-                        pipe_exit = process_get_exit_code();
-                    }
-                } else {
-                    int pid = exec_one_pid(av.argc, av.argv);
-                    wait_for_process(pid);
-                    pipe_exit = process_get_exit_code();
-                    first = false;
-                }
-            }
-            argvec_reset(&av); argvec_init(&av);
-        }
+    /* --- Build hierarchical execution plan (Stages ';' -> Parallel '&' -> Pipe '|') --- */
+    run_plan_t plan;
+    if (!build_run_plan(&tl, &plan)) {
         token_list_free(&tl);
-        return RUN_OK;
-    }
-
-    /* ---- Build program queue (shared by & and ;) ---- */
-    prog_queue_t pq; pq_init(&pq);
-    argvec_t av;     argvec_init(&av);
-
-    for (int i = 0; i <= tl.len; i++) {
-        bool flush = (i == tl.len) || tl.data[i].is_op;
-        if (!flush) { if (!argvec_push(&av, tl.data[i].str)) { argvec_reset(&av); pq_free(&pq); token_list_free(&tl); return RUN_ERROR; } continue; }
-        if (av.argc > 0) {
-            if (!pq_enqueue(&pq, &av)) { argvec_reset(&av); pq_free(&pq); token_list_free(&tl); return RUN_ERROR; }
-        }
-        argvec_reset(&av); argvec_init(&av);
+        printf("run: out of memory building execution plan\n");
+        return RUN_ERROR;
     }
     token_list_free(&tl);
 
-    /* ---- Sequential (;) — wait for each program + its async tasks ---- */
-    if (dom_op == ';') {
-        prog_entry_t *e = pq.head;
-        while (e) {
-            int pid = exec_one_pid(e->argc, e->argv);
-            /* Wait until this process AND all its async tasks are done */
-            wait_for_process(pid);
-            if (system_is_interrupted()) break;
-            e = e->next;
+    int result = RUN_OK;
+    for (int s = 0; s < plan.count; s++) {
+        result = exec_stage(&plan.stages[s]);
+        if (system_is_interrupted()) {
+            break;
         }
-        pq_free(&pq);
-        return RUN_OK;
     }
 
-    /* ---- Parallel (&) ----
-     * Start all programs concurrently; batch-scheduled via cooperative multitasking.
-     */
-    if (dom_op == '&') {
-        int count = pq.count;
-        if (count == 0) {
-            pq_free(&pq);
-            return RUN_OK;
-        }
-
-        process_t **procs = kmalloc((size_t)count * sizeof(process_t *));
-        if (!procs) {
-            pq_free(&pq);
-            return RUN_ERROR;
-        }
-
-        int spawned = 0;
-        prog_entry_t *e = pq.head;
-        while (e) {
-            char *path = resolve_command_path(e->argv[0]);
-            if (!path) {
-                if (terminal_is_builtin(e->argv[0])) {
-                    printf("run: '%s' is a shell built-in command (executing synchronously):\n", e->argv[0]);
-                    exec_one_pid(e->argc, e->argv);
-                    e = e->next;
-                    continue;
-                }
-                printf("run: command not found: %s\n", e->argv[0]);
-                e = e->next;
-                continue;
-            }
-            process_t *proc = process_spawn(path, e->argc, e->argv);
-            kfree(path);
-            if (proc) {
-                procs[spawned++] = proc;
-            }
-            e = e->next;
-        }
-
-        if (spawned > 0) {
-            process_run_batch(procs, spawned);
-        }
-
-        kfree(procs);
-        pq_free(&pq);
-        return RUN_OK;
-    }
-
-    pq_free(&pq);
-    return RUN_OK;
+    plan_free(&plan);
+    return result;
 }

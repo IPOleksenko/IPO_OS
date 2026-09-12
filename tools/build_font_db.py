@@ -93,9 +93,7 @@ def write_ifnt(out_path, records_dict):
 
 def main():
     fonts_dir = Path("build/fonts")
-    system_dir = Path("build/system")
     fonts_dir.mkdir(parents=True, exist_ok=True)
-    system_dir.mkdir(parents=True, exist_ok=True)
 
     print("Extracting Cyrillic console font (Fixed16)...")
     cyr_fixed = extract_psf1("/usr/share/consolefonts/FullCyrSlav-Fixed16.psf.gz")
@@ -113,7 +111,6 @@ def main():
     default_records = dict(cyr_fixed)
     default_records.update(hanzi)
     write_ifnt(fonts_dir / "default.fnt", default_records)
-    write_ifnt(system_dir / "fonts.bin", default_records)
 
     # 2. Terminus font: FullCyrSlav-Terminus16 (including ASCII)
     print("Extracting Terminus console font...")

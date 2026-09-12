@@ -34,6 +34,7 @@
 #define IPO_SYSCALL_FS_RENAME    0x1017u
 
 #define IPO_SYSCALL_FS_CLOSE     0x1018u
+#define IPO_SYSCALL_FS_SEEK      0x1019u
 
 #define IPO_SYSCALL_EXEC         0x1020u
 
@@ -42,7 +43,14 @@
 #define IPO_SYSCALL_TERMINAL_INPUT 0x1022u
 
 #define IPO_SYSCALL_PROCESS_YIELD 0x1023u
+
 #define IPO_SYSCALL_PROCESS_IS_FOREGROUND 0x1024u
+
+#define IPO_SYSCALL_GETCWD       0x1025u
+
+#define IPO_SYSCALL_CHDIR        0x1026u
+
+#define IPO_SYSCALL_GET_EXIT_CODE 0x1027u
 
 #define IPO_SYSCALL_ASYNC_START  0x1030u
 
@@ -58,37 +66,70 @@
 
 #define IPO_SYSCALL_VAR_DELETE   0x1044u
 
+#define IPO_SYSCALL_SBRK         0x1045u
+
+#define IPO_SYSCALL_TIME         0x1046u
+
+#define IPO_SYSCALL_FREE         0x1047u
+
 #define IPO_SYSCALL_KEYMAP_SET      0x1050u
+
 #define IPO_SYSCALL_KEYMAP_GET      0x1051u
+
 #define IPO_SYSCALL_FONT_LOAD       0x1052u
+
 #define IPO_SYSCALL_KEYMAP_DISABLE  0x1053u
+
 #define IPO_SYSCALL_KEYMAP_ENABLE   0x1054u
+
 #define IPO_SYSCALL_KEYMAP_REMOVE   0x1055u
+
 #define IPO_SYSCALL_KEYMAP_TRANSLATE 0x1056u
+
 #define IPO_SYSCALL_KEYMAP_IS_ACTIVE 0x1057u
+
 #define IPO_SYSCALL_KEYMAP_CYCLE_NEXT 0x1058u
+
 #define IPO_SYSCALL_KEYMAP_CYCLE_PREV 0x1059u
+
 #define IPO_SYSCALL_KEYMAP_GET_NAME  0x105Au
+
 #define IPO_SYSCALL_FONT_GET_INFO    0x105Bu
+
 #define IPO_SYSCALL_VGA_GLYPH        0x105Cu
+
 #define IPO_SYSCALL_VGA_SET_MODE     0x105Du
+
 #define IPO_SYSCALL_VGA_GET_MODE     0x105Eu
+
 #define IPO_SYSCALL_SYSTEM_INTERRUPT 0x105Fu
 
 #define IPO_SYSCALL_DRIVER_REGISTER   0x1060u
+
 #define IPO_SYSCALL_DRIVER_UNREGISTER 0x1061u
+
 #define IPO_SYSCALL_DRIVER_LIST       0x1062u
 
 #define IPO_SYSCALL_WM_CREATE_WINDOW   0x1070u
+
 #define IPO_SYSCALL_WM_DESTROY_WINDOW  0x1071u
+
 #define IPO_SYSCALL_WM_SESSION_START   0x1072u
+
 #define IPO_SYSCALL_WM_SESSION_STOP    0x1073u
+
 #define IPO_SYSCALL_WM_SESSION_ACTIVE  0x1074u
+
 #define IPO_SYSCALL_WM_GET_COUNT       0x1075u
+
 #define IPO_SYSCALL_WM_GET_FOCUSED     0x1076u
+
 #define IPO_SYSCALL_WM_SET_FOCUS       0x1077u
+
 #define IPO_SYSCALL_WM_FOCUS_NEXT      0x1078u
+
 #define IPO_SYSCALL_WM_FOCUS_PREV      0x1079u
+
 #define IPO_SYSCALL_WM_INVALIDATE      0x107Au
 
 #define IPO_SYSCALL_EXIT         0xFFFFu
@@ -252,6 +293,51 @@ static inline int ipo_delete(const char *path) {
     return ipo_syscall(IPO_SYSCALL_FS_DELETE, 1u, args);
 }
 
+static inline int ipo_seek(int fd, int32_t offset, int whence) {
+    uint32_t args[3];
+    args[0] = (uint32_t)fd;
+    args[1] = (uint32_t)offset;
+    args[2] = (uint32_t)whence;
+    return ipo_syscall(IPO_SYSCALL_FS_SEEK, 3u, args);
+}
+
+static inline void *ipo_sbrk(int32_t increment) {
+    uint32_t args[1];
+    args[0] = (uint32_t)increment;
+    int res = ipo_syscall(IPO_SYSCALL_SBRK, 1u, args);
+    return (void *)(intptr_t)res;
+}
+
+static inline uint32_t ipo_time(uint32_t *tloc) {
+    uint32_t args[1];
+    args[0] = (uint32_t)(uintptr_t)tloc;
+    return (uint32_t)ipo_syscall(IPO_SYSCALL_TIME, 1u, args);
+}
+
+static inline void ipo_exit(int status) {
+    uint32_t args[1];
+    args[0] = (uint32_t)status;
+    ipo_syscall(IPO_SYSCALL_EXIT, 1u, args);
+    while (1) { }
+}
+
+static inline int ipo_getcwd(char *buf, uint32_t size) {
+    uint32_t args[2];
+    args[0] = (uint32_t)(uintptr_t)buf;
+    args[1] = size;
+    return ipo_syscall(IPO_SYSCALL_GETCWD, 2u, args);
+}
+
+static inline int ipo_chdir(const char *path) {
+    uint32_t args[1];
+    args[0] = (uint32_t)(uintptr_t)path;
+    return ipo_syscall(IPO_SYSCALL_CHDIR, 1u, args);
+}
+
+static inline int ipo_get_exit_code(void) {
+    return ipo_syscall(IPO_SYSCALL_GET_EXIT_CODE, 0u, NULL);
+}
+
 struct ipo_inode;
 static inline int ipo_stat(const char *path, struct ipo_inode *st) {
     uint32_t args[2];
@@ -265,6 +351,21 @@ static inline int ipo_read_line(char *buf, uint32_t max_len) {
     uint32_t args[2];
     args[0] = (uint32_t)(uintptr_t)buf;
     args[1] = max_len;
+    return ipo_syscall(IPO_SYSCALL_READ, 2u, args);
+}
+
+static inline void ipo_kfree(void *ptr) {
+    if (ptr == NULL) return;
+    uint32_t args[1];
+    args[0] = (uint32_t)(uintptr_t)ptr;
+    ipo_syscall(IPO_SYSCALL_FREE, 1u, args);
+}
+
+static inline int ipo_read_line_dynamic(char **out_ptr) {
+    if (out_ptr == NULL) return -1;
+    uint32_t args[2];
+    args[0] = (uint32_t)(uintptr_t)out_ptr;
+    args[1] = 0u;
     return ipo_syscall(IPO_SYSCALL_READ, 2u, args);
 }
 
@@ -327,5 +428,7 @@ static inline int ipo_driver_unregister(const char *name) {
     args[0] = (uint32_t)(uintptr_t)name;
     return ipo_syscall(IPO_SYSCALL_DRIVER_UNREGISTER, 1u, args);
 }
+
+void syscall_reset_user_heap(void);
 
 #endif

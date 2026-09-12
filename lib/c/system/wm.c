@@ -1007,10 +1007,6 @@ void wm_compositor_tick(void) {
                 dynamic_keymap_cycle_next();
             } else if (make == 0x0F) { /* Tab / Shift+Tab */
                 if(keyboard_is_shift_pressed()) wm_focus_prev(); else wm_focus_next();
-            } else if ((keyboard_is_ctrl_pressed() && make == 0x2E /* C */) || make == 0x01 /* ESC */) {
-                system_request_interrupt();
-                wm_session_stop();
-                return;
             } else if ((keyboard_is_alt_pressed() && make == 0x3E /* F4 */) ||
                        (keyboard_is_ctrl_pressed() && (make == 0x11 /* W */ || make == 0x10 /* Q */))) {
                 /* Close focused window */
