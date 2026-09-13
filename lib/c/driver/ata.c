@@ -91,7 +91,7 @@ static bool ata_identify(uint8_t drive) {
     ata_io_wait();
 
     uint8_t status = inb(base + ATA_REG_STATUS);
-    if (status == 0)
+    if (status == 0 || status == 0xFF)
         return false;
 
     if (!ata_wait_bsy_clear(base))
