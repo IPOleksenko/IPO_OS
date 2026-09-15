@@ -113,6 +113,10 @@ static char *replace_extension(const char *path, const char *new_ext) {
 }
 
 int main(int argc, char **argv) {
+    if (argc < 1 || !argv || !argv[0]) {
+        fprintf(stderr, "gcc: no input files\n");
+        return 1;
+    }
     char *prog = strrchr(argv[0], '/');
     prog = prog ? prog + 1 : argv[0];
     if (strstr(prog, "g++") != NULL || strstr(prog, "c++") != NULL) {

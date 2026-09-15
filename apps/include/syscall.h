@@ -43,6 +43,7 @@
 #define IPO_SYSCALL_SBRK         0x1045u
 #define IPO_SYSCALL_TIME         0x1046u
 #define IPO_SYSCALL_FREE         0x1047u
+#define IPO_SYSCALL_GETPID       0x107Cu
 
 #define IPO_SYSCALL_EXIT         0xFFFFu
 
@@ -192,6 +193,10 @@ static inline int ipo_read_line_dynamic(char **out_ptr) {
     args[0] = (uint32_t)(uintptr_t)out_ptr;
     args[1] = 0u;
     return ipo_syscall(IPO_SYSCALL_READ, 2u, args);
+}
+
+static inline int ipo_getpid(void) {
+    return ipo_syscall(IPO_SYSCALL_GETPID, 0u, NULL);
 }
 
 #ifdef __cplusplus

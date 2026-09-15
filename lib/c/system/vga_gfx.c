@@ -401,9 +401,7 @@ void vga_set_mode_13h_hardware(void) {
 }
 
 void vga_set_mode_text_hardware(void) {
-    if (!vga_is_graphics_mode()) {
-        return;
-    }
+    /* Always restore hardware text mode registers, sequencer, CRTC, GC, AC, DAC and font */
 
     /* Misc */
     outb(0x3C2, saved_misc ? saved_misc : 0x67);
@@ -494,6 +492,9 @@ void vga_set_mode_text_hardware(void) {
         (void)inb(0x60);
     }
 
+    uint16_t active_cursor = has_saved_text_vram ? saved_cursor_pos : vga_get_cursor_position();
+    bool active_visible = has_saved_text_vram ? saved_cursor_visible : vga_is_cursor_visible();
+
     if (has_saved_text_vram) {
         volatile uint16_t *text_vram = (volatile uint16_t *)0xB8000;
         size_t text_count = saved_text_vram.count ? saved_text_vram.count : (80 * 25);
@@ -509,12 +510,11 @@ void vga_set_mode_text_hardware(void) {
             }
             text_vram[i] = entry;
         }
-        vga_set_cursor(saved_cursor_pos);
-        if (saved_cursor_visible) {
-            vga_show_cursor();
-        } else {
-            vga_hide_cursor();
-        }
+    }
+
+    vga_set_cursor(active_cursor);
+    if (active_visible) {
+        vga_show_cursor();
     } else {
         vga_hide_cursor();
     }

@@ -8,6 +8,8 @@ global inw
 global outl
 global inl
 global io_wait
+global insw
+global outsw
 
 ; void outb(uint16_t port, uint8_t value)
 outb:
@@ -55,3 +57,26 @@ io_wait:
     mov al, 0
     out 0x80, al
     ret
+
+; void insw(uint16_t port, void *addr, uint32_t count)
+insw:
+    push edi
+    mov edx, [esp + 8]   ; port
+    mov edi, [esp + 12]  ; addr
+    mov ecx, [esp + 16]  ; count
+    cld
+    rep insw
+    pop edi
+    ret
+
+; void outsw(uint16_t port, const void *addr, uint32_t count)
+outsw:
+    push esi
+    mov edx, [esp + 8]   ; port
+    mov esi, [esp + 12]  ; addr
+    mov ecx, [esp + 16]  ; count
+    cld
+    rep outsw
+    pop esi
+    ret
+

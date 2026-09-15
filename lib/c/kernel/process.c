@@ -15,6 +15,7 @@
 #include <wm.h>
 #include <syscall.h>
 #include <driver/input/mouse.h>
+#include <driver/audio_core.h>
 #include <ioport.h>
 
 
@@ -38,6 +39,7 @@ static int batch_proc_count = 0;
 static int batch_current_idx = 0;
 static uint32_t scheduler_esp = 0;
 static bool batch_active = false;
+static process_t *batch_foreground_proc = NULL;
 static process_t *currently_mapped_app = NULL;
 
 void process_map_app(process_t *proc) {
@@ -97,14 +99,14 @@ void process_yield_kernel(void) {
     int running = 0;
     for (int i = 0; i < batch_proc_count; i++) {
         if (batch_procs[i] && batch_procs[i]->is_running) {
-            if (batch_procs[i]->waiting_for_input && batch_procs[i] != fg) {
+            if (batch_procs[i]->waiting_for_input && batch_procs[i] != fg && !wm_session_active()) {
                 continue;
             }
             running++;
         }
     }
 
-    if (current_process == fg && running <= 1) {
+    if (current_process->is_running && current_process == fg && running <= 1 && !wm_session_active()) {
         return;
     }
 
@@ -117,6 +119,9 @@ process_t *process_get_foreground(void) {
     if (!batch_active) {
         return current_process;
     }
+    if (batch_foreground_proc && batch_foreground_proc->is_running) {
+        return batch_foreground_proc;
+    }
     for (int i = batch_proc_count - 1; i >= 0; i--) {
         if (batch_procs && batch_procs[i] && batch_procs[i]->is_running) {
             return batch_procs[i];
@@ -125,10 +130,24 @@ process_t *process_get_foreground(void) {
     return NULL;
 }
 
+void process_set_foreground(process_t *proc) {
+    if (!proc) return;
+    batch_foreground_proc = proc;
+    if (batch_active) {
+        for (int i = 0; i < batch_proc_count; i++) {
+            if (batch_procs && batch_procs[i] == proc) {
+                batch_current_idx = i;
+                proc->waiting_for_input = false;
+                break;
+            }
+        }
+    }
+}
+
 bool process_is_foreground(void) {
     if (batch_active) {
         bool is_fg = (process_get_foreground() == current_process);
-        if (!is_fg && current_process) {
+        if (!is_fg && current_process && !wm_session_active()) {
             current_process->waiting_for_input = true;
         }
         return is_fg;
@@ -148,12 +167,7 @@ void process_yield(void) {
     ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
 }
 
-static char *default_envp[] = {
-    "PATH=/app",
-    "USER=root",
-    "HOME=/",
-    "SHELL=/app/term_ctl",
-    "TERM=xterm",
+static char *default_env[] = {
     NULL
 };
 
@@ -171,7 +185,7 @@ static void process_trampoline(void) {
         __asm__ volatile("movl %%esp, %0" : "=r"(cur_esp));
         serial_printf("[process] pid=%u calling entry=0x%x esp=0x%x first4=0x%x\n",
                       proc->pid, (uint32_t)entry, cur_esp, *(uint32_t*)entry);
-        exit_code = entry(proc->argc, argv, default_envp);
+        exit_code = entry(proc->argc, argv, default_env);
     }
 
     proc->is_running = 0;
@@ -658,6 +672,7 @@ void process_cleanup(process_t *proc) {
     if (!proc) return;
     
     serial_printf("Cleaning up process %d\n", proc->pid);
+    audio_stop_all();
 
     if (proc->async_task_count > 0) {
         proc->is_running = 0;
@@ -761,38 +776,111 @@ static char *kstrdup(const char *s) {
     return copy;
 }
 
+typedef struct {
+    uint8_t  e_ident[16];
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint32_t e_entry;
+    uint32_t e_phoff;
+    uint32_t e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+} elf32_header_t;
+
+typedef struct {
+    uint32_t p_type;
+    uint32_t p_offset;
+    uint32_t p_vaddr;
+    uint32_t p_paddr;
+    uint32_t p_filesz;
+    uint32_t p_memsz;
+    uint32_t p_flags;
+    uint32_t p_align;
+} elf32_program_header_t;
+
 /**
  * universal_exec_load - Universally loads any file as an executable image.
  *
- * Every file is loaded and executed identically:
- *   - No format checks (zero magic byte checks, zero ELF, zero IPOB, zero PE).
- *   - Entire file image is loaded at PROCESS_HEAP_START (0x00800000).
- *   - Entry point is uniformly PROCESS_HEAP_START.
+ * Supports flat binary files and 32-bit ELF executables, properly allocating
+ * and zeroing .bss sections so that memory swaps between processes preserve
+ * complete process state and global data.
  */
 static int universal_exec_load(process_t *proc, const uint8_t *file_data, uint32_t file_size) {
     if (!proc || !file_data || file_size == 0) {
         return -1;
     }
 
-    /* Integer overflow check against process address space */
-    if (file_size > UINT32_MAX - PROCESS_HEAP_START) {
+    uint32_t total_memsz = file_size;
+    uint32_t entry_point = (uint32_t)PROCESS_HEAP_START;
+    bool is_elf = (file_size >= sizeof(elf32_header_t) &&
+                   file_data[0] == 0x7F && file_data[1] == 'E' &&
+                   file_data[2] == 'L'  && file_data[3] == 'F');
+
+    if (is_elf) {
+        const elf32_header_t *elf = (const elf32_header_t *)file_data;
+        if (elf->e_phoff > 0 && elf->e_phnum > 0 &&
+            elf->e_phoff + (uint32_t)elf->e_phnum * sizeof(elf32_program_header_t) <= file_size) {
+            uint32_t max_vaddr = PROCESS_HEAP_START;
+            const elf32_program_header_t *ph = (const elf32_program_header_t *)(file_data + elf->e_phoff);
+            for (uint16_t i = 0; i < elf->e_phnum; i++) {
+                if (ph[i].p_type == 1 /* PT_LOAD */) {
+                    uint32_t seg_end = ph[i].p_vaddr + ph[i].p_memsz;
+                    if (seg_end > max_vaddr) {
+                        max_vaddr = seg_end;
+                    }
+                }
+            }
+            if (max_vaddr > PROCESS_HEAP_START) {
+                total_memsz = max_vaddr - PROCESS_HEAP_START;
+            }
+            if (elf->e_entry >= PROCESS_HEAP_START) {
+                entry_point = elf->e_entry;
+            }
+        }
+    }
+
+    /* 4KB page align total_memsz */
+    total_memsz = (total_memsz + 4095u) & ~4095u;
+    if (total_memsz > UINT32_MAX - PROCESS_HEAP_START) {
         return -1;
     }
 
-    proc->binary_storage = kmalloc(file_size);
+    proc->binary_storage = kmalloc(total_memsz);
     if (!proc->binary_storage) {
         return -1;
     }
+    memset(proc->binary_storage, 0, total_memsz);
 
-    memset(proc->binary_storage, 0, file_size);
-    memcpy(proc->binary_storage, file_data, file_size);
+    if (is_elf) {
+        const elf32_header_t *elf = (const elf32_header_t *)file_data;
+        const elf32_program_header_t *ph = (const elf32_program_header_t *)(file_data + elf->e_phoff);
+        for (uint16_t i = 0; i < elf->e_phnum; i++) {
+            if (ph[i].p_type == 1 /* PT_LOAD */ && ph[i].p_filesz > 0) {
+                if (ph[i].p_vaddr >= PROCESS_HEAP_START) {
+                    uint32_t off = ph[i].p_vaddr - PROCESS_HEAP_START;
+                    if (ph[i].p_offset + ph[i].p_filesz <= file_size &&
+                        off + ph[i].p_filesz <= total_memsz) {
+                        memcpy((uint8_t *)proc->binary_storage + off, file_data + ph[i].p_offset, ph[i].p_filesz);
+                    }
+                }
+            }
+        }
+    } else {
+        memcpy(proc->binary_storage, file_data, file_size);
+    }
 
     proc->binary_base = (void *)PROCESS_HEAP_START;
-    proc->binary_size = file_size;
-    proc->entry_point = (uint32_t)PROCESS_HEAP_START;
+    proc->binary_size = total_memsz;
+    proc->entry_point = entry_point;
 
-    serial_printf("[universal_exec_load] Universally loaded: size=%u, entry=0x%x\n",
-                  file_size, proc->entry_point);
+    serial_printf("[universal_exec_load] Universally loaded: file_size=%u, mem_size=%u, entry=0x%x\n",
+                  file_size, total_memsz, proc->entry_point);
 
     return 0;
 }
@@ -845,6 +933,7 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
     proc->is_running = 1;
     proc->name = kstrdup(actual_path);
     proc->wants_graphics = false;
+    proc->user_heap_break = 0x08000000u + (proc->pid > 0 ? (proc->pid - 1) : 0) * 0x04000000u; /* Isolated 64MB slice per PID */
 
     proc->next = process_list;
     process_list = proc;
@@ -923,6 +1012,7 @@ int process_run_batch(process_t **procs, int count) {
     int old_batch_proc_count = batch_proc_count;
     int old_batch_current_idx = batch_current_idx;
     bool old_batch_active = batch_active;
+    process_t *old_batch_foreground_proc = batch_foreground_proc;
     uint32_t old_scheduler_esp = scheduler_esp;
     bool old_in_process_context = in_process_context;
 
@@ -930,6 +1020,7 @@ int process_run_batch(process_t **procs, int count) {
     batch_proc_count = count;
     batch_current_idx = 0;
     batch_active = true;
+    batch_foreground_proc = NULL;
     bool had_graphics = false;
     for (int i = 0; i < count; i++) {
         if (procs[i] && procs[i]->wants_graphics) {
@@ -1002,16 +1093,16 @@ int process_run_batch(process_t **procs, int count) {
                     vga_gfx_init_default_palette();
                     mouse_set_bounds(VGA_GFX_WIDTH, VGA_GFX_HEIGHT);
                     wm_invalidate_all();
-                } else {
+                } else if (vga_is_graphics_mode()) {
                     vga_set_mode_text_hardware();
                 }
             } else {
                 fg->waiting_for_input = false;
                 keyboard_set_app_input_mode(true);
-                if (fg->wants_graphics) {
+                if (fg->wants_graphics || wm_session_active()) {
                     vga_set_mode_13h_hardware();
                     vga_gfx_init_default_palette();
-                } else {
+                } else if (vga_is_graphics_mode()) {
                     vga_set_mode_text_hardware();
                 }
                 for (int i = 0; i < count; i++) {
@@ -1032,6 +1123,12 @@ int process_run_batch(process_t **procs, int count) {
         }
         if (running_count == 0) {
             if (wm_session_active()) {
+                if (wm_get_window_count() == 0) {
+                    wm_session_stop();
+                    break;
+                }
+                /* When in a GUI session, keep the desktop, taskbar, and cursor alive
+                   while application windows remain open. User exits via [Exit] or stopx. */
                 async_scheduler_tick();
                 wm_compositor_tick();
                 io_wait();
@@ -1040,9 +1137,9 @@ int process_run_batch(process_t **procs, int count) {
             break;
         }
 
-        // Drive async tasks and WM compositor if active and no full-screen app is running
+        // Drive async tasks and WM compositor if active and not in raw fullscreen VGA graphics
         async_scheduler_tick();
-        if (wm_session_active() && fg == NULL) {
+        if (wm_session_active() && (!fg || !fg->wants_graphics)) {
             wm_compositor_tick();
         }
 
@@ -1052,7 +1149,7 @@ int process_run_batch(process_t **procs, int count) {
             int idx = (batch_current_idx + step) % count;
             process_t *p = procs[idx];
             if (p && p->is_running) {
-                if (p->waiting_for_input && p != fg) {
+                if (p->waiting_for_input && p != fg && !wm_session_active()) {
                     continue;
                 }
                 found = idx;
@@ -1094,6 +1191,7 @@ int process_run_batch(process_t **procs, int count) {
         process_map_app(NULL);
     }
     batch_active = old_batch_active;
+    batch_foreground_proc = old_batch_foreground_proc;
     batch_procs = old_batch_procs;
     batch_proc_count = old_batch_proc_count;
     batch_current_idx = old_batch_current_idx;
@@ -1304,16 +1402,23 @@ int process_kill_by_pid(uint32_t pid) {
 }
 
 /**
+ * process_find_by_pid - Find process struct by PID
+ */
+process_t *process_find_by_pid(uint32_t pid) {
+    process_t *curr = process_list;
+    while (curr != NULL) {
+        if (curr->pid == pid) return curr;
+        curr = curr->next;
+    }
+    return NULL;
+}
+
+/**
  * process_is_alive - Check if a process with @pid is still in the process list.
  * Returns true if the process exists (even in background/keep-alive state).
  */
 bool process_is_alive(uint32_t pid) {
-    process_t *curr = process_list;
-    while (curr != NULL) {
-        if (curr->pid == pid) return true;
-        curr = curr->next;
-    }
-    return false;
+    return process_find_by_pid(pid) != NULL;
 }
 
 /**

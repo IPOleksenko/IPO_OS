@@ -40,7 +40,8 @@ typedef struct process {
     bool waiting_for_input; // Blocked waiting for user input
     bool wants_graphics;    // Process requested VGA graphics mode (Mode 13h)
     uint32_t async_task_count; // number of active async tasks owned by this process
-    
+    uint32_t user_heap_break;  // Per-process sbrk break point
+
     // Debugging
     char *name;             // Process name (dynamically allocated)
     
@@ -71,7 +72,9 @@ void process_yield_kernel(void);
 process_t *process_spawn(const char *path, int argc, char **argv);
 int process_run_batch(process_t **procs, int count);
 int process_get_batch_exit_code(int idx);
+process_t *process_find_by_pid(uint32_t pid);
 process_t *process_get_foreground(void);
+void process_set_foreground(process_t *proc);
 bool process_is_foreground(void);
 bool process_in_process_context(void);
 void process_map_app(process_t *proc);

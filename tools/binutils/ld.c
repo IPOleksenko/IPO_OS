@@ -384,6 +384,10 @@ static void write_padding(FILE *fout, uint32_t count) {
 }
 
 int main(int argc, char **argv) {
+    if (argc < 1 || !argv) {
+        fprintf(stderr, "ld: no input files\n");
+        return 1;
+    }
     add_lib_path("/usr/lib");
     add_lib_path("/lib");
     add_lib_path("build/lib");

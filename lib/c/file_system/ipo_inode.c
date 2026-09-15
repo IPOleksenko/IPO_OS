@@ -127,19 +127,51 @@ bool free_block(uint64_t phys_block) {
     return bitmap_set(sb.block_bitmap_start, i, false);
 }
 
-/* Find physical block for logical block index in Linked Extents (infinite file growth) */
-int64_t get_data_block_for_inode(struct ipo_inode *inode, uint64_t logical_index, bool alloc) {
+int64_t get_contiguous_data_blocks_for_inode(struct ipo_inode *inode, uint64_t logical_index, uint64_t *out_count) {
+    if (!inode) return -1;
+    if (out_count) *out_count = 1;
+
     /* 1. Search embedded primary extents */
     for (int i = 0; i < IPO_INODE_EXTENTS; i++) {
         struct ipo_extent *e = &inode->extents[i];
         if (e->block_count > 0) {
             if (logical_index >= e->logical_block && logical_index < e->logical_block + e->block_count) {
-                return (int64_t)(e->physical_block + (logical_index - e->logical_block));
+                uint64_t offset_in_ext = logical_index - e->logical_block;
+                if (out_count) *out_count = e->block_count - offset_in_ext;
+                return (int64_t)(e->physical_block + offset_in_ext);
             }
         }
     }
 
     /* 2. Search chained extent nodes */
+    uint64_t curr_node_blk = inode->next_extent_node;
+    while (curr_node_blk != 0) {
+        struct ipo_extent_node enode;
+        if (!block_read(curr_node_blk, &enode)) break;
+
+        for (uint32_t i = 0; i < enode.count && i < IPO_EXTENT_NODE_EXTENTS; i++) {
+            struct ipo_extent *e = &enode.extents[i];
+            if (e->block_count > 0) {
+                if (logical_index >= e->logical_block && logical_index < e->logical_block + e->block_count) {
+                    uint64_t offset_in_ext = logical_index - e->logical_block;
+                    if (out_count) *out_count = e->block_count - offset_in_ext;
+                    return (int64_t)(e->physical_block + offset_in_ext);
+                }
+            }
+        }
+        curr_node_blk = enode.next_node;
+    }
+
+    return -1;
+}
+
+/* Find physical block for logical block index in Linked Extents (infinite file growth) */
+int64_t get_data_block_for_inode(struct ipo_inode *inode, uint64_t logical_index, bool alloc) {
+    int64_t existing = get_contiguous_data_blocks_for_inode(inode, logical_index, NULL);
+    if (existing >= 0) return existing;
+    if (!alloc) return -1;
+
+    /* 2. Traverse chained extent nodes to find the last node for extension */
     uint64_t curr_node_blk = inode->next_extent_node;
     uint64_t last_node_blk = 0;
     struct ipo_extent_node last_enode;
@@ -149,21 +181,10 @@ int64_t get_data_block_for_inode(struct ipo_inode *inode, uint64_t logical_index
         struct ipo_extent_node enode;
         if (!block_read(curr_node_blk, &enode)) break;
 
-        for (uint32_t i = 0; i < enode.count && i < IPO_EXTENT_NODE_EXTENTS; i++) {
-            struct ipo_extent *e = &enode.extents[i];
-            if (e->block_count > 0) {
-                if (logical_index >= e->logical_block && logical_index < e->logical_block + e->block_count) {
-                    return (int64_t)(e->physical_block + (logical_index - e->logical_block));
-                }
-            }
-        }
-
         last_node_blk = curr_node_blk;
         memcpy(&last_enode, &enode, sizeof(enode));
         curr_node_blk = enode.next_node;
     }
-
-    if (!alloc) return -1;
 
     /* 3. Allocate a new physical block */
     int64_t new_phys = allocate_block();

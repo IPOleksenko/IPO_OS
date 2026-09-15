@@ -12,7 +12,7 @@ APP_WM_OBJ      := $(APPS_BUILD)/app_wm.o
 
 # Applications are compiled as Position Independent Code (PIC).
 # This allows them to run from any memory address dynamically allocated
-APPS_CFLAGS := -m32 \
+APPS_CFLAGS := -m32 -O2 \
 	-ffreestanding \
 	-fno-pic -fno-pie \
 	-fno-builtin \

@@ -131,6 +131,10 @@
 #define IPO_SYSCALL_WM_FOCUS_PREV      0x1079u
 
 #define IPO_SYSCALL_WM_INVALIDATE      0x107Au
+#define IPO_SYSCALL_WM_IS_VALID        0x107Bu
+#define IPO_SYSCALL_GETPID             0x107Cu
+#define IPO_SYSCALL_WM_TOGGLE_MAXIMIZE 0x107Du
+#define IPO_SYSCALL_WM_RESIZE          0x107Eu
 
 #define IPO_SYSCALL_EXIT         0xFFFFu
 
@@ -338,12 +342,24 @@ static inline int ipo_get_exit_code(void) {
     return ipo_syscall(IPO_SYSCALL_GET_EXIT_CODE, 0u, NULL);
 }
 
+static inline int ipo_getpid(void) {
+    return ipo_syscall(IPO_SYSCALL_GETPID, 0u, NULL);
+}
+
 struct ipo_inode;
 static inline int ipo_stat(const char *path, struct ipo_inode *st) {
     uint32_t args[2];
     args[0] = (uint32_t)(uintptr_t)path;
     args[1] = (uint32_t)(uintptr_t)st;
     return ipo_syscall(IPO_SYSCALL_FS_STAT, 2u, args);
+}
+
+static inline int ipo_list_dir(const char *path, char *buf, int size) {
+    uint32_t args[3];
+    args[0] = (uint32_t)(uintptr_t)path;
+    args[1] = (uint32_t)(uintptr_t)buf;
+    args[2] = (uint32_t)size;
+    return (int)ipo_syscall(IPO_SYSCALL_FS_LIST, 3u, args);
 }
 
 static inline int ipo_read_line(char *buf, uint32_t max_len) {

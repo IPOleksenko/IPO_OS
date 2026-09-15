@@ -14,4 +14,7 @@ uint32_t inl(uint16_t port);
 
 void     io_wait(void);
 
+void     insw(uint16_t port, void *addr, uint32_t count);
+void     outsw(uint16_t port, const void *addr, uint32_t count);
+
 #endif

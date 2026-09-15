@@ -3,6 +3,7 @@
 #include <ioport.h>
 #include <stdio.h>
 #include <kernel/driver.h>
+#include <wm.h>
 
 #define KBD_DATA_PORT    0x60
 #define KBD_STATUS_PORT  0x64
@@ -295,7 +296,9 @@ void mouse_poll(void) {
 
 void mouse_get_state(mouse_state_t *out_state) {
     if (!out_state) return;
-    mouse_poll();
+    if (!wm_session_active()) {
+        mouse_poll();
+    }
     *out_state = current_mouse_state;
 }
 

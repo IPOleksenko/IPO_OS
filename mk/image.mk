@@ -13,7 +13,7 @@ build/disk.img:
 	dd if=/dev/zero of=$@ bs=1M count=128
 	@echo "Created 128MB virtual disk: $@"
 
-# Create a 5MB ISO disk (for testing)
+# Create a 5MB ISO disk
 build/disk.iso:
 	mkdir -p build
 	dd if=/dev/zero of=$@ bs=1M count=5

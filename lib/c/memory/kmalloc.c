@@ -2,10 +2,13 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#ifdef IPO_APP
+#include <syscall.h>
+#endif
 
 #ifdef IPO_APP
-#define KMALLOC_HEAP_START  (0x2000000)  // 32 MB for user applications
-#define KMALLOC_HEAP_SIZE   (0x4000000)  // 64 MB
+#define KMALLOC_HEAP_START  (0x2000000)  // 32 MB base for user applications
+#define KMALLOC_HEAP_SIZE   (0x4000000)  // 64 MB per application
 #else
 #define KMALLOC_HEAP_START  (0x1000000)  // 16 MB kernel heap start
 #define KMALLOC_HEAP_SIZE   (0x1000000)  // 16 MB max heap
@@ -30,7 +33,13 @@ static size_t heap_used = 0;
  * Initialize kernel allocator
  */
 void kmalloc_init(void) {
+#ifdef IPO_APP
+    uint32_t pid = (uint32_t)ipo_syscall(0x107Cu /* IPO_SYSCALL_GETPID */, 0u, NULL);
+    if (pid == 0) pid = 1;
+    heap_start = (uint8_t *)(KMALLOC_HEAP_START + (pid - 1) * KMALLOC_HEAP_SIZE);
+#else
     heap_start = (uint8_t *)KMALLOC_HEAP_START;
+#endif
     heap_used = 0;
 }
 
@@ -198,6 +207,34 @@ void kfree(void* ptr) {
     block->magic = KMALLOC_FREED_MAGIC;
 
     kmalloc_coalesce_and_shrink();
+}
+
+/**
+ * Reallocate memory block
+ */
+void* krealloc(void* ptr, size_t size) {
+    if (ptr == NULL) {
+        return kmalloc(size);
+    }
+    if (size == 0) {
+        kfree(ptr);
+        return NULL;
+    }
+    kmalloc_block_t *block = (kmalloc_block_t *)ptr - 1;
+    if (block->magic != KMALLOC_MAGIC) {
+        return NULL;
+    }
+    size_t old_user_size = block->size > BLOCK_HEADER_SIZE ? (block->size - BLOCK_HEADER_SIZE) : 0;
+    if (size <= old_user_size) {
+        return ptr;
+    }
+    void *new_ptr = kmalloc(size);
+    if (!new_ptr) {
+        return NULL;
+    }
+    memcpy(new_ptr, ptr, old_user_size);
+    kfree(ptr);
+    return new_ptr;
 }
 
 /**

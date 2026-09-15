@@ -69,7 +69,7 @@ void keyboard_poll(void) {
             if (scancode == 0x2E && keyboard_is_ctrl_pressed() && !wm_session_active()) {
                 system_request_interrupt();
             }
-            if (keyboard_app_input_mode) {
+            if (keyboard_app_input_mode || wm_session_active()) {
                 keyboard_queue_push(&app_queue, scancode);
             } else {
                 keyboard_queue_push(&shell_queue, scancode);
@@ -139,26 +139,29 @@ static void yield_waiting(bool waiting) {
 
 uint8_t keyboard_get_scancode(void) {
     if (!is_foreground_process()) {
-        serial_printf("[kbd_get] not foreground!\n");
-        yield_waiting(true);
+        if (!wm_session_active()) {
+            yield_waiting(true);
+        }
         return 0x00u;
     }
 
     keyboard_poll();
-    struct keyboard_queue *q = keyboard_app_input_mode ? &app_queue : &shell_queue;
+    struct keyboard_queue *q = (keyboard_app_input_mode || wm_session_active()) ? &app_queue : &shell_queue;
     uint8_t sc = keyboard_queue_pop(q);
-    if (sc != 0x00u) {
-        serial_printf("[kbd_get] popped sc=0x%x\n", sc);
+    if (sc == 0x00u && wm_session_active()) {
+        sc = keyboard_queue_pop(&shell_queue);
     }
     if (keyboard_app_input_mode && (sc == 0x1C || sc == 0x9C)) {
         if (timer_elapsed_ms(app_input_mode_start_ms) < 250u) {
             sc = 0x00u;
         }
     }
-    if (sc == 0x00u) {
-        yield_waiting(true);
-    } else {
-        yield_waiting(false);
+    if (!wm_session_active()) {
+        if (sc == 0x00u) {
+            yield_waiting(true);
+        } else {
+            yield_waiting(false);
+        }
     }
     return sc;
 }

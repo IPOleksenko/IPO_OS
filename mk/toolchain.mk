@@ -75,6 +75,8 @@ build/toolchain/lua/lua.elf build/toolchain/lua/luac.elf: build/lib/libc.a build
 
 build/toolchain/nasm.elf: build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crt0.o build/lib/crti.o build/lib/crtn.o lib/linker.ld
 	@mkdir -p build/toolchain
+	@mkdir -p toolchains/nasm-2.16.03/doc && touch toolchains/nasm-2.16.03/doc/Makefile.in
+	$(MAKE) -C toolchains/nasm-2.16.03 asm/nasm.o
 	cd toolchains/nasm-2.16.03 && ld -m elf_i386 -T $(CURDIR)/lib/linker.ld $(CURDIR)/build/lib/crt0.o $(CURDIR)/build/lib/crti.o asm/nasm.o libnasm.a $(CURDIR)/build/lib/libc.a $(CURDIR)/build/lib/libm.a $(CURDIR)/build/lib/libgcc.a $(CURDIR)/build/lib/crtn.o -o $(CURDIR)/$@
 
 build/toolchain/python.elf: toolchains/micropython_shim.c build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crt0.o build/lib/crti.o build/lib/crtn.o lib/linker.ld

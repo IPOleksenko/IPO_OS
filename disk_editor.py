@@ -52,6 +52,8 @@ class DiskImage:
     # ================= BLOCK IO =================
 
     def _seek_block(self, idx):
+        if idx < 0:
+            raise DiskError(f"invalid negative block index: {idx}")
         self.f.seek((self.start_lba + idx) * BLOCK_SIZE)
 
     def read_block(self, idx):
@@ -242,7 +244,7 @@ class DiskImage:
     def free_inode_blocks(self, inode):
         # Free primary extents
         for ext in inode.get('extents', []):
-            if ext['block_count'] > 0 and ext['physical_block'] > 0:
+            if ext['block_count'] > 0 and ext['physical_block'] >= self.sb['data_blocks_start']:
                 for b in range(ext['block_count']):
                     self.bitmap_set(self.sb['block_bitmap_start'], (ext['physical_block'] + b) - self.sb['data_blocks_start'], 0)
             ext['block_count'] = 0
@@ -251,14 +253,21 @@ class DiskImage:
 
         # Free chained extent nodes
         curr = inode.get('next_extent_node', 0)
-        while curr != 0:
+        seen = set()
+        while curr != 0 and curr not in seen:
+            if curr < self.sb['data_blocks_start'] or curr >= self.sb['fs_size_blocks']:
+                break
+            seen.add(curr)
             raw = self.read_block(curr)
             count, flags, next_node = struct.unpack_from('<IIQ', raw, 0)
-            for i in range(min(count, IPO_EXTENT_NODE_EXTENTS)):
+            count = min(count, IPO_EXTENT_NODE_EXTENTS)
+            for i in range(count):
                 e_off = 16 + i * 24
                 l_blk, p_blk, b_cnt, flg = struct.unpack_from('<QQII', raw, e_off)
-                for b in range(b_cnt):
-                    self.bitmap_set(self.sb['block_bitmap_start'], (p_blk + b) - self.sb['data_blocks_start'], 0)
+                if p_blk >= self.sb['data_blocks_start'] and p_blk < self.sb['fs_size_blocks']:
+                    max_b = min(b_cnt, self.sb['fs_size_blocks'] - p_blk)
+                    for b in range(max_b):
+                        self.bitmap_set(self.sb['block_bitmap_start'], (p_blk + b) - self.sb['data_blocks_start'], 0)
             self.bitmap_set(self.sb['block_bitmap_start'], curr - self.sb['data_blocks_start'], 0)
             curr = next_node
         inode['next_extent_node'] = 0
@@ -266,15 +275,23 @@ class DiskImage:
     # ================= BITMAPS =================
 
     def bitmap_get(self, start, bit):
+        if bit < 0:
+            return 0
         byte = bit // 8
         block = byte // BLOCK_SIZE
         off = byte % BLOCK_SIZE
+        if start + block >= self.sb['fs_size_blocks']:
+            return 0
         return (self.read_block(start + block)[off] >> (bit & 7)) & 1
 
     def bitmap_set(self, start, bit, val):
+        if bit < 0:
+            return
         byte = bit // 8
         block = byte // BLOCK_SIZE
         off = byte % BLOCK_SIZE
+        if start + block >= self.sb['fs_size_blocks']:
+            return
         buf = bytearray(self.read_block(start + block))
         if val:
             buf[off] |= 1 << (bit & 7)

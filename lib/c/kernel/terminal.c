@@ -2054,8 +2054,19 @@ int try_execute_command(const char *cmdline) {
         kfree(argv);
         return res;
     } else if (strcmp(name, "startx") == 0) {
-        /* Start the WM video-mode session (returns immediately; async task composites) */
-        wm_session_start();
+        /* Start the WM video-mode session */
+        if (!wm_session_active()) {
+            wm_session_start();
+        }
+        if (argc >= 2) {
+            char *sub_path = resolve_command_path(argv[1]);
+            if (sub_path) {
+                process_exec(sub_path, argc - 1, argv + 1);
+                kfree(sub_path);
+            } else {
+                printf("startx: '%s' not found\n", argv[1]);
+            }
+        }
         builtin_handled = 1;
     } else if (strcmp(name, "stopx") == 0) {
         /* Stop the WM session and return to text mode */

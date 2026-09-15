@@ -189,6 +189,10 @@ static int strip_elf(const uint8_t *raw, long sz, const char *outfile) {
 }
 
 int main(int argc, char **argv) {
+    if (argc < 1 || !argv || !argv[0]) {
+        fprintf(stderr, "Usage: objcopy [-O binary] [-j section] [-S] <infile> [outfile]\n");
+        return 1;
+    }
     const char *infile = NULL;
     const char *outfile = NULL;
 

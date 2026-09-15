@@ -122,13 +122,34 @@ static void process_file(const char *path, int multi) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        process_file("a.out", 0);
+        printf("Usage: nm [options] <objfile...>\n");
+        printf("List symbols in [objfile...].\n");
         return 0;
+    }
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            printf("Usage: nm [options] <objfile...>\n");
+            printf("List symbols in [objfile...] (a.out by default).\n");
+            return 0;
+        }
     }
 
     int file_count = 0;
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] != '-') file_count++;
+    }
+
+    if (file_count == 0) {
+        FILE *f = fopen("a.out", "rb");
+        if (f) {
+            fclose(f);
+            process_file("a.out", 0);
+            return 0;
+        }
+        printf("Usage: nm [options] <objfile...>\n");
+        printf("List symbols in [objfile...] (a.out by default).\n");
+        return 0;
     }
 
     for (int i = 1; i < argc; i++) {

@@ -161,10 +161,10 @@
 /* Define to 1 if compiled with the -Werror=attributes compiler flag */
 #define CPPFLAGS_WERROR_ATTRIBUTES 1
 
-/* Define to 1 if you have the `access' function. */
+/* Define to 1 if you have the 'access' function. */
 #define HAVE_ACCESS 1
 
-/* Define to 1 if you have the `canonicalize_file_name' function. */
+/* Define to 1 if you have the 'canonicalize_file_name' function. */
 #define HAVE_CANONICALIZE_FILE_NAME 1
 
 /* Define to 1 if you have the `cpu_to_le16' intrinsic function. */
@@ -176,57 +176,57 @@
 /* Define to 1 if you have the `cpu_to_le64' intrinsic function. */
 /* #undef HAVE_CPU_TO_LE64 */
 
-/* Define to 1 if you have the declaration of `strcasecmp', and to 0 if you
+/* Define to 1 if you have the declaration of 'strcasecmp', and to 0 if you
    don't. */
 #define HAVE_DECL_STRCASECMP 1
 
-/* Define to 1 if you have the declaration of `stricmp', and to 0 if you
+/* Define to 1 if you have the declaration of 'stricmp', and to 0 if you
    don't. */
 #define HAVE_DECL_STRICMP 0
 
-/* Define to 1 if you have the declaration of `strlcpy', and to 0 if you
+/* Define to 1 if you have the declaration of 'strlcpy', and to 0 if you
    don't. */
 #define HAVE_DECL_STRLCPY 1
 
-/* Define to 1 if you have the declaration of `strncasecmp', and to 0 if you
+/* Define to 1 if you have the declaration of 'strncasecmp', and to 0 if you
    don't. */
 #define HAVE_DECL_STRNCASECMP 1
 
-/* Define to 1 if you have the declaration of `strnicmp', and to 0 if you
+/* Define to 1 if you have the declaration of 'strnicmp', and to 0 if you
    don't. */
 #define HAVE_DECL_STRNICMP 0
 
-/* Define to 1 if you have the declaration of `strnlen', and to 0 if you
+/* Define to 1 if you have the declaration of 'strnlen', and to 0 if you
    don't. */
 #define HAVE_DECL_STRNLEN 1
 
-/* Define to 1 if you have the declaration of `strrchrnul', and to 0 if you
+/* Define to 1 if you have the declaration of 'strrchrnul', and to 0 if you
    don't. */
 #define HAVE_DECL_STRRCHRNUL 0
 
-/* Define to 1 if you have the declaration of `strsep', and to 0 if you don't.
+/* Define to 1 if you have the declaration of 'strsep', and to 0 if you don't.
    */
 #define HAVE_DECL_STRSEP 1
 
 /* Define to 1 if you have the <endian.h> header file. */
 #define HAVE_ENDIAN_H 1
 
-/* Define to 1 if you have the `faccessat' function. */
+/* Define to 1 if you have the 'faccessat' function. */
 #define HAVE_FACCESSAT 1
 
 /* Define to 1 if you have the <fcntl.h> header file. */
 #define HAVE_FCNTL_H 1
 
-/* Define to 1 if you have the `fileno' function. */
+/* Define to 1 if you have the 'fileno' function. */
 #define HAVE_FILENO 1
 
-/* Define to 1 if fseeko (and presumably ftello) exists and is declared. */
+/* Define to 1 if fseeko (and ftello) are declared in stdio.h. */
 #define HAVE_FSEEKO 1
 
-/* Define to 1 if you have the `fstat' function. */
+/* Define to 1 if you have the 'fstat' function. */
 #define HAVE_FSTAT 1
 
-/* Define to 1 if you have the `ftruncate' function. */
+/* Define to 1 if you have the 'ftruncate' function. */
 #define HAVE_FTRUNCATE 1
 
 /* Define to 1 if your compiler supports the alloc_size function attribute */
@@ -310,16 +310,16 @@
    pointers */
 #define HAVE_FUNC_PTR_ATTRIBUTE_UNUSED 1
 
-/* Define to 1 if you have the `getgid' function. */
+/* Define to 1 if you have the 'getgid' function. */
 #define HAVE_GETGID 1
 
-/* Define to 1 if you have the `getpagesize' function. */
+/* Define to 1 if you have the 'getpagesize' function. */
 #define HAVE_GETPAGESIZE 1
 
-/* Define to 1 if you have the `getrlimit' function. */
+/* Define to 1 if you have the 'getrlimit' function. */
 #define HAVE_GETRLIMIT 1
 
-/* Define to 1 if you have the `getuid' function. */
+/* Define to 1 if you have the 'getuid' function. */
 #define HAVE_GETUID 1
 
 /* Define to 1 if you have the `htole16' intrinsic function. */
@@ -340,37 +340,37 @@
 /* Define to 1 if you have the <io.h> header file. */
 /* #undef HAVE_IO_H */
 
-/* Define to 1 if you have the `isascii' function. */
+/* Define to 1 if you have the 'isascii' function. */
 #define HAVE_ISASCII 1
 
-/* Define to 1 if you have the `iscntrl' function. */
+/* Define to 1 if you have the 'iscntrl' function. */
 #define HAVE_ISCNTRL 1
 
 /* Define to 1 if you have the <machine/endian.h> header file. */
 /* #undef HAVE_MACHINE_ENDIAN_H */
 
-/* Define to 1 if you have the `mempcpy' function. */
+/* Define to 1 if you have the 'mempcpy' function. */
 #define HAVE_MEMPCPY 1
 
-/* Define to 1 if you have the `mempset' function. */
+/* Define to 1 if you have the 'mempset' function. */
 /* #undef HAVE_MEMPSET */
 
 /* Define to 1 if you have the <minix/config.h> header file. */
 /* #undef HAVE_MINIX_CONFIG_H */
 
-/* Define to 1 if you have a working `mmap' system call. */
+/* Define to 1 if you have a working 'mmap' system call. */
 #define HAVE_MMAP 1
 
-/* Define to 1 if you have the `pathconf' function. */
+/* Define to 1 if you have the 'pathconf' function. */
 #define HAVE_PATHCONF 1
 
-/* Define to 1 if you have the `realpath' function. */
+/* Define to 1 if you have the 'realpath' function. */
 #define HAVE_REALPATH 1
 
 /* Define to 1 if you have some version of the snprintf function. */
 #define HAVE_SNPRINTF 1
 
-/* Define to 1 if you have the `stat' function. */
+/* Define to 1 if you have the 'stat' function. */
 #define HAVE_STAT 1
 
 /* Define to 1 if you have the <stdarg.h> header file. */
@@ -394,10 +394,10 @@
 /* Define to 1 if you have the <stdnoreturn.h> header file. */
 #define HAVE_STDNORETURN_H 1
 
-/* Define to 1 if you have the `strcasecmp' function. */
+/* Define to 1 if you have the 'strcasecmp' function. */
 #define HAVE_STRCASECMP 1
 
-/* Define to 1 if you have the `stricmp' function. */
+/* Define to 1 if you have the 'stricmp' function. */
 /* #undef HAVE_STRICMP */
 
 /* Define to 1 if you have the <strings.h> header file. */
@@ -406,31 +406,31 @@
 /* Define to 1 if you have the <string.h> header file. */
 #define HAVE_STRING_H 1
 
-/* Define to 1 if you have the `strlcpy' function. */
+/* Define to 1 if you have the 'strlcpy' function. */
 #define HAVE_STRLCPY 1
 
-/* Define to 1 if you have the `strncasecmp' function. */
+/* Define to 1 if you have the 'strncasecmp' function. */
 #define HAVE_STRNCASECMP 1
 
-/* Define to 1 if you have the `strnicmp' function. */
+/* Define to 1 if you have the 'strnicmp' function. */
 /* #undef HAVE_STRNICMP */
 
-/* Define to 1 if you have the `strnlen' function. */
+/* Define to 1 if you have the 'strnlen' function. */
 #define HAVE_STRNLEN 1
 
-/* Define to 1 if you have the `strrchrnul' function. */
+/* Define to 1 if you have the 'strrchrnul' function. */
 /* #undef HAVE_STRRCHRNUL */
 
-/* Define to 1 if you have the `strsep' function. */
+/* Define to 1 if you have the 'strsep' function. */
 #define HAVE_STRSEP 1
 
-/* Define to 1 if the system has the type `struct stat'. */
+/* Define to 1 if the system has the type 'struct stat'. */
 #define HAVE_STRUCT_STAT 1
 
-/* Define to 1 if the system has the type `struct _stati64'. */
+/* Define to 1 if the system has the type 'struct _stati64'. */
 /* #undef HAVE_STRUCT__STATI64 */
 
-/* Define to 1 if you have the `sysconf' function. */
+/* Define to 1 if you have the 'sysconf' function. */
 #define HAVE_SYSCONF 1
 
 /* Define to 1 if you have the <sys/endian.h> header file. */
@@ -451,13 +451,13 @@
 /* Define to 1 if you have the <sys/types.h> header file. */
 #define HAVE_SYS_TYPES_H 1
 
-/* Define to 1 if you have the `S_ISREG' function. */
+/* Define to 1 if you have the 'S_ISREG' function. */
 /* #undef HAVE_S_ISREG */
 
 /* Define to 1 if you have some version of the typeof operator. */
 #define HAVE_TYPEOF 1
 
-/* Define to 1 if the system has the type `uintptr_t'. */
+/* Define to 1 if the system has the type 'uintptr_t'. */
 #define HAVE_UINTPTR_T 1
 
 /* Define to 1 if you have the <unistd.h> header file. */
@@ -472,7 +472,7 @@
 /* Define to 1 if you have the <wchar.h> header file. */
 #define HAVE_WCHAR_H 1
 
-/* Define to 1 if you have the `_access' function. */
+/* Define to 1 if you have the '_access' function. */
 /* #undef HAVE__ACCESS */
 
 /* Define to 1 if you have the `_BitScanReverse' intrinsic function. */
@@ -481,7 +481,7 @@
 /* Define to 1 if you have the `_BitScanReverse64' intrinsic function. */
 /* #undef HAVE__BITSCANREVERSE64 */
 
-/* Define to 1 if the system has the type `_Bool'. */
+/* Define to 1 if the system has the type '_Bool'. */
 #define HAVE__BOOL 1
 
 /* Define to 1 if you have the `_byteswap_uint64' intrinsic function. */
@@ -493,25 +493,25 @@
 /* Define to 1 if you have the `_byteswap_ushort' intrinsic function. */
 /* #undef HAVE__BYTESWAP_USHORT */
 
-/* Define to 1 if you have the `_chsize' function. */
+/* Define to 1 if you have the '_chsize' function. */
 /* #undef HAVE__CHSIZE */
 
-/* Define to 1 if you have the `_chsize_s' function. */
+/* Define to 1 if you have the '_chsize_s' function. */
 /* #undef HAVE__CHSIZE_S */
 
-/* Define to 1 if you have the `_fileno' function. */
+/* Define to 1 if you have the '_fileno' function. */
 /* #undef HAVE__FILENO */
 
-/* Define to 1 if you have the `_fseeki64' function. */
+/* Define to 1 if you have the '_fseeki64' function. */
 /* #undef HAVE__FSEEKI64 */
 
-/* Define to 1 if you have the `_fstati64' function. */
+/* Define to 1 if you have the '_fstati64' function. */
 /* #undef HAVE__FSTATI64 */
 
-/* Define to 1 if you have the `_fullpath' function. */
+/* Define to 1 if you have the '_fullpath' function. */
 /* #undef HAVE__FULLPATH */
 
-/* Define to 1 if you have the `_stati64' function. */
+/* Define to 1 if you have the '_stati64' function. */
 /* #undef HAVE__STATI64 */
 
 /* Define to 1 if you have the `__bswap_16' intrinsic function. */
@@ -583,12 +583,12 @@
 /* Define to the version of this package. */
 #define PACKAGE_VERSION ""
 
-/* Define to 1 if all of the C90 standard headers exist (not just the ones
+/* Define to 1 if all of the C89 standard headers exist (not just the ones
    required in a freestanding environment). This macro is provided for
    backward compatibility; new code need not use it. */
 #define STDC_HEADERS 1
 
-/* Enable extensions on AIX 3, Interix.  */
+/* Enable extensions on AIX, Interix, z/OS.  */
 #ifndef _ALL_SOURCE
 # define _ALL_SOURCE 1
 #endif
@@ -649,11 +649,15 @@
 #ifndef __STDC_WANT_IEC_60559_DFP_EXT__
 # define __STDC_WANT_IEC_60559_DFP_EXT__ 1
 #endif
+/* Enable extensions specified by C23 Annex F.  */
+#ifndef __STDC_WANT_IEC_60559_EXT__
+# define __STDC_WANT_IEC_60559_EXT__ 1
+#endif
 /* Enable extensions specified by ISO/IEC TS 18661-4:2015.  */
 #ifndef __STDC_WANT_IEC_60559_FUNCS_EXT__
 # define __STDC_WANT_IEC_60559_FUNCS_EXT__ 1
 #endif
-/* Enable extensions specified by ISO/IEC TS 18661-3:2015.  */
+/* Enable extensions specified by C23 Annex H and ISO/IEC TS 18661-3:2015.  */
 #ifndef __STDC_WANT_IEC_60559_TYPES_EXT__
 # define __STDC_WANT_IEC_60559_TYPES_EXT__ 1
 #endif
@@ -687,16 +691,22 @@
 /* Number of bits in a file offset, on hosts where this is settable. */
 #define _FILE_OFFSET_BITS 64
 
-/* Define to 1 to make fseeko visible on some hosts (e.g. glibc 2.2). */
+/* Define to 1 if necessary to make fseeko visible. */
 /* #undef _LARGEFILE_SOURCE */
 
-/* Define for large files, on AIX-style hosts. */
+/* Define to 1 on platforms where this makes off_t a 64-bit type. */
 /* #undef _LARGE_FILES */
 
-/* Define to empty if `const' does not conform to ANSI C. */
+/* Number of bits in time_t, on hosts where this is settable. */
+/* #undef _TIME_BITS */
+
+/* Define to 1 on platforms where this makes time_t a 64-bit type. */
+/* #undef __MINGW_USE_VC2005_COMPAT */
+
+/* Define to empty if 'const' does not conform to ANSI C. */
 /* #undef const */
 
-/* Define to `__inline__' or `__inline' if that's what the C compiler
+/* Define to '__inline__' or '__inline' if that's what the C compiler
    calls it, or to nothing if 'inline' is not supported under any name.  */
 #ifndef __cplusplus
 /* #undef inline */
@@ -717,7 +727,7 @@
 # define __restrict__
 #endif
 
-/* Define to `unsigned int' if <sys/types.h> does not define. */
+/* Define as 'unsigned int' if <stddef.h> doesn't define. */
 /* #undef size_t */
 
 /* Define if your snprintf function is not named snprintf. */

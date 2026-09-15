@@ -199,6 +199,10 @@ static void extract_archive(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc < 1 || !argv || !argv[0]) {
+        fprintf(stderr, "usage: ar [rcstvx] archive [files...]\n");
+        return 1;
+    }
     const char *prog = strrchr(argv[0], '/');
     prog = prog ? prog + 1 : argv[0];
 

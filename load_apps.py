@@ -32,7 +32,7 @@ def safe_put_executable(disk, src_path, dest_path):
             magic = f.read(4)
         if magic == b"\x7fELF":
             tmp_bin = src.parent / f".{src.name}.raw_bin"
-            cmd = ["objcopy", "-O", "binary", str(src), str(tmp_bin)]
+            cmd = ["objcopy", "--set-section-flags", ".bss=alloc,load,contents", "-O", "binary", str(src), str(tmp_bin)]
             res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if res.returncode == 0 and tmp_bin.exists():
                 safe_put(disk, tmp_bin, dest_path)
@@ -109,8 +109,7 @@ def main():
         "nm": toolchain_dir / "nm.elf",
         "strip": toolchain_dir / "strip.elf",
         "nasm": toolchain_dir / "nasm.elf",
-        "python": toolchain_dir / "python.elf",
-        "python3": toolchain_dir / "python.elf",
+        "micropython": toolchain_dir / "python.elf",
         "lua": toolchain_dir / "lua" / "lua.elf",
         "luac": toolchain_dir / "lua" / "luac.elf",
     }
@@ -130,7 +129,6 @@ def main():
             safe_mkdir(disk, "/fonts")
             for f in font_files:
                 safe_put(disk, f, f"/fonts/{f.name}")
-
 
     # 4. Bundled compiler headers (only if present)
     tcc_include = project_root / "apps" / "tcc" / "include"

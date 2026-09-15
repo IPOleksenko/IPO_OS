@@ -11,6 +11,7 @@
 #include <kernel/driver.h>
 #include <system/state.h>
 #include <system/timer.h>
+#include <driver/sound.h>
 #include <vga.h>
 #include <vga_gfx.h>
 #include <wm.h>
@@ -1402,24 +1403,34 @@ static uint32_t syscall_builtin_sbrk(uint32_t num, uint32_t argc, uint32_t *argv
     if (argc >= 1u && argv != NULL) {
         inc = (int32_t)argv[0];
     }
-    uint32_t prev = user_heap_break;
+    process_t *proc = process_get_current();
+    uint32_t proc_base = USER_HEAP_START + (proc && proc->pid > 0 ? (proc->pid - 1) : 0) * 0x04000000u;
+    uint32_t proc_limit = proc_base + 0x04000000u;
+    uint32_t *pbreak = (proc && proc->user_heap_break >= proc_base) ? &proc->user_heap_break : &user_heap_break;
+    uint32_t prev = *pbreak;
     if (inc == 0) {
         return prev;
     }
     if (inc > 0) {
-        if (user_heap_break + (uint32_t)inc > USER_HEAP_LIMIT) {
+        if (*pbreak + (uint32_t)inc > proc_limit) {
             return (uint32_t)-1;
         }
-        user_heap_break += (uint32_t)inc;
+        *pbreak += (uint32_t)inc;
         return prev;
     } else {
         uint32_t dec = (uint32_t)(-inc);
-        if (user_heap_break - dec < USER_HEAP_START) {
+        if (*pbreak - dec < proc_base) {
             return (uint32_t)-1;
         }
-        user_heap_break -= dec;
+        *pbreak -= dec;
         return prev;
     }
+}
+
+static uint32_t syscall_builtin_getpid(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    process_t *proc = process_get_current();
+    return proc ? proc->pid : 1;
 }
 
 static uint32_t syscall_builtin_time(uint32_t num, uint32_t argc, uint32_t *argv) {
@@ -1446,6 +1457,7 @@ static uint32_t syscall_builtin_exit(uint32_t num, uint32_t argc, uint32_t *argv
     if (argc > 0 && argv != NULL) {
         code = (int)argv[0];
     }
+    sound_stop();
     process_t *proc = process_get_current();
     if (proc != NULL) {
         proc->is_running = 0;
@@ -1530,6 +1542,25 @@ static uint32_t syscall_builtin_wm_invalidate(uint32_t num, uint32_t argc, uint3
     return 0;
 }
 
+static uint32_t syscall_builtin_wm_is_valid(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc;
+    if (!argv || !argv[0]) return 0;
+    return wm_is_window_valid((wm_window_t *)(uintptr_t)argv[0]) ? 1u : 0u;
+}
+
+static uint32_t syscall_builtin_wm_toggle_maximize(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc;
+    if (!argv || !argv[0]) return 0;
+    wm_toggle_maximize((wm_window_t *)(uintptr_t)argv[0]);
+    return 0;
+}
+
+static uint32_t syscall_builtin_wm_resize(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc;
+    if (!argv || argc < 3 || !argv[0]) return 0;
+    return wm_resize((wm_window_t *)(uintptr_t)argv[0], (uint16_t)argv[1], (uint16_t)argv[2]) ? 1u : 0u;
+}
+
 static uint32_t syscall_builtin_process_yield(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num;
     process_t *cur = process_get_current();
@@ -1549,7 +1580,7 @@ static uint32_t syscall_builtin_process_is_foreground(uint32_t num, uint32_t arg
     process_t *fg = process_get_foreground();
     if (!fg || !cur) return 1;
     bool is_fg = (cur == fg);
-    if (!is_fg) {
+    if (!is_fg && !wm_session_active()) {
         cur->waiting_for_input = true;
     }
     return is_fg ? 1 : 0;
@@ -1850,6 +1881,22 @@ void syscall_init(void) {
     ipo_register_syscall(
         IPO_SYSCALL_WM_INVALIDATE,
         syscall_builtin_wm_invalidate);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_WM_IS_VALID,
+        syscall_builtin_wm_is_valid);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_WM_TOGGLE_MAXIMIZE,
+        syscall_builtin_wm_toggle_maximize);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_WM_RESIZE,
+        syscall_builtin_wm_resize);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_GETPID,
+        syscall_builtin_getpid);
 
     for (int i = 0; i < 32; i++) {
         ipo_idt_set_gate(

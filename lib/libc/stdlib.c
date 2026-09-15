@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <syscall.h>
 #include <stdio.h>
+#include <stdbool.h>
 
 /* -------------------------------------------------------------
  * Memory allocator over sbrk
@@ -194,27 +195,22 @@ void __assert_fail(const char *assertion, const char *file, unsigned int line, c
 }
 
 /* -------------------------------------------------------------
- * Environment variables
+ * Environment variables (Dynamically expandable, zero artificial limits)
  * ------------------------------------------------------------- */
 
-static char *static_env[] = {
-    "PATH=/app",
-    "HOME=/",
-    "USER=root",
-    "TERM=xterm",
-    "MICROPYPATH=:/lib:/app:/lib/python",
-    "PYTHONPATH=:/lib:/app:/lib/python",
-    "LD_LIBRARY_PATH=/lib",
-    "LIBRARY_PATH=/lib",
+static char *env[] = {
     NULL
 };
 extern char **environ;
 
+static bool env_is_allocated = false;
+static size_t env_cap = 0;
+
 char *getenv(const char *name) {
-    if (!name) return NULL;
-    char **env = environ ? environ : static_env;
+    if (!name || !*name) return NULL;
+    char **cur_env = environ ? environ : env;
     size_t nlen = strlen(name);
-    for (char **ep = env; *ep != NULL; ep++) {
+    for (char **ep = cur_env; *ep != NULL; ep++) {
         if (strncmp(*ep, name, nlen) == 0 && (*ep)[nlen] == '=') {
             return *ep + nlen + 1;
         }
@@ -223,12 +219,158 @@ char *getenv(const char *name) {
 }
 
 int setenv(const char *name, const char *value, int overwrite) {
-    (void)name; (void)value; (void)overwrite;
+    if (!name || !*name || strchr(name, '=') != NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (!value) value = "";
+    size_t nlen = strlen(name);
+    size_t vlen = strlen(value);
+    size_t entry_len = nlen + 1 + vlen + 1;
+
+    char **cur_env = environ ? environ : env;
+    size_t count = 0;
+    int found_idx = -1;
+
+    while (cur_env[count] != NULL) {
+        if (strncmp(cur_env[count], name, nlen) == 0 && cur_env[count][nlen] == '=') {
+            found_idx = (int)count;
+        }
+        count++;
+    }
+
+    /* If variable exists and we are not allowed to overwrite, return success */
+    if (found_idx >= 0 && !overwrite) {
+        return 0;
+    }
+
+    /* If variable exists and we can overwrite */
+    if (found_idx >= 0) {
+        char *new_entry = (char *)malloc(entry_len);
+        if (!new_entry) {
+            errno = ENOMEM;
+            return -1;
+        }
+        memcpy(new_entry, name, nlen);
+        new_entry[nlen] = '=';
+        memcpy(new_entry + nlen + 1, value, vlen + 1);
+
+        if (env_is_allocated) {
+            free(cur_env[found_idx]);
+        }
+        cur_env[found_idx] = new_entry;
+        return 0;
+    }
+
+    /* Variable does not exist: need to append */
+    char *new_entry = (char *)malloc(entry_len);
+    if (!new_entry) {
+        errno = ENOMEM;
+        return -1;
+    }
+    memcpy(new_entry, name, nlen);
+    new_entry[nlen] = '=';
+    memcpy(new_entry + nlen + 1, value, vlen + 1);
+
+    if (!env_is_allocated) {
+        size_t new_cap = count + 8;
+        char **new_env = (char **)malloc(new_cap * sizeof(char *));
+        if (!new_env) {
+            free(new_entry);
+            errno = ENOMEM;
+            return -1;
+        }
+        for (size_t i = 0; i < count; i++) {
+            new_env[i] = cur_env[i];
+        }
+        new_env[count] = new_entry;
+        new_env[count + 1] = NULL;
+        environ = new_env;
+        env_is_allocated = true;
+        env_cap = new_cap;
+    } else {
+        if (count + 2 > env_cap) {
+            size_t new_cap = env_cap ? env_cap * 2 : (count + 8);
+            char **new_env = (char **)realloc(environ, new_cap * sizeof(char *));
+            if (!new_env) {
+                free(new_entry);
+                errno = ENOMEM;
+                return -1;
+            }
+            environ = new_env;
+            env_cap = new_cap;
+        }
+        environ[count] = new_entry;
+        environ[count + 1] = NULL;
+    }
+
     return 0;
 }
 
+int putenv(char *string) {
+    if (!string || !*string) {
+        errno = EINVAL;
+        return -1;
+    }
+    char *eq = strchr(string, '=');
+    if (!eq) {
+        return unsetenv(string);
+    }
+    size_t nlen = (size_t)(eq - string);
+    char *name_buf = (char *)malloc(nlen + 1);
+    if (!name_buf) {
+        errno = ENOMEM;
+        return -1;
+    }
+    memcpy(name_buf, string, nlen);
+    name_buf[nlen] = '\0';
+    int res = setenv(name_buf, eq + 1, 1);
+    free(name_buf);
+    return res;
+}
+
 int unsetenv(const char *name) {
-    (void)name;
+    if (!name || !*name || strchr(name, '=') != NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    char **cur_env = environ ? environ : env;
+    size_t nlen = strlen(name);
+    size_t i = 0;
+
+    while (cur_env[i] != NULL) {
+        if (strncmp(cur_env[i], name, nlen) == 0 && cur_env[i][nlen] == '=') {
+            if (env_is_allocated) {
+                free(cur_env[i]);
+            }
+            /* Shift remaining entries down */
+            size_t j = i;
+            while (cur_env[j] != NULL) {
+                cur_env[j] = cur_env[j + 1];
+                j++;
+            }
+            /* Don't increment i; check the shifted element at index i */
+            continue;
+        }
+        i++;
+    }
+
+    return 0;
+}
+
+int clearenv(void) {
+    char **cur_env = environ ? environ : env;
+    if (env_is_allocated) {
+        for (size_t i = 0; cur_env[i] != NULL; i++) {
+            free(cur_env[i]);
+            cur_env[i] = NULL;
+        }
+    }
+    if (environ) {
+        environ[0] = NULL;
+    }
     return 0;
 }
 

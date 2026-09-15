@@ -34,14 +34,19 @@ void pci_write_word(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uin
 }
 
 bool pci_find_device(uint16_t vendor_id, uint16_t device_id, pci_device_t *out_dev) {
-    for (uint16_t bus = 0; bus < 256; bus++) {
+    /* Most x86 systems have PCI devices on bus 0 (or buses 0-7 with bridges).
+       Scanning 256 buses without bridge discovery causes hardware timeouts on real hardware. */
+    uint16_t max_buses = 8;
+    for (uint16_t bus = 0; bus < max_buses; bus++) {
+        bool bus_has_device = false;
         for (uint8_t slot = 0; slot < 32; slot++) {
             for (uint8_t func = 0; func < 8; func++) {
                 uint16_t ven = pci_read_word((uint8_t)bus, slot, func, 0x00);
-                if (ven == 0xFFFF) {
+                if (ven == 0xFFFF || ven == 0x0000) {
                     if (func == 0) break; // Slot is empty
                     continue;
                 }
+                bus_has_device = true;
                 uint16_t dev = pci_read_word((uint8_t)bus, slot, func, 0x02);
                 if (ven == vendor_id && dev == device_id) {
                     if (out_dev) {
@@ -56,6 +61,10 @@ bool pci_find_device(uint16_t vendor_id, uint16_t device_id, pci_device_t *out_d
                     return true;
                 }
             }
+        }
+        if (!bus_has_device && bus > 0) {
+            /* If an entire bus has no devices, stop scanning higher buses */
+            break;
         }
     }
     return false;

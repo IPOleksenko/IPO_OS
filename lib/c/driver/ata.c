@@ -191,9 +191,7 @@ bool ata_read_sectors_lba28(uint32_t lba, uint8_t count, void *buf) {
     uint16_t *wptr = (uint16_t *)buf;
     for (int s = 0; s < count; s++) {
         if (!ata_wait_drq(base)) return false;
-        for (int i = 0; i < 256; i++) {
-            wptr[i] = inw(base + ATA_REG_DATA);
-        }
+        insw(base + ATA_REG_DATA, wptr, 256);
         wptr += 256;
     }
 
@@ -230,9 +228,7 @@ bool ata_write_sectors_lba28(uint32_t lba, uint8_t count, const void *buf) {
             while (retry < 5 && !ata_wait_drq(base)) { ata_io_wait(); retry++; }
             if (retry == 5) { printf("ata_write_sectors_lba28: ata_wait_drq failed for sector %d after retries\n", s); return false; }
         }
-        for (int i = 0; i < 256; i++) {
-            outw(base + ATA_REG_DATA, wptr[i]);
-        }
+        outsw(base + ATA_REG_DATA, wptr, 256);
         wptr += 256;
         ata_io_wait();
     }
@@ -277,9 +273,7 @@ bool ata_read_sectors_lba48(uint64_t lba, uint16_t count, void *buf) {
     uint16_t *wptr = (uint16_t *)buf;
     for (int s = 0; s < count; s++) {
         if (!ata_wait_drq(base)) return false;
-        for (int i = 0; i < 256; i++) {
-            wptr[i] = inw(base + ATA_REG_DATA);
-        }
+        insw(base + ATA_REG_DATA, wptr, 256);
         wptr += 256;
     }
 
@@ -320,9 +314,7 @@ bool ata_write_sectors_lba48(uint64_t lba, uint16_t count, const void *buf) {
             while (retry < 5 && !ata_wait_drq(base)) { ata_io_wait(); retry++; }
             if (retry == 5) return false;
         }
-        for (int i = 0; i < 256; i++) {
-            outw(base + ATA_REG_DATA, wptr[i]);
-        }
+        outsw(base + ATA_REG_DATA, wptr, 256);
         wptr += 256;
         ata_io_wait();
     }

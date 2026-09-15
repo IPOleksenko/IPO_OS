@@ -13,15 +13,49 @@ int inode_read_bytes(struct ipo_inode *inode, void *buffer, uint32_t size, uint6
     uint8_t tmp[IPO_FS_BLOCK_SIZE];
     uint32_t copied = 0;
 
-    for (uint64_t b = first_block; b <= last_block; b++) {
-        int64_t phys = get_data_block_for_inode(inode, b, false);
+    uint64_t b = first_block;
+    while (b <= last_block && copied < size) {
+        uint64_t max_contig = 1;
+        int64_t phys = get_contiguous_data_blocks_for_inode(inode, b, &max_contig);
         if (phys < 0) break;
-        if (!block_read((uint64_t)phys, tmp)) break;
+
+        uint64_t blocks_remaining = last_block - b + 1;
+        if (max_contig > blocks_remaining) max_contig = blocks_remaining;
+
         uint32_t block_offset = (b == first_block) ? (uint32_t)(offset % IPO_FS_BLOCK_SIZE) : 0u;
-        uint32_t tocopy = IPO_FS_BLOCK_SIZE - block_offset;
-        if (tocopy > size - copied) tocopy = size - copied;
-        memcpy((uint8_t*)buffer + copied, tmp + block_offset, tocopy);
+
+        /* If unaligned at start, read single block via tmp buffer */
+        if (block_offset != 0) {
+            if (!block_read((uint64_t)phys, tmp)) break;
+            uint32_t tocopy = IPO_FS_BLOCK_SIZE - block_offset;
+            if (tocopy > size - copied) tocopy = size - copied;
+            memcpy((uint8_t*)buffer + copied, tmp + block_offset, tocopy);
+            copied += tocopy;
+            b++;
+            continue;
+        }
+
+        /* For aligned full blocks, batch up to 128 sectors (64 KB) directly into buffer */
+        uint64_t full_blocks = (size - copied) / IPO_FS_BLOCK_SIZE;
+        uint64_t batch_blocks = (max_contig < full_blocks) ? max_contig : full_blocks;
+        if (batch_blocks > 128) batch_blocks = 128;
+
+        if (batch_blocks > 0) {
+            if (!block_read_multi((uint64_t)phys, (uint16_t)batch_blocks, (uint8_t*)buffer + copied)) {
+                break;
+            }
+            copied += (uint32_t)(batch_blocks * IPO_FS_BLOCK_SIZE);
+            b += batch_blocks;
+            continue;
+        }
+
+        /* Trailing partial block */
+        if (!block_read((uint64_t)phys, tmp)) break;
+        uint32_t tocopy = size - copied;
+        if (tocopy > IPO_FS_BLOCK_SIZE) tocopy = IPO_FS_BLOCK_SIZE;
+        memcpy((uint8_t*)buffer + copied, tmp, tocopy);
         copied += tocopy;
+        b++;
     }
     return (int)copied;
 }

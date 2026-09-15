@@ -227,7 +227,7 @@ int isatty(int fd) {
 }
 
 pid_t getpid(void) {
-    return 1;
+    return (pid_t)ipo_syscall(IPO_SYSCALL_GETPID, 0u, NULL);
 }
 
 pid_t getppid(void) {

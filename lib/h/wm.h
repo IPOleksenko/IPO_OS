@@ -193,6 +193,7 @@ void wm_init(void);
 
 wm_window_t *wm_create_window(const wm_window_options_t *opts);
 void         wm_destroy_window(wm_window_t *win);
+bool         wm_is_window_valid(wm_window_t *win);
 
 int          wm_get_window_count(void);
 wm_window_t *wm_get_focused(void);

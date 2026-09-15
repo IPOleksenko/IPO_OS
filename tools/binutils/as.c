@@ -47,6 +47,10 @@ static void print_version(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc < 1 || !argv) {
+        fprintf(stderr, "as: no input files\n");
+        return 1;
+    }
     const char *infile = NULL;
     const char *outfile = "a.out";
     dyn_str_t extra_args;
@@ -90,17 +94,9 @@ int main(int argc, char **argv) {
     dyn_str_append(&cmd, outfile);
 
     int ret = system(cmd.data);
-    if (ret != 0) {
-        // If nasm failed, try /usr/bin/nasm directly
-        dyn_str_t fallback;
-        dyn_str_init(&fallback);
-        dyn_str_append(&fallback, "/usr/bin/");
-        dyn_str_append(&fallback, cmd.data);
-        ret = system(fallback.data);
-        dyn_str_free(&fallback);
-    }
 
     dyn_str_free(&cmd);
     dyn_str_free(&extra_args);
+    return ret;
     return ret;
 }
