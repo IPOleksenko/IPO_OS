@@ -887,7 +887,7 @@ static bool execute_command(void) {
             if (found) {
                 snprintf(status_msg, sizeof(status_msg), "Layout: %s", dynamic_keymap_get_name());
             } else {
-                snprintf(status_msg, sizeof(status_msg), "Layout '%s' not loaded. Run /app/lang_%s first", target, target);
+                snprintf(status_msg, sizeof(status_msg), "Layout '%s' not loaded. Run /applications/lang_%s first", target, target);
             }
         }
     } else if (strncmp(cmd, "font", 4) == 0) {

@@ -5,6 +5,7 @@
 #include <vga_gfx.h>
 #include <stdio.h>
 #include <string.h>
+#include <driver/input/mouse.h>
 
 static vbe_bga_info_t g_bga_info = {
     .available = false,
@@ -106,6 +107,7 @@ bool vbe_bga_set_mode(int width, int height, int bpp) {
     g_bga_info.width  = width;
     g_bga_info.height = height;
     g_bga_info.bpp    = bpp;
+    mouse_set_bounds_from_display();
     return true;
 }
 

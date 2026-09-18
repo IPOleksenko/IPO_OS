@@ -86,6 +86,7 @@ bool block_write_multi(uint64_t fs_block_index, uint16_t count, const void *buff
 /* Bitmap API */
 bool bitmap_get(uint64_t bitmap_start, uint64_t bit_index);
 bool bitmap_set(uint64_t bitmap_start, uint64_t bit_index, bool value);
+uint32_t bitmap_count_set(uint64_t bitmap_start, uint64_t total_bits);
 
 /* Inode API */
 bool read_inode(uint32_t inode_no, struct ipo_inode *out);

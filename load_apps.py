@@ -76,8 +76,8 @@ def main():
         disk = DiskImage(str(image), start_lba=args.start_lba, require_format=True)
         disk.format_disk()
 
-    # Mandatory OS registered components: only /app and /autorun
-    safe_mkdir(disk, "/app")
+    # Mandatory OS registered components: only /applications and /autorun
+    safe_mkdir(disk, "/applications")
     try:
         disk.cat("/autorun")
     except Exception:
@@ -86,15 +86,15 @@ def main():
         except Exception:
             pass
 
-    # 1. Upload applications to /app
+    # 1. Upload applications to /applications
     if apps_dir.exists():
         app_files = sorted(apps_dir.rglob("*.bin"))
-        print(f"Uploading {len(app_files)} app(s) to /app...")
+        print(f"Uploading {len(app_files)} app(s) to /applications...")
         for app in app_files:
             app_name = app.name[:-4] if app.name.endswith(".bin") else app.name
-            safe_put_executable(disk, app, f"/app/{app_name}")
+            safe_put_executable(disk, app, f"/applications/{app_name}")
 
-    # 2. Upload toolchain binaries to /app
+    # 2. Upload toolchain binaries to /applications
     toolchain_dir = project_root / "build" / "toolchain"
     tool_map = {
         "gcc": toolchain_dir / "gcc.elf",
@@ -114,10 +114,10 @@ def main():
         "luac": toolchain_dir / "lua" / "luac.elf",
     }
 
-    print("Uploading toolchain binaries to /app...")
+    print("Uploading toolchain binaries to /applications...")
     for tool_name, tool_path in tool_map.items():
         if tool_path.exists():
-            safe_put_executable(disk, tool_path, f"/app/{tool_name}")
+            safe_put_executable(disk, tool_path, f"/applications/{tool_name}")
         else:
             print(f"Notice: Toolchain binary not found: {tool_path}")
 

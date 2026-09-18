@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifndef TERMINAL_SCROLL_HISTORY_SIZE
+#define TERMINAL_SCROLL_HISTORY_SIZE 1024
+#endif
+
 void print_header(void);
 
 void terminal_initialize(void);

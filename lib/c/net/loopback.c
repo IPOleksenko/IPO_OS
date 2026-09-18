@@ -1,94 +1,46 @@
 #include <net/loopback.h>
 #include <net/net_state.h>
 #include <net/ipv4.h>
-#include <memory/kmalloc.h>
 #include <string.h>
 
-typedef struct loopback_packet {
-    uint8_t *data;
-    uint16_t len;
-    struct loopback_packet *next;
-} loopback_packet_t;
-
-static inline loopback_packet_t **get_loop_head(void) {
-    net_shared_ctx_t *ctx = net_get_shared_context();
-    return (loopback_packet_t **)&ctx->loop_head;
-}
-
-static inline loopback_packet_t **get_loop_tail(void) {
-    net_shared_ctx_t *ctx = net_get_shared_context();
-    return (loopback_packet_t **)&ctx->loop_tail;
-}
-
 void loopback_init(void) {
-    loopback_packet_t **head_ptr = get_loop_head();
-    loopback_packet_t **tail_ptr = get_loop_tail();
-    loopback_packet_t *cur = *head_ptr;
-    while (cur) {
-        loopback_packet_t *next = cur->next;
-        if (cur->data) {
-            kfree(cur->data);
-        }
-        kfree(cur);
-        cur = next;
-    }
-    *head_ptr = NULL;
-    *tail_ptr = NULL;
+    net_shared_ctx_t *ctx = net_get_shared_context();
+    memset(ctx->loop_slots, 0, sizeof(ctx->loop_slots));
+    ctx->loop_head_idx = 0;
+    ctx->loop_tail_idx = 0;
 }
 
 int loopback_send(const void *packet, uint16_t len) {
-    if (!packet || len == 0) {
+    if (!packet || len == 0 || len > 1536) {
         return -1;
     }
 
-    uint8_t *data_copy = (uint8_t *)kmalloc(len);
-    if (!data_copy) {
-        return -1;
-    }
-    memcpy(data_copy, packet, len);
-
-    loopback_packet_t *pkt = (loopback_packet_t *)kmalloc(sizeof(loopback_packet_t));
-    if (!pkt) {
-        kfree(data_copy);
+    net_shared_ctx_t *ctx = net_get_shared_context();
+    uint8_t next_tail = (uint8_t)((ctx->loop_tail_idx + 1) % LOOPBACK_QUEUE_SIZE);
+    if (ctx->loop_slots[ctx->loop_tail_idx].valid && next_tail == ctx->loop_head_idx) {
+        /* Queue full */
         return -1;
     }
 
-    pkt->data = data_copy;
-    pkt->len = len;
-    pkt->next = NULL;
-
-    loopback_packet_t **head_ptr = get_loop_head();
-    loopback_packet_t **tail_ptr = get_loop_tail();
-
-    if (*tail_ptr) {
-        (*tail_ptr)->next = pkt;
-        *tail_ptr = pkt;
-    } else {
-        *head_ptr = pkt;
-        *tail_ptr = pkt;
-    }
+    uint8_t idx = ctx->loop_tail_idx;
+    memcpy(ctx->loop_slots[idx].data, packet, len);
+    ctx->loop_slots[idx].len = len;
+    ctx->loop_slots[idx].valid = true;
+    ctx->loop_tail_idx = next_tail;
 
     return (int)len;
 }
 
 void loopback_poll(void) {
-    loopback_packet_t **head_ptr = get_loop_head();
-    loopback_packet_t **tail_ptr = get_loop_tail();
+    net_shared_ctx_t *ctx = net_get_shared_context();
 
-    while (*head_ptr) {
-        loopback_packet_t *pkt = *head_ptr;
-        *head_ptr = pkt->next;
-        if (!*head_ptr) {
-            *tail_ptr = NULL;
+    while (ctx->loop_slots[ctx->loop_head_idx].valid) {
+        uint8_t idx = ctx->loop_head_idx;
+        uint16_t len = ctx->loop_slots[idx].len;
+        if (len > 0) {
+            ip4_receive(ctx->loop_slots[idx].data, len);
         }
-
-        if (pkt->data && pkt->len > 0) {
-            ip4_receive(pkt->data, pkt->len);
-        }
-
-        if (pkt->data) {
-            kfree(pkt->data);
-        }
-        kfree(pkt);
+        ctx->loop_slots[idx].valid = false;
+        ctx->loop_head_idx = (uint8_t)((ctx->loop_head_idx + 1) % LOOPBACK_QUEUE_SIZE);
     }
 }

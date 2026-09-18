@@ -28,15 +28,35 @@ bool write_inode(uint32_t inode_no, const struct ipo_inode *in) {
 }
 
 int allocate_inode(void) {
-    /* Find a free bit in the inode bitmap */
-    for (uint64_t i = 0; i < sb.inode_count; i++) {
-        if (!bitmap_get(sb.inode_bitmap_start, i)) {
-            if (!bitmap_set(sb.inode_bitmap_start, i, true)) return -1;
-            /* zero the inode */
-            struct ipo_inode zero;
-            memset(&zero, 0, sizeof(zero));
-            write_inode((uint32_t)(i + 1), &zero);
-            return (int)(i + 1);
+    if (sb.inode_count == 0) return -1;
+    uint64_t bitmap_blocks = (sb.inode_count + (IPO_FS_BLOCK_SIZE * 8) - 1) / (IPO_FS_BLOCK_SIZE * 8);
+    uint8_t buf[IPO_FS_BLOCK_SIZE];
+
+    for (uint64_t b = 0; b < bitmap_blocks; b++) {
+        uint64_t lba = sb.inode_bitmap_start + b;
+        if (!block_read(lba, buf)) continue;
+
+        uint32_t *words = (uint32_t *)buf;
+        int num_words = IPO_FS_BLOCK_SIZE / sizeof(uint32_t);
+
+        for (int w = 0; w < num_words; w++) {
+            if (words[w] != 0xFFFFFFFFu) {
+                for (int bit = 0; bit < 32; bit++) {
+                    if ((words[w] & (1u << bit)) == 0) {
+                        uint64_t bit_idx = (b * IPO_FS_BLOCK_SIZE * 8) + (w * 32) + bit;
+                        if (bit_idx >= sb.inode_count) return -1;
+
+                        words[w] |= (1u << bit);
+                        if (!block_write(lba, buf)) return -1;
+
+                        /* zero the inode */
+                        struct ipo_inode zero;
+                        memset(&zero, 0, sizeof(zero));
+                        write_inode((uint32_t)(bit_idx + 1), &zero);
+                        return (int)(bit_idx + 1);
+                    }
+                }
+            }
         }
     }
     return -1; /* no free inodes */

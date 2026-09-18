@@ -5,6 +5,7 @@
 #include <stdarg.h>
 
 #include <stddef.h>
+#include <stdbool.h>
 
 /**
  * Output a single character to VGA memory at cursor position with specified colors
@@ -12,8 +13,9 @@
  * @param fg Foreground color
  * @param bg Background color
  */
-
 void putchar_color(char c, uint8_t fg, uint8_t bg);
+
+bool putchar_is_locked(void);
 
 /**
  * Low-level serial output (COM1)

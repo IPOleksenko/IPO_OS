@@ -1,6 +1,8 @@
 #include <system/timer.h>
 #include <system/pit.h>
 #include <kernel/terminal.h>
+#include <kernel/process.h>
+#include <stdio.h>
 #include <ioport.h>
 
 #define TSC_PER_MS 2000000ULL
@@ -8,6 +10,7 @@
 static volatile uint32_t timer_ms = 0;
 static volatile uint32_t timer_ticks = 0;
 static uint64_t last_tsc_value = 0ULL;
+static uint32_t last_slice_yield_ms = 0;
 
 uint64_t read_tsc(void) {
     uint32_t lo;
@@ -20,6 +23,7 @@ void timer_init(void) {
     timer_ms = 0;
     timer_ticks = 0;
     last_tsc_value = read_tsc();
+    last_slice_yield_ms = 0;
     pit_init(1000u);
 }
 
@@ -39,6 +43,13 @@ void timer_tick(void) {
     timer_ms += delta_ms;
     timer_ticks += delta_ms;
     last_tsc_value += (uint64_t)delta_ms * TSC_PER_MS;
+
+    if (process_is_batch_active() && process_in_process_context() && !putchar_is_locked()) {
+        if (timer_ms - last_slice_yield_ms >= 10u) {
+            last_slice_yield_ms = timer_ms;
+            process_yield_kernel();
+        }
+    }
 }
 
 uint32_t timer_millis(void) {

@@ -13,6 +13,8 @@
 #include <memory/kmalloc.h>
 #include <driver/input/keymap/dynamic_keymap.h>
 #include <kernel/process.h>
+#include <driver/vbe_bga.h>
+#include <driver/input/mouse.h>
 
 #define VGA_VRAM_ADDR 0xA0000
 
@@ -321,6 +323,7 @@ void vga_save_text_state(void) {
 }
 
 void vga_set_mode_13h_hardware(void) {
+    serial_printf("[vga] 13h hardware mode set (is_gfx=%d)\n", (int)is_gfx);
     if (vga_is_graphics_mode()) {
         return;
     }
@@ -398,42 +401,51 @@ void vga_set_mode_13h_hardware(void) {
     vga_gfx_init_default_palette();
     vga_gfx_clear(0);
     is_gfx = true;
+    mouse_set_bounds_from_display();
 }
 
 void vga_set_mode_text_hardware(void) {
+    serial_printf("[vga] text hardware mode set (is_gfx=%d)\n", (int)is_gfx);
     /* Always restore hardware text mode registers, sequencer, CRTC, GC, AC, DAC and font */
 
     /* Misc */
-    outb(0x3C2, saved_misc ? saved_misc : 0x67);
+    outb(0x3C2, 0x67);
 
-    /* Sequencer */
-    static const uint8_t default_seq[5] = {0x03, 0x00, 0x03, 0x00, 0x02};
-    size_t seq_count = saved_seq.count ? saved_seq.count : 5;
-    for (size_t i = 0; i < seq_count; i++) {
-        uint8_t def = (i < 5) ? default_seq[i] : 0;
-        seq_write((uint8_t)i, vga_dynbuf8_get(&saved_seq, i, def));
+    /* Sequencer (Standard Mode 03h) */
+    static const uint8_t text_seq[5] = {0x03, 0x00, 0x03, 0x00, 0x02};
+    for (uint8_t i = 0; i < 5; i++) {
+        seq_write(i, text_seq[i]);
     }
 
     /* Unlock CRTC */
     outb(0x3D4, 0x11);
     outb(0x3D5, inb(0x3D5) & ~0x80);
 
-    /* CRTC */
-    size_t crtc_count = saved_crtc.count ? saved_crtc.count : 25;
-    for (size_t i = 0; i < crtc_count; i++) {
-        crtc_write((uint8_t)i, vga_dynbuf8_get(&saved_crtc, i, 0));
+    /* CRTC (Standard 80x25 text mode) */
+    static const uint8_t text_crtc[25] = {
+        0x5F, 0x4F, 0x50, 0x82, 0x55, 0x81, 0xBF, 0x1F,
+        0x00, 0x4F, 0x0D, 0x0E, 0x00, 0x00, 0x00, 0x00,
+        0x9C, 0x8E, 0x8F, 0x28, 0x1F, 0x96, 0xB9, 0xA3,
+        0xFF
+    };
+    for (uint8_t i = 0; i < 25; i++) {
+        crtc_write(i, text_crtc[i]);
     }
 
-    /* GC */
-    size_t gc_count = saved_gc.count ? saved_gc.count : 9;
-    for (size_t i = 0; i < gc_count; i++) {
-        gc_write((uint8_t)i, vga_dynbuf8_get(&saved_gc, i, 0));
+    /* GC (Standard text mode) */
+    static const uint8_t text_gc[9] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x0E, 0x00, 0xFF};
+    for (uint8_t i = 0; i < 9; i++) {
+        gc_write(i, text_gc[i]);
     }
 
-    /* AC */
-    size_t ac_count = saved_ac.count ? saved_ac.count : 21;
-    for (size_t i = 0; i < ac_count; i++) {
-        ac_write((uint8_t)i, vga_dynbuf8_get(&saved_ac, i, 0));
+    /* AC (Standard text mode) */
+    static const uint8_t text_ac[21] = {
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14, 0x07,
+        0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F,
+        0x0C, 0x00, 0x0F, 0x08, 0x00
+    };
+    for (uint8_t i = 0; i < 21; i++) {
+        ac_write(i, text_ac[i]);
     }
     inb(0x3DA);
     outb(0x3C0, 0x20);
@@ -522,11 +534,47 @@ void vga_set_mode_text_hardware(void) {
     is_gfx = false;
     has_saved_text_vram = false;
     vga_sanitize_text_vram();
+    mouse_set_bounds_from_display();
 }
 
 bool vga_is_graphics_mode(void) {
     outb(0x3CE, 0x06);
     return (inb(0x3CF) & 0x01) != 0;
+}
+
+void vga_gfx_get_screen_bounds(int *out_w, int *out_h) {
+    int w = 640;
+    int h = 400;
+
+    if (vbe_bga_is_available() && vbe_bga_is_enabled()) {
+        int bga_w = vbe_bga_get_width();
+        int bga_h = vbe_bga_get_height();
+        if (bga_w > 0 && bga_h > 0) {
+            w = bga_w;
+            h = bga_h;
+        }
+    } else if (is_gfx || vga_is_graphics_mode()) {
+        w = VGA_GFX_WIDTH;
+        h = VGA_GFX_HEIGHT;
+    } else {
+        w = 640;
+        h = 400;
+    }
+
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
+}
+
+int vga_gfx_get_width(void) {
+    int w = 0, h = 0;
+    vga_gfx_get_screen_bounds(&w, &h);
+    return w;
+}
+
+int vga_gfx_get_height(void) {
+    int w = 0, h = 0;
+    vga_gfx_get_screen_bounds(&w, &h);
+    return h;
 }
 
 void vga_set_mode_13h(void) {
@@ -783,9 +831,22 @@ void vga_gfx_buf_fill_circle(uint8_t *buf, int xc, int yc, int r, uint8_t color)
 }
 
 void vga_gfx_flip(const uint8_t *buf) {
-    if (!is_foreground_process()) return;
+    process_t *cur = process_get_current();
+    if (!is_foreground_process()) {
+        if (cur) {
+            if (!cur->gfx_vram_backup) {
+                cur->gfx_vram_backup = (uint8_t *)kmalloc(VGA_GFX_SIZE);
+            }
+            if (cur->gfx_vram_backup) {
+                memcpy(cur->gfx_vram_backup, buf, VGA_GFX_SIZE);
+            }
+        }
+        process_yield();
+        return;
+    }
     if (!vga_is_graphics_mode()) return;
 
     volatile uint8_t *vram = (volatile uint8_t *)VGA_VRAM_ADDR;
     memcpy((void *)vram, buf, VGA_GFX_SIZE);
+    process_yield();
 }

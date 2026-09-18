@@ -98,9 +98,9 @@ bool ipo_fs_format(uint64_t disk_start_lba, uint64_t total_blocks, uint64_t tota
     root.size = 40;
     write_inode(1, &root);
 
-    /* create /app directory (protected) */
+    /* create /applications directory (protected) */
     int app_ino = allocate_inode();
-    if (app_ino < 0) { printf("ipo_fs_format: allocate_inode failed for /app\n"); return false; }
+    if (app_ino < 0) { printf("ipo_fs_format: allocate_inode failed for /applications\n"); return false; }
     struct ipo_inode app_inode;
     memset(&app_inode, 0, sizeof(app_inode));
     app_inode.mode = IPO_INODE_TYPE_DIR | IPO_INODE_FLAG_PROTECTED;
@@ -108,14 +108,14 @@ bool ipo_fs_format(uint64_t disk_start_lba, uint64_t total_blocks, uint64_t tota
     app_inode.links_count = 2;
     write_inode(app_ino, &app_inode);
     int64_t app_block = allocate_block();
-    if (app_block < 0) { printf("ipo_fs_format: allocate_block failed for /app\n"); return false; }
+    if (app_block < 0) { printf("ipo_fs_format: allocate_block failed for /applications\n"); return false; }
     app_inode.extents[0].logical_block = 0;
     app_inode.extents[0].physical_block = (uint64_t)app_block;
     app_inode.extents[0].block_count = 1;
     write_dir_dots(app_ino, 1, (uint64_t)app_block);
     app_inode.size = 40;
     write_inode(app_ino, &app_inode);
-    if (!dir_add_entry(1, "app", app_ino, IPO_INODE_TYPE_DIR)) { printf("ipo_fs_format: dir_add_entry failed for /app\n"); return false; }
+    if (!dir_add_entry(1, "applications", app_ino, IPO_INODE_TYPE_DIR)) { printf("ipo_fs_format: dir_add_entry failed for /applications\n"); return false; }
 
     /* create /autorun file (protected, empty) */
     int autorun_ino = allocate_inode();

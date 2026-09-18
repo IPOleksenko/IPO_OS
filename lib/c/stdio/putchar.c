@@ -4,13 +4,22 @@
 #include <ioport.h>
 #include <kernel/terminal.h>
 #include <kernel/driver.h>
+#include <kernel/process.h>
+#include <memory/kmalloc.h>
+#include <string.h>
 
 // Simple spinlock to prevent race conditions during VGA output
 static volatile uint8_t output_lock = 0;
 
+bool putchar_is_locked(void) {
+    return output_lock != 0;
+}
+
 static void acquire_output_lock(void) {
     while (__sync_lock_test_and_set(&output_lock, 1)) {
-        // Spin until lock is free
+        if (process_is_batch_active() && process_in_process_context()) {
+            process_yield();
+        }
     }
 }
 
@@ -27,15 +36,48 @@ void putchar(char c) {
 
 void putchar_color(char c, uint8_t fg, uint8_t bg) {
     serial_putc(c);
-    if (vga_is_graphics_mode()) {
-        c = driver_dispatch_char_output(c);
-        return;
+
+    process_t *curr = process_get_current();
+    if (process_is_batch_active() && !process_get_separate_windows() && curr && !curr->wants_graphics && !curr->is_wm_app) {
+        if (curr->text_output_len + 2 > curr->text_output_cap) {
+            uint32_t ncap = curr->text_output_cap ? curr->text_output_cap * 2 : 256;
+            char *nb = (char *)kmalloc(ncap);
+            if (nb) {
+                if (curr->text_output_buf) {
+                    memcpy(nb, curr->text_output_buf, curr->text_output_len);
+                    kfree(curr->text_output_buf);
+                }
+                curr->text_output_buf = nb;
+                curr->text_output_cap = ncap;
+            }
+        }
+        if (curr->text_output_buf && curr->text_output_len + 1 < curr->text_output_cap) {
+            curr->text_output_buf[curr->text_output_len++] = c;
+            curr->text_output_buf[curr->text_output_len] = '\0';
+        }
     }
-    terminal_on_external_output();
+
+    bool has_virtual = (process_get_separate_windows() && curr != NULL && curr->text_vram_backup != NULL);
+    process_t *active_disp = process_get_separate_windows() ? process_get_displayed_foreground() : process_get_foreground();
+    bool is_fg = (!has_virtual || curr == active_disp);
+
+    if (vga_is_graphics_mode()) {
+        if (!has_virtual) {
+            c = driver_dispatch_char_output(c);
+            return;
+        }
+    }
+
+    if (is_fg && !vga_is_graphics_mode()) {
+        if (terminal_get_bottom_buffer_count() > 0) {
+            terminal_return_to_present();
+        }
+        terminal_on_external_output();
+    }
     acquire_output_lock();
 
-    volatile uint16_t *vga = VGA_MEMORY;
-    uint16_t cursor = vga_get_cursor_position();
+    volatile uint16_t *vga = has_virtual ? curr->text_vram_backup : VGA_MEMORY;
+    uint16_t cursor = has_virtual ? curr->text_cursor_pos : vga_get_cursor_position();
     uint16_t top_row = VGA_START_CURSOR_POSITION / VGA_WIDTH;
     uint16_t terminal_rows = VGA_HEIGHT - top_row;
     uint16_t terminal_bottom = (top_row + terminal_rows) * VGA_WIDTH;
@@ -87,7 +129,9 @@ void putchar_color(char c, uint8_t fg, uint8_t bg) {
         cursor = VGA_START_CURSOR_POSITION;
     }
 
-    vga_cursor_erase();
+    if (is_fg && !vga_is_graphics_mode()) {
+        vga_cursor_erase();
+    }
 
     if (c == '\n') {
         uint16_t row = cursor / VGA_WIDTH;
@@ -106,22 +150,49 @@ void putchar_color(char c, uint8_t fg, uint8_t bg) {
             spaces = 8;
         }
         if (cursor + spaces >= terminal_bottom) {
-            terminal_auto_scroll();
+            if (has_virtual) {
+                if (is_fg && !vga_is_graphics_mode()) {
+                    terminal_auto_scroll();
+                } else {
+                    process_workspace_auto_scroll(curr);
+                }
+            } else {
+                terminal_auto_scroll();
+            }
             cursor = last_line_start;
         } else {
             cursor += spaces;
         }
     } else {
         if (cursor >= terminal_bottom) {
-            terminal_auto_scroll();
+            if (has_virtual) {
+                if (is_fg && !vga_is_graphics_mode()) {
+                    terminal_auto_scroll();
+                } else {
+                    process_workspace_auto_scroll(curr);
+                }
+            } else {
+                terminal_auto_scroll();
+            }
             cursor = last_line_start;
         }
         vga[cursor] = vga_entry((unsigned char)c, fg, bg);
+        if (has_virtual && is_fg && !vga_is_graphics_mode()) {
+            VGA_MEMORY[cursor] = vga_entry((unsigned char)c, fg, bg);
+        }
         cursor++;
     }
 
     if (cursor >= terminal_bottom) {
-        terminal_auto_scroll();
+        if (has_virtual) {
+            if (is_fg && !vga_is_graphics_mode()) {
+                terminal_auto_scroll();
+            } else {
+                process_workspace_auto_scroll(curr);
+            }
+        } else {
+            terminal_auto_scroll();
+        }
         cursor = last_line_start;
     }
 
@@ -129,6 +200,11 @@ void putchar_color(char c, uint8_t fg, uint8_t bg) {
         cursor = VGA_START_CURSOR_POSITION;
     }
 
-    vga_set_cursor(cursor);
+    if (has_virtual) {
+        curr->text_cursor_pos = cursor;
+    }
+    if (is_fg && !vga_is_graphics_mode()) {
+        vga_set_cursor(cursor);
+    }
     release_output_lock();
 }

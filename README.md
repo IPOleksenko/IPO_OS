@@ -97,7 +97,7 @@ make patch-config
 ## **load_apps.py**
 
 - **File:** [load_apps.py](load_apps.py)
-- **Purpose:** loads compiled applications into the OS disk image so they are available from `/app` at runtime.
+- **Purpose:** loads compiled applications into the OS disk image so they are available from `/applications` at runtime.
 
 ### Usage
 

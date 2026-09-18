@@ -5,6 +5,7 @@
 #include <string.h>
 #include <ioport.h>
 #include <stdio.h>
+#include <syscall.h>
 
 static uint8_t icmp_tx_buf[1500];
 
@@ -109,6 +110,7 @@ bool icmp_poll_reply(uint16_t id, uint16_t seq, icmp_echo_reply_t *out_reply, ui
                 return true;
             }
         }
+        ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
         io_wait();
     }
 

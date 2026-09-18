@@ -811,6 +811,7 @@ static void syscall_read_render(int32_t *start_cursor_ptr, int32_t start_origin,
     }
 
     volatile uint16_t *vga = VGA_MEMORY;
+    process_t *proc = process_get_current();
 
     /* Draw text */
     size_t vcol = 0;
@@ -822,7 +823,11 @@ static void syscall_read_render(int32_t *start_cursor_ptr, int32_t start_origin,
             for (size_t s = 0; s < tab_spaces; s++) {
                 int32_t off = *start_cursor_ptr + (int32_t)(vcol + s);
                 if (off >= VGA_START_CURSOR_POSITION && off < VGA_WIDTH * VGA_HEIGHT) {
-                    vga[off] = vga_entry(' ', VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                    uint16_t entry = vga_entry(' ', VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                    vga[off] = entry;
+                    if (proc && proc->text_vram_backup) {
+                        proc->text_vram_backup[off] = entry;
+                    }
                 }
             }
             vcol += tab_spaces;
@@ -833,7 +838,11 @@ static void syscall_read_render(int32_t *start_cursor_ptr, int32_t start_origin,
 
             int32_t off = *start_cursor_ptr + (int32_t)vcol;
             if (off >= VGA_START_CURSOR_POSITION && off < VGA_WIDTH * VGA_HEIGHT) {
-                vga[off] = vga_entry(glyph, VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                uint16_t entry = vga_entry(glyph, VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+                vga[off] = entry;
+                if (proc && proc->text_vram_backup) {
+                    proc->text_vram_backup[off] = entry;
+                }
             }
             vcol += 1;
             i += bytes;
@@ -844,7 +853,11 @@ static void syscall_read_render(int32_t *start_cursor_ptr, int32_t start_origin,
     for (size_t i = vcol; i < vis_prev; i++) {
         int32_t off = *start_cursor_ptr + (int32_t)i;
         if (off >= VGA_START_CURSOR_POSITION && off < VGA_WIDTH * VGA_HEIGHT) {
-            vga[off] = vga_entry(' ', VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+            uint16_t entry = vga_entry(' ', VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+            vga[off] = entry;
+            if (proc && proc->text_vram_backup) {
+                proc->text_vram_backup[off] = entry;
+            }
         }
     }
 
@@ -854,6 +867,10 @@ static void syscall_read_render(int32_t *start_cursor_ptr, int32_t start_origin,
     if (cur >= VGA_WIDTH * VGA_HEIGHT) cur = VGA_WIDTH * VGA_HEIGHT - 1;
     vga_set_cursor((uint16_t)cur);
     vga_show_cursor();
+    if (proc) {
+        proc->text_cursor_pos = (uint16_t)cur;
+        proc->text_cursor_visible = true;
+    }
 }
 
 static uint32_t syscall_builtin_read(uint32_t num,
@@ -897,13 +914,16 @@ static uint32_t syscall_builtin_read(uint32_t num,
             proc->waiting_for_input = true;
         }
         process_yield();
-        if (system_is_interrupted()) {
+        if (proc && !proc->is_running) {
             if (max_len == 0u && out_ptr != NULL) {
                 kfree(buffer);
                 *out_ptr = NULL;
             }
             return (uint32_t)(-2);
         }
+    }
+    if (proc) {
+        proc->waiting_for_input = false;
     }
 
     system_state_t prev_state = system_get_state();
@@ -923,10 +943,30 @@ static uint32_t syscall_builtin_read(uint32_t num,
     buffer[0] = '\0';
 
     for (;;) {
+        if (!process_is_foreground()) {
+            if (proc) {
+                proc->waiting_for_input = true;
+            }
+            process_yield();
+            if (proc && !proc->is_running) {
+                keyboard_set_app_input_mode(false);
+                system_set_state(proc ? SYSTEM_STATE_PROCESS_RUNNING : prev_state);
+                if (max_len == 0u && out_ptr != NULL) {
+                    kfree(buffer);
+                    *out_ptr = NULL;
+                }
+                return (uint32_t)(-2);
+            }
+            continue;
+        }
+        if (proc) {
+            proc->waiting_for_input = false;
+        }
+
         uint8_t scancode = keyboard_wait_scancode();
 
         if (scancode == 0x00u) {
-            if (system_is_interrupted()) {
+            if (system_is_interrupted() && process_is_foreground()) {
                 keyboard_set_app_input_mode(false);
                 system_set_state(proc ? SYSTEM_STATE_PROCESS_RUNNING : prev_state);
                 if (max_len == 0u && out_ptr != NULL) {
@@ -987,14 +1027,14 @@ static uint32_t syscall_builtin_read(uint32_t num,
 
         /* Navigation and Scrolling keys */
         if (scancode == 0x49) { /* Page Up */
-            for (int i = 0; i < 5 && terminal_get_top_buffer_count() > 0; i++) {
+            if (terminal_get_top_buffer_count() > 0) {
                 terminal_scroll_up();
                 start_cursor += VGA_WIDTH;
             }
             continue;
         }
         if (scancode == 0x51) { /* Page Down */
-            for (int i = 0; i < 5 && terminal_get_bottom_buffer_count() > 0; i++) {
+            if (terminal_get_bottom_buffer_count() > 0) {
                 terminal_scroll_down();
                 start_cursor -= VGA_WIDTH;
             }
@@ -1516,6 +1556,11 @@ static uint32_t syscall_builtin_wm_get_focused(uint32_t num, uint32_t argc, uint
     return (uint32_t)(uintptr_t)wm_get_focused();
 }
 
+static uint32_t syscall_builtin_wm_get_list(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    return (uint32_t)(uintptr_t)wm_get_window_list();
+}
+
 static uint32_t syscall_builtin_wm_set_focus(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num; (void)argc;
     if (!argv || !argv[0]) return 0;
@@ -1580,10 +1625,23 @@ static uint32_t syscall_builtin_process_is_foreground(uint32_t num, uint32_t arg
     process_t *fg = process_get_foreground();
     if (!fg || !cur) return 1;
     bool is_fg = (cur == fg);
-    if (!is_fg && !wm_session_active()) {
-        cur->waiting_for_input = true;
-    }
     return is_fg ? 1 : 0;
+}
+
+static uint32_t syscall_builtin_process_is_batch_active(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    return process_is_batch_active() ? 1 : 0;
+}
+
+static uint32_t syscall_builtin_process_switch_fg(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (!process_is_batch_active()) return 0;
+    if (argc > 0 && argv && argv[0] == 1) {
+        process_switch_foreground_prev();
+    } else {
+        process_switch_foreground_next();
+    }
+    return 0;
 }
 
 static uint32_t syscall_builtin_vga_set_mode(uint32_t num, uint32_t argc, uint32_t *argv) {
@@ -1705,6 +1763,14 @@ void syscall_init(void) {
     ipo_register_syscall(
         IPO_SYSCALL_PROCESS_IS_FOREGROUND,
         syscall_builtin_process_is_foreground);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_PROCESS_IS_BATCH_ACTIVE,
+        syscall_builtin_process_is_batch_active);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_PROCESS_SWITCH_FG,
+        syscall_builtin_process_switch_fg);
 
     ipo_register_syscall(
         IPO_SYSCALL_GETCWD,
@@ -1865,6 +1931,10 @@ void syscall_init(void) {
     ipo_register_syscall(
         IPO_SYSCALL_WM_GET_FOCUSED,
         syscall_builtin_wm_get_focused);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_WM_GET_LIST,
+        syscall_builtin_wm_get_list);
 
     ipo_register_syscall(
         IPO_SYSCALL_WM_SET_FOCUS,

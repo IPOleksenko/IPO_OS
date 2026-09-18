@@ -19,6 +19,8 @@
 #include <driver/input/keyboard.h>
 #include <driver/input/keymap/keymap.h>
 #include <ioport.h>
+#include <syscall.h>
+#include <system/state.h>
 
 static void print_usage(void) {
     printf("Usage: ping [-c count] [-i interval] [-s packetsize] [-t ttl] [-W timeout] [-q] <destination>\n");
@@ -33,6 +35,9 @@ static void print_usage(void) {
 }
 
 static bool check_user_interrupted(void) {
+    if (system_is_interrupted()) {
+        return true;
+    }
     keyboard_poll();
     uint8_t sc = keyboard_get_scancode();
     if (sc == 0x01 || sc == 0x10) { // ESC or 'q'
@@ -51,6 +56,7 @@ static void wait_with_interrupt(uint32_t wait_ms) {
             return;
         }
         net_poll();
+        ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
         io_wait();
     }
 }

@@ -55,6 +55,7 @@ void vga_sanitize_text_vram(void);
 
 uint16_t vga_get_cursor_position(void);
 bool vga_is_cursor_visible(void);
+bool vga_is_graphics_mode(void);
 
 uint16_t vga_increment_cursor_position(void);
 

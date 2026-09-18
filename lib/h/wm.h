@@ -28,8 +28,8 @@
  * Mouse cursor
  * ============
  * The compositor draws a software arrow cursor on every frame using the
- * position from mouse_get_state().  mouse_set_bounds(320,200) is called
- * during session start so coordinates are in Mode-13h screen space.
+ * position from mouse_get_state(). Mouse boundaries are dynamically derived
+ * from the active display area during session start/mode switches.
  */
 
 #ifndef LIB_WM_H
@@ -149,6 +149,7 @@ struct wm_window {
     wm_event_cb_t event_cb;
     void         *user_data;
     uint32_t      owner_pid;
+    int           window_id; // Workspace ID in batch mode
 
     bool dirty;
 
@@ -196,8 +197,12 @@ void         wm_destroy_window(wm_window_t *win);
 bool         wm_is_window_valid(wm_window_t *win);
 
 int          wm_get_window_count(void);
+int          wm_get_window_count_for_pid(uint32_t pid);
+bool         wm_has_windows_for_pid(uint32_t pid);
+wm_window_t *wm_get_window_list(void);
 wm_window_t *wm_get_focused(void);
 void         wm_set_focus(wm_window_t *win);
+void         wm_focus_window_for_pid(uint32_t pid);
 void         wm_focus_next(void);
 void         wm_focus_prev(void);
 
@@ -259,5 +264,10 @@ wm_window_t *wm_register_window(const char *title,
                                   wm_event_cb_t event_cb,
                                   void *user_data);
 void wm_remove_window(wm_window_t *win);
+
+/**
+ * Get current display/compositor screen bounds in pixels.
+ */
+void wm_get_screen_bounds(int *out_w, int *out_h);
 
 #endif /* LIB_WM_H */

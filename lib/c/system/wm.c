@@ -72,6 +72,7 @@
  * ========================================================================= */
 #define WM_FONT_W 6
 #define WM_FONT_H 8
+#define TITLEBAR_H 11
 
 static const uint8_t wm_font[95][WM_FONT_H] = {
 /*sp*/{0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
@@ -266,8 +267,15 @@ int wm_get_window_count(void) {
     return (int)ipo_syscall(IPO_SYSCALL_WM_GET_COUNT, 0u, NULL);
 }
 
+int wm_get_window_count_for_pid(uint32_t pid) { (void)pid; return 0; }
+bool wm_has_windows_for_pid(uint32_t pid) { (void)pid; return false; }
+
 wm_window_t *wm_get_focused(void) {
     return (wm_window_t *)(uintptr_t)ipo_syscall(IPO_SYSCALL_WM_GET_FOCUSED, 0u, NULL);
+}
+
+wm_window_t *wm_get_window_list(void) {
+    return (wm_window_t *)(uintptr_t)ipo_syscall(IPO_SYSCALL_WM_GET_LIST, 0u, NULL);
 }
 
 void wm_set_focus(wm_window_t *win) {
@@ -276,12 +284,18 @@ void wm_set_focus(wm_window_t *win) {
     ipo_syscall(IPO_SYSCALL_WM_SET_FOCUS, 1u, args);
 }
 
+void wm_focus_window_for_pid(uint32_t pid) { (void)pid; }
+
 void wm_focus_next(void) {
     ipo_syscall(IPO_SYSCALL_WM_FOCUS_NEXT, 0u, NULL);
 }
 
 void wm_focus_prev(void) {
     ipo_syscall(IPO_SYSCALL_WM_FOCUS_PREV, 0u, NULL);
+}
+
+void wm_get_screen_bounds(int *out_w, int *out_h) {
+    vga_gfx_get_screen_bounds(out_w, out_h);
 }
 
 void wm_invalidate(wm_window_t *win) {
@@ -363,6 +377,20 @@ static bool wm_prev_right  = false;
 /* Static 64 KB backbuffer in BSS (never freed, always available) */
 static uint8_t wm_backbuf[VGA_GFX_SIZE];
 
+static bool wm_window_is_visible_for_fg(const wm_window_t *w) {
+    if (!w) return false;
+    if (!process_is_batch_active()) return true;
+    if (!process_get_separate_windows()) return true; /* For single desktop batch: all windows visible */
+    process_t *fg = process_get_foreground();
+    if (!fg) return false;
+    if (w->owner_pid != 0) {
+        process_t *owner = process_find_by_pid(w->owner_pid);
+        int wid = owner ? owner->window_id : w->window_id;
+        return (wid == fg->window_id);
+    }
+    return (w->window_id == fg->window_id);
+}
+
 /* =========================================================================
  * Section 5: Core window API
  * ========================================================================= */
@@ -371,6 +399,12 @@ void wm_init(void) { wm_head=wm_tail=NULL; wm_count=0; }
 
 wm_window_t *wm_create_window(const wm_window_options_t *opts) {
     if (!opts) return NULL;
+
+    process_t *cur_proc = process_get_current();
+    if (cur_proc) {
+        cur_proc->is_wm_app = true;
+        cur_proc->wants_graphics = true;
+    }
 
     /* Auto-start WM session if not already running */
     if (!wm_sess_active) wm_session_start();
@@ -386,7 +420,7 @@ wm_window_t *wm_create_window(const wm_window_options_t *opts) {
         int16_t req_y = opts->y;
         /* If multiple windows share identical coordinates, cascade them slightly so they don't occlude */
         for (wm_window_t *w = wm_head; w; w = w->next) {
-            if (w->x == req_x && w->y == req_y && !w->fullscreen) {
+            if (wm_window_is_visible_for_fg(w) && w->x == req_x && w->y == req_y && !w->fullscreen) {
                 req_x = (int16_t)((req_x + 22) % (VGA_GFX_WIDTH - 60));
                 req_y = (int16_t)((req_y + 16) % (VGA_GFX_HEIGHT - 40));
                 if (req_y < 12) req_y = 12;
@@ -395,7 +429,12 @@ wm_window_t *wm_create_window(const wm_window_options_t *opts) {
         win->x=req_x; win->y=req_y;
         win->w = opts->w>0 ? opts->w : 80;
         win->h = opts->h>0 ? opts->h : 50;
-        if(win->x<0) win->x=0; if(win->y<0) win->y=0;
+        if(win->x<2) win->x=2;
+        if(opts->decor_style != WM_DECOR_NONE && win->y < TITLEBAR_H + 2) {
+            win->y = TITLEBAR_H + 2;
+        } else if (win->y < 0) {
+            win->y = 0;
+        }
         if(win->x>=VGA_GFX_WIDTH)  win->x=(int16_t)(VGA_GFX_WIDTH-1);
         if(win->y>=VGA_GFX_HEIGHT) win->y=(int16_t)(VGA_GFX_HEIGHT-1);
     }
@@ -423,8 +462,8 @@ wm_window_t *wm_create_window(const wm_window_options_t *opts) {
     win->draw_cb      = opts->draw_cb;   /* kept for wm_session_run() */
     win->event_cb     = opts->event_cb;
     win->user_data    = opts->user_data;
-    process_t *cur_proc = process_get_current();
     win->owner_pid    = cur_proc ? cur_proc->pid : 0;
+    win->window_id    = cur_proc ? cur_proc->window_id : 0;
 
     /* Copy the shape mask into kernel heap so it remains valid after the
        calling app exits (the original array lives in app memory).          */
@@ -525,10 +564,40 @@ void wm_destroy_window(wm_window_t *win) {
     if (win->shape_mask_owned && win->shape_mask) kfree((void *)win->shape_mask);
     if (win->title) kfree(win->title);
     kfree(win);
+
+    if (wm_sess_active) {
+        wm_invalidate_all();
+    }
 }
 
 int          wm_get_window_count(void) { return wm_count; }
-wm_window_t *wm_get_focused(void)      { return wm_tail; }
+
+int          wm_get_window_count_for_pid(uint32_t pid) {
+    if (pid == 0) return 0;
+    int c = 0;
+    for (wm_window_t *w = wm_head; w; w = w->next) {
+        if (w->owner_pid == pid) c++;
+    }
+    return c;
+}
+
+bool         wm_has_windows_for_pid(uint32_t pid) {
+    if (pid == 0) return false;
+    for (wm_window_t *w = wm_head; w; w = w->next) {
+        if (w->owner_pid == pid) return true;
+    }
+    return false;
+}
+
+wm_window_t *wm_get_window_list(void)  { return wm_head; }
+wm_window_t *wm_get_focused(void) {
+    for (wm_window_t *w = wm_tail; w; w = w->prev) {
+        if (wm_window_is_visible_for_fg(w) && !w->minimized) {
+            return w;
+        }
+    }
+    return NULL;
+}
 
 void wm_set_focus(wm_window_t *win) {
     if (!win) return;
@@ -549,8 +618,55 @@ void wm_set_focus(wm_window_t *win) {
         }
     }
 }
-void wm_focus_next(void) { if(wm_head && wm_count>=2) wm_set_focus(wm_head); }
-void wm_focus_prev(void) { if(wm_tail && wm_count>=2 && wm_tail->prev) wm_set_focus(wm_tail->prev); }
+
+void wm_focus_window_for_pid(uint32_t pid) {
+    if (pid == 0) return;
+    for (wm_window_t *w = wm_tail; w; w = w->prev) {
+        if (w->owner_pid == pid && !w->minimized) {
+            wm_set_focus(w);
+            return;
+        }
+    }
+    for (wm_window_t *w = wm_tail; w; w = w->prev) {
+        if (w->owner_pid == pid) {
+            w->minimized = false;
+            wm_set_focus(w);
+            return;
+        }
+    }
+}
+void wm_focus_next(void) {
+    wm_window_t *cur = wm_get_focused();
+    wm_window_t *start = cur ? cur->next : wm_head;
+    for (wm_window_t *w = start; w; w = w->next) {
+        if (wm_window_is_visible_for_fg(w) && !w->minimized) {
+            wm_set_focus(w);
+            return;
+        }
+    }
+    for (wm_window_t *w = wm_head; w && w != cur; w = w->next) {
+        if (wm_window_is_visible_for_fg(w) && !w->minimized) {
+            wm_set_focus(w);
+            return;
+        }
+    }
+}
+void wm_focus_prev(void) {
+    wm_window_t *cur = wm_get_focused();
+    wm_window_t *start = cur ? cur->prev : wm_tail;
+    for (wm_window_t *w = start; w; w = w->prev) {
+        if (wm_window_is_visible_for_fg(w) && !w->minimized) {
+            wm_set_focus(w);
+            return;
+        }
+    }
+    for (wm_window_t *w = wm_tail; w && w != cur; w = w->prev) {
+        if (wm_window_is_visible_for_fg(w) && !w->minimized) {
+            wm_set_focus(w);
+            return;
+        }
+    }
+}
 
 void wm_invalidate(wm_window_t *win) { if(win) win->dirty=true; }
 void wm_invalidate_all(void)         { for(wm_window_t *w=wm_head;w;w=w->next) w->dirty=true; }
@@ -700,7 +816,9 @@ void wm_set_fullscreen(wm_window_t *win, bool enable) {
 /* =========================================================================
  * Section 6: Windows 95 Colors and 3D primitives
  * ========================================================================= */
+#ifndef TITLEBAR_H
 #define TITLEBAR_H   11
+#endif
 #define TASKBAR_Y    186
 #define TASKBAR_H    14
 
@@ -919,8 +1037,10 @@ static void draw_taskbar(uint8_t *bb) {
     int visible_tab = 0;
     int tab_w = 40;
     int tab_h = 10;
-    for (wm_window_t *w = wm_head; w; w = w->next, win_idx++) {
-        if (win_idx < taskbar_scroll_offset) continue;
+    for (wm_window_t *w = wm_head; w; w = w->next) {
+        if (!wm_window_is_visible_for_fg(w)) continue;
+        if (win_idx < taskbar_scroll_offset) { win_idx++; continue; }
+        win_idx++;
         if (visible_tab >= 3) break;
 
         int tx = 54 + visible_tab * 43;
@@ -1012,12 +1132,17 @@ void wm_compose(uint8_t *backbuf) {
     /* 1. Windows 95 Teal desktop */
     memset(backbuf, WIN_CLR_DESKTOP, VGA_GFX_SIZE);
 
+    wm_window_t *fw = wm_get_focused();
+    bool top_fullscreen = (fw && fw->fullscreen && !fw->minimized);
+    int max_y = top_fullscreen ? VGA_GFX_HEIGHT : TASKBAR_Y;
+
     /* 2. Windows (back to front) */
     for (wm_window_t *win = wm_head; win; win = win->next) {
+        if (!wm_window_is_visible_for_fg(win)) continue;
         if (win->minimized) continue;
         for (int row = 0; row < (int)win->h; row++) {
             int sy = (int)win->y + row;
-            if (sy < 0 || sy >= TASKBAR_Y) continue;
+            if (sy < 0 || sy >= max_y) continue;
             for (int col = 0; col < (int)win->w; col++) {
                 int sx = (int)win->x + col;
                 if (sx < 0 || sx >= VGA_GFX_WIDTH) continue;
@@ -1030,8 +1155,10 @@ void wm_compose(uint8_t *backbuf) {
         draw_decorations(win, backbuf);
     }
 
-    /* 4. Taskbar at bottom */
-    draw_taskbar(backbuf);
+    /* 4. Taskbar at bottom (hidden if focused window is fullscreen) */
+    if (!top_fullscreen) {
+        draw_taskbar(backbuf);
+    }
 }
 
 /* =========================================================================
@@ -1046,7 +1173,7 @@ bool wm_dispatch_key(uint8_t scancode) {
         return true;
     }
     if ((keyboard_is_alt_pressed() && make == 0x3E /* F4 */) ||
-        (keyboard_is_ctrl_pressed() && (make == 0x11 /* W */ || make == 0x10 /* Q */))) {
+        (keyboard_is_ctrl_pressed() && make == 0x11 /* W */)) {
         wm_window_t *fw = wm_get_focused();
         if (fw) {
             wm_destroy_window(fw);
@@ -1083,6 +1210,10 @@ static int32_t drag_start_mx = 0, drag_start_my = 0;
 
 void wm_compositor_tick(void) {
     if (!wm_sess_active) return;
+    if (process_is_batch_active() && process_get_separate_windows()) {
+        process_t *cur_fg = process_get_foreground();
+        if (cur_fg && !cur_fg->is_wm_app && !cur_fg->wants_graphics) return;
+    }
 
     /* Keyboard */
     uint8_t sc;
@@ -1096,13 +1227,29 @@ void wm_compositor_tick(void) {
             } else if (make == 0x0F) { /* Tab / Shift+Tab */
                 if(keyboard_is_shift_pressed()) wm_focus_prev(); else wm_focus_next();
             } else if ((keyboard_is_alt_pressed() && make == 0x3E /* F4 */) ||
-                       (keyboard_is_ctrl_pressed() && (make == 0x11 /* W */ || make == 0x10 /* Q */))) {
+                       (keyboard_is_ctrl_pressed() && make == 0x11 /* W */)) {
                 /* Close focused window */
                 wm_window_t *fw = wm_get_focused();
                 if (fw) {
                     wm_destroy_window(fw);
+                    return;
                 }
-            } else if (keyboard_is_ctrl_pressed()) {
+            } else if (keyboard_is_ctrl_pressed() && (make == 0x49 || make == 0x51)) {
+                /* Ctrl + PageUp (0x49) / Ctrl + PageDown (0x51): switch workspace in batch mode */
+                if (process_is_batch_active() && process_get_separate_windows()) {
+                    if (make == 0x49) {
+                        process_switch_foreground_prev();
+                    } else {
+                        process_switch_foreground_next();
+                    }
+                    process_t *nfg = process_get_foreground();
+                    if (nfg && (nfg->is_wm_app || !process_get_separate_windows())) {
+                        wm_focus_window_for_pid(nfg->pid);
+                        wm_invalidate_all();
+                    }
+                }
+                return;
+            } else if (keyboard_is_ctrl_pressed() && (make == 0x48 || make == 0x50 || make == 0x4B || make == 0x4D)) {
                 wm_window_t *fw=wm_get_focused();
                 if (fw) {
                     if(make==0x48) wm_move(fw,fw->x,(int16_t)(fw->y-4));
@@ -1114,24 +1261,35 @@ void wm_compositor_tick(void) {
                 wm_window_t *fw=wm_get_focused();
                 if (fw) {
                     wm_dispatch_window_event(fw, WM_EVENT_KEY_DOWN, (uint32_t)sc);
-                } else if (wm_count == 0 && (make == 0x01 || (keyboard_is_ctrl_pressed() && make == 0x2E))) {
-                    wm_session_stop();
-                    return;
                 }
             }
         }
     }
     if (!wm_sess_active) return;
+    if (process_is_batch_active() && process_get_separate_windows()) {
+        process_t *cur_fg = process_get_foreground();
+        if (cur_fg && !cur_fg->is_wm_app && !cur_fg->wants_graphics) return;
+    }
 
     /* Mouse */
     mouse_poll();
+    if (!wm_sess_active) return;
+    if (process_is_batch_active() && process_get_separate_windows()) {
+        process_t *cur_fg = process_get_foreground();
+        if (cur_fg && !cur_fg->is_wm_app && !cur_fg->wants_graphics) return;
+    }
+    if (!vga_is_graphics_mode()) return;
+
     mouse_state_t ms;
     mouse_get_state(&ms);
     bool left_now = ms.left_button;
     bool right_now = ms.right_button;
 
+    wm_window_t *top_win = wm_get_focused();
+    bool top_fullscreen = (top_win && top_win->fullscreen && !top_win->minimized);
+
     if (right_now && !wm_prev_right) {
-        if (ms.y >= TASKBAR_Y) {
+        if (ms.y >= TASKBAR_Y && !top_fullscreen) {
             /* 1. Window tabs right-click (ПКМ - close clicked window directly!) */
             if (ms.x >= 54 && ms.x <= 182) {
                 int rel_x = (int)ms.x - 54;
@@ -1139,7 +1297,8 @@ void wm_compositor_tick(void) {
                 if (rel_x % 43 <= 40) {
                     int target_idx = taskbar_scroll_offset + tab_idx;
                     int cur_idx = 0;
-                    for (wm_window_t *w = wm_head; w; w = w->next, cur_idx++) {
+                    for (wm_window_t *w = wm_head; w; w = w->next) {
+                        if (!wm_window_is_visible_for_fg(w)) continue;
                         if (cur_idx == target_idx) {
                             wm_destroy_window(w);
                             if (taskbar_scroll_offset > 0 && taskbar_scroll_offset >= wm_count) {
@@ -1147,6 +1306,7 @@ void wm_compositor_tick(void) {
                             }
                             break;
                         }
+                        cur_idx++;
                     }
                 }
             }
@@ -1162,9 +1322,44 @@ void wm_compositor_tick(void) {
         bool handled = false;
 
         /* 1. Check Taskbar */
-        if (ms.y >= TASKBAR_Y) {
+        if (ms.y >= TASKBAR_Y && !top_fullscreen) {
             /* Start / Exit button */
             if (ms.x >= 2 && ms.x <= 42) {
+                if (process_is_batch_active() && process_get_separate_windows()) {
+                    process_t *fg = process_get_foreground();
+                    if (fg) {
+                        int wid = fg->window_id;
+                        wm_window_t *w = wm_head;
+                        while (w) {
+                            wm_window_t *next = w->next;
+                            if (w->window_id == wid || (fg->pid && w->owner_pid == fg->pid)) {
+                                if (w->owner_pid) {
+                                    process_t *op = process_find_by_pid(w->owner_pid);
+                                    if (op) op->completed_and_acknowledged = true;
+                                }
+                                wm_destroy_window(w);
+                            }
+                            w = next;
+                        }
+                        fg->completed_and_acknowledged = true;
+                        process_t *new_fg = process_get_foreground();
+                        if (new_fg) {
+                            process_set_foreground(new_fg);
+                        }
+                        if (wm_count == 0) {
+                            wm_session_stop();
+                        } else {
+                            if (new_fg && (new_fg->wants_graphics || new_fg->is_wm_app)) {
+                                wm_invalidate_all();
+                            }
+                        }
+                        return;
+                    }
+                }
+                process_t *fg = process_get_foreground();
+                if (fg) {
+                    fg->completed_and_acknowledged = true;
+                }
                 wm_session_stop();
                 return;
             }
@@ -1186,7 +1381,8 @@ void wm_compositor_tick(void) {
                     int target_idx = taskbar_scroll_offset + tab_idx;
                     int tab_in_x = rel_x % 43;
                     int cur_idx = 0;
-                    for (wm_window_t *w = wm_head; w; w = w->next, cur_idx++) {
+                    for (wm_window_t *w = wm_head; w; w = w->next) {
+                        if (!wm_window_is_visible_for_fg(w)) continue;
                         if (cur_idx == target_idx) {
                             if (tab_in_x >= 30 && tab_in_x <= 39) {
                                 /* Clicked dedicated [x] button on this tab: close ONLY this window! */
@@ -1206,7 +1402,7 @@ void wm_compositor_tick(void) {
                                 /* Already active and focused -> minimize */
                                 w->minimized = true;
                                 for (wm_window_t *pw = wm_tail; pw; pw = pw->prev) {
-                                    if (!pw->minimized) {
+                                    if (wm_window_is_visible_for_fg(pw) && !pw->minimized) {
                                         wm_set_focus(pw);
                                         break;
                                     }
@@ -1215,6 +1411,7 @@ void wm_compositor_tick(void) {
                             handled = true;
                             break;
                         }
+                        cur_idx++;
                     }
                 }
             }
@@ -1229,6 +1426,7 @@ void wm_compositor_tick(void) {
         /* 2. Check Windows (top to bottom) */
         if (!handled) {
             for (wm_window_t *w = wm_tail; w; w = w->prev) {
+                if (!wm_window_is_visible_for_fg(w)) continue;
                 if (w->minimized) continue;
 
                 int wx0 = (int)w->x - 2;
@@ -1393,6 +1591,10 @@ void wm_compositor_tick(void) {
         return;
     }
 
+    if (!vga_is_graphics_mode()) {
+        return;
+    }
+
     /* Compose & flip */
     wm_compose(wm_backbuf);
     draw_cursor(wm_backbuf, (int)ms.x, (int)ms.y);
@@ -1405,12 +1607,26 @@ void wm_compositor_tick(void) {
 
 bool wm_session_active(void) { return wm_sess_active; }
 
+void wm_get_screen_bounds(int *out_w, int *out_h) {
+    vga_gfx_get_screen_bounds(out_w, out_h);
+}
+
 /** wm_session_start — start async compositor, return immediately. */
 void wm_session_start(void) {
     if (wm_sess_active) return;
-    vga_set_mode_13h_hardware();
-    vga_gfx_init_default_palette();
-    mouse_set_bounds(VGA_GFX_WIDTH, VGA_GFX_HEIGHT);
+
+    process_t *fg = process_get_foreground();
+    bool should_switch_hw = (!process_is_batch_active() || !process_get_separate_windows() || (fg && (fg->wants_graphics || fg->is_wm_app)));
+
+    if (should_switch_hw) {
+        vga_set_mode_13h_hardware();
+        vga_gfx_init_default_palette();
+    }
+
+    int screen_w = 0, screen_h = 0;
+    wm_get_screen_bounds(&screen_w, &screen_h);
+    mouse_set_bounds(screen_w, screen_h);
+
     keyboard_flush_queue();
     keyboard_flush_hardware();
     wm_sess_active = true;
@@ -1421,8 +1637,10 @@ void wm_session_start(void) {
 
     /* Draw initial frame */
     wm_compose(wm_backbuf);
-    draw_cursor(wm_backbuf, VGA_GFX_WIDTH / 2, VGA_GFX_HEIGHT / 2);
-    vga_gfx_flip(wm_backbuf);
+    draw_cursor(wm_backbuf, screen_w / 2, screen_h / 2);
+    if (should_switch_hw) {
+        vga_gfx_flip(wm_backbuf);
+    }
 }
 
 /** wm_session_stop — stop compositor, destroy all windows, restore text mode. */
@@ -1436,6 +1654,7 @@ void wm_session_stop(void) {
     keyboard_flush_queue();
     vga_set_mode_text_hardware();
     dynamic_keymap_reapply_fonts();
+    mouse_set_bounds_from_display();
 }
 
 /**

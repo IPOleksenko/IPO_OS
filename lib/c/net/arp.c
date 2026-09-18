@@ -2,23 +2,11 @@
 #include <net/net_state.h>
 #include <net/ethernet.h>
 #include <system/timer.h>
-#include <memory/kmalloc.h>
 #include <string.h>
 #include <ioport.h>
+#include <syscall.h>
 
 #define ARP_ENTRY_TIMEOUT_MS 60000u
-
-typedef struct arp_entry {
-    ip4_addr_t ip;
-    mac_addr_t mac;
-    uint32_t   last_seen_ms;
-    struct arp_entry *next;
-} arp_entry_t;
-
-static inline arp_entry_t **get_arp_cache(void) {
-    net_shared_ctx_t *ctx = net_get_shared_context();
-    return &ctx->arp_cache;
-}
 
 static const mac_addr_t broadcast_mac = {
     {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
@@ -26,14 +14,10 @@ static const mac_addr_t broadcast_mac = {
 
 static void arp_cache_prune(void) {
     uint32_t now = timer_millis();
-    arp_entry_t **curr = get_arp_cache();
-    while (*curr) {
-        if (now - (*curr)->last_seen_ms >= ARP_ENTRY_TIMEOUT_MS) {
-            arp_entry_t *to_free = *curr;
-            *curr = (*curr)->next;
-            kfree(to_free);
-        } else {
-            curr = &(*curr)->next;
+    net_shared_ctx_t *ctx = net_get_shared_context();
+    for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+        if (ctx->arp_table[i].in_use && (now - ctx->arp_table[i].last_seen_ms >= ARP_ENTRY_TIMEOUT_MS)) {
+            ctx->arp_table[i].in_use = false;
         }
     }
 }
@@ -45,49 +29,62 @@ void arp_poll(void) {
 static void arp_cache_insert(ip4_addr_t ip, const mac_addr_t *mac) {
     arp_cache_prune();
     uint32_t now = timer_millis();
-    arp_entry_t *cur = *get_arp_cache();
-    while (cur) {
-        if (cur->ip == ip) {
-            memcpy(&cur->mac, mac, sizeof(mac_addr_t));
-            cur->last_seen_ms = now;
+    net_shared_ctx_t *ctx = net_get_shared_context();
+
+    /* 1. Update existing entry if present */
+    for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+        if (ctx->arp_table[i].in_use && ctx->arp_table[i].ip == ip) {
+            memcpy(&ctx->arp_table[i].mac, mac, sizeof(mac_addr_t));
+            ctx->arp_table[i].last_seen_ms = now;
             return;
         }
-        cur = cur->next;
     }
 
-    arp_entry_t *entry = (arp_entry_t *)kmalloc(sizeof(arp_entry_t));
-    if (!entry) return;
-    entry->ip = ip;
-    memcpy(&entry->mac, mac, sizeof(mac_addr_t));
-    entry->last_seen_ms = now;
-    entry->next = *get_arp_cache();
-    *get_arp_cache() = entry;
+    /* 2. Find free slot */
+    int slot = -1;
+    for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+        if (!ctx->arp_table[i].in_use) {
+            slot = i;
+            break;
+        }
+    }
+
+    /* 3. If full, find oldest slot to replace */
+    if (slot < 0) {
+        uint32_t oldest_time = 0xFFFFFFFF;
+        slot = 0;
+        for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+            if (ctx->arp_table[i].last_seen_ms < oldest_time) {
+                oldest_time = ctx->arp_table[i].last_seen_ms;
+                slot = i;
+            }
+        }
+    }
+
+    ctx->arp_table[slot].ip = ip;
+    memcpy(&ctx->arp_table[slot].mac, mac, sizeof(mac_addr_t));
+    ctx->arp_table[slot].last_seen_ms = now;
+    ctx->arp_table[slot].in_use = true;
 }
 
 static bool arp_cache_lookup(ip4_addr_t ip, mac_addr_t *out_mac) {
     arp_cache_prune();
+    net_shared_ctx_t *ctx = net_get_shared_context();
 
-    arp_entry_t *cur = *get_arp_cache();
-    while (cur) {
-        if (cur->ip == ip) {
+    for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+        if (ctx->arp_table[i].in_use && ctx->arp_table[i].ip == ip) {
             if (out_mac) {
-                memcpy(out_mac, &cur->mac, sizeof(mac_addr_t));
+                memcpy(out_mac, &ctx->arp_table[i].mac, sizeof(mac_addr_t));
             }
             return true;
         }
-        cur = cur->next;
     }
     return false;
 }
 
 void arp_init(void) {
-    arp_entry_t *cur = *get_arp_cache();
-    while (cur) {
-        arp_entry_t *next = cur->next;
-        kfree(cur);
-        cur = next;
-    }
-    *get_arp_cache() = NULL;
+    net_shared_ctx_t *ctx = net_get_shared_context();
+    memset(ctx->arp_table, 0, sizeof(ctx->arp_table));
 }
 
 void arp_send_request(ip4_addr_t target_ip) {
@@ -161,6 +158,7 @@ bool arp_resolve(ip4_addr_t target_ip, mac_addr_t *out_mac, uint32_t timeout_ms)
             arp_send_request(target_ip);
             last_req = timer_millis();
         }
+        ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
         io_wait();
     }
 

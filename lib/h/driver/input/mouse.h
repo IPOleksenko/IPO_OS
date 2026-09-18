@@ -51,8 +51,20 @@ void mouse_poll(void);
 void mouse_get_state(mouse_state_t *out_state);
 
 /**
- * Set custom screen boundaries (default: 640x400).
+ * Set custom screen boundaries.
+ * If max_x <= 0 or max_y <= 0, boundaries are dynamically detected from active display.
  */
 void mouse_set_bounds(int32_t max_x, int32_t max_y);
+
+/**
+ * Automatically update mouse bounds based on currently active display area
+ * (VBE BGA if active, VGA graphics if active, or text mode).
+ */
+void mouse_set_bounds_from_display(void);
+
+/**
+ * Get current mouse screen boundaries.
+ */
+void mouse_get_bounds(int32_t *out_x, int32_t *out_y);
 
 #endif /* _MOUSE_H */

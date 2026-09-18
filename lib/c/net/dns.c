@@ -1,9 +1,11 @@
 #include <net/dns.h>
 #include <net/udp.h>
+#include <net/net_state.h>
 #include <system/timer.h>
 #include <string.h>
 #include <stdio.h>
 #include <ioport.h>
+#include <syscall.h>
 
 typedef struct {
     uint16_t id;
@@ -14,17 +16,10 @@ typedef struct {
     uint16_t arcount;
 } __attribute__((packed)) dns_header_t;
 
-static volatile bool dns_resolved = false;
-static ip4_addr_t dns_result_ip = 0;
-static uint16_t dns_query_id = 0x1234;
-
-static void dns_callback(ip4_addr_t src_ip, uint16_t src_port, const void *data, uint16_t len) {
-    (void)src_ip;
-    (void)src_port;
+void dns_process_response_packet(const void *data, uint16_t len) {
     if (!data || len < sizeof(dns_header_t)) return;
 
     const dns_header_t *hdr = (const dns_header_t *)data;
-    if (ntohs(hdr->id) != dns_query_id) return;
     if ((ntohs(hdr->flags) & 0x8000) == 0) return; // Not a response
     if ((ntohs(hdr->flags) & 0x000F) != 0) return; // Response error (e.g. NXDOMAIN)
 
@@ -77,8 +72,13 @@ static void dns_callback(ip4_addr_t src_ip, uint16_t src_port, const void *data,
 
         if (atype == 1 && aclass == 1 && rdlength == 4) {
             /* Type A, Class IN, 4 bytes IPv4 */
-            dns_result_ip = IP4_ADDR(p[0], p[1], p[2], p[3]);
-            dns_resolved = true;
+            ip4_addr_t resolved_ip = IP4_ADDR(p[0], p[1], p[2], p[3]);
+            net_shared_ctx_t *ctx = net_get_shared_context();
+            uint8_t slot = ctx->dns_q_idx % DNS_QUEUE_SIZE;
+            ctx->dns_queue[slot].id = ntohs(hdr->id);
+            ctx->dns_queue[slot].ip = resolved_ip;
+            ctx->dns_queue[slot].valid = true;
+            ctx->dns_q_idx = (slot + 1) % DNS_QUEUE_SIZE;
             return;
         }
 
@@ -103,17 +103,15 @@ bool dns_resolve(const char *hostname, ip4_addr_t *out_ip, uint32_t timeout_ms) 
     net_if_t *netif = net_get_interface();
     if (!netif || !netif->link_up) return false;
 
-    uint16_t client_port = 53000 + (uint16_t)(timer_millis() % 1000);
-    dns_resolved = false;
-    dns_result_ip = 0;
-    dns_query_id++;
-
-    udp_bind(client_port, dns_callback);
+    uint32_t pid = (uint32_t)ipo_syscall(IPO_SYSCALL_GETPID, 0, NULL);
+    uint16_t client_port = 52000 + (uint16_t)((pid * 43 + timer_millis()) % 10000);
+    uint16_t query_id = (uint16_t)(((pid & 0x3F) << 10) ^ (timer_millis() & 0x3FF) ^ 0xA5A5);
+    if (query_id == 0) query_id = 0x1234;
 
     /* Construct DNS query packet */
     uint8_t query_buf[512];
     dns_header_t *hdr = (dns_header_t *)query_buf;
-    hdr->id = htons(dns_query_id);
+    hdr->id = htons(query_id);
     hdr->flags = htons(0x0100); // Standard recursive query
     hdr->qdcount = htons(1);
     hdr->ancount = 0;
@@ -150,18 +148,24 @@ bool dns_resolve(const char *hostname, ip4_addr_t *out_ip, uint32_t timeout_ms) 
     uint32_t last_send = start;
     while (timer_millis() - start < timeout_ms) {
         net_poll();
-        if (dns_resolved) {
-            udp_unbind(client_port);
-            *out_ip = dns_result_ip;
-            return true;
+
+        net_shared_ctx_t *ctx = net_get_shared_context();
+        for (int i = 0; i < DNS_QUEUE_SIZE; i++) {
+            if (ctx->dns_queue[i].valid && ctx->dns_queue[i].id == query_id) {
+                *out_ip = ctx->dns_queue[i].ip;
+                ctx->dns_queue[i].valid = false;
+                return true;
+            }
         }
+
         if (timer_millis() - last_send >= 1000) {
             udp_send(netif->dns, client_port, 53, query_buf, query_len);
             last_send = timer_millis();
         }
+
+        ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
         io_wait();
     }
 
-    udp_unbind(client_port);
     return false;
 }

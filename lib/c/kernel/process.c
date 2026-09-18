@@ -39,8 +39,20 @@ static int batch_proc_count = 0;
 static int batch_current_idx = 0;
 static uint32_t scheduler_esp = 0;
 static bool batch_active = false;
+static bool batch_separate_windows = false;
 static process_t *batch_foreground_proc = NULL;
+static process_t *batch_displayed_fg = NULL;
 static process_t *currently_mapped_app = NULL;
+
+static void process_sync_shared_context(void) {
+    process_shared_ctx_t *ctx = process_get_shared_context();
+    ctx->magic = PROCESS_SHARED_MAGIC;
+    ctx->current_process = current_process;
+    ctx->batch_foreground_proc = batch_foreground_proc;
+    ctx->batch_displayed_fg = batch_displayed_fg;
+    ctx->batch_active = batch_active;
+    ctx->batch_separate_windows = batch_separate_windows;
+}
 
 void process_map_app(process_t *proc) {
     if (currently_mapped_app == proc) {
@@ -48,13 +60,32 @@ void process_map_app(process_t *proc) {
     }
 
     if (currently_mapped_app != NULL && currently_mapped_app->binary_storage != NULL) {
-        // Save previous app's modified data/bss from 0x800000
-        memcpy(currently_mapped_app->binary_storage, (void *)PROCESS_HEAP_START, currently_mapped_app->binary_size);
+        // Save previous app's modified data/bss
+        uint32_t off = currently_mapped_app->data_offset;
+        uint32_t sz = currently_mapped_app->data_size;
+        if (sz == 0 || off + sz > currently_mapped_app->binary_size) {
+            off = 0; sz = currently_mapped_app->binary_size;
+        }
+        memcpy((uint8_t *)currently_mapped_app->binary_storage + off,
+               (uint8_t *)PROCESS_HEAP_START + off, sz);
     }
 
     if (proc != NULL && proc->binary_storage != NULL) {
-        // Load this app's code/data/bss into 0x800000
-        memcpy((void *)PROCESS_HEAP_START, proc->binary_storage, proc->binary_size);
+        // If code has not been loaded into 0x800000 or different executable name, load full image
+        if (!proc->code_mapped || currently_mapped_app == NULL ||
+            (currently_mapped_app->name && proc->name && strcmp(currently_mapped_app->name, proc->name) != 0)) {
+            memcpy((void *)PROCESS_HEAP_START, proc->binary_storage, proc->binary_size);
+            proc->code_mapped = true;
+        } else {
+            // Same executable image (e.g. edit && edit or edit & edit): code is already in place, only swap data/bss!
+            uint32_t off = proc->data_offset;
+            uint32_t sz = proc->data_size;
+            if (sz == 0 || off + sz > proc->binary_size) {
+                off = 0; sz = proc->binary_size;
+            }
+            memcpy((uint8_t *)PROCESS_HEAP_START + off,
+                   (uint8_t *)proc->binary_storage + off, sz);
+        }
     }
 
     currently_mapped_app = proc;
@@ -96,18 +127,8 @@ void process_yield_kernel(void) {
     }
 
     process_t *fg = process_get_foreground();
-    int running = 0;
-    for (int i = 0; i < batch_proc_count; i++) {
-        if (batch_procs[i] && batch_procs[i]->is_running) {
-            if (batch_procs[i]->waiting_for_input && batch_procs[i] != fg && !wm_session_active()) {
-                continue;
-            }
-            running++;
-        }
-    }
-
-    if (current_process->is_running && current_process == fg && running <= 1 && !wm_session_active()) {
-        return;
+    if (current_process != fg && !wm_session_active()) {
+        io_wait();
     }
 
     in_process_context = false;
@@ -115,25 +136,162 @@ void process_yield_kernel(void) {
     in_process_context = true;
 }
 
+bool process_is_active_or_has_windows(process_t *p) {
+    if (!p) return false;
+    if (p->is_running) return true;
+    if (p->is_wm_app || p->wants_graphics) {
+        if (p->completed_and_acknowledged) return false;
+        if (wm_session_active()) return true;
+        return (p->pid != 0 && wm_has_windows_for_pid(p->pid));
+    }
+    if (batch_separate_windows) {
+        if (p->text_vram_backup != NULL && !p->completed_and_acknowledged) return true;
+    }
+    return false;
+}
+
+process_t *process_get_displayed_foreground(void) {
+    process_shared_ctx_t *ctx = process_get_shared_context();
+    if (ctx && ctx->magic == PROCESS_SHARED_MAGIC && ctx->batch_active) {
+        if (ctx->batch_displayed_fg && process_is_active_or_has_windows(ctx->batch_displayed_fg)) {
+            return ctx->batch_displayed_fg;
+        }
+    }
+    if (batch_active && batch_displayed_fg && process_is_active_or_has_windows(batch_displayed_fg)) {
+        return batch_displayed_fg;
+    }
+    return process_get_foreground();
+}
+
 process_t *process_get_foreground(void) {
+    process_shared_ctx_t *ctx = process_get_shared_context();
+    if (ctx && ctx->magic == PROCESS_SHARED_MAGIC) {
+        if (!ctx->batch_active) {
+            return ctx->current_process ? ctx->current_process : current_process;
+        }
+        if (ctx->batch_foreground_proc && process_is_active_or_has_windows(ctx->batch_foreground_proc)) {
+            return ctx->batch_foreground_proc;
+        }
+    }
     if (!batch_active) {
         return current_process;
     }
-    if (batch_foreground_proc && batch_foreground_proc->is_running) {
+    if (batch_foreground_proc && process_is_active_or_has_windows(batch_foreground_proc)) {
         return batch_foreground_proc;
     }
-    for (int i = batch_proc_count - 1; i >= 0; i--) {
-        if (batch_procs && batch_procs[i] && batch_procs[i]->is_running) {
+    for (int i = 0; i < batch_proc_count; i++) {
+        if (batch_procs && batch_procs[i] && process_is_active_or_has_windows(batch_procs[i])) {
             return batch_procs[i];
         }
     }
     return NULL;
 }
 
+static void process_switch_workspace_screen(process_t *old_fg, process_t *new_fg) {
+    if (old_fg == new_fg) return;
+    if (!process_get_separate_windows()) return;
+
+    /* If both processes belong to the same workspace, they share the same screen.
+       Do not switch hardware modes or swap VRAM buffers. */
+    if (old_fg && new_fg && old_fg->window_id == new_fg->window_id) {
+        batch_displayed_fg = new_fg;
+        process_shared_ctx_t *ctx = process_get_shared_context();
+        if (ctx && ctx->magic == PROCESS_SHARED_MAGIC) {
+            ctx->batch_displayed_fg = new_fg;
+        }
+        process_sync_shared_context();
+        return;
+    }
+
+    serial_printf("[proc] switch_workspace_screen: %s -> %s\n",
+                  old_fg ? old_fg->name : "none",
+                  new_fg ? new_fg->name : "none");
+
+    keyboard_clear_key_state();
+    keyboard_flush_hardware();
+    keyboard_flush_queue();
+    keyboard_flush_app_queue();
+
+    /* 1. Preserve outgoing graphics or text screen state */
+    if (old_fg) {
+        if (old_fg->wants_graphics || old_fg->is_wm_app || vga_is_graphics_mode()) {
+            if (!old_fg->gfx_vram_backup) {
+                old_fg->gfx_vram_backup = (uint8_t *)kmalloc(VGA_GFX_SIZE);
+            }
+            if (old_fg->gfx_vram_backup) {
+                memcpy(old_fg->gfx_vram_backup, (const void *)VGA_GFX_VRAM_ADDR, VGA_GFX_SIZE);
+            }
+        } else {
+            if (old_fg->scroll_bottom_count > 0) {
+                terminal_return_to_present();
+            }
+            if (old_fg->text_vram_backup) {
+                memcpy(old_fg->text_vram_backup, (const void *)0xB8000, 80 * 25 * sizeof(uint16_t));
+                old_fg->text_cursor_pos = vga_get_cursor_position();
+                old_fg->text_cursor_visible = vga_is_cursor_visible();
+            }
+        }
+    }
+
+    /* Publish the new workspace before callbacks such as wm_set_focus can
+       call process_set_foreground() again. */
+    process_shared_ctx_t *ctx = process_get_shared_context();
+    if (ctx && ctx->magic == PROCESS_SHARED_MAGIC) {
+        ctx->batch_displayed_fg = new_fg;
+    }
+    batch_displayed_fg = new_fg;
+    process_sync_shared_context();
+
+    /* 2. Restore incoming graphics or text screen state */
+    if (new_fg == NULL) {
+        keyboard_set_app_input_mode(false);
+        if (vga_is_graphics_mode()) {
+            vga_set_mode_text_hardware();
+            dynamic_keymap_reapply_fonts();
+            mouse_set_bounds_from_display();
+        }
+    } else {
+        new_fg->waiting_for_input = false;
+        keyboard_set_app_input_mode(true);
+        if (new_fg->is_wm_app) {
+            vga_set_mode_13h_hardware();
+            vga_gfx_init_default_palette();
+            mouse_set_bounds_from_display();
+            wm_focus_window_for_pid(new_fg->pid);
+            wm_invalidate_all();
+            wm_compositor_tick();
+        } else if (new_fg->wants_graphics) {
+            vga_set_mode_13h_hardware();
+            vga_gfx_init_default_palette();
+            mouse_set_bounds_from_display();
+            if (new_fg->gfx_vram_backup) {
+                memcpy((void *)VGA_GFX_VRAM_ADDR, new_fg->gfx_vram_backup, VGA_GFX_SIZE);
+            }
+        } else {
+            if (vga_is_graphics_mode()) {
+                vga_set_mode_text_hardware();
+                dynamic_keymap_reapply_fonts();
+                mouse_set_bounds_from_display();
+            }
+            if (new_fg->text_vram_backup) {
+                memcpy((void *)0xB8000, new_fg->text_vram_backup, 80 * 25 * sizeof(uint16_t));
+                vga_set_cursor(new_fg->text_cursor_pos);
+                if (new_fg->text_cursor_visible) {
+                    vga_show_cursor();
+                } else {
+                    vga_hide_cursor();
+                }
+            }
+        }
+    }
+
+}
+
 void process_set_foreground(process_t *proc) {
     if (!proc) return;
     batch_foreground_proc = proc;
-    if (batch_active) {
+    process_sync_shared_context();
+    if (process_is_batch_active()) {
         for (int i = 0; i < batch_proc_count; i++) {
             if (batch_procs && batch_procs[i] == proc) {
                 batch_current_idx = i;
@@ -141,16 +299,240 @@ void process_set_foreground(process_t *proc) {
                 break;
             }
         }
+        if (process_get_separate_windows()) {
+            process_shared_ctx_t *ctx = process_get_shared_context();
+            process_t *cur_disp = (ctx && ctx->magic == PROCESS_SHARED_MAGIC) ? ctx->batch_displayed_fg : batch_displayed_fg;
+            if (cur_disp != proc) {
+                process_switch_workspace_screen(cur_disp, proc);
+            }
+        }
     }
+}
+
+bool process_is_batch_active(void) {
+    process_shared_ctx_t *ctx = process_get_shared_context();
+    if (ctx && ctx->magic == PROCESS_SHARED_MAGIC) {
+        return ctx->batch_active;
+    }
+    return batch_active;
+}
+
+bool process_get_separate_windows(void) {
+    process_shared_ctx_t *ctx = process_get_shared_context();
+    if (ctx && ctx->magic == PROCESS_SHARED_MAGIC) {
+        return ctx->batch_active ? ctx->batch_separate_windows : false;
+    }
+    return batch_active ? batch_separate_windows : false;
+}
+
+void process_init_text_screen(process_t *proc) {
+    if (!proc) return;
+    if (!proc->text_vram_backup) {
+        proc->text_vram_backup = (uint16_t *)kmalloc(80 * 25 * sizeof(uint16_t));
+    }
+    if (!proc->text_vram_backup) return;
+
+    if (!proc->scroll_top_buffer) {
+        proc->scroll_top_buffer = (uint16_t *)kmalloc(TERMINAL_SCROLL_HISTORY_SIZE * 80 * sizeof(uint16_t));
+    }
+    if (!proc->scroll_bottom_buffer) {
+        proc->scroll_bottom_buffer = (uint16_t *)kmalloc(TERMINAL_SCROLL_HISTORY_SIZE * 80 * sizeof(uint16_t));
+    }
+    proc->scroll_top_count = 0;
+    proc->scroll_bottom_count = 0;
+
+    /* Fill entire screen with clean blank spaces 0x0720 */
+    for (int i = 0; i < 80 * 25; i++) {
+        proc->text_vram_backup[i] = 0x0720;
+    }
+
+    /* Top row 0: Header "IPO_OS" on left, "Created by IPOleksenko" on right */
+    const char *os_name = "IPO_OS";
+    const char *created_by = "Created by IPOleksenko";
+    int os_len = strlen(os_name);
+    int cr_len = strlen(created_by);
+    for (int i = 0; i < os_len; i++) {
+        proc->text_vram_backup[i] = vga_entry(os_name[i], VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+    }
+    for (int i = 0; i < cr_len; i++) {
+        proc->text_vram_backup[80 - cr_len + i] = vga_entry(created_by[i], VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+    }
+
+    /* Start at beginning of workspace display content (row 2, column 0) */
+    proc->text_cursor_pos = (uint16_t)VGA_START_CURSOR_POSITION;
+    proc->text_cursor_visible = true;
+}
+
+void process_workspace_auto_scroll(process_t *proc) {
+    if (!proc || !proc->text_vram_backup) return;
+
+    uint16_t top_row = VGA_START_CURSOR_POSITION / VGA_WIDTH;
+    uint16_t terminal_rows = VGA_HEIGHT - top_row;
+    uint16_t last_line_start = (top_row + terminal_rows - 1) * VGA_WIDTH;
+
+    if (proc->scroll_top_buffer) {
+        if (proc->scroll_top_count >= TERMINAL_SCROLL_HISTORY_SIZE) {
+            int keep = TERMINAL_SCROLL_HISTORY_SIZE / 2;
+            int remove = proc->scroll_top_count - keep;
+            for (int i = 0; i < keep; i++) {
+                memcpy(&proc->scroll_top_buffer[i * 80],
+                       &proc->scroll_top_buffer[(i + remove) * 80],
+                       80 * sizeof(uint16_t));
+            }
+            proc->scroll_top_count = keep;
+        }
+        memcpy(&proc->scroll_top_buffer[proc->scroll_top_count * 80],
+               &proc->text_vram_backup[top_row * 80],
+               80 * sizeof(uint16_t));
+        proc->scroll_top_count++;
+    }
+    proc->scroll_bottom_count = 0;
+
+    for (uint16_t r = top_row; r < top_row + terminal_rows - 1; r++) {
+        memcpy((void *)&proc->text_vram_backup[r * 80],
+               (const void *)&proc->text_vram_backup[(r + 1) * 80],
+               80 * sizeof(uint16_t));
+    }
+    for (uint16_t col = 0; col < 80; col++) {
+        proc->text_vram_backup[last_line_start + col] = 0x0720;
+    }
+}
+
+void process_switch_foreground_next(void) {
+    if (!batch_active || batch_proc_count <= 1) return;
+    if (!batch_separate_windows) return;
+    process_t *cur_fg = process_get_foreground();
+
+    /* 1. Collect all distinct active workspace IDs (window_id) in order */
+    int unique_wins[16];
+    int unique_count = 0;
+    for (int i = 0; i < batch_proc_count; i++) {
+        if (batch_procs && batch_procs[i] && process_is_active_or_has_windows(batch_procs[i])) {
+            int wid = batch_procs[i]->window_id;
+            bool exists = false;
+            for (int u = 0; u < unique_count; u++) {
+                if (unique_wins[u] == wid) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists && unique_count < 16) {
+                unique_wins[unique_count++] = wid;
+            }
+        }
+    }
+
+    if (unique_count <= 1) return;
+
+    /* 2. Find index of current workspace */
+    int cur_wid = cur_fg ? cur_fg->window_id : unique_wins[0];
+    int cur_win_idx = -1;
+    for (int u = 0; u < unique_count; u++) {
+        if (unique_wins[u] == cur_wid) {
+            cur_win_idx = u;
+            break;
+        }
+    }
+    if (cur_win_idx == -1) cur_win_idx = 0;
+
+    /* 3. Determine next workspace */
+    int next_win_idx = (cur_win_idx + 1) % unique_count;
+    int target_wid = unique_wins[next_win_idx];
+
+    /* 4. Pick canonical foreground process for target workspace */
+    process_t *target_proc = NULL;
+    for (int i = 0; i < batch_proc_count; i++) {
+        if (batch_procs && batch_procs[i] && batch_procs[i]->window_id == target_wid &&
+            process_is_active_or_has_windows(batch_procs[i])) {
+            target_proc = batch_procs[i];
+            break;
+        }
+    }
+    if (!target_proc) return;
+
+    serial_printf("[proc] switch_fg: %s -> %s (win %d -> %d)\n",
+        cur_fg ? cur_fg->name : "none",
+        target_proc->name,
+        cur_fg ? cur_fg->window_id : 0,
+        target_wid);
+
+    process_set_foreground(target_proc);
+    if (wm_session_active() && (!process_get_separate_windows() || target_proc->is_wm_app)) {
+        wm_focus_window_for_pid(target_proc->pid);
+        wm_invalidate_all();
+    }
+    process_yield_kernel();
+}
+
+void process_switch_foreground_prev(void) {
+    if (!batch_active || batch_proc_count <= 1) return;
+    if (!batch_separate_windows) return;
+    process_t *cur_fg = process_get_foreground();
+
+    /* 1. Collect all distinct active workspace IDs (window_id) in order */
+    int unique_wins[16];
+    int unique_count = 0;
+    for (int i = 0; i < batch_proc_count; i++) {
+        if (batch_procs && batch_procs[i] && process_is_active_or_has_windows(batch_procs[i])) {
+            int wid = batch_procs[i]->window_id;
+            bool exists = false;
+            for (int u = 0; u < unique_count; u++) {
+                if (unique_wins[u] == wid) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists && unique_count < 16) {
+                unique_wins[unique_count++] = wid;
+            }
+        }
+    }
+
+    if (unique_count <= 1) return;
+
+    /* 2. Find index of current workspace */
+    int cur_wid = cur_fg ? cur_fg->window_id : unique_wins[0];
+    int cur_win_idx = -1;
+    for (int u = 0; u < unique_count; u++) {
+        if (unique_wins[u] == cur_wid) {
+            cur_win_idx = u;
+            break;
+        }
+    }
+    if (cur_win_idx == -1) cur_win_idx = 0;
+
+    /* 3. Determine previous workspace */
+    int prev_win_idx = (cur_win_idx - 1 + unique_count) % unique_count;
+    int target_wid = unique_wins[prev_win_idx];
+
+    /* 4. Pick canonical foreground process for target workspace */
+    process_t *target_proc = NULL;
+    for (int i = 0; i < batch_proc_count; i++) {
+        if (batch_procs && batch_procs[i] && batch_procs[i]->window_id == target_wid &&
+            process_is_active_or_has_windows(batch_procs[i])) {
+            target_proc = batch_procs[i];
+            break;
+        }
+    }
+    if (!target_proc) return;
+
+    serial_printf("[proc] switch_fg_prev: %s -> %s (win %d -> %d)\n",
+        cur_fg ? cur_fg->name : "none",
+        target_proc->name,
+        cur_fg ? cur_fg->window_id : 0,
+        target_wid);
+
+    process_set_foreground(target_proc);
+    if (wm_session_active() && (!process_get_separate_windows() || target_proc->is_wm_app)) {
+        wm_focus_window_for_pid(target_proc->pid);
+        wm_invalidate_all();
+    }
+    process_yield_kernel();
 }
 
 bool process_is_foreground(void) {
     if (batch_active) {
-        bool is_fg = (process_get_foreground() == current_process);
-        if (!is_fg && current_process && !wm_session_active()) {
-            current_process->waiting_for_input = true;
-        }
-        return is_fg;
+        return (process_get_foreground() == current_process);
     }
     int res = ipo_syscall(IPO_SYSCALL_PROCESS_IS_FOREGROUND, 0, NULL);
     if (res == (int)IPO_SYSCALL_ENOSYS) {
@@ -311,8 +693,10 @@ void process_set_keep_alive(process_t *proc, int enabled) {
     if (proc->async_task_count == 0) {
         serial_printf("[process] pid=%u final async cleanup\n", proc->pid);
         proc->is_running = 0;
-        process_cleanup(proc);
-        log_process_heap_state("after cleanup");
+        if (!process_is_batch_active()) {
+            process_cleanup(proc);
+            log_process_heap_state("after cleanup");
+        }
     }
 }
 
@@ -325,6 +709,7 @@ void process_init(void) {
     block_count = 0;
     max_blocks = 0;
     allocated_blocks = NULL;
+    process_sync_shared_context();
     
     printf("Process manager initialized\n");
 }
@@ -683,6 +1068,10 @@ void process_cleanup(process_t *proc) {
         currently_mapped_app = NULL;
     }
 
+    if (batch_displayed_fg == proc) {
+        batch_displayed_fg = NULL;
+    }
+
     if (proc->binary_storage) {
         kfree(proc->binary_storage);
         proc->binary_storage = NULL;
@@ -700,6 +1089,35 @@ void process_cleanup(process_t *proc) {
     if (proc->name) {
         kfree(proc->name);
         proc->name = NULL;
+    }
+
+    if (proc->text_vram_backup) {
+        kfree(proc->text_vram_backup);
+        proc->text_vram_backup = NULL;
+    }
+
+    if (proc->scroll_top_buffer) {
+        kfree(proc->scroll_top_buffer);
+        proc->scroll_top_buffer = NULL;
+    }
+
+    if (proc->scroll_bottom_buffer) {
+        kfree(proc->scroll_bottom_buffer);
+        proc->scroll_bottom_buffer = NULL;
+    }
+    proc->scroll_top_count = 0;
+    proc->scroll_bottom_count = 0;
+
+    if (proc->gfx_vram_backup) {
+        kfree(proc->gfx_vram_backup);
+        proc->gfx_vram_backup = NULL;
+    }
+
+    if (proc->text_output_buf) {
+        kfree(proc->text_output_buf);
+        proc->text_output_buf = NULL;
+        proc->text_output_len = 0;
+        proc->text_output_cap = 0;
     }
     
     // Freeing arguments
@@ -857,6 +1275,8 @@ static int universal_exec_load(process_t *proc, const uint8_t *file_data, uint32
     }
     memset(proc->binary_storage, 0, total_memsz);
 
+    uint32_t data_off = 0;
+    uint32_t data_sz = total_memsz;
     if (is_elf) {
         const elf32_header_t *elf = (const elf32_header_t *)file_data;
         const elf32_program_header_t *ph = (const elf32_program_header_t *)(file_data + elf->e_phoff);
@@ -868,6 +1288,10 @@ static int universal_exec_load(process_t *proc, const uint8_t *file_data, uint32
                         off + ph[i].p_filesz <= total_memsz) {
                         memcpy((uint8_t *)proc->binary_storage + off, file_data + ph[i].p_offset, ph[i].p_filesz);
                     }
+                    if (ph[i].p_flags & 2 /* PF_W: writeable data */) {
+                        data_off = off;
+                        data_sz = ph[i].p_memsz;
+                    }
                 }
             }
         }
@@ -878,9 +1302,12 @@ static int universal_exec_load(process_t *proc, const uint8_t *file_data, uint32
     proc->binary_base = (void *)PROCESS_HEAP_START;
     proc->binary_size = total_memsz;
     proc->entry_point = entry_point;
+    proc->data_offset = data_off;
+    proc->data_size = data_sz;
+    proc->code_mapped = false;
 
-    serial_printf("[universal_exec_load] Universally loaded: file_size=%u, mem_size=%u, entry=0x%x\n",
-                  file_size, total_memsz, proc->entry_point);
+    serial_printf("[universal_exec_load] Universally loaded: file_size=%u, mem_size=%u, data_off=%u, data_sz=%u, entry=0x%x\n",
+                  file_size, total_memsz, proc->data_offset, proc->data_size, proc->entry_point);
 
     return 0;
 }
@@ -989,22 +1416,89 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
     return proc;
 }
 
-static int last_batch_exit_codes[32];
+static int *last_batch_exit_codes = NULL;
+static int last_batch_exit_codes_cap = 0;
 static int last_batch_count = 0;
 
 int process_get_batch_exit_code(int idx) {
-    if (idx >= 0 && idx < last_batch_count) {
+    if (idx >= 0 && idx < last_batch_count && last_batch_exit_codes) {
         return last_batch_exit_codes[idx];
     }
     return 0;
 }
 
 /**
+ * process_run_batch_windows - Runs all processes in one batch with window grouping.
+ * Processes with the same window_id share a single virtual text screen (workspace).
+ * Processes with unique window_ids each get their own workspace.
+ * All processes execute truly in parallel in one batch loop.
+ */
+int process_run_batch_windows(process_t **procs, int count, const int *window_ids) {
+    if (!procs || count <= 0 || !window_ids) return -1;
+
+    /* Assign window_id to every process */
+    for (int i = 0; i < count; i++) {
+        if (procs[i]) {
+            procs[i]->window_id = window_ids[i];
+            procs[i]->text_screen_shared = false;
+        }
+    }
+
+    /* Initialize text screens: first process in each window group owns the buffers,
+       subsequent processes in the same group share them. */
+    for (int i = 0; i < count; i++) {
+        if (!procs[i]) continue;
+        int wid = procs[i]->window_id;
+
+        /* Find the first process in this window group */
+        process_t *owner = NULL;
+        for (int k = 0; k < i; k++) {
+            if (procs[k] && procs[k]->window_id == wid) {
+                owner = procs[k];
+                break;
+            }
+        }
+
+        if (owner == NULL) {
+            /* First process in this group — allocate its own text screen */
+            process_init_text_screen(procs[i]);
+        } else {
+            /* Share buffers from the owner */
+            procs[i]->text_vram_backup = owner->text_vram_backup;
+            procs[i]->gfx_vram_backup = owner->gfx_vram_backup;
+            procs[i]->text_cursor_pos = owner->text_cursor_pos;
+            procs[i]->text_cursor_visible = owner->text_cursor_visible;
+            procs[i]->scroll_top_buffer = owner->scroll_top_buffer;
+            procs[i]->scroll_bottom_buffer = owner->scroll_bottom_buffer;
+            procs[i]->scroll_top_count = owner->scroll_top_count;
+            procs[i]->scroll_bottom_count = owner->scroll_bottom_count;
+            procs[i]->text_screen_shared = true;
+        }
+    }
+
+    /* Delegate to batch_ex with separate_windows=true but skip its init_text_screen
+       since we already set up all screens above. We call it directly — it checks
+       the separate_windows flag and the screens are already allocated. */
+    return process_run_batch_ex(procs, count, true);
+}
+
+/**
  * process_run_batch - Executes one or more processes concurrently using cooperative multitasking
  */
-int process_run_batch(process_t **procs, int count) {
+int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
     if (!procs || count <= 0) {
         return -1;
+    }
+
+    /* If separate_windows is requested, initialize virtual text screens for all processes.
+       Skip processes with text_screen_shared=true — their buffers are already set up
+       by process_run_batch_windows(). */
+    if (separate_windows) {
+        for (int i = 0; i < count; i++) {
+            if (procs[i] && !procs[i]->text_screen_shared) {
+                process_init_text_screen(procs[i]);
+            }
+        }
     }
 
     process_t *old_process = current_process;
@@ -1012,6 +1506,7 @@ int process_run_batch(process_t **procs, int count) {
     int old_batch_proc_count = batch_proc_count;
     int old_batch_current_idx = batch_current_idx;
     bool old_batch_active = batch_active;
+    bool old_batch_separate_windows = batch_separate_windows;
     process_t *old_batch_foreground_proc = batch_foreground_proc;
     uint32_t old_scheduler_esp = scheduler_esp;
     bool old_in_process_context = in_process_context;
@@ -1020,7 +1515,10 @@ int process_run_batch(process_t **procs, int count) {
     batch_proc_count = count;
     batch_current_idx = 0;
     batch_active = true;
+    batch_separate_windows = separate_windows;
     batch_foreground_proc = NULL;
+    batch_displayed_fg = NULL;
+    process_sync_shared_context();
     bool had_graphics = false;
     for (int i = 0; i < count; i++) {
         if (procs[i] && procs[i]->wants_graphics) {
@@ -1055,6 +1553,7 @@ int process_run_batch(process_t **procs, int count) {
     system_set_state(SYSTEM_STATE_PROCESS_RUNNING);
     keyboard_set_app_input_mode(true);
 
+    batch_displayed_fg = NULL;
     process_t *fg_init = process_get_foreground();
     if (fg_init != NULL) {
         for (int i = 0; i < count; i++) {
@@ -1063,6 +1562,7 @@ int process_run_batch(process_t **procs, int count) {
                 break;
             }
         }
+        process_set_foreground(fg_init);
     }
 
     process_t *last_fg = NULL;
@@ -1073,37 +1573,91 @@ int process_run_batch(process_t **procs, int count) {
             had_graphics = true;
         }
 
-        if (system_is_interrupted()) {
-            break;
-        }
-
         process_t *fg = process_get_foreground();
         if (fg && fg->wants_graphics) {
             had_graphics = true;
         }
+
+        if (system_is_interrupted()) {
+            system_clear_interrupt();
+            if (separate_windows && fg) {
+                if (fg->is_running) {
+                    fg->is_running = 0;
+                    fg->exit_code = 130;
+                }
+                async_stop_tasks_by_owner(fg);
+                fg->completed_and_acknowledged = true;
+                if (!fg->text_screen_shared) {
+                    if (fg->text_vram_backup) {
+                        kfree(fg->text_vram_backup);
+                    }
+                    if (fg->scroll_top_buffer) {
+                        kfree(fg->scroll_top_buffer);
+                    }
+                    if (fg->scroll_bottom_buffer) {
+                        kfree(fg->scroll_bottom_buffer);
+                    }
+                    if (fg->gfx_vram_backup) {
+                        kfree(fg->gfx_vram_backup);
+                    }
+                }
+                fg->text_vram_backup = NULL;
+                fg->scroll_top_buffer = NULL;
+                fg->scroll_bottom_buffer = NULL;
+                fg->scroll_top_count = 0;
+                fg->scroll_bottom_count = 0;
+                fg->gfx_vram_backup = NULL;
+                process_t *next_fg = NULL;
+                for (int i = 0; i < count; i++) {
+                    if (procs[i] && procs[i] != fg && process_is_active_or_has_windows(procs[i])) {
+                        next_fg = procs[i];
+                        break;
+                    }
+                }
+                if (next_fg) {
+                    serial_printf("[proc] fg %s closed by Ctrl+C, auto-switching to %s\n", fg->name, next_fg->name);
+                    process_set_foreground(next_fg);
+                    continue;
+                }
+            } else {
+                break;
+            }
+        }
+
         if (fg != last_fg) {
-            keyboard_clear_key_state();
-            keyboard_flush_hardware();
-            keyboard_flush_queue();
-            keyboard_flush_app_queue();
+            serial_printf("[proc] batch fg changed: %s -> %s (wants_gfx=%d)\n",
+                          last_fg ? last_fg->name : "none",
+                          fg ? fg->name : "none",
+                          fg ? (int)fg->wants_graphics : -1);
+            if (fg && fg != batch_displayed_fg) {
+                process_set_foreground(fg);
+            }
+
             if (fg == NULL) {
                 keyboard_set_app_input_mode(false);
                 if (wm_session_active()) {
                     vga_set_mode_13h_hardware();
                     vga_gfx_init_default_palette();
-                    mouse_set_bounds(VGA_GFX_WIDTH, VGA_GFX_HEIGHT);
+                    mouse_set_bounds_from_display();
                     wm_invalidate_all();
                 } else if (vga_is_graphics_mode()) {
                     vga_set_mode_text_hardware();
+                    mouse_set_bounds_from_display();
                 }
             } else {
                 fg->waiting_for_input = false;
                 keyboard_set_app_input_mode(true);
-                if (fg->wants_graphics || wm_session_active()) {
-                    vga_set_mode_13h_hardware();
-                    vga_gfx_init_default_palette();
-                } else if (vga_is_graphics_mode()) {
-                    vga_set_mode_text_hardware();
+                if (wm_session_active()) {
+                    if (!process_get_separate_windows() || (fg && (fg->wants_graphics || fg->is_wm_app))) {
+                        if (fg->wants_graphics || fg->is_wm_app) {
+                            vga_set_mode_13h_hardware();
+                            vga_gfx_init_default_palette();
+                            mouse_set_bounds_from_display();
+                        }
+                        wm_focus_window_for_pid(fg->pid);
+                        wm_invalidate_all();
+                        wm_compositor_tick();
+                    }
                 }
                 for (int i = 0; i < count; i++) {
                     if (procs[i] == fg) {
@@ -1115,31 +1669,127 @@ int process_run_batch(process_t **procs, int count) {
             last_fg = fg;
         }
 
-        int running_count = 0;
+        /* Check if any process is still active (running, open WM windows, or unacknowledged separate workspace) */
+        int active_count = 0;
         for (int i = 0; i < count; i++) {
-            if (procs[i] && procs[i]->is_running) {
-                running_count++;
+            if (procs[i] && process_is_active_or_has_windows(procs[i])) {
+                active_count++;
             }
         }
-        if (running_count == 0) {
+
+        /* If all processes have finished and all separate workspaces closed:
+           the entire batch is finished -> return to console! */
+        if (active_count == 0) {
             if (wm_session_active()) {
-                if (wm_get_window_count() == 0) {
-                    wm_session_stop();
-                    break;
-                }
-                /* When in a GUI session, keep the desktop, taskbar, and cursor alive
-                   while application windows remain open. User exits via [Exit] or stopx. */
-                async_scheduler_tick();
-                wm_compositor_tick();
-                io_wait();
-                continue;
+                wm_session_stop();
             }
             break;
         }
 
-        // Drive async tasks and WM compositor if active and not in raw fullscreen VGA graphics
+        if (separate_windows && fg && !fg->is_running && !fg->is_wm_app && !fg->wants_graphics) {
+            if (!fg->completed_and_acknowledged) {
+                uint8_t sc = keyboard_get_scancode();
+                if (process_get_foreground() != fg) {
+                    continue;
+                }
+                if ((sc == 0x2E || sc == 0xAE) && keyboard_is_ctrl_pressed()) {
+                    fg->completed_and_acknowledged = true;
+                } else if (sc == 0x49) { // Page Up
+                    if (terminal_get_top_buffer_count() > 0) {
+                        terminal_scroll_up();
+                    }
+                } else if (sc == 0x51) { // Page Down
+                    if (terminal_get_bottom_buffer_count() > 0) {
+                        terminal_scroll_down();
+                    }
+                } else if (sc == 0x48) { // Up arrow
+                    if (terminal_get_top_buffer_count() > 0) {
+                        terminal_scroll_up();
+                    }
+                } else if (sc == 0x50) { // Down arrow
+                    if (terminal_get_bottom_buffer_count() > 0) {
+                        terminal_scroll_down();
+                    }
+                }
+            }
+            if (fg->completed_and_acknowledged) {
+                async_stop_tasks_by_owner(fg);
+                if (separate_windows && !fg->text_screen_shared) {
+                    if (fg->text_vram_backup) {
+                        kfree(fg->text_vram_backup);
+                    }
+                    if (fg->scroll_top_buffer) {
+                        kfree(fg->scroll_top_buffer);
+                    }
+                    if (fg->scroll_bottom_buffer) {
+                        kfree(fg->scroll_bottom_buffer);
+                    }
+                    if (fg->gfx_vram_backup) {
+                        kfree(fg->gfx_vram_backup);
+                    }
+                }
+                if (separate_windows) {
+                    fg->text_vram_backup = NULL;
+                    fg->scroll_top_buffer = NULL;
+                    fg->scroll_bottom_buffer = NULL;
+                    fg->scroll_top_count = 0;
+                    fg->scroll_bottom_count = 0;
+                    fg->gfx_vram_backup = NULL;
+                }
+                process_t *next_fg = NULL;
+                for (int i = 0; i < count; i++) {
+                    if (procs[i] && process_is_active_or_has_windows(procs[i])) {
+                        next_fg = procs[i];
+                        break;
+                    }
+                }
+                if (next_fg) {
+                    serial_printf("[proc] fg %s closed, auto-switching to %s\n", fg->name, next_fg->name);
+                    process_set_foreground(next_fg);
+                    continue;
+                }
+            }
+        }
+
+        /* Clean up any terminated and acknowledged process windows */
+        if (separate_windows) {
+            for (int i = 0; i < count; i++) {
+                if (procs[i] && !process_is_active_or_has_windows(procs[i])) {
+                    if (!procs[i]->text_screen_shared) {
+                        if (procs[i]->text_vram_backup) {
+                            kfree(procs[i]->text_vram_backup);
+                        }
+                        if (procs[i]->scroll_top_buffer) {
+                            kfree(procs[i]->scroll_top_buffer);
+                        }
+                        if (procs[i]->scroll_bottom_buffer) {
+                            kfree(procs[i]->scroll_bottom_buffer);
+                        }
+                        if (procs[i]->gfx_vram_backup) {
+                            kfree(procs[i]->gfx_vram_backup);
+                        }
+                    }
+                    procs[i]->text_vram_backup = NULL;
+                    procs[i]->scroll_top_buffer = NULL;
+                    procs[i]->scroll_bottom_buffer = NULL;
+                    procs[i]->scroll_top_count = 0;
+                    procs[i]->scroll_bottom_count = 0;
+                    procs[i]->gfx_vram_backup = NULL;
+                }
+            }
+        }
+
+        // Drive async tasks and WM compositor if active, in graphics mode, and not in raw fullscreen VGA graphics
         async_scheduler_tick();
-        if (wm_session_active() && (!fg || !fg->wants_graphics)) {
+        bool should_tick_wm = false;
+        if (wm_session_active() && vga_is_graphics_mode()) {
+            if (process_get_separate_windows()) {
+                should_tick_wm = (fg == NULL || fg->is_wm_app);
+            } else {
+                should_tick_wm = (!fg || fg->is_wm_app || !fg->wants_graphics);
+            }
+        }
+        if (should_tick_wm) {
             wm_compositor_tick();
         }
 
@@ -1165,8 +1815,13 @@ int process_run_batch(process_t **procs, int count) {
                         break;
                     }
                 }
+                io_wait();
             }
             if (found == -1) {
+                if (fg) {
+                    current_process = fg;
+                    process_sync_shared_context();
+                }
                 io_wait();
                 continue;
             }
@@ -1174,6 +1829,7 @@ int process_run_batch(process_t **procs, int count) {
 
         batch_current_idx = (found + 1) % count;
         current_process = procs[found];
+        process_sync_shared_context();
 
         // Map process binary to 0x800000
         process_map_app(current_process);
@@ -1191,6 +1847,7 @@ int process_run_batch(process_t **procs, int count) {
         process_map_app(NULL);
     }
     batch_active = old_batch_active;
+    batch_separate_windows = old_batch_separate_windows;
     batch_foreground_proc = old_batch_foreground_proc;
     batch_procs = old_batch_procs;
     batch_proc_count = old_batch_proc_count;
@@ -1198,6 +1855,8 @@ int process_run_batch(process_t **procs, int count) {
     scheduler_esp = old_scheduler_esp;
     in_process_context = old_in_process_context;
     current_process = old_process;
+    batch_displayed_fg = NULL;
+    process_sync_shared_context();
 
     if (!old_batch_active) {
         keyboard_set_app_input_mode(false);
@@ -1213,7 +1872,7 @@ int process_run_batch(process_t **procs, int count) {
         if (vga_is_graphics_mode()) {
             vga_set_mode_text_hardware();
         }
-        if (had_graphics && batch_saved_screen && !wm_session_active()) {
+        if ((had_graphics || separate_windows) && batch_saved_screen && !wm_session_active()) {
             memcpy((void *)0xB8000, batch_saved_screen, 80 * 25 * sizeof(uint16_t));
             vga_set_cursor(batch_saved_cursor);
             if (batch_saved_cursor_visible) {
@@ -1233,13 +1892,22 @@ int process_run_batch(process_t **procs, int count) {
         if (vga_is_graphics_mode()) {
             vga_set_mode_text_hardware();
         }
-        if (had_graphics && batch_saved_screen) {
+        if ((had_graphics || separate_windows) && batch_saved_screen) {
             memcpy((void *)0xB8000, batch_saved_screen, 80 * 25 * sizeof(uint16_t));
             vga_set_cursor(batch_saved_cursor);
             if (batch_saved_cursor_visible) {
                 vga_show_cursor();
             } else {
                 vga_hide_cursor();
+            }
+
+            /* Replay stdout produced by text processes only for single-workspace batches */
+            if (!separate_windows) {
+                for (int i = 0; i < count; i++) {
+                    if (procs[i] && procs[i]->text_output_buf && procs[i]->text_output_len > 0) {
+                        printf("%s", procs[i]->text_output_buf);
+                    }
+                }
             }
         }
         vga_font_set_app_mode(false);
@@ -1254,7 +1922,12 @@ int process_run_batch(process_t **procs, int count) {
         batch_saved_screen = NULL;
     }
 
-    last_batch_count = (count < 32) ? count : 32;
+    if (count > last_batch_exit_codes_cap) {
+        if (last_batch_exit_codes) kfree(last_batch_exit_codes);
+        last_batch_exit_codes = kmalloc((size_t)count * sizeof(int));
+        last_batch_exit_codes_cap = last_batch_exit_codes ? count : 0;
+    }
+    last_batch_count = (count <= last_batch_exit_codes_cap) ? count : last_batch_exit_codes_cap;
     for (int i = 0; i < last_batch_count; i++) {
         if (procs[i] && process_is_valid(procs[i])) {
             last_batch_exit_codes[i] = procs[i]->exit_code;
@@ -1278,6 +1951,10 @@ int process_run_batch(process_t **procs, int count) {
     log_process_heap_state("after cleanup");
 
     return 0;
+}
+
+int process_run_batch(process_t **procs, int count) {
+    return process_run_batch_ex(procs, count, false);
 }
 
 /**
@@ -1309,11 +1986,16 @@ void process_set_last_exit_code(int code) {
  * process_get_current - Returns the current process
  */
 process_t *process_get_current(void) {
+    process_shared_ctx_t *ctx = process_get_shared_context();
+    if (ctx && ctx->magic == PROCESS_SHARED_MAGIC && ctx->current_process != NULL) {
+        return ctx->current_process;
+    }
     return current_process;
 }
 
 void process_set_current(process_t *proc) {
     current_process = proc;
+    process_sync_shared_context();
 }
 
 bool process_is_valid(process_t *proc) {

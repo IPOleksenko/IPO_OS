@@ -85,6 +85,9 @@ void vga_load_font(uint8_t start_code, uint32_t count, const uint8_t *glyphs) {
         }
     }
 
+    /* In graphics mode (e.g. Mode 13h), do NOT touch Plane 2 sequencer/GC registers */
+    if (vga_is_graphics_mode()) return;
+
     /* Set Sequencer registers for Plane 2 write */
     outb(0x3C4, 0x00); outb(0x3C5, 0x01); // Synchronous reset
     outb(0x3C4, 0x02); outb(0x3C5, 0x04); // Write only to Plane 2

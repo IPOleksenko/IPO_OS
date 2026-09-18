@@ -33,6 +33,7 @@ static void vga_update_cursor_glyph(uint8_t src_char) {
 }
 
 void vga_cursor_erase(void) {
+    if (vga_is_graphics_mode()) return;
     if (!cursor_is_rendered) return;
     volatile uint16_t *vga = VGA_MEMORY;
     if (cursor_rendered_offset < VGA_WIDTH * VGA_HEIGHT) {
@@ -44,6 +45,7 @@ void vga_cursor_erase(void) {
 }
 
 static void vga_cursor_draw(void) {
+    if (vga_is_graphics_mode()) return;
     if (!cursor_is_visible) return;
     if (cursor_hw_offset >= VGA_WIDTH * VGA_HEIGHT) return;
 
@@ -137,6 +139,7 @@ void vga_hide_cursor(void) {
 }
 
 void vga_cursor_reset(void) {
+    if (vga_is_graphics_mode()) return;
     vga_cursor_erase();
 
     /* Sanitize any stale cursor glyph slot (0x1F) characters in VGA memory */
@@ -189,6 +192,7 @@ void vga_cursor_blink_tick(void) {
 }
 
 void vga_cursor_reset_blink(void) {
+    if (vga_is_graphics_mode()) return;
     if (!cursor_is_visible) return;
     cursor_blink_on = true;
     cursor_last_blink_ms = timer_millis();

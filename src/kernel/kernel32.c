@@ -116,11 +116,10 @@ void kmain(void) {
 
     ensure_fs_mounted();
 
-    vga_load_cyrillic_font("/fonts/default.fnt");
-
     play_startup_sound();
 
     terminal_initialize();
+    
     vga_save_text_state();
 
     mouse_init();

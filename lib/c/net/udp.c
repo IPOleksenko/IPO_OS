@@ -1,62 +1,44 @@
 #include <net/udp.h>
 #include <net/net_state.h>
 #include <net/ipv4.h>
-#include <memory/kmalloc.h>
 #include <string.h>
-
-typedef struct udp_socket {
-    uint16_t port;
-    udp_callback_t callback;
-    struct udp_socket *next;
-} udp_socket_t;
-
-static inline udp_socket_t **get_udp_sockets(void) {
-    net_shared_ctx_t *ctx = net_get_shared_context();
-    return &ctx->udp_sockets;
-}
 
 static uint8_t udp_tx_buf[1500];
 
 void udp_init(void) {
-    udp_socket_t *cur = *get_udp_sockets();
-    while (cur) {
-        udp_socket_t *next = cur->next;
-        kfree(cur);
-        cur = next;
-    }
-    *get_udp_sockets() = NULL;
+    net_shared_ctx_t *ctx = net_get_shared_context();
+    memset(ctx->udp_table, 0, sizeof(ctx->udp_table));
 }
 
 bool udp_bind(uint16_t port, udp_callback_t callback) {
-    udp_socket_t *cur = *get_udp_sockets();
-    while (cur) {
-        if (cur->port == port) {
-            cur->callback = callback;
+    net_shared_ctx_t *ctx = net_get_shared_context();
+
+    for (int i = 0; i < UDP_SOCKETS_MAX; i++) {
+        if (ctx->udp_table[i].in_use && ctx->udp_table[i].port == port) {
+            ctx->udp_table[i].callback = callback;
             return true;
         }
-        cur = cur->next;
     }
 
-    udp_socket_t *sock = (udp_socket_t *)kmalloc(sizeof(udp_socket_t));
-    if (!sock) {
-        return false;
+    for (int i = 0; i < UDP_SOCKETS_MAX; i++) {
+        if (!ctx->udp_table[i].in_use) {
+            ctx->udp_table[i].port = port;
+            ctx->udp_table[i].callback = callback;
+            ctx->udp_table[i].in_use = true;
+            return true;
+        }
     }
-    sock->port = port;
-    sock->callback = callback;
-    sock->next = *get_udp_sockets();
-    *get_udp_sockets() = sock;
-    return true;
+
+    return false;
 }
 
 void udp_unbind(uint16_t port) {
-    udp_socket_t **curr = get_udp_sockets();
-    while (*curr) {
-        udp_socket_t *entry = *curr;
-        if (entry->port == port) {
-            *curr = entry->next;
-            kfree(entry);
-        } else {
-            curr = &entry->next;
+    net_shared_ctx_t *ctx = net_get_shared_context();
+    for (int i = 0; i < UDP_SOCKETS_MAX; i++) {
+        if (ctx->udp_table[i].in_use && ctx->udp_table[i].port == port) {
+            ctx->udp_table[i].in_use = false;
+            ctx->udp_table[i].callback = NULL;
+            ctx->udp_table[i].port = 0;
         }
     }
 }
@@ -80,6 +62,9 @@ int udp_send(ip4_addr_t dst_ip, uint16_t src_port, uint16_t dst_port, const void
     return ip4_send(dst_ip, IPPROTO_UDP, 64, udp_tx_buf, total_len);
 }
 
+/* Forward declaration for central DNS response processing */
+void dns_process_response_packet(const void *data, uint16_t len);
+
 void udp_receive(ip4_addr_t src_ip, const void *data, uint16_t len) {
     if (!data || len < sizeof(udp_header_t)) {
         return;
@@ -97,13 +82,17 @@ void udp_receive(ip4_addr_t src_ip, const void *data, uint16_t len) {
     const uint8_t *payload = (const uint8_t *)data + sizeof(udp_header_t);
     uint16_t payload_len = ulen - (uint16_t)sizeof(udp_header_t);
 
-    udp_socket_t *cur = *get_udp_sockets();
-    while (cur) {
-        if (cur->port == dst_port) {
-            if (cur->callback) {
-                cur->callback(src_ip, src_port, payload, payload_len);
+    /* Central DNS response capture if from port 53 */
+    if (src_port == 53) {
+        dns_process_response_packet(payload, payload_len);
+    }
+
+    net_shared_ctx_t *ctx = net_get_shared_context();
+    for (int i = 0; i < UDP_SOCKETS_MAX; i++) {
+        if (ctx->udp_table[i].in_use && ctx->udp_table[i].port == dst_port) {
+            if (ctx->udp_table[i].callback) {
+                ctx->udp_table[i].callback(src_ip, src_port, payload, payload_len);
             }
         }
-        cur = cur->next;
     }
 }

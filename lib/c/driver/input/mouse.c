@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <kernel/driver.h>
 #include <wm.h>
+#include <vga_gfx.h>
 
 #define KBD_DATA_PORT    0x60
 #define KBD_STATUS_PORT  0x64
@@ -163,19 +164,7 @@ void mouse_init(void) {
 
     mouse_cycle = 0;
     mouse_initialized = true;
-
-    static driver_t ps2_mouse_drv = {
-        .name = "ps2_mouse",
-        .description = "PS/2 Mouse Driver with Wheel Support",
-        .flags = DRIVER_FLAG_KERNEL | DRIVER_FLAG_ACTIVE,
-        .init = NULL,
-        .cleanup = NULL,
-        .on_command = NULL,
-        .next = NULL
-    };
-    driver_register(&ps2_mouse_drv);
-
-    serial_printf("[mouse] PS/2 mouse driver registered successfully.\n");
+    mouse_set_bounds_from_display();
 }
 
 static void mouse_process_packet(void) {
@@ -303,8 +292,50 @@ void mouse_get_state(mouse_state_t *out_state) {
 }
 
 void mouse_set_bounds(int32_t max_x, int32_t max_y) {
-    if (max_x > 0) current_mouse_state.max_x = max_x;
-    if (max_y > 0) current_mouse_state.max_y = max_y;
-    current_mouse_state.x = current_mouse_state.max_x / 2;
-    current_mouse_state.y = current_mouse_state.max_y / 2;
+    if (max_x <= 0 || max_y <= 0) {
+        int w = 640, h = 400;
+        vga_gfx_get_screen_bounds(&w, &h);
+        if (max_x <= 0) max_x = w;
+        if (max_y <= 0) max_y = h;
+    }
+
+    int32_t old_max_x = current_mouse_state.max_x;
+    int32_t old_max_y = current_mouse_state.max_y;
+
+    current_mouse_state.max_x = max_x;
+    current_mouse_state.max_y = max_y;
+
+    if (old_max_x > 0 && old_max_y > 0) {
+        current_mouse_state.x = (current_mouse_state.x * max_x) / old_max_x;
+        current_mouse_state.y = (current_mouse_state.y * max_y) / old_max_y;
+    } else {
+        current_mouse_state.x = max_x / 2;
+        current_mouse_state.y = max_y / 2;
+    }
+
+    if (current_mouse_state.x < 0) current_mouse_state.x = 0;
+    if (current_mouse_state.x >= max_x) current_mouse_state.x = max_x - 1;
+    if (current_mouse_state.y < 0) current_mouse_state.y = 0;
+    if (current_mouse_state.y >= max_y) current_mouse_state.y = max_y - 1;
+
+    current_mouse_state.col = (current_mouse_state.x * 80) / current_mouse_state.max_x;
+    current_mouse_state.row = (current_mouse_state.y * 25) / current_mouse_state.max_y;
+    if (current_mouse_state.col < 0) current_mouse_state.col = 0;
+    if (current_mouse_state.col >= 80) current_mouse_state.col = 79;
+    if (current_mouse_state.row < 0) current_mouse_state.row = 0;
+    if (current_mouse_state.row >= 25) current_mouse_state.row = 24;
+
+    serial_printf("[mouse] bounds updated: %dx%d (pos: %d,%d, cell: %d,%d)\n",
+                  (int)current_mouse_state.max_x, (int)current_mouse_state.max_y,
+                  (int)current_mouse_state.x, (int)current_mouse_state.y,
+                  (int)current_mouse_state.col, (int)current_mouse_state.row);
+}
+
+void mouse_set_bounds_from_display(void) {
+    mouse_set_bounds(0, 0);
+}
+
+void mouse_get_bounds(int32_t *out_x, int32_t *out_y) {
+    if (out_x) *out_x = current_mouse_state.max_x;
+    if (out_y) *out_y = current_mouse_state.max_y;
 }

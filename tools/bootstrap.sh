@@ -63,18 +63,18 @@ ld -m elf_i386 -T lib/linker.ld build/lib/crt0.o build/lib/crti.o build/toolchai
 echo "[4/7] Building language runtimes (Lua, Python, NASM)..."
 if [ ! -f "build/toolchain/lua/lua.elf" ] || [ ! -f "build/toolchain/lua/luac.elf" ]; then
     echo "Building Lua 5.4.7..."
-    cd toolchains/lua-5.4.7/src
+    cd apps/lua/src
     make clean && make a CC="gcc -m32 -nostdinc -I$ROOT_DIR/apps/include" AR="ar rcs" RANLIB="ranlib" MYCFLAGS="-DLUA_USE_POSIX -DLUA_USE_C89 -ffreestanding -fno-builtin"
     cd "$ROOT_DIR"
-    gcc -m32 -nostdinc -Iapps/include -c toolchains/lua-5.4.7/src/lua.c -o toolchains/lua-5.4.7/src/lua.o -DLUA_COMPAT_5_3 -DLUA_USE_POSIX -DLUA_USE_C89 -ffreestanding -fno-builtin
-    gcc -m32 -nostdinc -Iapps/include -c toolchains/lua-5.4.7/src/luac.c -o toolchains/lua-5.4.7/src/luac.o -DLUA_COMPAT_5_3 -DLUA_USE_POSIX -DLUA_USE_C89 -ffreestanding -fno-builtin
-    ld -m elf_i386 -T lib/linker.ld build/lib/crt0.o build/lib/crti.o toolchains/lua-5.4.7/src/lua.o toolchains/lua-5.4.7/src/liblua.a build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/lua/lua.elf
-    ld -m elf_i386 -T lib/linker.ld build/lib/crt0.o build/lib/crti.o toolchains/lua-5.4.7/src/luac.o toolchains/lua-5.4.7/src/liblua.a build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/lua/luac.elf
+    gcc -m32 -nostdinc -Iapps/include -c apps/lua/src/lua.c -o apps/lua/src/lua.o -DLUA_COMPAT_5_3 -DLUA_USE_POSIX -DLUA_USE_C89 -ffreestanding -fno-builtin
+    gcc -m32 -nostdinc -Iapps/include -c apps/lua/src/luac.c -o apps/lua/src/luac.o -DLUA_COMPAT_5_3 -DLUA_USE_POSIX -DLUA_USE_C89 -ffreestanding -fno-builtin
+    ld -m elf_i386 -T lib/linker.ld build/lib/crt0.o build/lib/crti.o apps/lua/src/lua.o apps/lua/src/liblua.a build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/lua/lua.elf
+    ld -m elf_i386 -T lib/linker.ld build/lib/crt0.o build/lib/crti.o apps/lua/src/luac.o apps/lua/src/liblua.a build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/lua/luac.elf
 fi
 
 if [ ! -f "build/toolchain/nasm.elf" ]; then
     echo "Building NASM 2.16.03..."
-    cd toolchains/nasm-2.16.03
+    cd apps/nasm
     ld -m elf_i386 -T ../../lib/linker.ld ../../build/lib/crt0.o ../../build/lib/crti.o \
         asm/nasm.o libnasm.a \
         ../../build/lib/libc.a ../../build/lib/libm.a ../../build/lib/libgcc.a ../../build/lib/crtn.o \
@@ -84,12 +84,12 @@ fi
 
 if [ ! -f "build/toolchain/python.elf" ]; then
     echo "Building MicroPython 3.12..."
-    gcc -m32 -c toolchains/micropython_shim.c -o toolchains/micropython_shim.o \
-        -Itoolchains/micropython -Itoolchains/micropython/ports/unix \
-        -Itoolchains/micropython/ports/unix/variants/minimal \
-        -Itoolchains/micropython/ports/unix/build-minimal \
-        -Itoolchains/micropython/ports/unix/build-minimal/genhdr
-    OBJS="$(find toolchains/micropython/ports/unix/build-minimal -name '*.o' ! -name 'printf.o' ! -name 'abort_.o' ! -name 'vfs_blockdev.o') toolchains/micropython_shim.o"
+    gcc -m32 -c apps/micropython/micropython_shim.c -o apps/micropython/micropython_shim.o \
+        -Iapps/micropython -Iapps/micropython/ports/unix \
+        -Iapps/micropython/ports/unix/variants/minimal \
+        -Iapps/micropython/ports/unix/build-minimal \
+        -Iapps/micropython/ports/unix/build-minimal/genhdr
+    OBJS="$(find apps/micropython/ports/unix/build-minimal -name '*.o' ! -name 'printf.o' ! -name 'abort_.o' ! -name 'vfs_blockdev.o') apps/micropython/micropython_shim.o"
     ld -m elf_i386 -T lib/linker.ld build/lib/crt0.o build/lib/crti.o \
         $OBJS \
         build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o \
@@ -103,7 +103,7 @@ echo "[6/7] Populating IPO_OS 128MB filesystem disk image..."
 python3 load_apps.py
 
 echo "[7/7] Verifying filesystem contents..."
-python3 disk_editor.py -i build/disk.img ls /app
+python3 disk_editor.py -i build/disk.img ls /applications
 
 echo "================================================================="
 echo "✓ IPO_OS Developer Toolchain Bootstrap Completed Successfully!  "

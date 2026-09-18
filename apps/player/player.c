@@ -34,6 +34,11 @@
 #define MINIMP3_IMPLEMENTATION
 #include "minimp3.h"
 
+#include "apps/micropython/lib/uzlib/uzlib.h"
+#include "apps/micropython/lib/uzlib/tinflate.c"
+#include "apps/micropython/lib/uzlib/adler32.c"
+#include "apps/micropython/lib/uzlib/crc32.c"
+
 #define DEFAULT_WIN_W 240
 #define DEFAULT_WIN_H 150
 #define WIN_W DEFAULT_WIN_W
@@ -42,9 +47,11 @@
 /* Standard scancodes */
 #define SC_ESC       0x01
 #define SC_BACKSPACE 0x0E
+#define SC_T         0x14
 #define SC_O         0x18
 #define SC_ENTER     0x1C
 #define SC_F         0x21
+#define SC_B         0x30
 #define SC_SPACE     0x39
 #define SC_HOME      0x47
 #define SC_UP        0x48
@@ -67,12 +74,14 @@ typedef enum {
 typedef enum {
     MEDIA_MODE_VIDEO,
     MEDIA_MODE_IMAGE,
-    MEDIA_MODE_AUDIO
+    MEDIA_MODE_AUDIO,
+    MEDIA_MODE_DIR,
+    MEDIA_MODE_FILE
 } media_mode_t;
 
 typedef struct {
-    char         path[128];
-    char         name[64];
+    char         *path;
+    char         *name;
     uint32_t     size;
     media_mode_t mode;
 } media_entry_t;
@@ -133,6 +142,7 @@ typedef struct {
     int      width;
     int      height;
     uint8_t *rgba;
+    bool     has_alpha;
 } image_t;
 
 typedef struct {
@@ -243,17 +253,62 @@ static image_t *decode_bmp(const uint8_t *data, size_t size) {
     int w = bi->biWidth;
     int h = bi->biHeight > 0 ? bi->biHeight : -bi->biHeight;
     int bpp = bi->biBitCount;
-    if (w <= 0 || h <= 0 || (bpp != 8 && bpp != 16 && bpp != 24 && bpp != 32)) return NULL;
+    if (w <= 0 || h <= 0 || (bpp != 1 && bpp != 4 && bpp != 8 && bpp != 16 && bpp != 24 && bpp != 32)) return NULL;
     if (bf->bfOffBits >= size) return NULL;
 
     image_t *img = (image_t *)kmalloc(sizeof(image_t));
     if (!img) return NULL;
     img->width = w;
     img->height = h;
+    img->has_alpha = false;
     img->rgba = (uint8_t *)kmalloc((size_t)w * h * 4);
     if (!img->rgba) { kfree(img); return NULL; }
 
     const uint8_t *src = data + bf->bfOffBits;
+
+    if (bpp == 1) {
+        const uint8_t *palette = data + 14 + bi->biSize;
+        int row_stride = ((w + 31) / 32) * 4;
+        for (int y = 0; y < h; y++) {
+            int src_y = (bi->biHeight > 0) ? (h - 1 - y) : y;
+            const uint8_t *row = src + src_y * row_stride;
+            for (int x = 0; x < w; x++) {
+                uint8_t byte = row[x / 8];
+                uint8_t idx = (byte >> (7 - (x % 8))) & 1;
+                uint8_t b = palette[idx * 4 + 0];
+                uint8_t g = palette[idx * 4 + 1];
+                uint8_t r = palette[idx * 4 + 2];
+                size_t off = ((size_t)y * w + x) * 4;
+                img->rgba[off + 0] = r;
+                img->rgba[off + 1] = g;
+                img->rgba[off + 2] = b;
+                img->rgba[off + 3] = 0xFF;
+            }
+        }
+        return img;
+    }
+
+    if (bpp == 4) {
+        const uint8_t *palette = data + 14 + bi->biSize;
+        int row_stride = ((w * 4 + 31) / 32) * 4;
+        for (int y = 0; y < h; y++) {
+            int src_y = (bi->biHeight > 0) ? (h - 1 - y) : y;
+            const uint8_t *row = src + src_y * row_stride;
+            for (int x = 0; x < w; x++) {
+                uint8_t byte = row[x / 2];
+                uint8_t idx = (x % 2 == 0) ? ((byte >> 4) & 0x0F) : (byte & 0x0F);
+                uint8_t b = palette[idx * 4 + 0];
+                uint8_t g = palette[idx * 4 + 1];
+                uint8_t r = palette[idx * 4 + 2];
+                size_t off = ((size_t)y * w + x) * 4;
+                img->rgba[off + 0] = r;
+                img->rgba[off + 1] = g;
+                img->rgba[off + 2] = b;
+                img->rgba[off + 3] = 0xFF;
+            }
+        }
+        return img;
+    }
 
     if (bpp == 8) {
         const uint8_t *palette = data + 14 + bi->biSize;
@@ -314,34 +369,76 @@ static image_t *decode_bmp(const uint8_t *data, size_t size) {
             img->rgba[off + 3] = a;
         }
     }
+
+    if (bpp == 32) {
+        bool all_zero = true;
+        bool has_trans = false;
+        for (size_t i = 0; i < (size_t)w * h; i++) {
+            uint8_t a = img->rgba[i * 4 + 3];
+            if (a != 0) all_zero = false;
+            if (a < 255) has_trans = true;
+        }
+        if (all_zero) {
+            for (size_t i = 0; i < (size_t)w * h; i++) {
+                img->rgba[i * 4 + 3] = 0xFF;
+            }
+            img->has_alpha = false;
+        } else {
+            img->has_alpha = has_trans;
+        }
+    }
+
     return img;
 }
 
 static image_t *decode_tga(const uint8_t *data, size_t size) {
     if (size < sizeof(tga_header_t)) return NULL;
     const tga_header_t *th = (const tga_header_t *)data;
-    if (th->image_type != 2 && th->image_type != 10) return NULL;
+    if (th->image_type != 2 && th->image_type != 3 && th->image_type != 10 && th->image_type != 11) return NULL;
     int w = th->width;
     int h = th->height;
     int bpp = th->pixel_depth;
-    if (w <= 0 || h <= 0 || (bpp != 24 && bpp != 32)) return NULL;
+    if (w <= 0 || h <= 0 || (bpp != 8 && bpp != 16 && bpp != 24 && bpp != 32)) return NULL;
 
     image_t *img = (image_t *)kmalloc(sizeof(image_t));
     if (!img) return NULL;
     img->width = w;
     img->height = h;
+    img->has_alpha = false;
     img->rgba = (uint8_t *)kmalloc((size_t)w * h * 4);
     if (!img->rgba) { kfree(img); return NULL; }
 
     const uint8_t *src = data + sizeof(tga_header_t) + th->id_length;
-    int bytes_per_pix = bpp / 8;
+    int bytes_per_pix = (bpp == 8) ? 1 : ((bpp == 16) ? 2 : (bpp / 8));
 
-    if (th->image_type == 2) {
+    if (th->image_type == 3) {
+        /* 8-bit uncompressed grayscale */
+        for (int y = 0; y < h; y++) {
+            int src_y = (th->image_descriptor & 0x20) ? y : (h - 1 - y);
+            for (int x = 0; x < w; x++) {
+                uint8_t val = src[src_y * w + x];
+                size_t off = ((size_t)y * w + x) * 4;
+                img->rgba[off + 0] = val;
+                img->rgba[off + 1] = val;
+                img->rgba[off + 2] = val;
+                img->rgba[off + 3] = 0xFF;
+            }
+        }
+    } else if (th->image_type == 2) {
         for (int y = 0; y < h; y++) {
             int src_y = (th->image_descriptor & 0x20) ? y : (h - 1 - y);
             for (int x = 0; x < w; x++) {
                 const uint8_t *p = src + (src_y * w + x) * bytes_per_pix;
-                uint8_t b = p[0], g = p[1], r = p[2], a = (bytes_per_pix == 4) ? p[3] : 0xFF;
+                uint8_t r, g, b, a = 0xFF;
+                if (bpp == 16) {
+                    uint16_t val = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+                    r = (uint8_t)(((val >> 10) & 0x1F) * 255 / 31);
+                    g = (uint8_t)(((val >> 5)  & 0x1F) * 255 / 31);
+                    b = (uint8_t)((val         & 0x1F) * 255 / 31);
+                } else {
+                    b = p[0]; g = p[1]; r = p[2];
+                    if (bytes_per_pix == 4) a = p[3];
+                }
                 size_t off = ((size_t)y * w + x) * 4;
                 img->rgba[off + 0] = r;
                 img->rgba[off + 1] = g;
@@ -350,6 +447,7 @@ static image_t *decode_tga(const uint8_t *data, size_t size) {
             }
         }
     } else {
+        /* RLE compressed (type 10 or 11) */
         int total = w * h;
         int count = 0;
         const uint8_t *p = src;
@@ -357,8 +455,20 @@ static image_t *decode_tga(const uint8_t *data, size_t size) {
             uint8_t packet = *p++;
             int len = (packet & 0x7F) + 1;
             if (packet & 0x80) {
-                uint8_t b = p[0], g = p[1], r = p[2], a = (bytes_per_pix == 4) ? p[3] : 0xFF;
-                p += bytes_per_pix;
+                uint8_t r, g, b, a = 0xFF;
+                if (bpp == 8) {
+                    r = g = b = *p++;
+                } else if (bpp == 16) {
+                    uint16_t val = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+                    p += 2;
+                    r = (uint8_t)(((val >> 10) & 0x1F) * 255 / 31);
+                    g = (uint8_t)(((val >> 5)  & 0x1F) * 255 / 31);
+                    b = (uint8_t)((val         & 0x1F) * 255 / 31);
+                } else {
+                    b = p[0]; g = p[1]; r = p[2];
+                    if (bytes_per_pix == 4) a = p[3];
+                    p += bytes_per_pix;
+                }
                 for (int i = 0; i < len && count < total; i++) {
                     size_t off = (size_t)count * 4;
                     img->rgba[off + 0] = r;
@@ -369,8 +479,20 @@ static image_t *decode_tga(const uint8_t *data, size_t size) {
                 }
             } else {
                 for (int i = 0; i < len && count < total; i++) {
-                    uint8_t b = p[0], g = p[1], r = p[2], a = (bytes_per_pix == 4) ? p[3] : 0xFF;
-                    p += bytes_per_pix;
+                    uint8_t r, g, b, a = 0xFF;
+                    if (bpp == 8) {
+                        r = g = b = *p++;
+                    } else if (bpp == 16) {
+                        uint16_t val = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+                        p += 2;
+                        r = (uint8_t)(((val >> 10) & 0x1F) * 255 / 31);
+                        g = (uint8_t)(((val >> 5)  & 0x1F) * 255 / 31);
+                        b = (uint8_t)((val         & 0x1F) * 255 / 31);
+                    } else {
+                        b = p[0]; g = p[1]; r = p[2];
+                        if (bytes_per_pix == 4) a = p[3];
+                        p += bytes_per_pix;
+                    }
                     size_t off = (size_t)count * 4;
                     img->rgba[off + 0] = r;
                     img->rgba[off + 1] = g;
@@ -381,6 +503,306 @@ static image_t *decode_tga(const uint8_t *data, size_t size) {
             }
         }
     }
+
+    if (bpp == 32) {
+        bool all_zero = true;
+        bool has_trans = false;
+        for (size_t i = 0; i < (size_t)w * h; i++) {
+            uint8_t a = img->rgba[i * 4 + 3];
+            if (a != 0) all_zero = false;
+            if (a < 255) has_trans = true;
+        }
+        if (all_zero) {
+            for (size_t i = 0; i < (size_t)w * h; i++) {
+                img->rgba[i * 4 + 3] = 0xFF;
+            }
+            img->has_alpha = false;
+        } else {
+            img->has_alpha = has_trans;
+        }
+    }
+
+    return img;
+}
+
+static image_t *decode_png(const uint8_t *data, size_t size) {
+    if (!data || size < 33) return NULL;
+    static const uint8_t png_sig[8] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+    if (memcmp(data, png_sig, 8) != 0) return NULL;
+
+    size_t offset = 8;
+    int width = 0, height = 0;
+    int bit_depth = 0, color_type = 0;
+    const uint8_t *palette = NULL;
+    int palette_entries = 0;
+    const uint8_t *trns_data = NULL;
+    size_t trns_len = 0;
+
+    size_t idat_total_len = 0;
+    size_t scan_off = 8;
+    while (scan_off + 8 <= size) {
+        uint32_t chunk_len = ((uint32_t)data[scan_off] << 24) |
+                             ((uint32_t)data[scan_off + 1] << 16) |
+                             ((uint32_t)data[scan_off + 2] << 8) |
+                             (uint32_t)data[scan_off + 3];
+        const uint8_t *type = data + scan_off + 4;
+        scan_off += 8;
+        if (scan_off + chunk_len > size) break;
+        if (memcmp(type, "IDAT", 4) == 0) {
+            idat_total_len += chunk_len;
+        }
+        scan_off += chunk_len + 4;
+    }
+
+    if (idat_total_len == 0) return NULL;
+
+    uint8_t *idat_buf = (uint8_t *)kmalloc(idat_total_len);
+    if (!idat_buf) return NULL;
+
+    size_t idat_copied = 0;
+
+    while (offset + 8 <= size) {
+        uint32_t chunk_len = ((uint32_t)data[offset] << 24) |
+                             ((uint32_t)data[offset + 1] << 16) |
+                             ((uint32_t)data[offset + 2] << 8) |
+                             (uint32_t)data[offset + 3];
+        const uint8_t *type = data + offset + 4;
+        offset += 8;
+        if (offset + chunk_len > size) break;
+
+        if (memcmp(type, "IHDR", 4) == 0 && chunk_len >= 13) {
+            width = (int)(((uint32_t)data[offset] << 24) | ((uint32_t)data[offset + 1] << 16) |
+                          ((uint32_t)data[offset + 2] << 8) | (uint32_t)data[offset + 3]);
+            height = (int)(((uint32_t)data[offset + 4] << 24) | ((uint32_t)data[offset + 5] << 16) |
+                           ((uint32_t)data[offset + 6] << 8) | (uint32_t)data[offset + 7]);
+            bit_depth = data[offset + 8];
+            color_type = data[offset + 9];
+        } else if (memcmp(type, "PLTE", 4) == 0) {
+            palette = data + offset;
+            palette_entries = chunk_len / 3;
+        } else if (memcmp(type, "tRNS", 4) == 0) {
+            trns_data = data + offset;
+            trns_len = chunk_len;
+        } else if (memcmp(type, "IDAT", 4) == 0) {
+            if (idat_copied + chunk_len <= idat_total_len) {
+                memcpy(idat_buf + idat_copied, data + offset, chunk_len);
+                idat_copied += chunk_len;
+            }
+        } else if (memcmp(type, "IEND", 4) == 0) {
+            break;
+        }
+        offset += chunk_len + 4;
+    }
+
+    if (width <= 0 || height <= 0 ||
+        (bit_depth != 1 && bit_depth != 2 && bit_depth != 4 && bit_depth != 8 && bit_depth != 16)) {
+        kfree(idat_buf);
+        return NULL;
+    }
+
+    int channels = 0;
+    if (color_type == 0) channels = 1;      /* Grayscale */
+    else if (color_type == 2) channels = 3; /* RGB */
+    else if (color_type == 3) channels = 1; /* Indexed */
+    else if (color_type == 4) channels = 2; /* Grayscale + Alpha */
+    else if (color_type == 6) channels = 4; /* RGBA */
+    else {
+        kfree(idat_buf);
+        return NULL;
+    }
+
+    size_t stride = (bit_depth < 8) ? (((size_t)width * bit_depth + 7) / 8)
+                                    : ((size_t)width * channels * (bit_depth / 8));
+    size_t uncomp_size = (size_t)(stride + 1) * height;
+
+    uint8_t *uncomp = (uint8_t *)kmalloc(uncomp_size);
+    if (!uncomp) {
+        kfree(idat_buf);
+        return NULL;
+    }
+
+    uint8_t *dict = (uint8_t *)kmalloc(32768);
+    uzlib_uncomp_t d;
+    memset(&d, 0, sizeof(d));
+    uzlib_uncompress_init(&d, dict, dict ? 32768 : 0);
+
+    size_t zlib_hdr = (idat_copied >= 2) ? 2 : 0;
+    d.source = idat_buf + zlib_hdr;
+    d.source_limit = idat_buf + idat_copied - ((idat_copied >= 6) ? 4 : 0);
+    d.dest_start = uncomp;
+    d.dest = uncomp;
+    d.dest_limit = uncomp + uncomp_size;
+
+    int ures = uzlib_uncompress(&d);
+    if (dict) kfree(dict);
+    kfree(idat_buf);
+
+    if (ures != UZLIB_DONE && ures != UZLIB_OK) {
+        kfree(uncomp);
+        return NULL;
+    }
+
+    image_t *img = (image_t *)kmalloc(sizeof(image_t));
+    if (!img) {
+        kfree(uncomp);
+        return NULL;
+    }
+    img->width = width;
+    img->height = height;
+    img->has_alpha = false;
+    img->rgba = (uint8_t *)kmalloc((size_t)width * height * 4);
+    if (!img->rgba) {
+        kfree(img);
+        kfree(uncomp);
+        return NULL;
+    }
+
+    uint8_t *curr_row = (uint8_t *)kmalloc(stride);
+    uint8_t *prev_row = (uint8_t *)kmalloc(stride);
+    if (!curr_row || !prev_row) {
+        if (curr_row) kfree(curr_row);
+        if (prev_row) kfree(prev_row);
+        kfree(img->rgba);
+        kfree(img);
+        kfree(uncomp);
+        return NULL;
+    }
+    memset(prev_row, 0, stride);
+
+    const uint8_t *raw_ptr = uncomp;
+    int bpp_val = (bit_depth < 8) ? 1 : (channels * (bit_depth / 8));
+
+    bool has_trns_key = false;
+    uint8_t trns_r = 0, trns_g = 0, trns_b = 0, trns_gray = 0;
+    if (trns_data) {
+        if (color_type == 2 && trns_len >= 6) {
+            has_trns_key = true;
+            trns_r = (bit_depth == 16) ? trns_data[0] : trns_data[1];
+            trns_g = (bit_depth == 16) ? trns_data[2] : trns_data[3];
+            trns_b = (bit_depth == 16) ? trns_data[4] : trns_data[5];
+        } else if (color_type == 0 && trns_len >= 2) {
+            has_trns_key = true;
+            trns_gray = (bit_depth == 16) ? trns_data[0] : trns_data[1];
+        }
+    }
+
+    for (int y = 0; y < height; y++) {
+        uint8_t filter_type = *raw_ptr++;
+        memcpy(curr_row, raw_ptr, stride);
+        raw_ptr += stride;
+
+        for (size_t x = 0; x < stride; x++) {
+            uint8_t a = (x >= (size_t)bpp_val) ? curr_row[x - bpp_val] : 0;
+            uint8_t b = prev_row[x];
+            uint8_t c = (x >= (size_t)bpp_val) ? prev_row[x - bpp_val] : 0;
+
+            if (filter_type == 1) {
+                curr_row[x] = (uint8_t)(curr_row[x] + a);
+            } else if (filter_type == 2) {
+                curr_row[x] = (uint8_t)(curr_row[x] + b);
+            } else if (filter_type == 3) {
+                curr_row[x] = (uint8_t)(curr_row[x] + ((a + b) >> 1));
+            } else if (filter_type == 4) {
+                int p = (int)a + (int)b - (int)c;
+                int pa = p > a ? (p - a) : (a - p);
+                int pb = p > b ? (p - b) : (b - p);
+                int pc = p > c ? (p - c) : (c - p);
+                uint8_t pr = (pa <= pb && pa <= pc) ? a : ((pb <= pc) ? b : c);
+                curr_row[x] = (uint8_t)(curr_row[x] + pr);
+            }
+        }
+
+        for (int x = 0; x < width; x++) {
+            size_t dst_off = ((size_t)y * width + x) * 4;
+            uint8_t r = 0, g = 0, b = 0, a = 0xFF;
+
+            if (color_type == 6) { /* RGBA */
+                if (bit_depth == 16) {
+                    r = curr_row[x * 8 + 0];
+                    g = curr_row[x * 8 + 2];
+                    b = curr_row[x * 8 + 4];
+                    a = curr_row[x * 8 + 6];
+                } else {
+                    r = curr_row[x * 4 + 0];
+                    g = curr_row[x * 4 + 1];
+                    b = curr_row[x * 4 + 2];
+                    a = curr_row[x * 4 + 3];
+                }
+            } else if (color_type == 2) { /* RGB */
+                if (bit_depth == 16) {
+                    r = curr_row[x * 6 + 0];
+                    g = curr_row[x * 6 + 2];
+                    b = curr_row[x * 6 + 4];
+                } else {
+                    r = curr_row[x * 3 + 0];
+                    g = curr_row[x * 3 + 1];
+                    b = curr_row[x * 3 + 2];
+                }
+                if (has_trns_key && r == trns_r && g == trns_g && b == trns_b) {
+                    a = 0;
+                }
+            } else if (color_type == 0) { /* Grayscale */
+                if (bit_depth == 16) {
+                    g = curr_row[x * 2 + 0];
+                } else if (bit_depth == 8) {
+                    g = curr_row[x];
+                } else if (bit_depth == 4) {
+                    g = (uint8_t)(((curr_row[x >> 1] >> ((1 - (x & 1)) * 4)) & 0x0F) * 255 / 15);
+                } else if (bit_depth == 2) {
+                    g = (uint8_t)(((curr_row[x >> 2] >> ((3 - (x & 3)) * 2)) & 0x03) * 255 / 3);
+                } else if (bit_depth == 1) {
+                    g = ((curr_row[x >> 3] >> (7 - (x & 7))) & 1) ? 255 : 0;
+                }
+                r = b = g;
+                if (has_trns_key && g == trns_gray) {
+                    a = 0;
+                }
+            } else if (color_type == 3) { /* Indexed */
+                uint8_t idx = 0;
+                if (bit_depth == 8) {
+                    idx = curr_row[x];
+                } else if (bit_depth == 4) {
+                    idx = (uint8_t)((curr_row[x >> 1] >> ((1 - (x & 1)) * 4)) & 0x0F);
+                } else if (bit_depth == 2) {
+                    idx = (uint8_t)((curr_row[x >> 2] >> ((3 - (x & 3)) * 2)) & 0x03);
+                } else if (bit_depth == 1) {
+                    idx = (uint8_t)((curr_row[x >> 3] >> (7 - (x & 7))) & 1);
+                }
+                if (palette && idx < palette_entries) {
+                    r = palette[idx * 3 + 0];
+                    g = palette[idx * 3 + 1];
+                    b = palette[idx * 3 + 2];
+                }
+                if (trns_data && idx < trns_len) {
+                    a = trns_data[idx];
+                }
+            } else if (color_type == 4) { /* Grayscale + Alpha */
+                if (bit_depth == 16) {
+                    g = curr_row[x * 4 + 0];
+                    a = curr_row[x * 4 + 2];
+                } else {
+                    g = curr_row[x * 2 + 0];
+                    a = curr_row[x * 2 + 1];
+                }
+                r = b = g;
+            }
+
+            img->rgba[dst_off + 0] = r;
+            img->rgba[dst_off + 1] = g;
+            img->rgba[dst_off + 2] = b;
+            img->rgba[dst_off + 3] = a;
+            if (a < 255) {
+                img->has_alpha = true;
+            }
+        }
+
+        memcpy(prev_row, curr_row, stride);
+    }
+
+    kfree(curr_row);
+    kfree(prev_row);
+    kfree(uncomp);
+
     return img;
 }
 
@@ -1212,6 +1634,71 @@ static void render_procedural_frame(int frame_no) {
  * 3. File Loader Helpers via IPO_FS
  * ========================================================================= */
 
+static char *current_browse_dir = NULL;
+static char search_filter[32] = "";
+static size_t search_filter_len = 0;
+
+static void set_browse_dir(const char *dir) {
+    if (!dir || dir[0] == '\0') dir = "/";
+    size_t len = strlen(dir);
+    char *nd = (char *)kmalloc(len + 1);
+    if (nd) {
+        memcpy(nd, dir, len + 1);
+        if (current_browse_dir) kfree(current_browse_dir);
+        current_browse_dir = nd;
+    }
+}
+
+static const char *ipo_strcasestr(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return NULL;
+    if (*needle == '\0') return haystack;
+    for (; *haystack; haystack++) {
+        const char *h = haystack;
+        const char *n = needle;
+        while (*h && *n) {
+            char ch1 = *h;
+            char ch2 = *n;
+            if (ch1 >= 'A' && ch1 <= 'Z') ch1 += ('a' - 'A');
+            if (ch2 >= 'A' && ch2 <= 'Z') ch2 += ('a' - 'A');
+            if (ch1 != ch2) break;
+            h++;
+            n++;
+        }
+        if (*n == '\0') return haystack;
+    }
+    return NULL;
+}
+
+static char scancode_to_char(uint8_t sc, bool shift) {
+    if (sc >= 0x02 && sc <= 0x0A) {
+        const char *norm = "123456789";
+        const char *sh = "!@#$%^&*(";
+        return shift ? sh[sc - 0x02] : norm[sc - 0x02];
+    }
+    if (sc == 0x0B) return shift ? ')' : '0';
+    if (sc == 0x0C) return shift ? '_' : '-';
+    if (sc == 0x34) return shift ? '>' : '.';
+    if (sc == 0x35) return shift ? '?' : '/';
+    if (sc == 0x39) return ' ';
+
+    static const char row1[] = "qwertyuiop";
+    if (sc >= 0x10 && sc <= 0x19) {
+        char c = row1[sc - 0x10];
+        return (shift) ? (c - 'a' + 'A') : c;
+    }
+    static const char row2[] = "asdfghjkl";
+    if (sc >= 0x1E && sc <= 0x26) {
+        char c = row2[sc - 0x1E];
+        return (shift) ? (c - 'a' + 'A') : c;
+    }
+    static const char row3[] = "zxcvbnm";
+    if (sc >= 0x2C && sc <= 0x32) {
+        char c = row3[sc - 0x2C];
+        return (shift) ? (c - 'a' + 'A') : c;
+    }
+    return '\0';
+}
+
 static uint8_t *read_entire_file(const char *path, size_t *out_size) {
     if (!path || !out_size) return NULL;
     struct ipo_inode st;
@@ -1220,15 +1707,24 @@ static uint8_t *read_entire_file(const char *path, size_t *out_size) {
     int fd = ipo_open(path);
     if (fd < 0) return NULL;
 
-    uint8_t *buf = (uint8_t *)kmalloc((size_t)st.size + 1);
+    const char *dot = strrchr(path, '.');
+    bool is_mp3_path = (dot && (strcmp(dot, ".mp3") == 0 || strcmp(dot, ".MP3") == 0));
+
+    size_t alloc_sz = (size_t)st.size + 1;
+    if (is_mp3_path && alloc_sz > 16 * 1024 * 1024) {
+        alloc_sz = 16 * 1024 * 1024;
+    }
+
+    uint8_t *buf = (uint8_t *)kmalloc(alloc_sz);
+    if (!buf && is_mp3_path) {
+        alloc_sz = 4 * 1024 * 1024;
+        buf = (uint8_t *)kmalloc(alloc_sz);
+    }
     if (!buf) {
-        printf("[player] Failed to allocate %u bytes for %s!\n", (uint32_t)st.size, path);
+        printf("[player] Failed to allocate memory for %s!\n", path);
         ipo_close(fd);
         return NULL;
     }
-
-    const char *dot = strrchr(path, '.');
-    bool is_mp3_path = (dot && (strcmp(dot, ".mp3") == 0 || strcmp(dot, ".MP3") == 0));
 
     if (is_mp3_path && st.size > 128 * 1024) {
         uint32_t initial_chunk = 128 * 1024;
@@ -1242,7 +1738,7 @@ static uint8_t *read_entire_file(const char *path, size_t *out_size) {
         current_file_buffered = (size_t)rd;
         current_file_size = (size_t)st.size;
         current_file_data = buf;
-        buf[st.size] = 0;
+        buf[initial_chunk] = 0;
         *out_size = (size_t)st.size;
         printf("[player] Stream started: buffered %d/%u bytes\n", rd, (uint32_t)st.size);
         return buf;
@@ -1258,7 +1754,7 @@ static uint8_t *read_entire_file(const char *path, size_t *out_size) {
     buf[rd] = 0;
     current_stream_fd = -1;
     current_file_buffered = (size_t)rd;
-    current_file_size = (size_t)st.size;
+    current_file_size = (size_t)rd;
     current_file_data = buf;
     *out_size = (size_t)rd;
     return buf;
@@ -1290,10 +1786,16 @@ static void add_media_entry(const char *path, const char *name, uint32_t size, m
         media_list = new_arr;
         media_cap = new_cap;
     }
-    strncpy(media_list[media_count].path, path, sizeof(media_list[media_count].path) - 1);
-    media_list[media_count].path[sizeof(media_list[media_count].path) - 1] = '\0';
-    strncpy(media_list[media_count].name, name, sizeof(media_list[media_count].name) - 1);
-    media_list[media_count].name[sizeof(media_list[media_count].name) - 1] = '\0';
+    size_t plen = strlen(path);
+    media_list[media_count].path = (char *)kmalloc(plen + 1);
+    if (media_list[media_count].path) {
+        memcpy(media_list[media_count].path, path, plen + 1);
+    }
+    size_t nlen = strlen(name);
+    media_list[media_count].name = (char *)kmalloc(nlen + 1);
+    if (media_list[media_count].name) {
+        memcpy(media_list[media_count].name, name, nlen + 1);
+    }
     media_list[media_count].size = size;
     media_list[media_count].mode = mode;
     media_count++;
@@ -1301,6 +1803,16 @@ static void add_media_entry(const char *path, const char *name, uint32_t size, m
 
 static void free_media_list(void) {
     if (media_list) {
+        for (size_t i = 0; i < media_count; i++) {
+            if (media_list[i].path) {
+                kfree(media_list[i].path);
+                media_list[i].path = NULL;
+            }
+            if (media_list[i].name) {
+                kfree(media_list[i].name);
+                media_list[i].name = NULL;
+            }
+        }
         kfree(media_list);
         media_list = NULL;
     }
@@ -1308,59 +1820,138 @@ static void free_media_list(void) {
     media_cap = 0;
 }
 
-static void scan_media_files(void) {
+static int get_filtered_count(void) {
+    if (search_filter_len == 0) return (int)media_count;
+    int cnt = 0;
+    for (size_t i = 0; i < media_count; i++) {
+        if (media_list[i].mode == MEDIA_MODE_DIR && strcmp(media_list[i].name, "..") == 0) {
+            cnt++;
+        } else if (ipo_strcasestr(media_list[i].name, search_filter) != NULL) {
+            cnt++;
+        }
+    }
+    return cnt;
+}
+
+static int get_filtered_index(int filtered_idx) {
+    if (search_filter_len == 0) return filtered_idx;
+    int cnt = 0;
+    for (size_t i = 0; i < media_count; i++) {
+        if (media_list[i].mode == MEDIA_MODE_DIR && strcmp(media_list[i].name, "..") == 0) {
+            if (cnt == filtered_idx) return (int)i;
+            cnt++;
+        } else if (ipo_strcasestr(media_list[i].name, search_filter) != NULL) {
+            if (cnt == filtered_idx) return (int)i;
+            cnt++;
+        }
+    }
+    return -1;
+}
+
+static void scan_media_files(const char *dir_path) {
     free_media_list();
 
-    char dir_buf[2048];
-    memset(dir_buf, 0, sizeof(dir_buf));
-    int res = ipo_list_dir("/media", dir_buf, sizeof(dir_buf) - 1);
+    if (!dir_path || dir_path[0] == '\0') {
+        dir_path = "/";
+    }
 
-    if (res > 0) {
-        char *line = dir_buf;
-        while (*line) {
-            char *next = strchr(line, '\n');
-            if (next) *next = '\0';
+    /* Add ".." navigation if not in root */
+    if (strcmp(dir_path, "/") != 0) {
+        add_media_entry("..", "..", 0, MEDIA_MODE_DIR);
+    }
 
-            /* Strip carriage returns and spaces */
-            size_t llen = strlen(line);
-            while (llen > 0 && (line[llen - 1] == '\r' || line[llen - 1] == ' ')) {
+    /* Dynamic self-expanding dir_buf, starting at 4KB and doubling without limits */
+    size_t dir_buf_cap = 4096;
+    char *dir_buf = (char *)kmalloc(dir_buf_cap);
+    if (!dir_buf) return;
+
+    while (dir_buf) {
+        memset(dir_buf, 0, dir_buf_cap);
+        int res = ipo_list_dir(dir_path, dir_buf, (int)dir_buf_cap - 1);
+        if (res < 0) {
+            kfree(dir_buf);
+            return;
+        }
+        if ((size_t)res >= dir_buf_cap - 256) {
+            size_t new_cap = dir_buf_cap * 2;
+            char *new_buf = (char *)kmalloc(new_cap);
+            if (!new_buf) break;
+            kfree(dir_buf);
+            dir_buf = new_buf;
+            dir_buf_cap = new_cap;
+            continue;
+        }
+        break;
+    }
+
+    char *line = dir_buf;
+    while (*line) {
+        char *next = strchr(line, '\n');
+        if (next) *next = '\0';
+
+        /* Strip carriage returns and spaces */
+        size_t llen = strlen(line);
+        while (llen > 0 && (line[llen - 1] == '\r' || line[llen - 1] == ' ')) {
+            line[--llen] = '\0';
+        }
+
+        if (llen > 0) {
+            bool is_dir = false;
+            if (line[llen - 1] == '/') {
+                is_dir = true;
                 line[--llen] = '\0';
             }
 
-            /* Skip trailing slash if directory */
-            if (llen > 0 && line[llen - 1] != '/') {
-                char full_path[128];
-                snprintf(full_path, sizeof(full_path), "/media/%s", line);
-
-                struct ipo_inode st;
-                if (ipo_stat(full_path, &st) == 0 && st.size > 0) {
-                    const char *dot = strrchr(line, '.');
-                    if (dot) {
-                        if (strcmp(dot, ".avi") == 0 || strcmp(dot, ".AVI") == 0) {
-                            add_media_entry(full_path, line, (uint32_t)st.size, MEDIA_MODE_VIDEO);
-                        } else if (strcmp(dot, ".mp3") == 0 || strcmp(dot, ".MP3") == 0) {
-                            add_media_entry(full_path, line, (uint32_t)st.size, MEDIA_MODE_AUDIO);
-                        } else if (strcmp(dot, ".vid") == 0) {
-                            add_media_entry(full_path, line, (uint32_t)st.size, MEDIA_MODE_VIDEO);
-                        } else if (strcmp(dot, ".gif") == 0) {
-                            add_media_entry(full_path, line, (uint32_t)st.size, MEDIA_MODE_VIDEO);
-                        } else if (strcmp(dot, ".bmp") == 0 || strcmp(dot, ".tga") == 0) {
-                            add_media_entry(full_path, line, (uint32_t)st.size, MEDIA_MODE_IMAGE);
-                        } else if (strcmp(dot, ".wav") == 0) {
-                            add_media_entry(full_path, line, (uint32_t)st.size, MEDIA_MODE_AUDIO);
-                        }
+            if (strcmp(line, ".") != 0 && strcmp(line, "..") != 0 && llen > 0) {
+                size_t dlen = strlen(dir_path);
+                size_t llen_alloc = strlen(line);
+                char *full_path = (char *)kmalloc(dlen + llen_alloc + 2);
+                if (full_path) {
+                    if (strcmp(dir_path, "/") == 0) {
+                        snprintf(full_path, dlen + llen_alloc + 2, "/%s", line);
+                    } else {
+                        snprintf(full_path, dlen + llen_alloc + 2, "%s/%s", dir_path, line);
                     }
+
+                    if (is_dir) {
+                        add_media_entry(full_path, line, 0, MEDIA_MODE_DIR);
+                    } else {
+                        struct ipo_inode st;
+                        uint32_t fsz = 0;
+                        if (ipo_stat(full_path, &st) == 0) {
+                            fsz = (uint32_t)st.size;
+                        }
+                        media_mode_t mode = MEDIA_MODE_FILE;
+                        const char *dot = strrchr(line, '.');
+                        if (dot) {
+                            if (strcmp(dot, ".avi") == 0 || strcmp(dot, ".AVI") == 0 ||
+                                strcmp(dot, ".vid") == 0 || strcmp(dot, ".gif") == 0 || strcmp(dot, ".GIF") == 0) {
+                                mode = MEDIA_MODE_VIDEO;
+                            } else if (strcmp(dot, ".mp3") == 0 || strcmp(dot, ".MP3") == 0 ||
+                                       strcmp(dot, ".wav") == 0 || strcmp(dot, ".WAV") == 0) {
+                                mode = MEDIA_MODE_AUDIO;
+                            } else if (strcmp(dot, ".bmp") == 0 || strcmp(dot, ".BMP") == 0 ||
+                                       strcmp(dot, ".tga") == 0 || strcmp(dot, ".TGA") == 0 ||
+                                       strcmp(dot, ".png") == 0 || strcmp(dot, ".PNG") == 0) {
+                                mode = MEDIA_MODE_IMAGE;
+                            }
+                        }
+                        add_media_entry(full_path, line, fsz, mode);
+                    }
+                    kfree(full_path);
                 }
             }
-
-            if (!next) break;
-            line = next + 1;
         }
+
+        if (!next) break;
+        line = next + 1;
     }
 
-    /* Fallback procedural items if /media is empty */
-    add_media_entry("test_photo", "SMPTE Color Chart (Photo)", 160 * 120 * 4, MEDIA_MODE_IMAGE);
-    if (media_count <= 1) {
+    kfree(dir_buf);
+
+    /* Fallback procedural items if empty in root */
+    if (media_count == 0) {
+        add_media_entry("test_photo", "SMPTE Color Chart (Photo)", 160 * 120 * 4, MEDIA_MODE_IMAGE);
         add_media_entry("procedural", "Procedural Video Demo", 64 * 64 * 4 * 60, MEDIA_MODE_VIDEO);
         add_media_entry("synthesizer", "Synthesizer Audio Demo", 16000, MEDIA_MODE_AUDIO);
     }
@@ -1381,6 +1972,7 @@ static bool          is_paused = false;
 
 static int            browser_scroll_offset = 0;
 static image_t        *current_image = NULL;
+static int             image_bg_mode = 2; /* 0: Solid White, 1: Solid Black, 2: Checkerboard Grid (default) */
 static uint8_t        *companion_wav_data = NULL;
 
 static vid_header_t  current_vid_hdr;
@@ -1624,14 +2216,15 @@ static void blit_rgba_to_window(wm_window_t *win, const uint8_t *rgba, int src_w
         off_y = 0;
     }
 
-    /* Fill letterbox bars with black */
+    /* Fill letterbox bars (white in White mode, black in Black/Grid modes) */
+    uint8_t letterbox_clr = (image_bg_mode == 0) ? CLR_WHITE : CLR_BLACK;
     if (off_y > 0) {
-        wm_buf_fill_rect(fb, bw, bh, 0, 0, dst_w, off_y, CLR_BLACK);
-        wm_buf_fill_rect(fb, bw, bh, 0, off_y + render_h, dst_w, dst_h - (off_y + render_h), CLR_BLACK);
+        wm_buf_fill_rect(fb, bw, bh, 0, 0, dst_w, off_y, letterbox_clr);
+        wm_buf_fill_rect(fb, bw, bh, 0, off_y + render_h, dst_w, dst_h - (off_y + render_h), letterbox_clr);
     }
     if (off_x > 0) {
-        wm_buf_fill_rect(fb, bw, bh, 0, off_y, off_x, render_h, CLR_BLACK);
-        wm_buf_fill_rect(fb, bw, bh, off_x + render_w, off_y, dst_w - (off_x + render_w), render_h, CLR_BLACK);
+        wm_buf_fill_rect(fb, bw, bh, 0, off_y, off_x, render_h, letterbox_clr);
+        wm_buf_fill_rect(fb, bw, bh, off_x + render_w, off_y, dst_w - (off_x + render_w), render_h, letterbox_clr);
     }
 
     if (render_w <= 0 || render_h <= 0) return;
@@ -1639,6 +2232,14 @@ static void blit_rgba_to_window(wm_window_t *win, const uint8_t *rgba, int src_w
     int step_x = (src_w << 16) / render_w;
     int step_y = (src_h << 16) / render_h;
     int cur_y_fp = 0;
+
+    /* Bayer 4x4 Dithering Matrix (scaled for 6x6x6 color cube step 51) */
+    static const int8_t bayer4x4[4][4] = {
+        { -8,  0, -6,  2 },
+        {  4, -4,  6, -2 },
+        { -5,  3, -7,  1 },
+        {  7, -1,  5, -3 }
+    };
 
     /* Fast direct integer-scaled blit directly to window framebuffer */
     for (int dy = 0; dy < render_h; dy++) {
@@ -1654,7 +2255,43 @@ static void blit_rgba_to_window(wm_window_t *win, const uint8_t *rgba, int src_w
             cur_x_fp += step_x;
             if (sx >= src_w) sx = src_w - 1;
             const uint8_t *p = src_line + sx * 4;
-            dst_line[dx] = rgb_to_palette(p[0], p[1], p[2]);
+            uint8_t a = p[3];
+
+            uint8_t bg_r, bg_g, bg_b;
+            if (image_bg_mode == 0) {
+                /* Solid White (default clean canvas) */
+                bg_r = bg_g = bg_b = 255;
+            } else if (image_bg_mode == 1) {
+                /* Solid Black */
+                bg_r = bg_g = bg_b = 0;
+            } else {
+                /* Checkerboard Grid (8x8 tiles) using exact 6x6x6 cube palette levels (204 and 153) */
+                int cx = (off_x + dx) >> 3;
+                int cy = (off_y + dy) >> 3;
+                uint8_t v = (((cx + cy) & 1) == 0) ? 204 : 153;
+                bg_r = bg_g = bg_b = v;
+            }
+
+            if (a < 4) {
+                /* Fully transparent or imperceptible sub-1.5% alpha noise */
+                dst_line[dx] = rgb_to_palette(bg_r, bg_g, bg_b);
+            } else if (a == 255) {
+                /* Fully solid pixel: direct palette mapping preserves crisp lines without dither noise */
+                dst_line[dx] = rgb_to_palette(p[0], p[1], p[2]);
+            } else {
+                uint32_t inv_a = 255 - a;
+                int r = (int)(((uint32_t)p[0] * a + (uint32_t)bg_r * inv_a + 127) / 255);
+                int g = (int)(((uint32_t)p[1] * a + (uint32_t)bg_g * inv_a + 127) / 255);
+                int b = (int)(((uint32_t)p[2] * a + (uint32_t)bg_b * inv_a + 127) / 255);
+
+                /* Ordered Bayer dithering for smooth color gradients and translucency */
+                int bias = (int)bayer4x4[(off_y + dy) & 3][(off_x + dx) & 3] * 3;
+                r += bias; if (r < 0) r = 0; else if (r > 255) r = 255;
+                g += bias; if (g < 0) g = 0; else if (g > 255) g = 255;
+                b += bias; if (b < 0) b = 0; else if (b > 255) b = 255;
+
+                dst_line[dx] = rgb_to_palette((uint8_t)r, (uint8_t)g, (uint8_t)b);
+            }
         }
     }
 }
@@ -1751,10 +2388,20 @@ static void render_browser_ui(wm_window_t *win) {
     wm_buf_fill_rect(fb, bw, bh, 0, 0, bw, bh, CLR_DARK_GRAY);
 
     /* Header banner */
-    wm_buf_fill_rect(fb, bw, bh, 0, 0, bw, 20, CLR_BLUE);
-    wm_buf_draw_line(fb, bw, bh, 0, 20, bw - 1, 20, CLR_WHITE);
-    wm_buf_draw_string(fb, bw, bh, 8, 3, "IPO Media Player - File Browser", CLR_WHITE);
-    wm_buf_draw_string(fb, bw, bh, 8, 12, "Select media to open from /media:", CLR_LIGHT_CYAN);
+    wm_buf_fill_rect(fb, bw, bh, 0, 0, bw, 22, CLR_BLUE);
+    wm_buf_draw_line(fb, bw, bh, 0, 22, bw - 1, 22, CLR_WHITE);
+
+    char dir_hdr[64];
+    snprintf(dir_hdr, sizeof(dir_hdr), "Dir: %s", current_browse_dir);
+    wm_buf_draw_string(fb, bw, bh, 6, 2, dir_hdr, CLR_WHITE);
+
+    if (search_filter_len > 0) {
+        char filter_hdr[64];
+        snprintf(filter_hdr, sizeof(filter_hdr), "Filter: %s_", search_filter);
+        wm_buf_draw_string(fb, bw, bh, 6, 12, filter_hdr, CLR_YELLOW);
+    } else {
+        wm_buf_draw_string(fb, bw, bh, 6, 12, "Type to search / Enter to open / Esc", CLR_LIGHT_CYAN);
+    }
 
     /* Bottom Control Bar */
     int bbar_h = 24;
@@ -1765,8 +2412,10 @@ static void render_browser_ui(wm_window_t *win) {
     draw_button(fb, bw, bh, 8, bbar_y + 4, 60, 16, "Open", false);
     draw_button(fb, bw, bh, 74, bbar_y + 4, 60, 16, "Scan", false);
 
+    int filtered_count = get_filtered_count();
+
     char pos_buf[32];
-    snprintf(pos_buf, sizeof(pos_buf), "[%d/%d] Select", selected_file_idx + 1, (int)media_count);
+    snprintf(pos_buf, sizeof(pos_buf), "[%d/%d] Select", selected_file_idx + 1, filtered_count);
     wm_buf_draw_string(fb, bw, bh, 142, bbar_y + 4, pos_buf, CLR_BLACK);
     wm_buf_draw_string(fb, bw, bh, 142, bbar_y + 13, "Enter: Open", CLR_BLACK);
 
@@ -1776,20 +2425,22 @@ static void render_browser_ui(wm_window_t *win) {
     int avail_h = bbar_y - list_y - 2;
     int max_rows = avail_h / row_h;
     if (max_rows < 1) max_rows = 1;
-    int max_scroll = (media_count > (size_t)max_rows) ? (int)(media_count - max_rows) : 0;
+    int max_scroll = (filtered_count > max_rows) ? (filtered_count - max_rows) : 0;
     if (browser_scroll_offset > max_scroll) browser_scroll_offset = max_scroll;
     if (browser_scroll_offset < 0) browser_scroll_offset = 0;
 
-    bool has_scrollbar = (media_count > (size_t)max_rows);
+    bool has_scrollbar = (filtered_count > max_rows);
     int sb_w = 10;
     int row_w = has_scrollbar ? (bw - sb_w - 8) : (bw - 8);
 
     for (int r = 0; r < max_rows; r++) {
-        int i = browser_scroll_offset + r;
-        if ((size_t)i >= media_count) break;
+        int fil_idx = browser_scroll_offset + r;
+        if (fil_idx >= filtered_count) break;
+        int i = get_filtered_index(fil_idx);
+        if (i < 0 || (size_t)i >= media_count) break;
 
         int ry = list_y + r * row_h;
-        bool is_sel = (i == selected_file_idx);
+        bool is_sel = (fil_idx == selected_file_idx);
 
         uint8_t row_bg = is_sel ? CLR_BLUE : ((r % 2 == 0) ? CLR_BLACK : 23);
         wm_buf_fill_rect(fb, bw, bh, 4, ry, row_w, row_h, row_bg);
@@ -1799,26 +2450,43 @@ static void render_browser_ui(wm_window_t *win) {
 
         /* Mode badge */
         const char *badge = "[FILE]";
-        uint8_t badge_clr = CLR_WHITE;
-        const char *fext = strrchr(media_list[i].name, '.');
-        if (fext && (strcmp(fext, ".avi") == 0 || strcmp(fext, ".AVI") == 0)) {
-            badge = "[AVI]";
-            badge_clr = CLR_LIGHT_MAGENTA;
-        } else if (fext && (strcmp(fext, ".mp3") == 0 || strcmp(fext, ".MP3") == 0)) {
-            badge = "[MP3]";
-            badge_clr = CLR_YELLOW;
-        } else if (fext && (strcmp(fext, ".gif") == 0 || strcmp(fext, ".GIF") == 0)) {
-            badge = "[GIF]";
-            badge_clr = CLR_LIGHT_MAGENTA;
-        } else if (media_list[i].mode == MEDIA_MODE_VIDEO) {
-            badge = "[VID]";
-            badge_clr = CLR_LIGHT_MAGENTA;
-        } else if (media_list[i].mode == MEDIA_MODE_IMAGE) {
-            badge = "[IMG]";
+        uint8_t badge_clr = CLR_LIGHT_GRAY;
+        if (media_list[i].mode == MEDIA_MODE_DIR) {
+            badge = "[DIR]";
             badge_clr = CLR_LIGHT_GREEN;
-        } else if (media_list[i].mode == MEDIA_MODE_AUDIO) {
-            badge = "[AUD]";
-            badge_clr = CLR_YELLOW;
+        } else {
+            const char *fext = strrchr(media_list[i].name, '.');
+            if (fext && (strcmp(fext, ".avi") == 0 || strcmp(fext, ".AVI") == 0)) {
+                badge = "[AVI]";
+                badge_clr = CLR_LIGHT_MAGENTA;
+            } else if (fext && (strcmp(fext, ".mp3") == 0 || strcmp(fext, ".MP3") == 0)) {
+                badge = "[MP3]";
+                badge_clr = CLR_YELLOW;
+            } else if (fext && (strcmp(fext, ".wav") == 0 || strcmp(fext, ".WAV") == 0)) {
+                badge = "[WAV]";
+                badge_clr = CLR_YELLOW;
+            } else if (fext && (strcmp(fext, ".png") == 0 || strcmp(fext, ".PNG") == 0)) {
+                badge = "[PNG]";
+                badge_clr = CLR_LIGHT_CYAN;
+            } else if (fext && (strcmp(fext, ".bmp") == 0 || strcmp(fext, ".BMP") == 0)) {
+                badge = "[BMP]";
+                badge_clr = CLR_LIGHT_CYAN;
+            } else if (fext && (strcmp(fext, ".tga") == 0 || strcmp(fext, ".TGA") == 0)) {
+                badge = "[TGA]";
+                badge_clr = CLR_LIGHT_CYAN;
+            } else if (fext && (strcmp(fext, ".gif") == 0 || strcmp(fext, ".GIF") == 0)) {
+                badge = "[GIF]";
+                badge_clr = CLR_LIGHT_MAGENTA;
+            } else if (media_list[i].mode == MEDIA_MODE_VIDEO) {
+                badge = "[VID]";
+                badge_clr = CLR_LIGHT_MAGENTA;
+            } else if (media_list[i].mode == MEDIA_MODE_IMAGE) {
+                badge = "[IMG]";
+                badge_clr = CLR_LIGHT_CYAN;
+            } else if (media_list[i].mode == MEDIA_MODE_AUDIO) {
+                badge = "[AUD]";
+                badge_clr = CLR_YELLOW;
+            }
         }
 
         wm_buf_draw_string(fb, bw, bh, 8, ry + 2, badge, badge_clr);
@@ -1826,9 +2494,13 @@ static void render_browser_ui(wm_window_t *win) {
         /* Filename */
         wm_buf_draw_string(fb, bw, bh, 48, ry + 2, media_list[i].name, is_sel ? CLR_WHITE : CLR_LIGHT_GRAY);
 
-        /* Filesize */
+        /* Filesize / DIR indicator */
         char sz_buf[16];
-        if (media_list[i].size >= 1024) {
+        if (media_list[i].mode == MEDIA_MODE_DIR) {
+            snprintf(sz_buf, sizeof(sz_buf), "<DIR>");
+        } else if (media_list[i].size >= 1024 * 1024) {
+            snprintf(sz_buf, sizeof(sz_buf), "%u MB", media_list[i].size / (1024 * 1024));
+        } else if (media_list[i].size >= 1024) {
             snprintf(sz_buf, sizeof(sz_buf), "%u KB", media_list[i].size / 1024);
         } else {
             snprintf(sz_buf, sizeof(sz_buf), "%u B", media_list[i].size);
@@ -1857,9 +2529,9 @@ static void render_browser_ui(wm_window_t *win) {
 
         /* Draggable Thumb */
         int track_h = sb_h - 20;
-        int thumb_h = (max_rows * track_h) / (int)media_count;
+        int thumb_h = (max_rows * track_h) / filtered_count;
         if (thumb_h < 12) thumb_h = 12;
-        int thumb_y = sb_y + 10 + (browser_scroll_offset * (track_h - thumb_h)) / max_scroll;
+        int thumb_y = sb_y + 10 + (browser_scroll_offset * (track_h - thumb_h)) / (max_scroll > 0 ? max_scroll : 1);
 
         draw_button(fb, bw, bh, sb_x, thumb_y, sb_w, thumb_h, "", false);
         if (thumb_h >= 14) {
@@ -1948,8 +2620,15 @@ static void render_player_toolbar(wm_window_t *win) {
         snprintf(status_str, sizeof(status_str), "%s %02u:%02u/%02u:%02u",
                  is_paused ? "[PAUSE]" : "[PLAY]", cur_sec / 60, cur_sec % 60, total_sec / 60, total_sec % 60);
     } else {
-        snprintf(status_str, sizeof(status_str), "[PHOTO] %dx%d",
-                 current_image ? current_image->width : 0, current_image ? current_image->height : 0);
+        if (current_image && current_image->has_alpha) {
+            static const char *bg_names[] = { "White", "Black", "Grid" };
+            const char *bg_str = (image_bg_mode >= 0 && image_bg_mode <= 2) ? bg_names[image_bg_mode] : "White";
+            snprintf(status_str, sizeof(status_str), "[PHOTO] %dx%d [A:%s] (T)",
+                     current_image->width, current_image->height, bg_str);
+        } else {
+            snprintf(status_str, sizeof(status_str), "[PHOTO] %dx%d",
+                     current_image ? current_image->width : 0, current_image ? current_image->height : 0);
+        }
     }
     if (bw >= 240) {
         wm_buf_draw_string(fb, bw, bh, 138, btn_y + 3, status_str, CLR_BLACK);
@@ -2015,6 +2694,43 @@ static void unload_current_media(void) {
 
 static void load_and_play(const media_entry_t *entry, wm_window_t *win) {
     if (!entry) return;
+
+    if (entry->mode == MEDIA_MODE_DIR) {
+        if (strcmp(entry->name, "..") == 0) {
+            char *slash = current_browse_dir ? strrchr(current_browse_dir, '/') : NULL;
+            if (slash && slash != current_browse_dir) {
+                *slash = '\0';
+                set_browse_dir(current_browse_dir);
+            } else {
+                set_browse_dir("/");
+            }
+        } else {
+            const char *base = (current_browse_dir && current_browse_dir[0]) ? current_browse_dir : "/";
+            size_t blen = strlen(base);
+            size_t nlen = strlen(entry->name);
+            char *new_dir = (char *)kmalloc(blen + nlen + 2);
+            if (new_dir) {
+                if (strcmp(base, "/") == 0) {
+                    snprintf(new_dir, blen + nlen + 2, "/%s", entry->name);
+                } else {
+                    snprintf(new_dir, blen + nlen + 2, "%s/%s", base, entry->name);
+                }
+                set_browse_dir(new_dir);
+                kfree(new_dir);
+            }
+        }
+        search_filter[0] = '\0';
+        search_filter_len = 0;
+        selected_file_idx = 0;
+        browser_scroll_offset = 0;
+        scan_media_files(current_browse_dir);
+        needs_redraw = true;
+        return;
+    }
+    if (entry->mode == MEDIA_MODE_FILE) {
+        return;
+    }
+
     unload_current_media();
 
     snprintf(current_title, sizeof(current_title), "IPO Player - %s", entry->name);
@@ -2109,6 +2825,13 @@ static void load_and_play(const media_entry_t *entry, wm_window_t *win) {
                         current_image->width = gif->width;
                         current_image->height = gif->height;
                         current_image->rgba = gif->frames_data;
+                        current_image->has_alpha = false;
+                        for (size_t pi = 0; pi < (size_t)gif->width * gif->height; pi++) {
+                            if (current_image->rgba[pi * 4 + 3] < 255) {
+                                current_image->has_alpha = true;
+                                break;
+                            }
+                        }
                         gif->frames_data = NULL;
                     }
                     free_gif(gif);
@@ -2130,6 +2853,8 @@ static void load_and_play(const media_entry_t *entry, wm_window_t *win) {
                     gif->frame_delays = NULL;
                     free_gif(gif);
                 }
+            } else if ((current_image = decode_png(current_file_data, current_file_size)) != NULL) {
+                current_mode = MEDIA_MODE_IMAGE;
             } else if ((current_image = decode_bmp(current_file_data, current_file_size)) != NULL) {
                 current_mode = MEDIA_MODE_IMAGE;
             } else if ((current_image = decode_tga(current_file_data, current_file_size)) != NULL) {
@@ -2302,25 +3027,29 @@ static void handle_user_input(wm_window_t *win) {
 
         if (ui_state == UI_STATE_BROWSER) {
             int sb_w = 10;
-            int row_w = (media_count > (size_t)max_rows) ? (bw - sb_w - 8) : (bw - 8);
+            int fil_cnt = get_filtered_count();
+            int row_w = (fil_cnt > max_rows) ? (bw - sb_w - 8) : (bw - 8);
 
             /* 1. File rows */
             if (cx >= 4 && cx <= 4 + row_w && cy >= BROWSER_LIST_Y && cy < BROWSER_LIST_Y + max_rows * BROWSER_ROW_H) {
                 int clicked_row = (cy - BROWSER_LIST_Y) / BROWSER_ROW_H;
-                int clicked_idx = browser_scroll_offset + clicked_row;
-                if (clicked_idx >= 0 && (size_t)clicked_idx < media_count) {
-                    if (selected_file_idx == clicked_idx) {
-                        load_and_play(&media_list[selected_file_idx], win);
-                        return;
-                    } else {
-                        selected_file_idx = clicked_idx;
-                        needs_redraw = true;
+                int clicked_fil_idx = browser_scroll_offset + clicked_row;
+                if (clicked_fil_idx >= 0 && clicked_fil_idx < fil_cnt) {
+                    int actual_idx = get_filtered_index(clicked_fil_idx);
+                    if (actual_idx >= 0 && (size_t)actual_idx < media_count) {
+                        if (selected_file_idx == clicked_fil_idx) {
+                            load_and_play(&media_list[actual_idx], win);
+                            return;
+                        } else {
+                            selected_file_idx = clicked_fil_idx;
+                            needs_redraw = true;
+                        }
                     }
                 }
             }
 
             /* 2. Scrollbar clicks */
-            if (media_count > (size_t)max_rows && cx >= bw - sb_w - 3 && cx <= bw - 3) {
+            if (fil_cnt > max_rows && cx >= bw - sb_w - 3 && cx <= bw - 3) {
                 int sb_y = BROWSER_LIST_Y;
                 int sb_h = avail_h;
                 if (cy >= sb_y && cy < sb_y + 10) {
@@ -2336,7 +3065,7 @@ static void handle_user_input(wm_window_t *win) {
                 } else if (cy >= sb_y + 10 && cy < sb_y + sb_h - 10) {
                     int track_h = sb_h - 20;
                     if (track_h < 10) track_h = 10;
-                    int thumb_h = (max_rows * track_h) / (int)media_count;
+                    int thumb_h = (max_rows * track_h) / fil_cnt;
                     if (thumb_h < 12) thumb_h = 12;
                     int thumb_y = sb_y + 10 + (browser_scroll_offset * (track_h - thumb_h)) / (max_scroll > 0 ? max_scroll : 1);
                     if (cy < thumb_y) {
@@ -2357,14 +3086,19 @@ static void handle_user_input(wm_window_t *win) {
 
             /* Open button */
             if (cx >= 8 && cx <= 68 && cy >= bbar_y + 4 && cy <= bbar_y + 20) {
-                if (selected_file_idx >= 0 && (size_t)selected_file_idx < media_count) {
-                    load_and_play(&media_list[selected_file_idx], win);
-                    return;
+                if (selected_file_idx >= 0 && selected_file_idx < fil_cnt) {
+                    int actual_idx = get_filtered_index(selected_file_idx);
+                    if (actual_idx >= 0 && (size_t)actual_idx < media_count) {
+                        load_and_play(&media_list[actual_idx], win);
+                        return;
+                    }
                 }
             }
             /* Scan button */
             if (cx >= 74 && cx <= 134 && cy >= bbar_y + 4 && cy <= bbar_y + 20) {
-                scan_media_files();
+                scan_media_files(current_browse_dir);
+                selected_file_idx = 0;
+                browser_scroll_offset = 0;
                 needs_redraw = true;
                 return;
             }
@@ -2449,6 +3183,15 @@ static void handle_user_input(wm_window_t *win) {
                     needs_redraw = true;
                     return;
                 }
+
+                /* Status text area click: toggle alpha background mode for images */
+                if (cx >= 138) {
+                    if (current_mode == MEDIA_MODE_IMAGE) {
+                        image_bg_mode = (image_bg_mode + 1) % 3;
+                        needs_redraw = true;
+                        return;
+                    }
+                }
             }
         }
     }
@@ -2474,6 +3217,7 @@ static void handle_user_input(wm_window_t *win) {
         uint8_t sc = (uint8_t)(last_key_scancode & 0x7F);
 
         if (ui_state == UI_STATE_BROWSER) {
+            int fil_cnt = get_filtered_count();
             if (sc == SC_UP) {
                 if (selected_file_idx > 0) {
                     selected_file_idx--;
@@ -2483,7 +3227,7 @@ static void handle_user_input(wm_window_t *win) {
                     needs_redraw = true;
                 }
             } else if (sc == SC_DOWN) {
-                if (media_count > 0 && (size_t)selected_file_idx + 1 < media_count) {
+                if (fil_cnt > 0 && selected_file_idx + 1 < fil_cnt) {
                     selected_file_idx++;
                     if (selected_file_idx >= browser_scroll_offset + max_rows) {
                         browser_scroll_offset = selected_file_idx - max_rows + 1;
@@ -2498,9 +3242,9 @@ static void handle_user_input(wm_window_t *win) {
                 }
                 needs_redraw = true;
             } else if (sc == SC_PAGE_DOWN) {
-                if (media_count > 0) {
+                if (fil_cnt > 0) {
                     selected_file_idx += max_rows;
-                    if ((size_t)selected_file_idx >= media_count) selected_file_idx = (int)media_count - 1;
+                    if (selected_file_idx >= fil_cnt) selected_file_idx = fil_cnt - 1;
                     if (selected_file_idx >= browser_scroll_offset + max_rows) {
                         browser_scroll_offset = selected_file_idx - max_rows + 1;
                     }
@@ -2511,17 +3255,58 @@ static void handle_user_input(wm_window_t *win) {
                 browser_scroll_offset = 0;
                 needs_redraw = true;
             } else if (sc == SC_END) {
-                if (media_count > 0) {
-                    selected_file_idx = (int)media_count - 1;
+                if (fil_cnt > 0) {
+                    selected_file_idx = fil_cnt - 1;
                     browser_scroll_offset = max_scroll;
                     needs_redraw = true;
                 }
             } else if (sc == SC_ENTER || sc == SC_SPACE) {
-                if (selected_file_idx >= 0 && (size_t)selected_file_idx < media_count) {
-                    load_and_play(&media_list[selected_file_idx], win);
+                if (selected_file_idx >= 0 && selected_file_idx < fil_cnt) {
+                    int actual_idx = get_filtered_index(selected_file_idx);
+                    if (actual_idx >= 0 && (size_t)actual_idx < media_count) {
+                        load_and_play(&media_list[actual_idx], win);
+                    }
+                }
+            } else if (sc == SC_BACKSPACE) {
+                if (search_filter_len > 0) {
+                    search_filter[--search_filter_len] = '\0';
+                    selected_file_idx = 0;
+                    browser_scroll_offset = 0;
+                    needs_redraw = true;
+                } else if (current_browse_dir && strcmp(current_browse_dir, "/") != 0) {
+                    char *slash = strrchr(current_browse_dir, '/');
+                    if (slash && slash != current_browse_dir) {
+                        *slash = '\0';
+                        set_browse_dir(current_browse_dir);
+                    } else {
+                        set_browse_dir("/");
+                    }
+                    search_filter[0] = '\0';
+                    search_filter_len = 0;
+                    selected_file_idx = 0;
+                    browser_scroll_offset = 0;
+                    scan_media_files(current_browse_dir);
+                    needs_redraw = true;
                 }
             } else if (sc == SC_ESC) {
-                app_running = false;
+                if (search_filter_len > 0) {
+                    search_filter[0] = '\0';
+                    search_filter_len = 0;
+                    selected_file_idx = 0;
+                    browser_scroll_offset = 0;
+                    needs_redraw = true;
+                } else {
+                    app_running = false;
+                }
+            } else {
+                char ch = scancode_to_char(sc, false);
+                if (ch != '\0' && search_filter_len + 1 < sizeof(search_filter)) {
+                    search_filter[search_filter_len++] = ch;
+                    search_filter[search_filter_len] = '\0';
+                    selected_file_idx = 0;
+                    browser_scroll_offset = 0;
+                    needs_redraw = true;
+                }
             }
         } else if (ui_state == UI_STATE_PLAYING) {
             if (sc == SC_SPACE) {
@@ -2563,6 +3348,11 @@ static void handle_user_input(wm_window_t *win) {
                     player_seek_to((float)(cur_p + 0.05));
                 }
                 needs_redraw = true;
+            } else if (sc == SC_T || sc == SC_B) {
+                if (current_mode == MEDIA_MODE_IMAGE) {
+                    image_bg_mode = (image_bg_mode + 1) % 3;
+                    needs_redraw = true;
+                }
             } else if (sc == SC_O || sc == SC_F || sc == SC_BACKSPACE) {
                 ui_state = UI_STATE_BROWSER;
                 wm_set_title(win, "IPO Media Player - File Browser");
@@ -2584,7 +3374,8 @@ int main(int argc, char **argv) {
     audio_init();
 
     /* Scan media folder */
-    scan_media_files();
+    set_browse_dir("/");
+    scan_media_files(current_browse_dir);
 
     /* Check if target file passed on command line */
     const char *target_file = (argc >= 2 && argv && argv[1]) ? argv[1] : NULL;
@@ -2603,6 +3394,7 @@ int main(int argc, char **argv) {
     wm_window_t *win = wm_create_window(&opt);
     if (!win) {
         free_media_list();
+        if (current_browse_dir) { kfree(current_browse_dir); current_browse_dir = NULL; }
         return 1;
     }
 
@@ -2611,19 +3403,19 @@ int main(int argc, char **argv) {
     /* If CLI argument given, load it immediately */
     if (target_file) {
         media_entry_t cli_entry;
-        strncpy(cli_entry.path, target_file, sizeof(cli_entry.path) - 1);
-        cli_entry.path[sizeof(cli_entry.path) - 1] = '\0';
+        cli_entry.path = (char *)target_file;
         const char *slash = strrchr(target_file, '/');
-        strncpy(cli_entry.name, slash ? slash + 1 : target_file, sizeof(cli_entry.name) - 1);
-        cli_entry.name[sizeof(cli_entry.name) - 1] = '\0';
+        cli_entry.name = (char *)(slash ? slash + 1 : target_file);
         cli_entry.size = 0;
         cli_entry.mode = MEDIA_MODE_VIDEO;
 
         const char *dot = strrchr(target_file, '.');
         if (dot) {
-            if (strcmp(dot, ".bmp") == 0 || strcmp(dot, ".tga") == 0) cli_entry.mode = MEDIA_MODE_IMAGE;
-            else if (strcmp(dot, ".wav") == 0 || strcmp(dot, ".mp3") == 0 || strcmp(dot, ".MP3") == 0) cli_entry.mode = MEDIA_MODE_AUDIO;
-            else if (strcmp(dot, ".avi") == 0 || strcmp(dot, ".AVI") == 0 || strcmp(dot, ".vid") == 0 || strcmp(dot, ".gif") == 0) cli_entry.mode = MEDIA_MODE_VIDEO;
+            if (strcmp(dot, ".bmp") == 0 || strcmp(dot, ".BMP") == 0 ||
+                strcmp(dot, ".tga") == 0 || strcmp(dot, ".TGA") == 0 ||
+                strcmp(dot, ".png") == 0 || strcmp(dot, ".PNG") == 0) cli_entry.mode = MEDIA_MODE_IMAGE;
+            else if (strcmp(dot, ".wav") == 0 || strcmp(dot, ".WAV") == 0 || strcmp(dot, ".mp3") == 0 || strcmp(dot, ".MP3") == 0) cli_entry.mode = MEDIA_MODE_AUDIO;
+            else if (strcmp(dot, ".avi") == 0 || strcmp(dot, ".AVI") == 0 || strcmp(dot, ".vid") == 0 || strcmp(dot, ".gif") == 0 || strcmp(dot, ".GIF") == 0) cli_entry.mode = MEDIA_MODE_VIDEO;
         }
         load_and_play(&cli_entry, win);
     } else {
@@ -2775,6 +3567,10 @@ int main(int argc, char **argv) {
     /* Cleanup */
     unload_current_media();
     free_media_list();
+    if (current_browse_dir) {
+        kfree(current_browse_dir);
+        current_browse_dir = NULL;
+    }
     if (wm_is_window_valid(win)) {
         wm_destroy_window(win);
     }

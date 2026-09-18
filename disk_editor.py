@@ -161,8 +161,8 @@ class DiskImage:
         root_inode['size'] = 40
         self.write_inode(1, root_inode)
         
-        # Create /app directory
-        self.bitmap_set(inode_bitmap_start, 1, 1)  # inode 2 is /app
+        # Create /applications directory
+        self.bitmap_set(inode_bitmap_start, 1, 1)  # inode 2 is /applications
         app_block = self.allocate_block()
         app_inode = self.empty_inode()
         app_inode['mode'] = IPO_INODE_TYPE_DIR | 0x80000000
@@ -178,7 +178,7 @@ class DiskImage:
         self.write_block(app_block, bytes(dots))
         app_inode['size'] = 40
         self.write_inode(2, app_inode)
-        self.dir_add_entry(1, 'app', 2, IPO_INODE_TYPE_DIR)
+        self.dir_add_entry(1, 'applications', 2, IPO_INODE_TYPE_DIR)
 
         # Create /autorun file (empty, protected)
         self.bitmap_set(inode_bitmap_start, 2, 1)  # inode 3 is /autorun

@@ -125,9 +125,16 @@ static bool lex_cmdline(const char *src, token_list_t *out) {
 
         if (c == '&' || c == ';' || c == '|') {
             if (have_content || cb.len > 0) { if (!cbuf_flush(&cb, out, false)) goto oom; have_content = false; cb.len = 0; }
-            char *op = kmalloc(2); if (!op) goto oom;
-            op[0] = c; op[1] = '\0';
-            if (!token_list_push(out, op, true)) { kfree(op); goto oom; }
+            if (c == '&' && *src == '&') {
+                src++;
+                char *op = kmalloc(3); if (!op) goto oom;
+                op[0] = '&'; op[1] = '&'; op[2] = '\0';
+                if (!token_list_push(out, op, true)) { kfree(op); goto oom; }
+            } else {
+                char *op = kmalloc(2); if (!op) goto oom;
+                op[0] = c; op[1] = '\0';
+                if (!token_list_push(out, op, true)) { kfree(op); goto oom; }
+            }
             continue;
         }
 
@@ -197,12 +204,14 @@ typedef struct {
     run_cmd_t *cmds;
     int count;
     int cap;
+    int window;
 } run_pipeline_t;
 
 static void pipe_init(run_pipeline_t *p) {
     p->cmds = NULL;
     p->count = 0;
     p->cap = 0;
+    p->window = 0;
 }
 
 static void pipe_free(run_pipeline_t *p) {
@@ -313,6 +322,17 @@ static bool plan_push(run_plan_t *pl, run_stage_t *s) {
     return true;
 }
 
+static void cmd_strip_redundant_run(run_cmd_t *c) {
+    while (c->argc > 1 && strcmp(c->argv[0], "run") == 0) {
+        kfree(c->argv[0]);
+        for (int i = 0; i < c->argc - 1; i++) {
+            c->argv[i] = c->argv[i + 1];
+        }
+        c->argc--;
+        c->argv[c->argc] = NULL;
+    }
+}
+
 static bool build_run_plan(const token_list_t *tl, run_plan_t *plan) {
     plan_init(plan);
 
@@ -325,37 +345,57 @@ static bool build_run_plan(const token_list_t *tl, run_plan_t *plan) {
     run_cmd_t cur_cmd;
     cmd_init(&cur_cmd);
 
+    int cur_window = 0;
+
     for (int i = 0; i < tl->len; i++) {
         if (!tl->data[i].is_op) {
             if (!cmd_push(&cur_cmd, tl->data[i].str)) goto oom;
         } else {
-            char op = tl->data[i].str[0];
-            if (op == '|') {
+            const char *op_str = tl->data[i].str;
+            if (strcmp(op_str, "|") == 0) {
                 if (cur_cmd.argc > 0) {
+                    cmd_strip_redundant_run(&cur_cmd);
                     if (!pipe_push(&cur_pipe, &cur_cmd)) goto oom;
                     cmd_init(&cur_cmd);
                 }
-            } else if (op == '&') {
+            } else if (strcmp(op_str, "&") == 0) {
                 if (cur_cmd.argc > 0) {
+                    cmd_strip_redundant_run(&cur_cmd);
                     if (!pipe_push(&cur_pipe, &cur_cmd)) goto oom;
                     cmd_init(&cur_cmd);
                 }
                 if (cur_pipe.count > 0) {
+                    cur_pipe.window = cur_window;
+                    if (!stage_push(&cur_stage, &cur_pipe)) goto oom;
+                    pipe_init(&cur_pipe);
+                    cur_window++;
+                }
+            } else if (strcmp(op_str, "&&") == 0) {
+                if (cur_cmd.argc > 0) {
+                    cmd_strip_redundant_run(&cur_cmd);
+                    if (!pipe_push(&cur_pipe, &cur_cmd)) goto oom;
+                    cmd_init(&cur_cmd);
+                }
+                if (cur_pipe.count > 0) {
+                    cur_pipe.window = cur_window;
                     if (!stage_push(&cur_stage, &cur_pipe)) goto oom;
                     pipe_init(&cur_pipe);
                 }
-            } else if (op == ';') {
+            } else if (strcmp(op_str, ";") == 0) {
                 if (cur_cmd.argc > 0) {
+                    cmd_strip_redundant_run(&cur_cmd);
                     if (!pipe_push(&cur_pipe, &cur_cmd)) goto oom;
                     cmd_init(&cur_cmd);
                 }
                 if (cur_pipe.count > 0) {
+                    cur_pipe.window = cur_window;
                     if (!stage_push(&cur_stage, &cur_pipe)) goto oom;
                     pipe_init(&cur_pipe);
                 }
                 if (cur_stage.count > 0) {
                     if (!plan_push(plan, &cur_stage)) goto oom;
                     stage_init(&cur_stage);
+                    cur_window = 0;
                 }
             }
         }
@@ -363,6 +403,7 @@ static bool build_run_plan(const token_list_t *tl, run_plan_t *plan) {
 
     /* Flush trailing elements */
     if (cur_cmd.argc > 0) {
+        cmd_strip_redundant_run(&cur_cmd);
         if (!pipe_push(&cur_pipe, &cur_cmd)) goto oom;
         cmd_init(&cur_cmd);
     } else {
@@ -370,6 +411,7 @@ static bool build_run_plan(const token_list_t *tl, run_plan_t *plan) {
     }
 
     if (cur_pipe.count > 0) {
+        cur_pipe.window = cur_window;
         if (!stage_push(&cur_stage, &cur_pipe)) goto oom;
         pipe_init(&cur_pipe);
     } else {
@@ -405,28 +447,7 @@ static int exec_one_pid(int argc, char **argv) {
     if (argc == 0 || !argv || !argv[0]) return RUN_NOT_FOUND;
     char *path = resolve_command_path(argv[0]);
     if (!path) {
-        if (terminal_is_builtin(argv[0])) {
-            size_t total_len = 0;
-            for (int i = 0; i < argc; i++) {
-                total_len += strlen(argv[i]) + 1;
-            }
-            char *reconstructed = kmalloc(total_len + 1);
-            if (reconstructed) {
-                char *dst = reconstructed;
-                for (int i = 0; i < argc; i++) {
-                    if (i > 0) *dst++ = ' ';
-                    size_t len = strlen(argv[i]);
-                    memcpy(dst, argv[i], len);
-                    dst += len;
-                }
-                *dst = '\0';
-                int res = try_execute_command(reconstructed);
-                kfree(reconstructed);
-                process_set_last_exit_code(0);
-                return res;
-            }
-        }
-        printf("run: command not found: %s\n", argv[0]);
+        printf("run: program not found: %s\n", argv[0]);
         return RUN_NOT_FOUND;
     }
     int ret = process_exec(path, argc, argv);
@@ -525,7 +546,8 @@ static int exec_pipeline(const run_pipeline_t *pipe) {
             break;
         }
     }
-    return RUN_OK;
+    process_set_last_exit_code(pipe_exit);
+    return pipe_exit;
 }
 
 static int exec_stage(const run_stage_t *stage) {
@@ -536,10 +558,22 @@ static int exec_stage(const run_stage_t *stage) {
         return exec_pipeline(&stage->pipes[0]);
     }
 
-    /* Multiple pipelines in stage -> parallel batch execution (&) */
+    /* Multiple pipelines in stage -> batch execution.
+     * Pipelines are grouped by their window ID (assigned during parsing in build_run_plan()):
+     *   - Groups of size n == 1 (isolated by '&') run in a dedicated workspace (separate_windows = true).
+     *   - Groups of size n > 1  (chained by '&&') share a common workspace (separate_windows = false).
+     *
+     * NOTE: Each window group is executed sequentially via process_run_batch_ex(); true parallelism
+     * across different window groups is bounded because subsequent groups wait for earlier groups to finish.
+     */
     int total_procs = 0;
     process_t **procs = kmalloc((size_t)stage->count * sizeof(process_t *));
     if (!procs) return RUN_ERROR;
+    int *wins = kmalloc((size_t)stage->count * sizeof(int));
+    if (!wins) {
+        kfree(procs);
+        return RUN_ERROR;
+    }
 
     for (int p = 0; p < stage->count; p++) {
         const run_pipeline_t *pipe = &stage->pipes[p];
@@ -547,18 +581,16 @@ static int exec_stage(const run_stage_t *stage) {
 
         if (pipe->count == 1) {
             const run_cmd_t *cmd = &pipe->cmds[0];
+            if (cmd->argc == 0) continue;
             char *path = resolve_command_path(cmd->argv[0]);
             if (!path) {
-                if (terminal_is_builtin(cmd->argv[0])) {
-                    exec_one_pid(cmd->argc, cmd->argv);
-                    continue;
-                }
-                printf("run: command not found: %s\n", cmd->argv[0]);
+                printf("run: program not found: %s\n", cmd->argv[0]);
                 continue;
             }
             process_t *proc = process_spawn(path, cmd->argc, cmd->argv);
             kfree(path);
             if (proc) {
+                wins[total_procs] = pipe->window;
                 procs[total_procs++] = proc;
             }
         } else {
@@ -567,13 +599,18 @@ static int exec_stage(const run_stage_t *stage) {
         }
     }
 
+    int stage_exit = 0;
     if (total_procs > 0) {
-        process_run_batch(procs, total_procs);
+        /* Run all processes in one batch with window grouping.
+         * process_run_batch_windows() handles shared text screens for same-window
+         * groups and runs everything in parallel in a single batch loop. */
+        process_run_batch_windows(procs, total_procs, wins);
         if (terminal_get_show_return_value()) {
-            for (int i = 0; i < total_procs; i++) {
-                printf("Return value: %d\n", process_get_batch_exit_code(i));
+            for (int k = 0; k < total_procs; k++) {
+                printf("Return value: %d\n", process_get_batch_exit_code(k));
             }
         }
+        stage_exit = process_get_batch_exit_code(total_procs - 1);
     } else {
         /* If no external processes were spawned but WM session is active, wait until exit */
         while (wm_session_active()) {
@@ -584,8 +621,10 @@ static int exec_stage(const run_stage_t *stage) {
         }
     }
 
+    kfree(wins);
     kfree(procs);
-    return RUN_OK;
+    process_set_last_exit_code(stage_exit);
+    return stage_exit;
 }
 
 /* =========================================================================
@@ -595,9 +634,15 @@ static int exec_stage(const run_stage_t *stage) {
 int run_cmd_execute(const char *cmdline) {
     if (!cmdline || !*cmdline) {
         printf("Usage: run <prog> [args] [OP <prog> [args] ...]\n");
-        printf("  &  parallel   — start all in parallel batch; cooperative multitasking\n");
-        printf("  ;  sequential — wait for each batch/program before next stage\n");
-        printf("  |  pipe       — pass exit-code of left as argv[1] of right\n");
+        printf("Operators:\n");
+        printf("  &   — run each program in a separate workspace (separate startx/terminal)\n");
+        printf("  &&  — run asynchronously in one workspace (shared startx desktop/terminal)\n");
+        printf("  |   — wait for left program to complete and pass return code to right\n");
+        printf("  ;   — wait until program completes, then run next program\n");
+        printf("Hotkeys:\n");
+        printf("  Ctrl + Page Up   — switch to previous workspace\n");
+        printf("  Ctrl + Page Down — switch to next workspace\n");
+        printf("  Ctrl + C        — close completed workspace or interrupt active program\n");
         return RUN_BUILTIN_OK;
     }
 
@@ -612,23 +657,22 @@ int run_cmd_execute(const char *cmdline) {
         return RUN_BUILTIN_OK;
     }
 
-    /* --- Build hierarchical execution plan (Stages ';' -> Parallel '&' -> Pipe '|') --- */
+    /* --- Build hierarchical execution plan (Stages ';' -> Parallel '&'/ '&&' -> Pipe '|') --- */
     run_plan_t plan;
     if (!build_run_plan(&tl, &plan)) {
         token_list_free(&tl);
-        printf("run: out of memory building execution plan\n");
         return RUN_ERROR;
     }
     token_list_free(&tl);
 
-    int result = RUN_OK;
+    int last_exit = 0;
     for (int s = 0; s < plan.count; s++) {
-        result = exec_stage(&plan.stages[s]);
+        last_exit = exec_stage(&plan.stages[s]);
         if (system_is_interrupted()) {
             break;
         }
     }
 
     plan_free(&plan);
-    return result;
+    return last_exit;
 }

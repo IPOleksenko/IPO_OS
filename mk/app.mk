@@ -3,7 +3,7 @@
 APPS_DIR     := apps
 APPS_BUILD   := build/apps
 APPS_SRCS_RAW := $(shell find $(APPS_DIR) -maxdepth 2 -name "*.c" -type f)
-GENERIC_APP_SRCS := $(filter-out apps/tcc/%, $(APPS_SRCS_RAW))
+GENERIC_APP_SRCS := $(filter-out apps/tcc/% apps/lua/% apps/micropython/% apps/nasm/%, $(APPS_SRCS_RAW))
 APPS_BINS    := $(patsubst $(APPS_DIR)/%.c, $(APPS_BUILD)/%.bin, $(GENERIC_APP_SRCS)) $(APPS_BUILD)/tcc/tcc.bin
 APP_ENTRY_OBJ   := $(APPS_BUILD)/entry.o
 APP_PRINTF_OBJ  := $(APPS_BUILD)/app_printf.o
@@ -18,7 +18,9 @@ APPS_CFLAGS := -m32 -O2 \
 	-fno-builtin \
 	-nostdlib -nostartfiles \
 	-DIPO_APP \
-	-Ilib/h
+	-Ilib/h \
+	-Iapps/micropython/lib/uzlib \
+	-I.
 
 TCC_CFLAGS := -m32 \
 	-ffreestanding \

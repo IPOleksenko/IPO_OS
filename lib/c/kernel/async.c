@@ -172,12 +172,14 @@ int async_stop_task(const char *name)
         return -1;
     }
 
+    process_t *cur = process_get_current();
     async_task_t **it = &async_task_list;
 
     while (*it != NULL) {
         async_task_t *node = *it;
 
-        if (node->active && strcmp(node->name, name) == 0) {
+        if (node->active && strcmp(node->name, name) == 0 &&
+            (node->owner == NULL || cur == NULL || node->owner == cur)) {
             process_t *owner = node->owner;
 
             node->active = false;

@@ -221,10 +221,10 @@ int main(int argc, char **argv) {
             if (flag_verbose) printf("%s\n", cmd.data);
             int ret = system(cmd.data);
             if (ret != 0) {
-                // Try /usr/bin/tcc or /app/tcc
+                // Try /usr/bin/tcc or /applications/tcc
                 dyn_str_t fallback;
                 dyn_str_init(&fallback);
-                dyn_str_append(&fallback, "/app/tcc -c ");
+                dyn_str_append(&fallback, "/applications/tcc -c ");
                 dyn_str_append(&fallback, inc_str.data);
                 dyn_str_append(&fallback, " ");
                 dyn_str_append(&fallback, in);

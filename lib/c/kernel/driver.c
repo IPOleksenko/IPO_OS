@@ -109,7 +109,6 @@ static void print_padded(const char *s, int width) {
 void driver_print_list(void) {
     if (driver_head == NULL) {
         printf("No external drivers loaded.\n");
-        printf("Run a driver app (e.g. /app/driver_demo) to load an external driver.\n");
         return;
     }
 

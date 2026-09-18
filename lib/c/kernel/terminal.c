@@ -88,6 +88,46 @@ static uint16_t terminal_bottom_buffer[SCROLL_HISTORY_SIZE][VGA_WIDTH];
 static int top_buffer_count = 0;
 static int bottom_buffer_count = 0;
 
+static inline uint16_t (*active_top_buffer(void))[VGA_WIDTH] {
+    if (process_is_batch_active() && process_get_separate_windows()) {
+        process_t *fg = process_get_foreground();
+        if (fg && fg->scroll_top_buffer) {
+            return (uint16_t (*)[VGA_WIDTH])fg->scroll_top_buffer;
+        }
+    }
+    return terminal_top_buffer;
+}
+
+static inline int *active_top_count(void) {
+    if (process_is_batch_active() && process_get_separate_windows()) {
+        process_t *fg = process_get_foreground();
+        if (fg) {
+            return &fg->scroll_top_count;
+        }
+    }
+    return &top_buffer_count;
+}
+
+static inline uint16_t (*active_bottom_buffer(void))[VGA_WIDTH] {
+    if (process_is_batch_active() && process_get_separate_windows()) {
+        process_t *fg = process_get_foreground();
+        if (fg && fg->scroll_bottom_buffer) {
+            return (uint16_t (*)[VGA_WIDTH])fg->scroll_bottom_buffer;
+        }
+    }
+    return terminal_bottom_buffer;
+}
+
+static inline int *active_bottom_count(void) {
+    if (process_is_batch_active() && process_get_separate_windows()) {
+        process_t *fg = process_get_foreground();
+        if (fg) {
+            return &fg->scroll_bottom_count;
+        }
+    }
+    return &bottom_buffer_count;
+}
+
 void terminal_scroll_up(void);
 void terminal_scroll_down(void);
 
@@ -520,40 +560,51 @@ static void restore_snapshot_input(void) {
 }
 
 static void trim_top_buffer(void) {
-    if (top_buffer_count < SCROLL_HISTORY_CLEAR_THRESHOLD) {
+    int *top_cnt = active_top_count();
+    uint16_t (*top_buf)[VGA_WIDTH] = active_top_buffer();
+
+    if (*top_cnt < SCROLL_HISTORY_CLEAR_THRESHOLD) {
         return;
     }
 
-    int remove_count = top_buffer_count - SCROLL_HISTORY_KEEP_SIZE;
+    int remove_count = *top_cnt - SCROLL_HISTORY_KEEP_SIZE;
     if (remove_count <= 0) {
         return;
     }
 
     for (int i = 0; i < SCROLL_HISTORY_KEEP_SIZE; i++) {
         memcpy(
-            terminal_top_buffer[i],
-            terminal_top_buffer[i + remove_count],
+            top_buf[i],
+            top_buf[i + remove_count],
             VGA_WIDTH * sizeof(uint16_t)
         );
     }
 
-    top_buffer_count = SCROLL_HISTORY_KEEP_SIZE;
+    *top_cnt = SCROLL_HISTORY_KEEP_SIZE;
 }
 
 static void save_top_line(uint16_t row) {
-    if (top_buffer_count >= SCROLL_HISTORY_SIZE) {
+    int *top_cnt = active_top_count();
+    uint16_t (*top_buf)[VGA_WIDTH] = active_top_buffer();
+
+    if (*top_cnt >= SCROLL_HISTORY_SIZE) {
         trim_top_buffer();
     }
 
-    if (top_buffer_count < SCROLL_HISTORY_SIZE) {
-        read_line_from_vga(row, terminal_top_buffer[top_buffer_count]);
-        top_buffer_count++;
+    if (*top_cnt < SCROLL_HISTORY_SIZE) {
+        read_line_from_vga(row, top_buf[*top_cnt]);
+        (*top_cnt)++;
     }
 }
 
 /* Scroll down - restore next line from history if available */
 void terminal_scroll_down(void) {
-    if (bottom_buffer_count == 0) {
+    int *bot_cnt = active_bottom_count();
+    int *top_cnt = active_top_count();
+    uint16_t (*bot_buf)[VGA_WIDTH] = active_bottom_buffer();
+    uint16_t (*top_buf)[VGA_WIDTH] = active_top_buffer();
+
+    if (*bot_cnt == 0) {
         return;
     }
 
@@ -573,9 +624,9 @@ void terminal_scroll_down(void) {
         input_start_cursor -= VGA_WIDTH;
     }
 
-    if (top_buffer_count < SCROLL_HISTORY_SIZE) {
-        read_line_from_vga(top, terminal_top_buffer[top_buffer_count]);
-        top_buffer_count++;
+    if (*top_cnt < SCROLL_HISTORY_SIZE) {
+        read_line_from_vga(top, top_buf[*top_cnt]);
+        (*top_cnt)++;
     }
 
     for (uint16_t r = 0; r < rows - 1; r++) {
@@ -591,33 +642,45 @@ void terminal_scroll_down(void) {
         }
     }
 
-    write_line_to_vga(top + rows - 1, terminal_bottom_buffer[bottom_buffer_count - 1]);
-    bottom_buffer_count--;
+    write_line_to_vga(top + rows - 1, bot_buf[*bot_cnt - 1]);
+    (*bot_cnt)--;
 
-    if (bottom_buffer_count == 0) {
+    if (process_is_batch_active() && process_get_separate_windows()) {
+        process_t *fg = process_get_foreground();
+        if (fg && fg->text_vram_backup) {
+            memcpy(fg->text_vram_backup, (const void *)vga, 80 * 25 * sizeof(uint16_t));
+        }
+    }
+
+    if (*bot_cnt == 0) {
         vga_show_cursor();
     }
 }
 
 /* Return to present - restore current output when user starts typing */
 void terminal_return_to_present(void) {
-    while (bottom_buffer_count > 0) {
+    while (*active_bottom_count() > 0) {
         terminal_scroll_down();
     }
     vga_show_cursor();
 }
 
 int terminal_get_top_buffer_count(void) {
-    return top_buffer_count;
+    return *active_top_count();
 }
 
 int terminal_get_bottom_buffer_count(void) {
-    return bottom_buffer_count;
+    return *active_bottom_count();
 }
 
 /* Scroll up - show previous line from history */
 void terminal_scroll_up(void) {
-    if (top_buffer_count == 0) {
+    int *top_cnt = active_top_count();
+    int *bot_cnt = active_bottom_count();
+    uint16_t (*top_buf)[VGA_WIDTH] = active_top_buffer();
+    uint16_t (*bot_buf)[VGA_WIDTH] = active_bottom_buffer();
+
+    if (*top_cnt == 0) {
         return;
     }
 
@@ -639,9 +702,9 @@ void terminal_scroll_up(void) {
 
     vga_hide_cursor();
 
-    if (bottom_buffer_count < SCROLL_HISTORY_SIZE) {
-        read_line_from_vga(top + rows - 1, terminal_bottom_buffer[bottom_buffer_count]);
-        bottom_buffer_count++;
+    if (*bot_cnt < SCROLL_HISTORY_SIZE) {
+        read_line_from_vga(top + rows - 1, bot_buf[*bot_cnt]);
+        (*bot_cnt)++;
     }
 
     for (uint16_t r = rows - 1; r > 0; r--) {
@@ -657,8 +720,15 @@ void terminal_scroll_up(void) {
         }
     }
 
-    write_line_to_vga(top, terminal_top_buffer[top_buffer_count - 1]);
-    top_buffer_count--;
+    write_line_to_vga(top, top_buf[*top_cnt - 1]);
+    (*top_cnt)--;
+
+    if (process_is_batch_active() && process_get_separate_windows()) {
+        process_t *fg = process_get_foreground();
+        if (fg && fg->text_vram_backup) {
+            memcpy(fg->text_vram_backup, (const void *)vga, 80 * 25 * sizeof(uint16_t));
+        }
+    }
 }
 
 const char *terminal_get_cwd(void) {
@@ -736,6 +806,7 @@ char* resolve_command_path(const char *cmd) {
     else {
         static const char * const search_paths[] = {
             NULL, /* indicates cwd */
+            "/applications",
             "/app",
             NULL
         };
@@ -776,6 +847,7 @@ bool terminal_is_builtin(const char *name) {
         "cp", "copy", "mv", "move", "rename", "stat", "echo",
         "reboot", "restart", "shutdown", "poweroff", "exit", "halt",
         "ps", "tasks", "procs", "kill", "killall",
+        "run",
         "df", "diskinfo", "meminfo", "free",
         "driver", "drivers", "lsmod",
         "keymap", "layout", "keymaps",
@@ -825,15 +897,19 @@ static void builtin_help(void) {
     printf("    killall\n");
     printf("      - Terminate all active processes and stop background async tasks.\n");
     printf("    run <prog> [args] [OP <prog> [args] ...]\n");
-    printf("      - Multitasking process batch launcher for standalone executables (/app/...). Operators:\n");
-    printf("          &  parallel    — launch all; cooperative multitasking & background async tasks.\n");
-    printf("          ;  sequential  — wait for each (incl. async tasks) before next.\n");
-    printf("          |  pipe        — pass exit-code of left as argv[1] of right.\n");
-    printf("      - Program names/args support quoting ('...'/\"...\") and escaping (\\x).\n");
+    printf("      - Launch executables with multitasking batch operators:\n");
+    printf("          &   — run each program in a separate workspace\n");
+    printf("                (separate text buffers / separate startx workspaces).\n");
+    printf("          &&  — run programs asynchronously in a single shared workspace\n");
+    printf("                (main terminal / same startx desktop with all windows open).\n");
+    printf("          |   — wait for left program to complete and pass return code to right.\n");
+    printf("          ;   — wait until program completes, then run next program.\n");
+    printf("        Switch workspaces: Ctrl + Page Up / Ctrl + Page Down; exit: Ctrl + C.\n");
+    printf("        Supports quoting ('...'/\"...\") and escaping (\\x).\n");
     printf("    startx\n");
     printf("      - Enter VGA Mode 13h (320x200) and start the window manager compositor\n");
     printf("        as a background async task. Returns to the shell immediately.\n");
-    printf("        The [X Exit] button in the bottom-left of the screen always exits.\n");
+    printf("        The [Close] button in the bottom-left of the screen always exits.\n");
     printf("    stopx\n");
     printf("      - Stop the WM compositor, destroy all windows, return to text mode.\n");
     printf("\n");
@@ -860,8 +936,9 @@ static void builtin_help(void) {
     printf("      - Show storage pool capacity: total, used, free blocks, inodes, drives.\n");
     printf("    meminfo | free\n");
     printf("      - Show kernel heap stats: total, used, free, block count, overhead.\n");
-    printf("    keymap [list | on <id/name> | off <id/name> | rm <id/name>] | layout\n");
+    printf("    keymap [list | on <id/name> | off <id/name> | rm <id/name>]\n");
     printf("      - Manage keyboard layouts: list registered layouts, enable (on), disable (off), or remove (rm).\n");
+    printf("        (Aliases: layout, keymaps)\n");
     printf("    return | retval | show_return [on | off]\n");
     printf("      - Toggle display of process exit return value (Return value: X).\n");
     printf("\n");
@@ -869,7 +946,7 @@ static void builtin_help(void) {
     printf("  IPO_OS executes Position Independent Executables via three methods:\n");
     printf("  [Method 1: Direct Name (Automatic PATH Resolution)]\n");
     printf("    Syntax: <command> [arguments...]\n");
-    printf("    - Searches current directory, /app directory, then root directory.\n");
+    printf("    - Searches current directory, /applications directory, then root directory.\n");
     printf("  [Method 2: Explicit Relative or Absolute Path]\n");
     printf("    Syntax: <path/to/binary> [arguments...]\n");
     printf("    - Resolves absolute paths starting with '/' or relative paths.\n");
@@ -877,14 +954,16 @@ static void builtin_help(void) {
     printf("    - Reads commands line-by-line from '/autorun' during kernel boot.\n");
     printf("\n");
     printf("3. TERMINAL SHORTCUTS & KEYBOARD CONTROLS\n");
-    printf("    - Ctrl + Left Shift   : Cycle active keyboard layout backwards (previous).\n");
-    printf("    - Ctrl + Right Shift  : Cycle active keyboard layout forwards (next).\n");
-    printf("    - Alt + Left/Right Shift: Cycle active keyboard layout backwards / forwards.\n");
-    printf("    - Ctrl + C            : Cancellation/interruption of most tasks or queues.\n");
-    printf("    - Page Up / Page Down : Scroll terminal output up / down.\n");
-    printf("    - Up / Down Arrows    : Command history navigation.\n");
-    printf("    - Left / Right Arrows : Move cursor across current line.\n");
-    printf("    - Home / End          : Move cursor to beginning / end of line.\n");
+    printf("   - Ctrl + Page Up         : Switch to previous multitasking workspace.\n");
+    printf("   - Ctrl + Page Down       : Switch to next multitasking workspace.\n");
+    printf("   - Ctrl + Left Shift      : Cycle active keyboard layout backwards (previous).\n");
+    printf("   - Ctrl + Right Shift     : Cycle active keyboard layout forwards (next).\n");
+    printf("   - Alt + Left/Right Shift : Cycle active keyboard layout backwards / forwards.\n");
+    printf("   - Ctrl + C               : Interrupt active task, or exit finished workspace.\n");
+    printf("   - Page Up / Page Down    : Scroll terminal output up / down.\n");
+    printf("   - Up / Down Arrows       : Command history navigation.\n");
+    printf("   - Left / Right Arrows    : Move cursor across current line.\n");
+    printf("   - Home / End             : Move cursor to beginning / end of line.\n");
     printf("\n");
     printf("4. SYSTEM STATUS & LANGUAGE BAR\n");
     printf("  [Top Language Bar Operation]\n");
@@ -1328,32 +1407,24 @@ static void fs_count_blocks(uint32_t *out_used, uint32_t *out_total) {
 
     /* data_blocks_start is the first LBA of data area;
        total data blocks = fs_size_blocks - data_blocks_start */
-    uint32_t data_start = sb.data_blocks_start;
+    uint32_t data_start = (uint32_t)sb.data_blocks_start;
     uint32_t total = (sb.fs_size_blocks > data_start)
-                     ? sb.fs_size_blocks - data_start : 0;
+                     ? (uint32_t)(sb.fs_size_blocks - data_start) : 0;
     *out_total = total;
+    if (total == 0) return;
 
-    uint32_t used = 0;
-    for (uint32_t i = 0; i < total; i++) {
-        if (bitmap_get(sb.block_bitmap_start, i)) {
-            used++;
-        }
-    }
-    *out_used = used;
+    *out_used = bitmap_count_set(sb.block_bitmap_start, total);
 }
 
 /* ---------------------------------------------------------------
  * Helper: count used/total inodes by scanning the inode bitmap
  * --------------------------------------------------------------- */
 static void fs_count_inodes(uint32_t *out_used, uint32_t *out_total) {
-    *out_total = sb.inode_count;
-    uint32_t used = 0;
-    for (uint32_t i = 0; i < sb.inode_count; i++) {
-        if (bitmap_get(sb.inode_bitmap_start, i)) {
-            used++;
-        }
-    }
-    *out_used = used;
+    *out_total = (uint32_t)sb.inode_count;
+    *out_used  = 0;
+    if (!fs_mounted || sb.inode_count == 0) return;
+
+    *out_used = bitmap_count_set(sb.inode_bitmap_start, sb.inode_count);
 }
 
 static void builtin_df(void) {
@@ -1400,7 +1471,12 @@ static void builtin_driver(int argc, char **argv) {
 }
 
 static void builtin_keymap(int argc, char **argv) {
-    if (argc < 2 || strcmp(argv[1], "list") == 0 || strcmp(argv[1], "дшые") == 0) {
+    if (argc < 2) {
+        printf("Usage: keymap [list | on <id/name> | off <id/name> | rm <id/name>]\n");
+        return;
+    }
+
+    if (strcmp(argv[1], "list") == 0 || strcmp(argv[1], "дшые") == 0) {
         uint32_t total = dynamic_keymap_get_count();
         uint32_t active = dynamic_keymap_get_active_index();
         printf("=== Registered Keyboard Layouts (%u) ===\n", total);
@@ -1449,7 +1525,7 @@ static void builtin_keymap(int argc, char **argv) {
             printf("Failed to remove layout '%s' (not found or base layout).\n", target);
         }
     } else {
-        printf("Unknown action '%s'. Usage: keymap [list | on | off | rm] <target>\n", action);
+        printf("Unknown action '%s'. Usage: keymap [list | on <id/name> | off <id/name> | rm <id/name>]\n", action);
     }
 }
 
@@ -2031,14 +2107,12 @@ int try_execute_command(const char *cmdline) {
         builtin_driver(argc, argv);
         builtin_handled = 1;
     } else if (strcmp(name, "keymap") == 0 || strcmp(name, "layout") == 0 ||
-               strcmp(name, "keymaps") == 0 || strcmp(name, "луньфз") == 0 ||
-               strcmp(name, "дфнщге") == 0) {
+               strcmp(name, "keymaps") == 0) {
         builtin_keymap(argc, argv);
         builtin_handled = 1;
     } else if (strcmp(name, "return") == 0 || strcmp(name, "retval") == 0 ||
                strcmp(name, "show_return") == 0 || strcmp(name, "return_val") == 0 ||
-               strcmp(name, "ret") == 0 || strcmp(name, "куегкт") == 0 ||
-               strcmp(name, "куе") == 0) {
+               strcmp(name, "ret") == 0) {
         builtin_show_return(argc, argv);
         builtin_handled = 1;
     } else if (strcmp(name, "run") == 0) {
@@ -2052,7 +2126,9 @@ int try_execute_command(const char *cmdline) {
             kfree(argv[j]);
         }
         kfree(argv);
-        return res;
+        if (res < 0) return res;
+        process_set_last_exit_code(res);
+        return 1000;
     } else if (strcmp(name, "startx") == 0) {
         /* Start the WM video-mode session */
         if (!wm_session_active()) {
@@ -2192,13 +2268,13 @@ void terminal_console(void){
          */
         if (!is_break_code) {
             if (scancode == SC_PAGE_UP) {
-                for (int i = 0; i < 5 && top_buffer_count > 0; i++) {
+                if (top_buffer_count > 0) {
                     terminal_scroll_up();
                 }
                 return;
             }
             if (scancode == SC_PAGE_DOWN) {
-                for (int i = 0; i < 5 && bottom_buffer_count > 0; i++) {
+                if (bottom_buffer_count > 0) {
                     terminal_scroll_down();
                 }
                 return;
@@ -2444,7 +2520,7 @@ void terminal_auto_scroll(void) {
     }
 
     save_top_line(top);
-    bottom_buffer_count = 0;
+    *active_bottom_count() = 0;
 
     for (uint16_t r = 0; r < rows - 1; r++) {
         uint16_t src_offset = (top + r + 1) * VGA_WIDTH;
@@ -2464,5 +2540,12 @@ void terminal_auto_scroll(void) {
 
     for (uint16_t c = 0; c < VGA_WIDTH; c++) {
         vga[bottom_offset + c] = blank;
+    }
+
+    if (process_is_batch_active() && process_get_separate_windows()) {
+        process_t *fg = process_get_foreground();
+        if (fg && fg->text_vram_backup) {
+            memcpy(fg->text_vram_backup, (const void *)vga, 80 * 25 * sizeof(uint16_t));
+        }
     }
 }
