@@ -24,7 +24,7 @@ build/fonts/default.fnt: tools/build_font_db.py
 
 .PHONY: disks
 disks: build/disk.img build/disk.iso build/fonts/default.fnt toolchain
-	python3 load_apps.py
+	python3 load_applications.py
 
 .PHONY: clean-disks
 clean-disks:

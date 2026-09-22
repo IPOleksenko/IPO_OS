@@ -48,9 +48,11 @@ Combines bootloader and kernel into a single OS image:
 make image
 ```
 
-#### `make apps` — Build applications
+#### `make applications` (alias `make apps`) — Build applications
 Builds userland applications from `applications/`:
 ```bash
+make applications
+# or
 make apps
 ```
 
@@ -80,10 +82,10 @@ Removes only the library build artifacts:
 make clean-lib
 ```
 
-#### `make clean-apps` — Clean Applications Only
+#### `make clean-applications` (alias `make clean-apps`) — Clean Applications Only
 Removes only the applications build artifacts:
 ```bash
-make clean-apps
+make clean-applications
 ```
 
 ### 🔧 Utility Commands
@@ -94,15 +96,15 @@ Updates the boot configuration with kernel size information:
 make patch-config
 ```
 
-## **load_apps.py**
+## **load_applications.py**
 
-- **File:** [load_apps.py](load_apps.py)
+- **File:** [load_applications.py](load_applications.py) (backwards-compatible alias: [load_apps.py](load_apps.py))
 - **Purpose:** loads compiled applications into the OS disk image so they are available from `/applications` at runtime.
 
 ### Usage
 
 ```bash
-python3 load_apps.py
+python3 load_applications.py
 ```
 
 It scans the built app binaries in `build/applications`, copies them into the filesystem image, and makes them executable from the shell.

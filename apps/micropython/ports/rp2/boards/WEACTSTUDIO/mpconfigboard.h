@@ -1,1 +1,0 @@
-#define MICROPY_HW_BOARD_NAME "WeAct Studio RP2040"

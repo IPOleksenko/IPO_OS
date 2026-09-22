@@ -17,8 +17,6 @@
 #define IPO_INODE_TYPE_FILE 0x2
 #define IPO_INODE_FLAG_PROTECTED 0x80000000u
 
-#define IPO_MAX_FDS 256
-
 struct ipo_superblock {
     char magic[8];             /* "IPO_FS\0\0" */
     uint64_t fs_size_blocks;    /* Total blocks in storage pool (up to 9.44 Zettabytes!) */
@@ -75,7 +73,8 @@ struct ipo_fd {
 extern struct ipo_superblock sb;
 extern uint64_t fs_start_lba;
 extern bool fs_mounted;
-extern struct ipo_fd fds[IPO_MAX_FDS];
+extern struct ipo_fd *fds;
+extern uint32_t fds_capacity;
 
 /* Block layer */
 bool block_read(uint64_t fs_block_index, void *buffer);

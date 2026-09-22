@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <syscall.h>
 
-static uint8_t icmp_tx_buf[1500];
+#include <memory/kmalloc.h>
 
 void icmp_init(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
@@ -16,11 +16,13 @@ void icmp_init(void) {
 }
 
 int icmp_send_echo(ip4_addr_t dst_ip, uint16_t id, uint16_t seq, uint8_t ttl, const void *payload, uint16_t len) {
-    if (len > (1500 - sizeof(icmp_header_t))) {
+    uint16_t total_len = (uint16_t)(sizeof(icmp_header_t) + len);
+    uint8_t *tx_buf = (uint8_t *)kmalloc(total_len);
+    if (!tx_buf) {
         return -1;
     }
 
-    icmp_header_t *hdr = (icmp_header_t *)icmp_tx_buf;
+    icmp_header_t *hdr = (icmp_header_t *)tx_buf;
     hdr->type = ICMP_TYPE_ECHO_REQUEST;
     hdr->code = 0;
     hdr->checksum = 0;
@@ -28,13 +30,14 @@ int icmp_send_echo(ip4_addr_t dst_ip, uint16_t id, uint16_t seq, uint8_t ttl, co
     hdr->sequence = htons(seq);
 
     if (payload && len > 0) {
-        memcpy(icmp_tx_buf + sizeof(icmp_header_t), payload, len);
+        memcpy(tx_buf + sizeof(icmp_header_t), payload, len);
     }
 
-    uint16_t total_len = (uint16_t)(sizeof(icmp_header_t) + len);
-    hdr->checksum = net_checksum(icmp_tx_buf, total_len);
+    hdr->checksum = net_checksum(tx_buf, total_len);
 
-    return ip4_send(dst_ip, IPPROTO_ICMP, ttl, icmp_tx_buf, total_len);
+    int res = ip4_send(dst_ip, IPPROTO_ICMP, ttl, tx_buf, total_len);
+    kfree(tx_buf);
+    return res;
 }
 
 void icmp_receive(ip4_addr_t src_ip, uint8_t ttl, const void *data, uint16_t len) {
@@ -52,14 +55,17 @@ void icmp_receive(ip4_addr_t src_ip, uint8_t ttl, const void *data, uint16_t len
 
     if (hdr->type == ICMP_TYPE_ECHO_REQUEST) {
         /* Echo request -> reply back */
-        memcpy(icmp_tx_buf, data, len);
-        icmp_header_t *rep_hdr = (icmp_header_t *)icmp_tx_buf;
+        uint8_t *rep_buf = (uint8_t *)kmalloc(len);
+        if (!rep_buf) return;
+        memcpy(rep_buf, data, len);
+        icmp_header_t *rep_hdr = (icmp_header_t *)rep_buf;
         rep_hdr->type = ICMP_TYPE_ECHO_REPLY;
         rep_hdr->code = 0;
         rep_hdr->checksum = 0;
-        rep_hdr->checksum = net_checksum(icmp_tx_buf, len);
+        rep_hdr->checksum = net_checksum(rep_buf, len);
 
-        ip4_send(src_ip, IPPROTO_ICMP, 64, icmp_tx_buf, len);
+        ip4_send(src_ip, IPPROTO_ICMP, 64, rep_buf, len);
+        kfree(rep_buf);
         return;
     }
 

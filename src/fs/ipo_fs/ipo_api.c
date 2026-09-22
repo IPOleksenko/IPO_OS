@@ -205,19 +205,38 @@ int ipo_fs_open(const char *path) {
     struct ipo_inode inode;
     if (!read_inode(ino, &inode)) return -1;
     if ((inode.mode & IPO_INODE_TYPE_DIR) != 0) return -1;
-    for (int i = 3; i < IPO_MAX_FDS; i++) {
+
+    for (uint32_t i = 3; i < fds_capacity; i++) {
         if (!fds[i].used) {
             fds[i].used = 1;
             fds[i].inode = ino;
             fds[i].offset = 0;
-            return i;
+            return (int)i;
         }
     }
-    return -1;
+
+    /* Dynamically expand fds table if full */
+    uint32_t old_cap = fds_capacity;
+    uint32_t new_cap = (old_cap == 0) ? 32 : (old_cap * 2);
+    struct ipo_fd *new_fds = (struct ipo_fd *)kmalloc(new_cap * sizeof(struct ipo_fd));
+    if (!new_fds) return -1;
+
+    if (fds && old_cap > 0) {
+        memcpy(new_fds, fds, old_cap * sizeof(struct ipo_fd));
+        kfree(fds);
+    }
+    memset(new_fds + old_cap, 0, (new_cap - old_cap) * sizeof(struct ipo_fd));
+    fds = new_fds;
+    fds_capacity = new_cap;
+
+    fds[old_cap].used = 1;
+    fds[old_cap].inode = ino;
+    fds[old_cap].offset = 0;
+    return (int)old_cap;
 }
 
 int ipo_fs_close(int fd) {
-    if (fd < 3 || fd >= IPO_MAX_FDS) return -1;
+    if (fd < 3 || (uint32_t)fd >= fds_capacity || !fds) return -1;
     if (!fds[fd].used) return -1;
 
     fds[fd].used = 0;
@@ -228,7 +247,7 @@ int ipo_fs_close(int fd) {
 }
 
 int ipo_fs_read(int fd, void *buffer, uint32_t size, uint32_t offset) {
-    if (fd < 0 || fd >= IPO_MAX_FDS) return -1;
+    if (fd < 0 || (uint32_t)fd >= fds_capacity || !fds) return -1;
     if (!fds[fd].used) return -1;
     struct ipo_inode inode;
     if (!read_inode(fds[fd].inode, &inode)) return -1;
@@ -236,7 +255,7 @@ int ipo_fs_read(int fd, void *buffer, uint32_t size, uint32_t offset) {
 }
 
 int ipo_fs_write(int fd, const void *buffer, uint32_t size, uint32_t offset) {
-    if (fd < 0 || fd >= IPO_MAX_FDS) return -1;
+    if (fd < 0 || (uint32_t)fd >= fds_capacity || !fds) return -1;
     if (!fds[fd].used) return -1;
     struct ipo_inode inode;
     if (!read_inode(fds[fd].inode, &inode)) return -1;

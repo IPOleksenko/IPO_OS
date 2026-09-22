@@ -7,7 +7,6 @@
 #include <stdio.h>
 
 #define AUTORUN_PATH "/autorun"
-#define AUTORUN_BUF_SIZE (10 * 1024 * 1024)  // 10 MB for autorun file
 
 /**
  * Extract first token from line
@@ -47,11 +46,6 @@ void autorun_init(void) {
     
     if ((stat.mode & IPO_INODE_TYPE_DIR) != 0) {
         serial_printf("[autorun] /autorun is a directory, skipping\n");
-        return;
-    }
-    
-    if (stat.size > AUTORUN_BUF_SIZE) {
-        serial_printf("[autorun] /autorun too large (max %d bytes)\n", AUTORUN_BUF_SIZE);
         return;
     }
     

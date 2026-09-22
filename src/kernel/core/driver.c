@@ -18,7 +18,7 @@ driver_t* driver_find(const char *name) {
 }
 
 int driver_register(driver_t *drv) {
-    if (drv == NULL || drv->name[0] == '\0') {
+    if (drv == NULL || drv->name == NULL || drv->name[0] == '\0') {
         return -1;
     }
 
@@ -34,9 +34,27 @@ int driver_register(driver_t *drv) {
     }
     memcpy(node, drv, sizeof(driver_t));
 
+    node->name = (char *)kmalloc(strlen(drv->name) + 1u);
+    if (node->name == NULL) {
+        kfree(node);
+        return -2;
+    }
+    strcpy(node->name, drv->name);
+
+    if (drv->description != NULL) {
+        node->description = (char *)kmalloc(strlen(drv->description) + 1u);
+        if (node->description != NULL) {
+            strcpy(node->description, drv->description);
+        }
+    } else {
+        node->description = NULL;
+    }
+
     if (node->init != NULL) {
         int init_res = node->init();
         if (init_res < 0) {
+            if (node->name) kfree(node->name);
+            if (node->description) kfree(node->description);
             kfree(node);
             return init_res;
         }
@@ -45,7 +63,7 @@ int driver_register(driver_t *drv) {
     node->next = driver_head;
     driver_head = node;
 
-    serial_printf("[driver] registered '%s': %s\n", node->name, node->description);
+    serial_printf("[driver] registered '%s': %s\n", node->name, node->description ? node->description : "");
     return 0;
 }
 
@@ -71,6 +89,12 @@ int driver_unregister(const char *name) {
             }
 
             serial_printf("[driver] unregistered '%s'\n", curr->name);
+            if (curr->name != NULL) {
+                kfree(curr->name);
+            }
+            if (curr->description != NULL) {
+                kfree(curr->description);
+            }
             kfree(curr);
             return 0;
         }
@@ -208,8 +232,8 @@ void driver_init_system_drivers(void) {
     for (size_t i = 0; i < sizeof(sys_drvs) / sizeof(sys_drvs[0]); i++) {
         driver_t drv;
         memset(&drv, 0, sizeof(drv));
-        strncpy(drv.name, sys_drvs[i].name, sizeof(drv.name) - 1);
-        strncpy(drv.description, sys_drvs[i].desc, sizeof(drv.description) - 1);
+        drv.name = (char *)sys_drvs[i].name;
+        drv.description = (char *)sys_drvs[i].desc;
         drv.flags = DRIVER_FLAG_KERNEL | DRIVER_FLAG_ACTIVE;
         driver_register(&drv);
     }

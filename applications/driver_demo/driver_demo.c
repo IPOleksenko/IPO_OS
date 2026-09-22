@@ -145,8 +145,8 @@ int main(int argc, char **argv) {
 
     /* Initialize driver dynamically with valid runtime function pointers */
     memset(&rtc_driver, 0, sizeof(driver_t));
-    strcpy(rtc_driver.name, "cmos_rtc");
-    strcpy(rtc_driver.description, "Motorola MC146818 CMOS Real-Time Clock");
+    rtc_driver.name = "cmos_rtc";
+    rtc_driver.description = "Motorola MC146818 CMOS Real-Time Clock";
     rtc_driver.flags = DRIVER_FLAG_USER | DRIVER_FLAG_ACTIVE;
     rtc_driver.on_command = rtc_driver_command;
 

@@ -1,5 +1,0 @@
-poll
-thread gc start
-thread gc end
-result: []
-dt in range

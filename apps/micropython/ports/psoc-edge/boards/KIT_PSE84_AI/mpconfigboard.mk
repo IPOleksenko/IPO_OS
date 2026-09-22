@@ -1,3 +1,0 @@
-BOARD_VERSION=release-v1.1.0
-
-MICROPY_PY_EXT_FLASH = 1

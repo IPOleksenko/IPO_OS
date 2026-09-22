@@ -49,8 +49,6 @@ bool terminal_is_input_locked(void) {
 #define SC_HOME      0x47
 #define SC_END       0x4F
 #define SC_DELETE    0x53
-#define COMMAND_HISTORY_SIZE 128
-#define COMMAND_HISTORY_ENTRY_SIZE 1024
 
 /* Prompt / styling */
 #define PROMPT_STR "> "
@@ -70,6 +68,7 @@ static int32_t input_start_cursor = 0;
 static bool terminal_suppress_external_hook = false;
 
 static char **command_history = NULL;
+static int command_history_capacity = 0;
 static int command_history_count = 0;
 static int command_history_index = -1;
 static char *current_input_snapshot = NULL;
@@ -457,29 +456,18 @@ static void ensure_history_storage(void) {
         return;
     }
 
-    command_history = kmalloc(COMMAND_HISTORY_SIZE * sizeof(char *));
+    command_history_capacity = 16;
+    command_history = (char **)kmalloc(command_history_capacity * sizeof(char *));
     if (command_history == NULL) {
+        command_history_capacity = 0;
         return;
     }
 
-    for (int i = 0; i < COMMAND_HISTORY_SIZE; i++) {
-        command_history[i] = kmalloc(COMMAND_HISTORY_ENTRY_SIZE);
-        if (command_history[i] == NULL) {
-            command_history[i] = NULL;
-        } else {
-            command_history[i][0] = '\0';
-        }
-    }
+    memset(command_history, 0, command_history_capacity * sizeof(char *));
 }
 
 static void load_command_history_from_file(void) {
     ensure_history_storage();
-    for (int i = 0; i < COMMAND_HISTORY_SIZE; i++) {
-        if (command_history[i] != NULL) {
-            command_history[i][0] = '\0';
-        }
-    }
-    command_history_count = 0;
     command_history_index = -1;
 }
 
@@ -488,32 +476,35 @@ static void push_command_history(const char *cmd) {
         return;
     }
 
-    if (strlen(cmd) >= COMMAND_HISTORY_ENTRY_SIZE) {
+    ensure_history_storage();
+    if (!command_history) {
         return;
     }
 
-    if (command_history_count < COMMAND_HISTORY_SIZE) {
-        if (command_history[command_history_count] == NULL) {
-            command_history[command_history_count] = kmalloc(COMMAND_HISTORY_ENTRY_SIZE);
+    /* Expand history capacity if full */
+    if (command_history_count >= command_history_capacity) {
+        int new_cap = (command_history_capacity == 0) ? 16 : (command_history_capacity * 2);
+        char **new_history = (char **)kmalloc(new_cap * sizeof(char *));
+        if (!new_history) {
+            return;
         }
-        if (command_history[command_history_count] != NULL) {
-            strncpy(command_history[command_history_count], cmd, COMMAND_HISTORY_ENTRY_SIZE - 1u);
-            command_history[command_history_count][COMMAND_HISTORY_ENTRY_SIZE - 1u] = '\0';
-            command_history_count++;
+        if (command_history && command_history_count > 0) {
+            memcpy(new_history, command_history, command_history_count * sizeof(char *));
+            kfree(command_history);
         }
-    } else {
-        for (int i = 1; i < COMMAND_HISTORY_SIZE; i++) {
-            if (command_history[i] != NULL) {
-                strncpy(command_history[i - 1], command_history[i], COMMAND_HISTORY_ENTRY_SIZE - 1u);
-                command_history[i - 1][COMMAND_HISTORY_ENTRY_SIZE - 1u] = '\0';
-            }
-        }
-        if (command_history[COMMAND_HISTORY_SIZE - 1] != NULL) {
-            strncpy(command_history[COMMAND_HISTORY_SIZE - 1], cmd, COMMAND_HISTORY_ENTRY_SIZE - 1u);
-            command_history[COMMAND_HISTORY_SIZE - 1][COMMAND_HISTORY_ENTRY_SIZE - 1u] = '\0';
-        }
+        memset(new_history + command_history_count, 0, (new_cap - command_history_count) * sizeof(char *));
+        command_history = new_history;
+        command_history_capacity = new_cap;
     }
 
+    size_t len = strlen(cmd);
+    char *entry = (char *)kmalloc(len + 1u);
+    if (!entry) {
+        return;
+    }
+    memcpy(entry, cmd, len + 1u);
+
+    command_history[command_history_count++] = entry;
     command_history_index = -1;
 }
 

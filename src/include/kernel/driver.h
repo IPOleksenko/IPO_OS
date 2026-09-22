@@ -5,15 +5,12 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#define DRIVER_NAME_MAX 64
-#define DRIVER_DESC_MAX 128
-
 /**
  * Driver structure for dynamically loading drivers and kernel extensions.
  */
 typedef struct driver {
-    char name[DRIVER_NAME_MAX];
-    char description[DRIVER_DESC_MAX];
+    char *name;
+    char *description;
     uint32_t flags;
 
     /* Lifecycle callbacks */

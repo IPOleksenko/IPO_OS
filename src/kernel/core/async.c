@@ -11,9 +11,7 @@
 
 
 typedef struct async_task {
-
-    char name[32];
-
+    char *name;
     async_task_fn_t fn;
 
     uint32_t interval_ms;
@@ -24,7 +22,6 @@ typedef struct async_task {
     process_t *owner;
 
     struct async_task *next;
-
 } async_task_t;
 
 
@@ -39,6 +36,10 @@ static void remove_inactive_tasks(void) {
         async_task_t *task = *it;
         if (!task->active) {
             *it = task->next;
+            if (task->name != NULL) {
+                kfree(task->name);
+                task->name = NULL;
+            }
             kfree(task);
             continue;
         }
@@ -138,13 +139,13 @@ int async_start_task(
 
     memset(new_task, 0, sizeof(async_task_t));
 
-    strncpy(
-        new_task->name,
-        name,
-        sizeof(new_task->name) - 1
-    );
-
-    new_task->name[sizeof(new_task->name) - 1] = '\0';
+    size_t name_len = strlen(name);
+    new_task->name = (char *)kmalloc(name_len + 1);
+    if (new_task->name == NULL) {
+        kfree(new_task);
+        return -1;
+    }
+    memcpy(new_task->name, name, name_len + 1);
 
     new_task->fn = fn;
     new_task->interval_ms = interval_ms;

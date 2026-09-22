@@ -23,8 +23,6 @@ static inline bool should_use_keymap_syscalls(void) {
     return dynamic_keymap_app_mode;
 }
 
-#define MAX_KEYMAPS 8
-
 typedef struct {
     char *name;
     keymap_entry_t *entries;
@@ -33,7 +31,8 @@ typedef struct {
     bool enabled;
 } keymap_slot_t;
 
-static keymap_slot_t keymap_storage[MAX_KEYMAPS];
+static keymap_slot_t *keymap_storage = NULL;
+static uint32_t keymap_storage_capacity = 0;
 static uint32_t keymap_storage_count = 0;
 static uint32_t active_storage_index = 0;
 static bool storage_initialized = false;
@@ -57,7 +56,14 @@ static void register_slot_fonts(keymap_slot_t *slot) {
 }
 
 static void init_storage_if_needed(void) {
-    if (storage_initialized) return;
+    if (storage_initialized && keymap_storage != NULL) return;
+
+    if (!keymap_storage) {
+        keymap_storage_capacity = 8;
+        keymap_storage = (keymap_slot_t *)kmalloc(sizeof(keymap_slot_t) * keymap_storage_capacity);
+        if (!keymap_storage) return;
+        memset(keymap_storage, 0, sizeof(keymap_slot_t) * keymap_storage_capacity);
+    }
 
     /* Slot 0 is always default English */
     keymap_storage[0].name = (char *)default_keymap_name;
@@ -100,17 +106,19 @@ int dynamic_keymap_set(const char *name, const keymap_entry_t *entries, uint32_t
     }
 
     if (slot < 0) {
-        if (keymap_storage_count < MAX_KEYMAPS) {
-            slot = (int)keymap_storage_count++;
-        } else {
-            /* Storage full: replace last slot */
-            slot = MAX_KEYMAPS - 1;
-            free_slot_entries(&keymap_storage[slot]);
-            if (keymap_storage[slot].name != NULL) {
-                kfree(keymap_storage[slot].name);
-                keymap_storage[slot].name = NULL;
+        if (keymap_storage_count >= keymap_storage_capacity) {
+            uint32_t new_cap = (keymap_storage_capacity == 0) ? 8 : (keymap_storage_capacity * 2);
+            keymap_slot_t *new_storage = (keymap_slot_t *)kmalloc(sizeof(keymap_slot_t) * new_cap);
+            if (!new_storage) return -1;
+            if (keymap_storage && keymap_storage_capacity > 0) {
+                memcpy(new_storage, keymap_storage, sizeof(keymap_slot_t) * keymap_storage_capacity);
+                kfree(keymap_storage);
             }
+            memset(new_storage + keymap_storage_capacity, 0, sizeof(keymap_slot_t) * (new_cap - keymap_storage_capacity));
+            keymap_storage = new_storage;
+            keymap_storage_capacity = new_cap;
         }
+        slot = (int)keymap_storage_count++;
     } else {
         free_slot_entries(&keymap_storage[slot]);
         if (keymap_storage[slot].name != NULL) {

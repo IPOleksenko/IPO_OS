@@ -4,10 +4,10 @@
 #include <net/ipv4.h>
 #include <string.h>
 
-static uint8_t tx_frame_buf[1536];
+#include <memory/kmalloc.h>
 
 int eth_send(const mac_addr_t *dest, uint16_t ethertype, const void *payload, uint16_t len) {
-    if (!dest || !payload || len > (1500)) {
+    if (!dest || !payload) {
         return -1;
     }
 
@@ -16,15 +16,22 @@ int eth_send(const mac_addr_t *dest, uint16_t ethertype, const void *payload, ui
         return -1;
     }
 
-    eth_header_t *hdr = (eth_header_t *)tx_frame_buf;
+    uint16_t total_len = (uint16_t)(sizeof(eth_header_t) + len);
+    uint8_t *tx_frame = (uint8_t *)kmalloc(total_len);
+    if (!tx_frame) {
+        return -1;
+    }
+
+    eth_header_t *hdr = (eth_header_t *)tx_frame;
     memcpy(&hdr->dest, dest, sizeof(mac_addr_t));
     memcpy(&hdr->src, &netif->mac, sizeof(mac_addr_t));
     hdr->type = htons(ethertype);
 
-    memcpy(tx_frame_buf + sizeof(eth_header_t), payload, len);
+    memcpy(tx_frame + sizeof(eth_header_t), payload, len);
 
-    uint16_t total_len = (uint16_t)(sizeof(eth_header_t) + len);
-    return rtl8139_send_packet(tx_frame_buf, total_len);
+    int res = rtl8139_send_packet(tx_frame, total_len);
+    kfree(tx_frame);
+    return res;
 }
 
 #include <stdio.h>

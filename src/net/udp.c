@@ -2,8 +2,7 @@
 #include <net/net_state.h>
 #include <net/ipv4.h>
 #include <string.h>
-
-static uint8_t udp_tx_buf[1500];
+#include <memory/kmalloc.h>
 
 void udp_init(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
@@ -44,22 +43,25 @@ void udp_unbind(uint16_t port) {
 }
 
 int udp_send(ip4_addr_t dst_ip, uint16_t src_port, uint16_t dst_port, const void *payload, uint16_t len) {
-    if (len > (1500 - sizeof(udp_header_t))) {
+    uint16_t total_len = (uint16_t)(sizeof(udp_header_t) + len);
+    uint8_t *tx_buf = (uint8_t *)kmalloc(total_len);
+    if (!tx_buf) {
         return -1;
     }
 
-    udp_header_t *hdr = (udp_header_t *)udp_tx_buf;
+    udp_header_t *hdr = (udp_header_t *)tx_buf;
     hdr->src_port = htons(src_port);
     hdr->dst_port = htons(dst_port);
-    hdr->length = htons((uint16_t)(sizeof(udp_header_t) + len));
+    hdr->length = htons(total_len);
     hdr->checksum = 0; // Checksum optional in IPv4 UDP
 
     if (payload && len > 0) {
-        memcpy(udp_tx_buf + sizeof(udp_header_t), payload, len);
+        memcpy(tx_buf + sizeof(udp_header_t), payload, len);
     }
 
-    uint16_t total_len = (uint16_t)(sizeof(udp_header_t) + len);
-    return ip4_send(dst_ip, IPPROTO_UDP, 64, udp_tx_buf, total_len);
+    int ret = ip4_send(dst_ip, IPPROTO_UDP, 64, tx_buf, total_len);
+    kfree(tx_buf);
+    return ret;
 }
 
 /* Forward declaration for central DNS response processing */

@@ -1,3 +1,0 @@
-*MPY-ROMFS-TEST-PARTITION*
-
-This is a ROMFS partition to be used in MicroPython tests, usually for CI.

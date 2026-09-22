@@ -421,7 +421,7 @@ static uint32_t syscall_builtin_fs_read(uint32_t num,
     if (argc >= 4u) {
         offset = argv[3];
     } else {
-        if (fd < 0 || fd >= IPO_MAX_FDS || !fds[fd].used) return (uint32_t)-1;
+        if (fd < 0 || (uint32_t)fd >= fds_capacity || !fds || !fds[fd].used) return (uint32_t)-1;
         offset = fds[fd].offset;
     }
 
@@ -449,7 +449,7 @@ static uint32_t syscall_builtin_fs_write(uint32_t num,
     if (argc >= 4u) {
         offset = argv[3];
     } else {
-        if (fd < 0 || fd >= IPO_MAX_FDS || !fds[fd].used) return (uint32_t)-1;
+        if (fd < 0 || (uint32_t)fd >= fds_capacity || !fds || !fds[fd].used) return (uint32_t)-1;
         offset = fds[fd].offset;
     }
 
@@ -473,7 +473,7 @@ static uint32_t syscall_builtin_fs_seek(uint32_t num,
     int32_t offset = (int32_t)argv[1];
     int whence = (int)argv[2];
 
-    if (fd < 0 || fd >= IPO_MAX_FDS || !fds[fd].used) {
+    if (fd < 0 || (uint32_t)fd >= fds_capacity || !fds || !fds[fd].used) {
         return (uint32_t)-1;
     }
 

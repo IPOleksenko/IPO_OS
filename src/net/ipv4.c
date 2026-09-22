@@ -6,23 +6,30 @@
 #include <net/loopback.h>
 #include <string.h>
 
+#include <memory/kmalloc.h>
+
 static uint16_t ip_ident_counter = 1;
-static uint8_t ip_tx_buf[1536];
 
 int ip4_send(ip4_addr_t dst_ip, uint8_t protocol, uint8_t ttl, const void *payload, uint16_t len) {
-    if (!payload || len > (1500 - sizeof(ip4_header_t))) {
+    if (!payload && len > 0) {
         return -1;
     }
 
     net_if_t *netif = net_get_interface();
     if (!netif) return -1;
 
+    uint16_t total_len = (uint16_t)(sizeof(ip4_header_t) + len);
+    uint8_t *tx_buf = (uint8_t *)kmalloc(total_len);
+    if (!tx_buf) {
+        return -1;
+    }
+
     /* Check for loopback destination 127.0.0.0/8 */
     if ((dst_ip >> 24) == 127) {
-        ip4_header_t *hdr = (ip4_header_t *)ip_tx_buf;
+        ip4_header_t *hdr = (ip4_header_t *)tx_buf;
         hdr->ihl_version = 0x45;
         hdr->tos = 0;
-        hdr->total_len = htons((uint16_t)(sizeof(ip4_header_t) + len));
+        hdr->total_len = htons(total_len);
         hdr->id = htons(ip_ident_counter++);
         hdr->flags_frag = 0;
         hdr->ttl = ttl ? ttl : 64;
@@ -32,11 +39,16 @@ int ip4_send(ip4_addr_t dst_ip, uint8_t protocol, uint8_t ttl, const void *paylo
         hdr->dst_ip = htonl(dst_ip);
         hdr->checksum = net_checksum(hdr, sizeof(ip4_header_t));
 
-        memcpy(ip_tx_buf + sizeof(ip4_header_t), payload, len);
-        return loopback_send(ip_tx_buf, (uint16_t)(sizeof(ip4_header_t) + len));
+        if (payload && len > 0) {
+            memcpy(tx_buf + sizeof(ip4_header_t), payload, len);
+        }
+        int ret = loopback_send(tx_buf, total_len);
+        kfree(tx_buf);
+        return ret;
     }
 
     if (!netif->link_up) {
+        kfree(tx_buf);
         return -1;
     }
 
@@ -50,14 +62,15 @@ int ip4_send(ip4_addr_t dst_ip, uint8_t protocol, uint8_t ttl, const void *paylo
 
     mac_addr_t next_hop_mac;
     if (!arp_resolve(next_hop, &next_hop_mac, 1000)) {
+        kfree(tx_buf);
         return -2; // ARP resolution failed
     }
 
     /* Build IPv4 packet */
-    ip4_header_t *hdr = (ip4_header_t *)ip_tx_buf;
+    ip4_header_t *hdr = (ip4_header_t *)tx_buf;
     hdr->ihl_version = 0x45;
     hdr->tos = 0;
-    hdr->total_len = htons((uint16_t)(sizeof(ip4_header_t) + len));
+    hdr->total_len = htons(total_len);
     hdr->id = htons(ip_ident_counter++);
     hdr->flags_frag = 0;
     hdr->ttl = ttl ? ttl : 64;
@@ -67,10 +80,13 @@ int ip4_send(ip4_addr_t dst_ip, uint8_t protocol, uint8_t ttl, const void *paylo
     hdr->dst_ip = htonl(dst_ip);
     hdr->checksum = net_checksum(hdr, sizeof(ip4_header_t));
 
-    memcpy(ip_tx_buf + sizeof(ip4_header_t), payload, len);
+    if (payload && len > 0) {
+        memcpy(tx_buf + sizeof(ip4_header_t), payload, len);
+    }
 
-    uint16_t total_len = (uint16_t)(sizeof(ip4_header_t) + len);
-    return eth_send(&next_hop_mac, ETHERTYPE_IPV4, ip_tx_buf, total_len);
+    int ret = eth_send(&next_hop_mac, ETHERTYPE_IPV4, tx_buf, total_len);
+    kfree(tx_buf);
+    return ret;
 }
 
 #include <stdio.h>
