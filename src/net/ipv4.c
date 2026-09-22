@@ -4,6 +4,7 @@
 #include <net/icmp.h>
 #include <net/udp.h>
 #include <net/loopback.h>
+#include <net/tcp.h>
 #include <string.h>
 
 #include <memory/kmalloc.h>
@@ -133,5 +134,7 @@ void ip4_receive(const void *packet, uint16_t len) {
         icmp_receive(src_ip, ttl, payload, payload_len);
     } else if (hdr->protocol == IPPROTO_UDP) {
         udp_receive(src_ip, payload, payload_len);
+    } else if (hdr->protocol == IPPROTO_TCP) {
+        tcp_receive(src_ip, dst_ip, payload, payload_len);
     }
 }

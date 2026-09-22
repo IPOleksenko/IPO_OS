@@ -55,5 +55,6 @@ bool str_to_ip(const char *str, ip4_addr_t *out_ip);
 bool net_init(void);
 void net_poll(void);
 net_if_t *net_get_interface(void);
+void net_set_ip(ip4_addr_t ip, ip4_addr_t netmask, ip4_addr_t gateway, ip4_addr_t dns);
 
 #endif /* IPO_NET_NET_H */

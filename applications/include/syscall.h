@@ -172,6 +172,14 @@ static inline int ipo_stat(const char *path, struct ipo_inode *st) {
     return ipo_syscall(IPO_SYSCALL_FS_STAT, 2u, args);
 }
 
+static inline int ipo_list_dir(const char *path, char *buf, int size) {
+    uint32_t args[3];
+    args[0] = (uint32_t)(uintptr_t)path;
+    args[1] = (uint32_t)(uintptr_t)buf;
+    args[2] = (uint32_t)size;
+    return (int)ipo_syscall(IPO_SYSCALL_FS_LIST, 3u, args);
+}
+
 static inline int ipo_read_line(char *buf, uint32_t max_len) {
     if (buf == NULL || max_len == 0u) return -1;
     uint32_t args[2];

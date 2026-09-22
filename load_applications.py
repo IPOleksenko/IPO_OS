@@ -97,6 +97,8 @@ def main():
         for app in app_files:
             app_name = app.name[:-4] if app.name.endswith(".bin") else app.name
             safe_put_executable(disk, app, f"/applications/{app_name}")
+            if app_name == "ifconfig":
+                safe_put_executable(disk, app, "/applications/ipconfig")
 
     # 2. Upload toolchain binaries to /applications
     toolchain_dir = project_root / "build" / "toolchain"

@@ -5,6 +5,8 @@
 #include <net/arp.h>
 #include <net/icmp.h>
 #include <net/udp.h>
+#include <net/tcp.h>
+#include <net/socket.h>
 #include <net/loopback.h>
 #include <stdio.h>
 #include <string.h>
@@ -80,24 +82,29 @@ bool net_init(void) {
         memset(ctx, 0, sizeof(net_shared_ctx_t));
         ctx->magic = NET_SHARED_MAGIC;
         ctx->default_if.mac = (mac_addr_t){{0x52, 0x54, 0x00, 0x12, 0x34, 0x56}};
-        ctx->default_if.ip = IP4_ADDR(10, 0, 2, 15);
+        ctx->default_if.ip = IP4_ADDR(192, 168, 7, 2);
         ctx->default_if.netmask = IP4_ADDR(255, 255, 255, 0);
-        ctx->default_if.gateway = IP4_ADDR(10, 0, 2, 2);
-        ctx->default_if.dns = IP4_ADDR(10, 0, 2, 3);
+        ctx->default_if.gateway = IP4_ADDR(192, 168, 7, 1);
+        ctx->default_if.dns = IP4_ADDR(192, 168, 7, 1);
         ctx->default_if.link_up = false;
 
         loopback_init();
         arp_init();
         icmp_init();
         udp_init();
+        tcp_init();
+        socket_subsystem_init();
 
         if (rtl8139_init()) {
             const uint8_t *mac = rtl8139_get_mac();
             memcpy(ctx->default_if.mac.mac, mac, 6);
             ctx->default_if.link_up = true;
-            serial_printf("[net] RTL8139 init SUCCESS, MAC: %x:%x:%x:%x:%x:%x, IP: 10.0.2.15\n",
+            char ip_str[32];
+            ip_to_str(ctx->default_if.ip, ip_str, sizeof(ip_str));
+            serial_printf("[net] RTL8139 init SUCCESS, MAC: %02x:%02x:%02x:%02x:%02x:%02x, IP: %s\n",
                           (unsigned int)mac[0], (unsigned int)mac[1], (unsigned int)mac[2],
-                          (unsigned int)mac[3], (unsigned int)mac[4], (unsigned int)mac[5]);
+                          (unsigned int)mac[3], (unsigned int)mac[4], (unsigned int)mac[5],
+                          ip_str);
         } else {
             ctx->default_if.link_up = false;
             serial_printf("[net] RTL8139 init FAILED, link is down\n");
@@ -118,6 +125,7 @@ void net_poll(void) {
     }
 
     loopback_poll();
+    tcp_poll();
 
     if (!ctx->default_if.link_up) return;
 
@@ -133,4 +141,13 @@ net_if_t *net_get_interface(void) {
         net_init();
     }
     return &ctx->default_if;
+}
+
+void net_set_ip(ip4_addr_t ip, ip4_addr_t netmask, ip4_addr_t gateway, ip4_addr_t dns) {
+    net_if_t *netif = net_get_interface();
+    if (!netif) return;
+    if (ip != 0) netif->ip = ip;
+    if (netmask != 0) netif->netmask = netmask;
+    if (gateway != 0) netif->gateway = gateway;
+    if (dns != 0) netif->dns = dns;
 }

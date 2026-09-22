@@ -21,6 +21,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdio.h>
+#include <net/net.h>
 
 /* Terminal input locking */
 static bool terminal_input_locked = false;
@@ -843,6 +844,7 @@ bool terminal_is_builtin(const char *name) {
         "driver", "drivers", "lsmod",
         "keymap", "layout", "keymaps",
         "return", "retval", "show_return", "return_val", "ret",
+        "ifconfig", "ipconfig", "ip",
         "startx", "stopx",
         NULL
     };
@@ -907,6 +909,10 @@ static void builtin_help(void) {
     printf("  [Output & Redirection]\n");
     printf("    echo [text] [> file | >> file]\n");
     printf("      - Print text to stdout, overwrite to file (>), or append (>>).\n");
+    printf("\n");
+    printf("  [Networking]\n");
+    printf("    ifconfig | ip [<new_ip> [netmask] [gateway] [dns]]\n");
+    printf("      - Display or configure device IP address, netmask, gateway and MAC.\n");
     printf("\n");
     printf("  [External Drivers Subsystem]\n");
     printf("    driver | drivers | lsmod\n");
@@ -1850,6 +1856,67 @@ static int terminal_try_execute_script(const char *path, int argc, char **argv) 
     return res;
 }
 
+static void builtin_ifconfig(int argc, char **argv) {
+    net_if_t *netif = net_get_interface();
+    if (!netif) {
+        printf("ifconfig: no network interface available\n");
+        return;
+    }
+
+    if (argc >= 2) {
+        if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
+            printf("Usage: ifconfig [<ip> [netmask] [gateway] [dns]]\n");
+            return;
+        }
+
+        ip4_addr_t new_ip = 0;
+        if (!str_to_ip(argv[1], &new_ip)) {
+            printf("ifconfig: invalid IP address '%s'\n", argv[1]);
+            return;
+        }
+
+        ip4_addr_t netmask = 0;
+        if (argc >= 3) {
+            if (!str_to_ip(argv[2], &netmask)) {
+                printf("ifconfig: invalid netmask '%s'\n", argv[2]);
+                return;
+            }
+        }
+
+        ip4_addr_t gateway = 0;
+        if (argc >= 4) {
+            if (!str_to_ip(argv[3], &gateway)) {
+                printf("ifconfig: invalid gateway '%s'\n", argv[3]);
+                return;
+            }
+        }
+
+        ip4_addr_t dns = 0;
+        if (argc >= 5) {
+            if (!str_to_ip(argv[4], &dns)) {
+                printf("ifconfig: invalid DNS '%s'\n", argv[4]);
+                return;
+            }
+        }
+
+        net_set_ip(new_ip, netmask, gateway, dns);
+        printf("[ifconfig] Network settings updated.\n");
+    }
+
+    char ip_str[32], mask_str[32], gw_str[32], dns_str[32];
+    ip_to_str(netif->ip, ip_str, sizeof(ip_str));
+    ip_to_str(netif->netmask, mask_str, sizeof(mask_str));
+    ip_to_str(netif->gateway, gw_str, sizeof(gw_str));
+    ip_to_str(netif->dns, dns_str, sizeof(dns_str));
+
+    printf("eth0: flags=<%s> mtu 1500\n", netif->link_up ? "UP,RUNNING" : "DOWN");
+    printf("      inet %s  netmask %s\n", ip_str, mask_str);
+    printf("      gateway %s  dns %s\n", gw_str, dns_str);
+    printf("      ether %02x:%02x:%02x:%02x:%02x:%02x\n",
+           netif->mac.mac[0], netif->mac.mac[1], netif->mac.mac[2],
+           netif->mac.mac[3], netif->mac.mac[4], netif->mac.mac[5]);
+}
+
 int try_execute_command(const char *cmdline) {
     if (!cmdline) return -1;
 
@@ -2105,6 +2172,9 @@ int try_execute_command(const char *cmdline) {
                strcmp(name, "show_return") == 0 || strcmp(name, "return_val") == 0 ||
                strcmp(name, "ret") == 0) {
         builtin_show_return(argc, argv);
+        builtin_handled = 1;
+    } else if (strcmp(name, "ifconfig") == 0 || strcmp(name, "ip") == 0 || strcmp(name, "ipconfig") == 0) {
+        builtin_ifconfig(argc, argv);
         builtin_handled = 1;
     } else if (strcmp(name, "run") == 0) {
         /* Find the part of cmdline after "run " */

@@ -113,6 +113,15 @@ LIB_CFLAGS := -m32 \
 
 LD_FLAGS := -T $(SRC)/kernel/linker.ld -nostdlib
 
+NET_MODE ?= tap
+TAP_DEV  ?= tap0
+
+ifeq ($(NET_MODE),tap)
+  QEMU_NET_FLAGS := -netdev tap,id=net0,ifname=$(TAP_DEV),script=no,downscript=no -device rtl8139,netdev=net0
+else
+  QEMU_NET_FLAGS := -netdev user,id=net0,hostfwd=tcp::8080-:8080,hostfwd=tcp::8000-:8000 -device rtl8139,netdev=net0
+endif
+
 AUDIODEV ?= pa
 
 QEMU_FLAGS := 	-m 2048 \
@@ -121,5 +130,5 @@ QEMU_FLAGS := 	-m 2048 \
                	-cdrom build/disk.iso \
                	-device sb16,audiodev=snd \
                	-audiodev $(AUDIODEV),id=snd -machine pcspk-audiodev=snd \
-               	-netdev user,id=net0 -device rtl8139,netdev=net0 \
+               	$(QEMU_NET_FLAGS) \
 				-serial stdio

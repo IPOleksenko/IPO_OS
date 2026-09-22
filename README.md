@@ -56,6 +56,17 @@ make applications
 make apps
 ```
 
+#### `make setup-tap` — Setup TAP Network Interface
+Configures the host virtual TAP interface (`tap0`) for direct L2 communication with IPO_OS:
+- Automatically loads the `tun` kernel module (`modprobe tun`)
+- Configures `/dev/net/tun`
+- Assigns host IP `192.168.7.1/24` to `tap0`
+- Exposes all 65,535 TCP/UDP ports directly between host and guest without port forwarding
+
+```bash
+make setup-tap
+```
+
 #### `make run` — Launch in QEMU
 Runs the OS image in QEMU emulator:
 ```bash
@@ -173,6 +184,62 @@ python3 disk_editor.py touch /hello.txt "Hello IPO"
 ```bash
 python3 disk_editor.py rm /oldfile
 ```
+
+## 🌐 Networking (TAP Mode & Direct Ports Access)
+
+IPO_OS implements a native bare-metal TCP/IP stack (RTL8139 NIC driver, Ethernet, ARP, IPv4 with routing table and default gateway, TCP with RFC 793/RFC 9293 state machine, and a POSIX-like Socket API).
+
+### 🚀 TAP Network Interface Setup (`setup-tap.sh`)
+
+By default, QEMU is configured in **TAP networking mode** (`NET_MODE ?= tap` in `mk/config.mk`). In TAP mode, all 65,535 TCP/UDP ports are directly exposed and reachable between host and guest without predefined port forwarding.
+
+#### Script: `tools/setup-tap.sh`
+```bash
+./tools/setup-tap.sh [tap_dev] [host_ip] [netmask] [guest_ip]
+```
+- Parameters:
+  - `tap_dev` — virtual TAP interface name (default: `tap0`)
+  - `host_ip` — IP assigned to host interface (default: `192.168.7.1`)
+  - `netmask` — subnet CIDR prefix (default: `24` -> `255.255.255.0`)
+  - `guest_ip` — default target IP for IPO_OS (default: `192.168.7.2`)
+
+#### Quick Start:
+```bash
+# 1. Setup virtual TAP device on host
+make setup-tap
+# (or: sudo ./tools/setup-tap.sh tap0)
+
+# 2. Launch IPO_OS
+make run
+
+# 3. Inside IPO_OS: check or change IP configuration dynamically
+ifconfig
+# (or set custom: ifconfig 192.168.7.100 255.255.255.0 192.168.7.1)
+
+# 4. Inside IPO_OS: run the hosting server on any port
+hosting_server 8000
+
+# 5. Connect to server:
+curl http://192.168.7.2:8000/
+
+# 6. Inside IPO_OS: fetch data from another host
+hosting_client 192.168.7.1 9000 /
+```
+
+#### Connecting across routed networks or virtual environments:
+If running in an environment where the TAP network needs to be reached from other machines or interfaces:
+1. Enable IP forwarding on the host machine:
+   ```bash
+   sudo sysctl -w net.ipv4.ip_forward=1
+   ```
+2. On the client machine, add a route to the IPO_OS subnet:
+   ```bash
+   route add 192.168.7.0 mask 255.255.255.0 <HOST_IP>
+   ```
+3. Connect directly to any port:
+   ```bash
+   curl http://192.168.7.2:8000/
+   ```
 
 ## 🧑‍💻 Authors
 

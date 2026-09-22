@@ -12,4 +12,4 @@ include mk/clean.mk
 
 all: clean lib kernel boot applications toolchain image disks run
 
-.PHONY: all run patch-config lib kernel boot applications apps image disks toolchain
+.PHONY: all run patch-config lib kernel boot applications apps image disks toolchain setup-tap
