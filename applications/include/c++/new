@@ -1,0 +1,32 @@
+#ifndef _CPP_NEW_H
+#define _CPP_NEW_H
+
+#include <stddef.h>
+
+void* operator new(size_t size);
+void* operator new[](size_t size);
+void operator delete(void* ptr) noexcept;
+void operator delete[](void* ptr) noexcept;
+void operator delete(void* ptr, size_t size) noexcept;
+void operator delete[](void* ptr, size_t size) noexcept;
+
+inline void* operator new(size_t size, void* ptr) noexcept {
+    (void)size;
+    return ptr;
+}
+
+inline void* operator new[](size_t size, void* ptr) noexcept {
+    (void)size;
+    return ptr;
+}
+
+inline void operator delete(void* ptr, void* place) noexcept {
+    (void)ptr; (void)place;
+}
+
+inline void operator delete[](void* ptr, void* place) noexcept {
+    (void)ptr; (void)place;
+}
+
+#endif
+

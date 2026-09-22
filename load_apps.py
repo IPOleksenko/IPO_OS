@@ -50,13 +50,17 @@ def main():
     parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parent)
     parser.add_argument("--image", type=Path, default=Path(__file__).resolve().parent / "build" / "disk.img")
     parser.add_argument("--start-lba", type=int, default=2048)
-    parser.add_argument("--apps-dir", type=Path, default=Path(__file__).resolve().parent / "build" / "apps")
+    parser.add_argument("--apps-dir", type=Path, default=Path(__file__).resolve().parent / "build" / "applications")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be copied without modifying the image")
     args = parser.parse_args()
 
     project_root = args.project_root.resolve()
     image = (project_root / args.image).resolve() if not args.image.is_absolute() else args.image.resolve()
     apps_dir = (project_root / args.apps_dir).resolve() if not args.apps_dir.is_absolute() else args.apps_dir.resolve()
+    if not apps_dir.exists():
+        fallback_apps = project_root / "build" / "apps"
+        if fallback_apps.exists():
+            apps_dir = fallback_apps
 
     if not image.exists():
         print(f"Creating disk image {image} (128MB)...")
@@ -131,13 +135,17 @@ def main():
                 safe_put(disk, f, f"/fonts/{f.name}")
 
     # 4. Bundled compiler headers (only if present)
-    tcc_include = project_root / "apps" / "tcc" / "include"
+    tcc_include = project_root / "applications" / "tcc" / "include"
+    if not tcc_include.exists():
+        tcc_include = project_root / "apps" / "tcc" / "include"
     if tcc_include.exists():
         safe_mkdir(disk, "/include")
         for h in tcc_include.glob("*.h"):
             safe_put(disk, h, f"/include/{h.name}")
 
-    include_dir = project_root / "apps" / "include"
+    include_dir = project_root / "applications" / "include"
+    if not include_dir.exists():
+        include_dir = project_root / "apps" / "include"
     if include_dir.exists():
         safe_mkdir(disk, "/include")
         for h in include_dir.glob("*.h"):
@@ -177,7 +185,9 @@ def main():
             if p.exists():
                 safe_put(disk, p, f"/lib/{lf}")
 
-        linker_script = project_root / "lib" / "linker.ld"
+        linker_script = project_root / "src" / "userland" / "linker.ld"
+        if not linker_script.exists():
+            linker_script = project_root / "lib" / "linker.ld"
         if linker_script.exists():
             safe_put(disk, linker_script, "/lib/linker.ld")
 

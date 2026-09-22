@@ -1,0 +1,95 @@
+#ifndef _CPP_IOSTREAM_H
+#define _CPP_IOSTREAM_H
+
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+
+namespace std {
+
+class ostream {
+public:
+    FILE *file;
+    ostream(FILE *f) : file(f) {}
+
+    ostream& operator<<(const char *s) {
+        if (s) fputs(s, file);
+        return *this;
+    }
+
+    ostream& operator<<(char c) {
+        fputc(c, file);
+        return *this;
+    }
+
+    ostream& operator<<(int val) {
+        fprintf(file, "%d", val);
+        return *this;
+    }
+
+    ostream& operator<<(unsigned int val) {
+        fprintf(file, "%u", val);
+        return *this;
+    }
+
+    ostream& operator<<(long val) {
+        fprintf(file, "%ld", val);
+        return *this;
+    }
+
+    ostream& operator<<(unsigned long val) {
+        fprintf(file, "%lu", val);
+        return *this;
+    }
+
+    ostream& operator<<(double val) {
+        fprintf(file, "%f", val);
+        return *this;
+    }
+
+    ostream& operator<<(const void *p) {
+        fprintf(file, "%p", p);
+        return *this;
+    }
+
+    ostream& operator<<(ostream& (*manip)(ostream&)) {
+        return manip(*this);
+    }
+};
+
+class istream {
+public:
+    FILE *file;
+    istream(FILE *f) : file(f) {}
+
+    istream& operator>>(char *s) {
+        if (s) fscanf(file, "%s", s);
+        return *this;
+    }
+
+    istream& operator>>(int &val) {
+        fscanf(file, "%d", &val);
+        return *this;
+    }
+
+    istream& operator>>(char &c) {
+        int ch = fgetc(file);
+        if (ch != EOF) c = (char)ch;
+        return *this;
+    }
+};
+
+inline ostream& endl(ostream& os) {
+    fputc('\n', os.file);
+    fflush(os.file);
+    return os;
+}
+
+extern ostream cout;
+extern ostream cerr;
+extern istream cin;
+
+} // namespace std
+
+#endif
+

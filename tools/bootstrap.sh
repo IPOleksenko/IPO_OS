@@ -26,56 +26,56 @@ cp "$(gcc -m32 -print-libgcc-file-name)" build/lib/libgcc.a
 
 echo "[3/7] Building Binutils & GCC compiler drivers for IPO_OS..."
 # GCC & G++
-gcc -m32 -nostdinc -Iapps/include -c tools/binutils/gcc.c -o build/toolchain/gcc.o
-ld -m elf_i386 -T lib/linker.ld build/lib/crt0.o build/lib/crti.o build/toolchain/gcc.o build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/gcc.elf
+gcc -m32 -nostdinc -Iapplications/include -c tools/binutils/gcc.c -o build/toolchain/gcc.o
+ld -m elf_i386 -T src/userland/linker.ld build/lib/crt0.o build/lib/crti.o build/toolchain/gcc.o build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/gcc.elf
 cp build/toolchain/gcc.elf build/toolchain/g++.elf
 
 # Linker (ld)
-gcc -m32 -nostdinc -Iapps/include -c tools/binutils/ld.c -o build/toolchain/ld.o
-ld -m elf_i386 -T lib/linker.ld build/lib/crt0.o build/lib/crti.o build/toolchain/ld.o build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/ld.elf
+gcc -m32 -nostdinc -Iapplications/include -c tools/binutils/ld.c -o build/toolchain/ld.o
+ld -m elf_i386 -T src/userland/linker.ld build/lib/crt0.o build/lib/crti.o build/toolchain/ld.o build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/ld.elf
 
 # Assembler (as)
-gcc -m32 -nostdinc -Iapps/include -c tools/binutils/as.c -o build/toolchain/as.o
-ld -m elf_i386 -T lib/linker.ld build/lib/crt0.o build/lib/crti.o build/toolchain/as.o build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/as.elf
+gcc -m32 -nostdinc -Iapplications/include -c tools/binutils/as.c -o build/toolchain/as.o
+ld -m elf_i386 -T src/userland/linker.ld build/lib/crt0.o build/lib/crti.o build/toolchain/as.o build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/as.elf
 
 # Archive manager (ar & ranlib)
-gcc -m32 -nostdinc -Iapps/include -c tools/binutils/ar.c -o build/toolchain/ar.o
-ld -m elf_i386 -T lib/linker.ld build/lib/crt0.o build/lib/crti.o build/toolchain/ar.o build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/ar.elf
+gcc -m32 -nostdinc -Iapplications/include -c tools/binutils/ar.c -o build/toolchain/ar.o
+ld -m elf_i386 -T src/userland/linker.ld build/lib/crt0.o build/lib/crti.o build/toolchain/ar.o build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/ar.elf
 cp build/toolchain/ar.elf build/toolchain/ranlib.elf
 
 # Object copy & strip (objcopy & strip)
-gcc -m32 -nostdinc -Iapps/include -c tools/binutils/objcopy.c -o build/toolchain/objcopy.o
-ld -m elf_i386 -T lib/linker.ld build/lib/crt0.o build/lib/crti.o build/toolchain/objcopy.o build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/objcopy.elf
+gcc -m32 -nostdinc -Iapplications/include -c tools/binutils/objcopy.c -o build/toolchain/objcopy.o
+ld -m elf_i386 -T src/userland/linker.ld build/lib/crt0.o build/lib/crti.o build/toolchain/objcopy.o build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/objcopy.elf
 cp build/toolchain/objcopy.elf build/toolchain/strip.elf
 
 # Object dumper (objdump)
-gcc -m32 -nostdinc -Iapps/include -c tools/binutils/objdump.c -o build/toolchain/objdump.o
-ld -m elf_i386 -T lib/linker.ld build/lib/crt0.o build/lib/crti.o build/toolchain/objdump.o build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/objdump.elf
+gcc -m32 -nostdinc -Iapplications/include -c tools/binutils/objdump.c -o build/toolchain/objdump.o
+ld -m elf_i386 -T src/userland/linker.ld build/lib/crt0.o build/lib/crti.o build/toolchain/objdump.o build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/objdump.elf
 
 # Readelf
-gcc -m32 -nostdinc -Iapps/include -c tools/binutils/readelf.c -o build/toolchain/readelf.o
-ld -m elf_i386 -T lib/linker.ld build/lib/crt0.o build/lib/crti.o build/toolchain/readelf.o build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/readelf.elf
+gcc -m32 -nostdinc -Iapplications/include -c tools/binutils/readelf.c -o build/toolchain/readelf.o
+ld -m elf_i386 -T src/userland/linker.ld build/lib/crt0.o build/lib/crti.o build/toolchain/readelf.o build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/readelf.elf
 
 # Symbol listing (nm)
-gcc -m32 -nostdinc -Iapps/include -c tools/binutils/nm.c -o build/toolchain/nm.o
-ld -m elf_i386 -T lib/linker.ld build/lib/crt0.o build/lib/crti.o build/toolchain/nm.o build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/nm.elf
+gcc -m32 -nostdinc -Iapplications/include -c tools/binutils/nm.c -o build/toolchain/nm.o
+ld -m elf_i386 -T src/userland/linker.ld build/lib/crt0.o build/lib/crti.o build/toolchain/nm.o build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/nm.elf
 
 echo "[4/7] Building language runtimes (Lua, Python, NASM)..."
 if [ ! -f "build/toolchain/lua/lua.elf" ] || [ ! -f "build/toolchain/lua/luac.elf" ]; then
     echo "Building Lua 5.4.7..."
-    cd apps/lua/src
-    make clean && make a CC="gcc -m32 -nostdinc -I$ROOT_DIR/apps/include" AR="ar rcs" RANLIB="ranlib" MYCFLAGS="-DLUA_USE_POSIX -DLUA_USE_C89 -ffreestanding -fno-builtin"
+    cd applications/lua/src
+    make clean && make a CC="gcc -m32 -nostdinc -I$ROOT_DIR/applications/include" AR="ar rcs" RANLIB="ranlib" MYCFLAGS="-DLUA_USE_POSIX -DLUA_USE_C89 -ffreestanding -fno-builtin"
     cd "$ROOT_DIR"
-    gcc -m32 -nostdinc -Iapps/include -c apps/lua/src/lua.c -o apps/lua/src/lua.o -DLUA_COMPAT_5_3 -DLUA_USE_POSIX -DLUA_USE_C89 -ffreestanding -fno-builtin
-    gcc -m32 -nostdinc -Iapps/include -c apps/lua/src/luac.c -o apps/lua/src/luac.o -DLUA_COMPAT_5_3 -DLUA_USE_POSIX -DLUA_USE_C89 -ffreestanding -fno-builtin
-    ld -m elf_i386 -T lib/linker.ld build/lib/crt0.o build/lib/crti.o apps/lua/src/lua.o apps/lua/src/liblua.a build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/lua/lua.elf
-    ld -m elf_i386 -T lib/linker.ld build/lib/crt0.o build/lib/crti.o apps/lua/src/luac.o apps/lua/src/liblua.a build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/lua/luac.elf
+    gcc -m32 -nostdinc -Iapplications/include -c applications/lua/src/lua.c -o applications/lua/src/lua.o -DLUA_COMPAT_5_3 -DLUA_USE_POSIX -DLUA_USE_C89 -ffreestanding -fno-builtin
+    gcc -m32 -nostdinc -Iapplications/include -c applications/lua/src/luac.c -o applications/lua/src/luac.o -DLUA_COMPAT_5_3 -DLUA_USE_POSIX -DLUA_USE_C89 -ffreestanding -fno-builtin
+    ld -m elf_i386 -T src/userland/linker.ld build/lib/crt0.o build/lib/crti.o applications/lua/src/lua.o applications/lua/src/liblua.a build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/lua/lua.elf
+    ld -m elf_i386 -T src/userland/linker.ld build/lib/crt0.o build/lib/crti.o applications/lua/src/luac.o applications/lua/src/liblua.a build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o -o build/toolchain/lua/luac.elf
 fi
 
 if [ ! -f "build/toolchain/nasm.elf" ]; then
     echo "Building NASM 2.16.03..."
-    cd apps/nasm
-    ld -m elf_i386 -T ../../lib/linker.ld ../../build/lib/crt0.o ../../build/lib/crti.o \
+    cd applications/nasm
+    ld -m elf_i386 -T ../../src/userland/linker.ld ../../build/lib/crt0.o ../../build/lib/crti.o \
         asm/nasm.o libnasm.a \
         ../../build/lib/libc.a ../../build/lib/libm.a ../../build/lib/libgcc.a ../../build/lib/crtn.o \
         -o ../../build/toolchain/nasm.elf
@@ -84,13 +84,13 @@ fi
 
 if [ ! -f "build/toolchain/python.elf" ]; then
     echo "Building MicroPython 3.12..."
-    gcc -m32 -c apps/micropython/micropython_shim.c -o apps/micropython/micropython_shim.o \
-        -Iapps/micropython -Iapps/micropython/ports/unix \
-        -Iapps/micropython/ports/unix/variants/minimal \
-        -Iapps/micropython/ports/unix/build-minimal \
-        -Iapps/micropython/ports/unix/build-minimal/genhdr
-    OBJS="$(find apps/micropython/ports/unix/build-minimal -name '*.o' ! -name 'printf.o' ! -name 'abort_.o' ! -name 'vfs_blockdev.o') apps/micropython/micropython_shim.o"
-    ld -m elf_i386 -T lib/linker.ld build/lib/crt0.o build/lib/crti.o \
+    gcc -m32 -c applications/micropython/micropython_shim.c -o applications/micropython/micropython_shim.o \
+        -Iapplications/micropython -Iapplications/micropython/ports/unix \
+        -Iapplications/micropython/ports/unix/variants/minimal \
+        -Iapplications/micropython/ports/unix/build-minimal \
+        -Iapplications/micropython/ports/unix/build-minimal/genhdr
+    OBJS="$(find applications/micropython/ports/unix/build-minimal -name '*.o' ! -name 'printf.o' ! -name 'abort_.o' ! -name 'vfs_blockdev.o') applications/micropython/micropython_shim.o"
+    ld -m elf_i386 -T src/userland/linker.ld build/lib/crt0.o build/lib/crti.o \
         $OBJS \
         build/lib/libc.a build/lib/libm.a build/lib/libgcc.a build/lib/crtn.o \
         -o build/toolchain/python.elf
@@ -108,4 +108,3 @@ python3 disk_editor.py -i build/disk.img ls /applications
 echo "================================================================="
 echo "✓ IPO_OS Developer Toolchain Bootstrap Completed Successfully!  "
 echo "================================================================="
-

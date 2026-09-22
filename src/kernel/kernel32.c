@@ -126,6 +126,8 @@ void kmain(void) {
 
     net_init();
 
+    driver_init_system_drivers();
+
     printf("Type \"help\" or \"?\" on the keyboard to view commands, shortcuts, and OS features.\n\n");
 
     system_set_state(SYSTEM_STATE_TERMINAL_IDLE);

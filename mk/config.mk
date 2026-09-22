@@ -14,8 +14,9 @@ QEMU    := qemu-system-i386
 #                 PROJECT DIRECTORIES
 # ==================================================
 
-SRC     := src
-BUILD   := build
+SRC          := src
+APPS_DIR     := applications
+BUILD        := build
 
 
 # ==================================================
@@ -33,9 +34,7 @@ OS_IMAGE   := $(BUILD)/IPO_OS.img
 #                 LIBRARY PATHS
 # ==================================================
 
-LIB_DIR       := lib
 LIB_BUILD_DIR := $(BUILD)/lib
-LIB_A         := $(LIB_BUILD_DIR)/libc.a
 LIB_A         := $(LIB_BUILD_DIR)/libk.a
 
 USER_LIBC_A   := $(LIB_BUILD_DIR)/libc.a
@@ -60,24 +59,28 @@ STAGE2_CFG_OUT := $(BUILD)/boot/stage2/config.inc
 
 
 # ==================================================
-#                 LIBRARY SOURCES
+#            KERNEL & SUBSYSTEM SOURCES
 # ==================================================
 
-SRCS_C        := $(shell find $(LIB_DIR)/c   -type f -name '*.c'   2>/dev/null)
-SRCS_ASM      := $(shell find $(LIB_DIR)/asm -type f -name '*.asm' 2>/dev/null)
-SRCS_S        := $(shell find $(LIB_DIR)/asm -type f -name '*.s'   2>/dev/null)
-SRCS_CAPS_S   := $(shell find $(LIB_DIR)/asm -type f -name '*.S'   2>/dev/null)
+KERNEL_DIRS   := $(SRC)/kernel $(SRC)/drivers $(SRC)/fs $(SRC)/net $(SRC)/graphics
+
+SRCS_C        := $(filter-out $(SRC)/kernel/kernel32.c, $(shell find $(KERNEL_DIRS) -type f -name '*.c' 2>/dev/null))
+SRCS_ASM      := $(filter-out $(SRC)/kernel/entry32.asm, $(shell find $(KERNEL_DIRS) -type f -name '*.asm' 2>/dev/null))
+SRCS_S        := $(shell find $(KERNEL_DIRS) -type f -name '*.s' 2>/dev/null)
+SRCS_CAPS_S   := $(shell find $(KERNEL_DIRS) -type f -name '*.S' 2>/dev/null)
 
 
 # ==================================================
-#                 LIBRARY OBJECTS
+#                 LIBRARY / KERNEL OBJECTS
 # ==================================================
 
 LIB_OBJS := \
-	$(patsubst $(LIB_DIR)/%.c,   $(LIB_BUILD_DIR)/%.o, $(SRCS_C)) \
-	$(patsubst $(LIB_DIR)/%.asm, $(LIB_BUILD_DIR)/%.o, $(SRCS_ASM)) \
-	$(patsubst $(LIB_DIR)/%.s,   $(LIB_BUILD_DIR)/%.o, $(SRCS_S)) \
-	$(patsubst $(LIB_DIR)/%.S,   $(LIB_BUILD_DIR)/%.o, $(SRCS_CAPS_S))
+	$(patsubst $(SRC)/%.c,   $(BUILD)/kernel/%.o, $(SRCS_C)) \
+	$(patsubst $(SRC)/%.asm, $(BUILD)/kernel/%.o, $(SRCS_ASM)) \
+	$(patsubst $(SRC)/%.s,   $(BUILD)/kernel/%.o, $(SRCS_S)) \
+	$(patsubst $(SRC)/%.S,   $(BUILD)/kernel/%.o, $(SRCS_CAPS_S))
+
+KERNEL_OBJS := $(LIB_OBJS)
 
 
 # ==================================================
@@ -106,7 +109,7 @@ LIB_CFLAGS := -m32 \
 	-fno-pic -fno-pie \
 	-fno-builtin \
 	-nostdlib -nostartfiles \
-	-Ilib/h
+	-I$(SRC)/include
 
 LD_FLAGS := -T $(SRC)/kernel/linker.ld -nostdlib
 

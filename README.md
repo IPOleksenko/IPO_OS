@@ -25,13 +25,13 @@ make all
 ```
 
 #### `make lib` — Build Library Only
-Compiles the C library (lib/c) and assembler utilities (lib/asm):
+Compiles the C runtime, userspace C standard library (src/userland) and kernel library:
 ```bash
 make lib
 ```
 
 #### `make kernel` — Build Kernel Only
-Compiles kernel entry point and kernel code, links with the library:
+Compiles kernel, drivers, filesystems, networking, graphics and arch HAL:
 ```bash
 make kernel
 ```
@@ -49,7 +49,7 @@ make image
 ```
 
 #### `make apps` — Build applications
-Build applications:
+Builds userland applications from `applications/`:
 ```bash
 make apps
 ```
@@ -105,7 +105,7 @@ make patch-config
 python3 load_apps.py
 ```
 
-It scans the built app binaries in `build/apps`, copies them into the filesystem image, and makes them executable from the shell.
+It scans the built app binaries in `build/applications`, copies them into the filesystem image, and makes them executable from the shell.
 
 ## **Disk Editor**
 

@@ -1,0 +1,18 @@
+#ifndef _CPP_EXCEPTION_H
+#define _CPP_EXCEPTION_H
+
+namespace std {
+
+class exception {
+public:
+    exception() noexcept {}
+    virtual ~exception() noexcept {}
+    virtual const char* what() const noexcept {
+        return "std::exception";
+    }
+};
+
+} // namespace std
+
+#endif
+

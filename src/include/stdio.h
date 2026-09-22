@@ -1,0 +1,77 @@
+#ifndef _STDIO_H
+#define _STDIO_H
+
+#include <stdint.h>
+#include <stdarg.h>
+
+#include <stddef.h>
+#include <stdbool.h>
+
+/**
+ * Output a single character to VGA memory at cursor position with specified colors
+ * @param c Character to output
+ * @param fg Foreground color
+ * @param bg Background color
+ */
+void putchar_color(char c, uint8_t fg, uint8_t bg);
+
+bool putchar_is_locked(void);
+
+/**
+ * Low-level serial output (COM1)
+ * @param c Character to output
+ */
+void serial_putc(char c);
+
+/**
+ * Output a single character to VGA memory at cursor position
+ * @param c Character to output
+ */
+void putchar(char c);
+
+/**
+ * Formatted print function
+ * Supports: %d (int), %u (unsigned), %x (hex), %c (char), %s (string), %%
+ * @param format Format string
+ * @param ... Variable arguments
+ * @return Number of characters printed
+ */
+int printf(const char *format, ...);
+
+/**
+ * Minimal scanf implementation for keyboard input.
+ * Supports: %s, %c, %d, %u.
+ */
+int scanf(const char *format, ...);
+
+/**
+ * Formatted print to buffer
+ * @param buf Output buffer
+ * @param size Maximum size to write (including null terminator)
+ * @param format Format string
+ * @param ... Variable arguments
+ * @return Number of characters written (excluding null terminator)
+ */
+int snprintf(char *buf, size_t size, const char *format, ...);
+int vsnprintf(char *buf, size_t size, const char *format, va_list args);
+
+/**
+ * Convert unsigned integer to string (internal use)
+ */
+int itoa(unsigned int num, char *str, int base);
+
+/**
+ * Convert unsigned 64-bit integer to string (internal use)
+ */
+int itoa64(uint64_t num, char *str, int base);
+
+/**
+ * Formatted print to serial port
+ * Supports: %d (int), %u (unsigned), %x (hex), %c (char), %s (string), %%
+ * @param format Format string
+ * @param ... Variable arguments
+ * @return Number of characters printed
+ */
+int serial_printf(const char *format, ...);
+
+#endif
