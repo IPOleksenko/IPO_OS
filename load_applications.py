@@ -100,6 +100,11 @@ def main():
             if app_name == "ifconfig":
                 safe_put_executable(disk, app, "/applications/ipconfig")
 
+        doom_wad = project_root / "applications" / "doom" / "doom1.wad"
+        if doom_wad.exists():
+            safe_put(disk, doom_wad, "/applications/doom1.wad")
+
+
     # 2. Upload toolchain binaries to /applications
     toolchain_dir = project_root / "build" / "toolchain"
     tool_map = {

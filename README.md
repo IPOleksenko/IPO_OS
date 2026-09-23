@@ -109,7 +109,7 @@ make patch-config
 
 ## **load_applications.py**
 
-- **File:** [load_applications.py](load_applications.py) (backwards-compatible alias: [load_apps.py](load_apps.py))
+- **File:** [load_applications.py](load_applications.py)
 - **Purpose:** loads compiled applications into the OS disk image so they are available from `/applications` at runtime.
 
 ### Usage
