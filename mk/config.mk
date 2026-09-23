@@ -119,7 +119,7 @@ TAP_DEV  ?= tap0
 ifeq ($(NET_MODE),tap)
   QEMU_NET_FLAGS := -netdev tap,id=net0,ifname=$(TAP_DEV),script=no,downscript=no -device rtl8139,netdev=net0
 else
-  QEMU_NET_FLAGS := -netdev user,id=net0,hostfwd=tcp::8080-:8080,hostfwd=tcp::8000-:8000 -device rtl8139,netdev=net0
+  QEMU_NET_FLAGS := -netdev user,id=net0,net=192.168.7.0/24,host=192.168.7.1,dns=192.168.7.3,dhcpstart=192.168.7.2,hostfwd=tcp::8080-:8080,hostfwd=tcp::8000-:8000 -device rtl8139,netdev=net0
 endif
 
 AUDIODEV ?= pa

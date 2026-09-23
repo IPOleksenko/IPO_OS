@@ -3,6 +3,8 @@
 APPS_DIR     := applications
 APPS_BUILD   := build/applications
 APPS_SRCS_RAW := $(shell find $(APPS_DIR) -maxdepth 2 -name "*.c" -type f)
+GENERIC_APP_SRCS := $(filter-out $(APPS_DIR)/tcc/% $(APPS_DIR)/lua/% $(APPS_DIR)/micropython/% $(APPS_DIR)/nasm/% $(APPS_DIR)/browser/%, $(APPS_SRCS_RAW))
+APPS_BINS    := $(patsubst $(APPS_DIR)/%.c, $(APPS_BUILD)/%.bin, $(GENERIC_APP_SRCS)) $(APPS_BUILD)/tcc/tcc.bin $(APPS_BUILD)/browser/browser.bin
 GENERIC_APP_SRCS := $(filter-out $(APPS_DIR)/tcc/% $(APPS_DIR)/lua/% $(APPS_DIR)/micropython/% $(APPS_DIR)/nasm/%, $(APPS_SRCS_RAW))
 APPS_BINS    := $(patsubst $(APPS_DIR)/%.c, $(APPS_BUILD)/%.bin, $(GENERIC_APP_SRCS)) $(APPS_BUILD)/tcc/tcc.bin
 APP_ENTRY_OBJ   := $(APPS_BUILD)/entry.o
@@ -71,6 +73,45 @@ $(APPS_BUILD)/tcc/tcc.bin: $(APPS_BUILD)/tcc/tcc.o $(APPS_BUILD)/tcc/libc_shim.o
 	@echo "[applications] Building official TinyCC: $(APPS_DIR)/tcc/tcc.c → $@"
 	@$(CC) $(APPS_CFLAGS) -Wl,-T,$(APPS_DIR)/app.ld \
 		$(APP_ENTRY_OBJ) $(APPS_BUILD)/tcc/tcc.o $(APPS_BUILD)/tcc/libc_shim.o $(APPS_BUILD)/tcc/setjmp.o $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) -Wl,--start-group $(LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
+	@$(OBJCOPY) --set-section-flags .bss=alloc,load,contents \
+		-j .text -j .rodata -j .data -j .bss -O binary $@.elf $@
+	@rm -f $@.elf
+	@SIZE=$$(stat -c%s "$@" 2>/dev/null || stat -f%z "$@" 2>/dev/null); \
+	echo "[applications] ✓ Created: $@ ($$SIZE bytes)"
+
+# Browser rules
+BROWSER_OBJS := \
+	$(APPS_BUILD)/browser/browser.o \
+	$(APPS_BUILD)/browser/dom.o \
+	$(APPS_BUILD)/browser/html_parser.o \
+	$(APPS_BUILD)/browser/http_client.o \
+	$(APPS_BUILD)/browser/layout.o \
+	$(APPS_BUILD)/browser/tinflate.o \
+	$(APPS_BUILD)/browser/header.o \
+	$(APPS_BUILD)/browser/adler32.o \
+	$(APPS_BUILD)/browser/crc32.o
+
+$(APPS_BUILD)/browser/tinflate.o: $(APPS_DIR)/micropython/lib/uzlib/tinflate.c
+	@mkdir -p $(dir $@)
+	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS)
+
+$(APPS_BUILD)/browser/header.o: $(APPS_DIR)/micropython/lib/uzlib/header.c
+	@mkdir -p $(dir $@)
+	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS)
+
+$(APPS_BUILD)/browser/adler32.o: $(APPS_DIR)/micropython/lib/uzlib/adler32.c
+	@mkdir -p $(dir $@)
+	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS)
+
+$(APPS_BUILD)/browser/crc32.o: $(APPS_DIR)/micropython/lib/uzlib/crc32.c
+	@mkdir -p $(dir $@)
+	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS)
+
+$(APPS_BUILD)/browser/browser.bin: $(BROWSER_OBJS) $(APP_ENTRY_OBJ) $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) $(APP_WM_OBJ) $(LIB_A)
+	@mkdir -p $(dir $@)
+	@echo "[applications] Building Web Browser: $(APPS_DIR)/browser → $@"
+	@$(CC) $(APPS_CFLAGS) -Wl,-T,$(APPS_DIR)/app.ld \
+		$(APP_ENTRY_OBJ) $(BROWSER_OBJS) $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) $(APP_WM_OBJ) -Wl,--start-group $(LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
 	@$(OBJCOPY) --set-section-flags .bss=alloc,load,contents \
 		-j .text -j .rodata -j .data -j .bss -O binary $@.elf $@
 	@rm -f $@.elf

@@ -406,6 +406,11 @@ void tcp_receive(ip4_addr_t src_ip, ip4_addr_t dst_ip, const void *payload, uint
                     /* In-order data: append to self-expanding dynamic buffer */
                     dyn_buf_append(&tcb->rx_buf, tcp_data, tcp_data_len);
                     tcb->rcv_nxt += tcp_data_len;
+                    if (tcb->rx_buf.size < 65535) {
+                        tcb->rcv_wnd = 65535 - tcb->rx_buf.size;
+                    } else {
+                        tcb->rcv_wnd = 0; /* Flow control: close window to pause sender */
+                    }
                     tcp_send_ack(tcb);
                 } else if (seq_num < tcb->rcv_nxt) {
                     /* Duplicate data, re-ACK */

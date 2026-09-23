@@ -776,6 +776,19 @@ static uint32_t syscall_builtin_driver_list(uint32_t num,
     return IPO_SYSCALL_OK;
 }
 
+static uint32_t syscall_builtin_driver_set_desc(uint32_t num,
+                                                uint32_t argc,
+                                                uint32_t *argv) {
+    (void)num;
+    if (argc < 2u || argv == NULL) {
+        return IPO_SYSCALL_ENOSYS;
+    }
+    const char *name = (const char *)(uintptr_t)argv[0];
+    const char *desc = (const char *)(uintptr_t)argv[1];
+    int res = driver_set_description(name, desc);
+    return (uint32_t)res;
+}
+
 static size_t syscall_read_visual_offset(const char *buf, uint32_t len, uint32_t index) {
     size_t vcol = 0;
     for (uint32_t i = 0; i < index && i < len; i++) {
@@ -1903,6 +1916,10 @@ void syscall_init(void) {
     ipo_register_syscall(
         IPO_SYSCALL_DRIVER_LIST,
         syscall_builtin_driver_list);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_DRIVER_SET_DESC,
+        syscall_builtin_driver_set_desc);
 
     ipo_register_syscall(
         IPO_SYSCALL_WM_CREATE_WINDOW,

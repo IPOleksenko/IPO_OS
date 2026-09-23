@@ -18,6 +18,7 @@
 #include <net/dyn_buf.h>
 #include <system/timer.h>
 #include <driver/input/keyboard.h>
+#include <driver/input/keymap/keymap.h>
 #include <system/state.h>
 #include <syscall.h>
 #include <ioport.h>
@@ -28,6 +29,20 @@ static void print_usage(void) {
     printf("  hosting_client 10.0.2.2 8080 /\n");
     printf("  hosting_client 127.0.0.1 8080 /index.html\n");
     printf("  hosting_client a-very-long-hostname-with-arbitrary-characters-example.local 80 /\n");
+    printf("Press ESC, 'q', or Ctrl+C at any time to abort.\n");
+}
+
+static bool check_user_interrupted(void) {
+    if (system_is_interrupted()) {
+        return true;
+    }
+    keyboard_poll();
+    uint8_t sc = keyboard_get_scancode();
+    if (sc == 0x01 || sc == 0x10 || (sc == 0x2E && keyboard_is_ctrl_pressed())) { /* ESC, 'q', or Ctrl+C */
+        system_request_interrupt();
+        return true;
+    }
+    return false;
 }
 
 int main(int argc, char **argv) {
@@ -35,6 +50,9 @@ int main(int argc, char **argv) {
         print_usage();
         return 1;
     }
+
+    keyboard_set_app_input_mode(true);
+    system_clear_interrupt();
 
     /* Support arbitrary-length host/IP strings (even 100+ chars) */
     dyn_str_t host_str;
@@ -62,17 +80,43 @@ int main(int argc, char **argv) {
     if (sock < 0) {
         printf("[error] Failed to create socket\n");
         dyn_str_free(&host_str);
+        keyboard_set_app_input_mode(false);
+        system_clear_interrupt();
         return 1;
     }
 
-    /* 2. Connect to remote endpoint */
-    printf("[client] Connecting to %s:%u...\n", dyn_str_c(&host_str), port);
-    int res = connect_endpoint(sock, dyn_str_c(&host_str), port);
-    if (res < 0) {
-        printf("[error] Connection failed to %s:%u\n", dyn_str_c(&host_str), port);
+    if (check_user_interrupted()) {
+        printf("\n[client] Aborted by user.\n");
         close(sock);
         dyn_str_free(&host_str);
+        keyboard_set_app_input_mode(false);
+        system_clear_interrupt();
+        return 0;
+    }
+
+    /* 2. Connect to remote endpoint */
+    printf("[client] Connecting to %s:%u (press ESC/q/Ctrl+C to abort)...\n", dyn_str_c(&host_str), port);
+    int res = connect_endpoint(sock, dyn_str_c(&host_str), port);
+    if (res < 0) {
+        if (check_user_interrupted()) {
+            printf("\n[client] Aborted by user.\n");
+        } else {
+            printf("[error] Connection failed to %s:%u\n", dyn_str_c(&host_str), port);
+        }
+        close(sock);
+        dyn_str_free(&host_str);
+        keyboard_set_app_input_mode(false);
+        system_clear_interrupt();
         return 1;
+    }
+
+    if (check_user_interrupted()) {
+        printf("\n[client] Aborted by user.\n");
+        close(sock);
+        dyn_str_free(&host_str);
+        keyboard_set_app_input_mode(false);
+        system_clear_interrupt();
+        return 0;
     }
 
     printf("[client] Connected successfully!\n");
@@ -97,11 +141,13 @@ int main(int argc, char **argv) {
         printf("[error] Failed to send request\n");
         close(sock);
         dyn_str_free(&host_str);
+        keyboard_set_app_input_mode(false);
+        system_clear_interrupt();
         return 1;
     }
 
     /* 4. Stream response into self-expanding dynamic buffer */
-    printf("[client] Receiving data stream from server...\n");
+    printf("[client] Receiving data stream from server (ESC/q/Ctrl+C to abort)...\n");
 
     dyn_buf_t resp_buf;
     dyn_buf_init(&resp_buf, 1024);
@@ -109,10 +155,23 @@ int main(int argc, char **argv) {
     char chunk[512];
     ssize_t bytes_recv;
     uint32_t start_time = timer_millis();
+    bool aborted = false;
 
     while (true) {
+        if (check_user_interrupted()) {
+            aborted = true;
+            printf("\n[client] Aborted by user.\n");
+            break;
+        }
+
         net_poll();
         bytes_recv = recv(sock, chunk, sizeof(chunk), 0);
+
+        if (check_user_interrupted()) {
+            aborted = true;
+            printf("\n[client] Aborted by user.\n");
+            break;
+        }
 
         if (bytes_recv > 0) {
             /* Append chunk to self-expanding dynamic buffer */
@@ -123,6 +182,11 @@ int main(int argc, char **argv) {
             break;
         } else {
             /* Error or timeout */
+            if (system_is_interrupted()) {
+                aborted = true;
+                printf("\n[client] Aborted by user.\n");
+                break;
+            }
             if (timer_millis() - start_time > 10000) {
                 printf("[warning] Read timeout reached\n");
                 break;
@@ -134,21 +198,26 @@ int main(int argc, char **argv) {
 
     uint32_t elapsed_ms = timer_millis() - start_time;
 
-    /* 5. Print received data */
-    dyn_buf_append_byte(&resp_buf, '\0');
+    /* 5. Print received data if not aborted */
+    if (!aborted) {
+        dyn_buf_append_byte(&resp_buf, '\0');
 
-    printf("\n------------------- [ RECEIVED DATA ] -------------------\n");
-    printf("%s\n", (char *)resp_buf.data);
-    printf("---------------------------------------------------------\n");
-    printf("[stats] Downloaded : %u bytes\n", (unsigned int)resp_buf.size - 1);
-    printf("[stats] Elapsed    : %u ms\n", elapsed_ms);
-    printf("=========================================================\n");
+        printf("\n------------------- [ RECEIVED DATA ] -------------------\n");
+        printf("%s\n", (char *)resp_buf.data);
+        printf("---------------------------------------------------------\n");
+        printf("[stats] Downloaded : %u bytes\n", (unsigned int)resp_buf.size - 1);
+        printf("[stats] Elapsed    : %u ms\n", elapsed_ms);
+        printf("=========================================================\n");
+    }
 
     /* 6. Clean up */
     close(sock);
     dyn_buf_free(&resp_buf);
     dyn_str_free(&host_str);
 
-    return 0;
+    keyboard_set_app_input_mode(false);
+    system_clear_interrupt();
+
+    return aborted ? 130 : 0;
 }
 

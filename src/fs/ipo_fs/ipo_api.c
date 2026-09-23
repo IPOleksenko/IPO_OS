@@ -136,11 +136,22 @@ bool ipo_fs_format(uint64_t disk_start_lba, uint64_t total_blocks, uint64_t tota
 bool ipo_fs_mount(uint64_t disk_start_lba) {
     fs_start_lba = disk_start_lba;
     uint8_t buf[IPO_FS_BLOCK_SIZE];
-    if (!block_read(0, buf)) return false;
+    if (!block_read(0, buf)) {
+        serial_printf("[mount] block_read(0) failed at lba %llu\n", disk_start_lba);
+        return false;
+    }
     memcpy(&sb, buf, sizeof(sb));
-    if (strncmp(sb.magic, IPO_FS_MAGIC_STR, sizeof(IPO_FS_MAGIC_STR)-1) != 0) return false;
-    if (sb.block_size != IPO_FS_BLOCK_SIZE) return false;
+    if (strncmp(sb.magic, IPO_FS_MAGIC_STR, sizeof(IPO_FS_MAGIC_STR)-1) != 0) {
+        serial_printf("[mount] magic mismatch at lba %llu (read '%.8s')\n", disk_start_lba, sb.magic);
+        return false;
+    }
+    if (sb.block_size != IPO_FS_BLOCK_SIZE) {
+        serial_printf("[mount] block size mismatch: %u\n", sb.block_size);
+        return false;
+    }
     fs_mounted = true;
+    serial_printf("[mount] success at lba %llu: inodes=%llu table=%llu\n",
+                  disk_start_lba, sb.inode_count, sb.inode_table_start);
     return true;
 }
 

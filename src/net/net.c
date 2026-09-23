@@ -12,6 +12,7 @@
 #include <string.h>
 
 static uint8_t rx_packet_buf[1536];
+net_shared_ctx_t g_net_shared_ctx __attribute__((aligned(4)));
 
 uint16_t net_checksum(const void *data, size_t len) {
     const uint16_t *ptr = (const uint16_t *)data;
@@ -150,4 +151,7 @@ void net_set_ip(ip4_addr_t ip, ip4_addr_t netmask, ip4_addr_t gateway, ip4_addr_
     if (netmask != 0) netif->netmask = netmask;
     if (gateway != 0) netif->gateway = gateway;
     if (dns != 0) netif->dns = dns;
+    if (ip != 0) {
+        arp_send_gratuitous();
+    }
 }

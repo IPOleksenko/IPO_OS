@@ -28,6 +28,8 @@ typedef struct driver {
     int (*write)(const void *buffer, size_t size, uint32_t offset);
     int (*ioctl)(uint32_t cmd, void *arg);
 
+    void *owner;                                                /* owner process_t pointer (for user-space drivers) */
+
     struct driver *next;
 } driver_t;
 
@@ -43,6 +45,7 @@ driver_t* driver_get_list(void);
 uint32_t driver_count(void);
 void driver_print_list(void);
 void driver_init_system_drivers(void);
+int driver_set_description(const char *name, const char *new_desc);
 
 /* Kernel dispatchers */
 void driver_dispatch_tick(void);

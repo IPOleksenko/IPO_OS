@@ -112,6 +112,8 @@
 
 #define IPO_SYSCALL_DRIVER_LIST       0x1062u
 
+#define IPO_SYSCALL_DRIVER_SET_DESC   0x1063u
+
 #define IPO_SYSCALL_WM_CREATE_WINDOW   0x1070u
 
 #define IPO_SYSCALL_WM_DESTROY_WINDOW  0x1071u
@@ -447,6 +449,17 @@ static inline int ipo_driver_unregister(const char *name) {
     uint32_t args[1];
     args[0] = (uint32_t)(uintptr_t)name;
     return ipo_syscall(IPO_SYSCALL_DRIVER_UNREGISTER, 1u, args);
+}
+
+static inline int ipo_driver_set_description(const char *name, const char *desc) {
+    uint32_t args[2];
+    args[0] = (uint32_t)(uintptr_t)name;
+    args[1] = (uint32_t)(uintptr_t)desc;
+    return ipo_syscall(IPO_SYSCALL_DRIVER_SET_DESC, 2u, args);
+}
+
+static inline int ipo_driver_list(void) {
+    return ipo_syscall(IPO_SYSCALL_DRIVER_LIST, 0u, (void *)0);
 }
 
 void syscall_reset_user_heap(void);

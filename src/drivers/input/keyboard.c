@@ -9,6 +9,7 @@
 #include <system/state.h>
 #include <wm.h>
 #include <stdio.h>
+#include <kernel/driver.h>
 
 #define KEYBOARD_QUEUE_SIZE 256
 
@@ -106,6 +107,11 @@ void keyboard_poll(void) {
                 vga_cursor_reset_blink();
             }
             update_hot_key_state(scancode);
+
+            bool is_break = (scancode & 0x80u) != 0;
+            if (driver_dispatch_key(scancode & 0x7Fu, is_break)) {
+                continue;
+            }
             serial_printf("[kbd_raw] data=0x%x sc=0x%x ctrl=%d wm=%d batch=%d\n",
                           data, scancode, (int)keyboard_is_ctrl_pressed(),
                           (int)is_wm_active(), (int)is_batch_running());
@@ -125,6 +131,13 @@ void keyboard_poll(void) {
             if (scancode == 0x2E && keyboard_is_ctrl_pressed() && !wm_active_and_focused) {
                 system_request_interrupt();
                 continue;
+                /* When an app or batch process is active, consume the key
+                 * so the running app gets interrupted via system_is_interrupted().
+                 * When the terminal shell prompt is active, let the scancode
+                 * fall through to shell_queue so terminal.c can handle ^C line clearing. */
+                if (keyboard_app_input_mode || is_batch_running()) {
+                    continue;
+                }
             }
 
             /* Ctrl + PageUp: Switch to previous process / window */

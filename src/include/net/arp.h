@@ -22,5 +22,6 @@ void arp_init(void);
 void arp_receive(const void *data, uint16_t len);
 bool arp_resolve(ip4_addr_t target_ip, mac_addr_t *out_mac, uint32_t timeout_ms);
 void arp_send_request(ip4_addr_t target_ip);
+void arp_send_gratuitous(void);
 
 #endif /* IPO_NET_ARP_H */

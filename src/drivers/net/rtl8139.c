@@ -1,6 +1,7 @@
 #include <driver/net/rtl8139.h>
 #include <driver/net/pci.h>
 #include <net/net_state.h>
+#include <system/timer.h>
 #include <ioport.h>
 #include <string.h>
 #include <stdio.h>
@@ -81,10 +82,13 @@ int rtl8139_send_packet(const void *data, uint16_t len) {
     uint8_t cur = ctx->rtl_dev.tx_cur;
 
     /* Wait for previous transmit on this descriptor if busy */
-    uint32_t timeout = 50000;
-    while ((inl(io + 0x10 + (cur * 4)) & 0x2000) == 0 && --timeout) {
+    uint32_t start_ms = timer_millis();
+    while ((inl(io + 0x10 + (cur * 4)) & 0x2000) == 0) {
         /* Wait for OWN bit (0x2000) indicating descriptor is ready */
         if (inl(io + 0x10 + (cur * 4)) == 0) break; // First transmit
+        if (timer_millis() - start_ms > 100) {
+            return -1; // Timed out waiting for descriptor
+        }
         io_wait();
     }
 

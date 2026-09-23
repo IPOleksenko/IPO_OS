@@ -1618,6 +1618,8 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
                     serial_printf("[proc] fg %s closed by Ctrl+C, auto-switching to %s\n", fg->name, next_fg->name);
                     process_set_foreground(next_fg);
                     continue;
+                } else {
+                    break;
                 }
             } else {
                 break;
@@ -1687,28 +1689,36 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
         }
 
         if (separate_windows && fg && !fg->is_running && !fg->is_wm_app && !fg->wants_graphics) {
+            keyboard_set_app_input_mode(true);
             if (!fg->completed_and_acknowledged) {
-                uint8_t sc = keyboard_get_scancode();
-                if (process_get_foreground() != fg) {
-                    continue;
-                }
-                if ((sc == 0x2E || sc == 0xAE) && keyboard_is_ctrl_pressed()) {
+                if (system_is_interrupted()) {
+                    system_clear_interrupt();
                     fg->completed_and_acknowledged = true;
-                } else if (sc == 0x49) { // Page Up
-                    if (terminal_get_top_buffer_count() > 0) {
-                        terminal_scroll_up();
+                } else {
+                    uint8_t sc = keyboard_get_scancode();
+                    if (process_get_foreground() != fg) {
+                        continue;
                     }
-                } else if (sc == 0x51) { // Page Down
-                    if (terminal_get_bottom_buffer_count() > 0) {
-                        terminal_scroll_down();
-                    }
-                } else if (sc == 0x48) { // Up arrow
-                    if (terminal_get_top_buffer_count() > 0) {
-                        terminal_scroll_up();
-                    }
-                } else if (sc == 0x50) { // Down arrow
-                    if (terminal_get_bottom_buffer_count() > 0) {
-                        terminal_scroll_down();
+                    /* Accept ESC (0x01), 'q' (0x10), Enter (0x1C), Space (0x39), or Ctrl+C */
+                    if (sc == 0x01 || sc == 0x10 || sc == 0x1C || sc == 0x39 ||
+                        ((sc == 0x2E || sc == 0xAE) && keyboard_is_ctrl_pressed())) {
+                        fg->completed_and_acknowledged = true;
+                    } else if (sc == 0x49) { // Page Up
+                        if (terminal_get_top_buffer_count() > 0) {
+                            terminal_scroll_up();
+                        }
+                    } else if (sc == 0x51) { // Page Down
+                        if (terminal_get_bottom_buffer_count() > 0) {
+                            terminal_scroll_down();
+                        }
+                    } else if (sc == 0x48) { // Up arrow
+                        if (terminal_get_top_buffer_count() > 0) {
+                            terminal_scroll_up();
+                        }
+                    } else if (sc == 0x50) { // Down arrow
+                        if (terminal_get_bottom_buffer_count() > 0) {
+                            terminal_scroll_down();
+                        }
                     }
                 }
             }
@@ -1747,6 +1757,8 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
                     serial_printf("[proc] fg %s closed, auto-switching to %s\n", fg->name, next_fg->name);
                     process_set_foreground(next_fg);
                     continue;
+                } else {
+                    break;
                 }
             }
         }

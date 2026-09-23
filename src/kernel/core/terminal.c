@@ -140,23 +140,21 @@ static inline uint16_t terminal_rows(void) {
     return VGA_HEIGHT - terminal_top_row();
 }
 
-static void make_abs_path(const char *rel_or_abs, char *out, size_t out_size) {
-    if (!out || out_size == 0) return;
-    if (!rel_or_abs || rel_or_abs[0] == '\0') {
-        strncpy(out, terminal_cwd, out_size - 1);
-        out[out_size - 1] = '\0';
-        return;
-    }
+static char *make_abs_path_dyn(const char *rel_or_abs) {
     size_t cwd_l = terminal_cwd ? strlen(terminal_cwd) : 0u;
-    size_t rel_l = strlen(rel_or_abs);
+    size_t rel_l = rel_or_abs ? strlen(rel_or_abs) : 0u;
     size_t temp_size = cwd_l + rel_l + 32u;
-    if (temp_size < out_size) temp_size = out_size;
-    char *temp = kmalloc(temp_size);
-    if (!temp) return;
+    if (temp_size < 256u) temp_size = 256u;
 
-    if (rel_or_abs[0] == '/') {
-        strncpy(temp, rel_or_abs, temp_size - 1);
-        temp[temp_size - 1] = '\0';
+    char *temp = kmalloc(temp_size);
+    if (!temp) return NULL;
+
+    if (!rel_or_abs || rel_or_abs[0] == '\0') {
+        strncpy(temp, (terminal_cwd && terminal_cwd[0]) ? terminal_cwd : "/", temp_size - 1u);
+        temp[temp_size - 1u] = '\0';
+    } else if (rel_or_abs[0] == '/') {
+        strncpy(temp, rel_or_abs, temp_size - 1u);
+        temp[temp_size - 1u] = '\0';
     } else {
         if (strcmp(terminal_cwd, "/") == 0) {
             snprintf(temp, temp_size, "/%s", rel_or_abs);
@@ -164,8 +162,48 @@ static void make_abs_path(const char *rel_or_abs, char *out, size_t out_size) {
             snprintf(temp, temp_size, "%s/%s", terminal_cwd, rel_or_abs);
         }
     }
-    fs_canonicalize(temp, out, out_size);
+
+    char *out = kmalloc(temp_size);
+    if (!out) {
+        kfree(temp);
+        return NULL;
+    }
+    fs_canonicalize(temp, out, temp_size);
     kfree(temp);
+    return out;
+}
+
+static char *path_combine_and_canonicalize(const char *dir, const char *file) {
+    if (!dir) return make_abs_path_dyn(file);
+    if (!file) return make_abs_path_dyn(dir);
+    size_t needed = strlen(dir) + strlen(file) + 32u;
+    char *combined = kmalloc(needed);
+    if (!combined) return NULL;
+    if (strcmp(dir, "/") == 0) {
+        snprintf(combined, needed, "/%s", file);
+    } else {
+        snprintf(combined, needed, "%s/%s", dir, file);
+    }
+    char *out = kmalloc(needed);
+    if (!out) {
+        kfree(combined);
+        return NULL;
+    }
+    fs_canonicalize(combined, out, needed);
+    kfree(combined);
+    return out;
+}
+
+static void make_abs_path(const char *rel_or_abs, char *out, size_t out_size) {
+    if (!out || out_size == 0) return;
+    char *dyn = make_abs_path_dyn(rel_or_abs);
+    if (!dyn) {
+        out[0] = '\0';
+        return;
+    }
+    strncpy(out, dyn, out_size - 1u);
+    out[out_size - 1u] = '\0';
+    kfree(dyn);
 }
 
 
@@ -1168,17 +1206,25 @@ static void builtin_cp(int argc, char **argv) {
         printf("Usage: cp <source> <dest>\n");
         return;
     }
-    char src[1024];
-    char dst[1024];
-    make_abs_path(argv[1], src, sizeof(src));
-    make_abs_path(argv[2], dst, sizeof(dst));
+    char *src = make_abs_path_dyn(argv[1]);
+    char *dst = make_abs_path_dyn(argv[2]);
+    if (!src || !dst) {
+        if (src) kfree(src);
+        if (dst) kfree(dst);
+        return;
+    }
 
     struct ipo_inode src_stat;
     if (!ipo_fs_stat(src, &src_stat)) {
         printf("cp: cannot stat '%s': No such file\n", argv[1]);
+        kfree(src);
+        kfree(dst);
+        return;
     }
     if ((src_stat.mode & IPO_INODE_TYPE_DIR) != 0) {
         printf("cp: copying directories is not supported\n");
+        kfree(src);
+        kfree(dst);
         return;
     }
 
@@ -1186,23 +1232,27 @@ static void builtin_cp(int argc, char **argv) {
     if (ipo_fs_stat(dst, &dst_stat) && (dst_stat.mode & IPO_INODE_TYPE_DIR) != 0) {
         const char *slash = strrchr(src, '/');
         const char *filename = slash ? (slash + 1) : src;
-        char combined[256];
-        if (strcmp(dst, "/") == 0) {
-            snprintf(combined, sizeof(combined), "/%s", filename);
-        } else {
-            snprintf(combined, sizeof(combined), "%s/%s", dst, filename);
+        char *expanded_dst = path_combine_and_canonicalize(dst, filename);
+        if (expanded_dst) {
+            kfree(dst);
+            dst = expanded_dst;
         }
-        fs_canonicalize(combined, dst, sizeof(dst));
     }
 
     int src_fd = ipo_fs_open(src);
     if (src_fd < 0) {
+        printf("cp: cannot open source '%s'\n", argv[1]);
+        kfree(src);
+        kfree(dst);
+        return;
     }
 
     if (ipo_fs_stat(dst, &dst_stat)) {
         if (!ipo_fs_delete(dst)) {
             printf("cp: cannot overwrite destination '%s'\n", argv[2]);
             ipo_fs_close(src_fd);
+            kfree(src);
+            kfree(dst);
             return;
         }
     }
@@ -1211,6 +1261,8 @@ static void builtin_cp(int argc, char **argv) {
     if (dst_ino < 0) {
         printf("cp: cannot create destination '%s'\n", argv[2]);
         ipo_fs_close(src_fd);
+        kfree(src);
+        kfree(dst);
         return;
     }
 
@@ -1218,6 +1270,8 @@ static void builtin_cp(int argc, char **argv) {
     if (dst_fd < 0) {
         printf("cp: cannot open destination '%s'\n", argv[2]);
         ipo_fs_close(src_fd);
+        kfree(src);
+        kfree(dst);
         return;
     }
 
@@ -1238,6 +1292,8 @@ static void builtin_cp(int argc, char **argv) {
 
     ipo_fs_close(src_fd);
     ipo_fs_close(dst_fd);
+    kfree(src);
+    kfree(dst);
 }
 
 static void builtin_mv(int argc, char **argv) {
@@ -1245,14 +1301,31 @@ static void builtin_mv(int argc, char **argv) {
         printf("Usage: mv <source> <dest>\n");
         return;
     }
-    char src[1024];
-    char dst[1024];
-    make_abs_path(argv[1], src, sizeof(src));
-    make_abs_path(argv[2], dst, sizeof(dst));
+    char *src = make_abs_path_dyn(argv[1]);
+    char *dst = make_abs_path_dyn(argv[2]);
+    if (!src || !dst) {
+        if (src) kfree(src);
+        if (dst) kfree(dst);
+        return;
+    }
+
+    struct ipo_inode dst_stat;
+    if (ipo_fs_stat(dst, &dst_stat) && (dst_stat.mode & IPO_INODE_TYPE_DIR) != 0) {
+        const char *slash = strrchr(src, '/');
+        const char *filename = slash ? (slash + 1) : src;
+        char *expanded_dst = path_combine_and_canonicalize(dst, filename);
+        if (expanded_dst) {
+            kfree(dst);
+            dst = expanded_dst;
+        }
+    }
 
     if (!ipo_fs_rename(src, dst)) {
         printf("mv: failed to move '%s' to '%s'\n", argv[1], argv[2]);
     }
+
+    kfree(src);
+    kfree(dst);
 }
 
 static void builtin_stat(int argc, char **argv) {
@@ -1460,11 +1533,6 @@ static void builtin_df(void) {
            (ino_total >= ino_used) ? ino_total - ino_used : 0);
     printf("Partition    : Start LBA %u, Total %u blocks (%u KB)\n",
            (uint32_t)fs_start_lba, (uint32_t)sb.fs_size_blocks, (uint32_t)((sb.fs_size_blocks * bs) / 1024));
-}
-
-static void builtin_driver(int argc, char **argv) {
-    (void)argc; (void)argv;
-    driver_print_list();
 }
 
 static void builtin_keymap(int argc, char **argv) {
@@ -2162,7 +2230,7 @@ int try_execute_command(const char *cmdline) {
         builtin_meminfo();
         builtin_handled = 1;
     } else if (strcmp(name, "driver") == 0 || strcmp(name, "drivers") == 0 || strcmp(name, "lsmod") == 0) {
-        builtin_driver(argc, argv);
+        driver_print_list();
         builtin_handled = 1;
     } else if (strcmp(name, "keymap") == 0 || strcmp(name, "layout") == 0 ||
                strcmp(name, "keymaps") == 0) {

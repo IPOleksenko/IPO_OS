@@ -51,12 +51,12 @@ static bool ata_wait_bsy_clear(uint16_t base) {
 static bool ata_wait_drq(uint16_t base) {
     for (int i = 0; i < 100000; i++) {
         uint8_t st = inb(base + ATA_REG_STATUS);
-        if (st & ATA_SR_ERR) { printf("ata_wait_drq: ERR status=%u\n", (unsigned)st); return false; }
+        if (st & ATA_SR_ERR) { serial_printf("ata_wait_drq: ERR status=%u\n", (unsigned)st); return false; }
         if (st & ATA_SR_DRQ) return true;
         ata_io_wait();
     }
     uint8_t st = inb(base + ATA_REG_STATUS);
-    printf("ata_wait_drq: timeout status=%u\n", (unsigned)st);
+    serial_printf("ata_wait_drq: timeout status=%u\n", (unsigned)st);
     return false;
 }
 
@@ -135,12 +135,13 @@ static bool ata_identify(uint8_t drive) {
 void ata_init(void) {
     ata_device_count = 0;
 
-    printf("ATA: scanning primary channel...\n");
+    serial_printf("ATA: scanning primary channel...\n");
 
     ata_identify(0); /* primary master */
     ata_identify(1); /* primary slave */
 
-    printf("ATA: found %d device(s)\n", ata_device_count);
+    serial_printf("ATA: found %d device(s)\n", ata_device_count);
+    ata_print_devices();
 }
 
 uint8_t ata_get_device_count(void) {
@@ -154,22 +155,27 @@ ata_device_t *ata_get_device(uint8_t index) {
 }
 
 void ata_print_devices(void) {
-    printf("=== ATA DEVICES ===\n");
+    serial_printf("=== ATA DEVICES ===\n");
 
     for (uint8_t i = 0; i < ata_device_count; i++) {
         ata_device_t *d = &ata_devices[i];
-        printf("Device %d:\n", i);
-        printf("  Model: %s\n", d->model);
-        printf("  Serial: %s\n", d->serial);
-        printf("  Sectors: %llu\n", d->capacity_sectors);
-        printf("  Size: %llu MB\n", d->capacity_sectors / 2048);
-        printf("\n");
+        serial_printf("Device %d:\n", i);
+        serial_printf("  Model: %s\n", d->model);
+        serial_printf("  Serial: %s\n", d->serial);
+        serial_printf("  Sectors: %llu\n", d->capacity_sectors);
+        serial_printf("  Size: %llu MB\n", d->capacity_sectors / 2048);
     }
 }
 
 bool ata_read_sectors_lba28(uint32_t lba, uint8_t count, void *buf) {
-    if (count == 0 || buf == NULL) return false;
-    if (ata_device_count == 0) return false;
+    if (count == 0 || buf == NULL) {
+        serial_printf("ata_read_sectors_lba28: invalid count or buf\n");
+        return false;
+    }
+    if (ata_device_count == 0) {
+        serial_printf("ata_read_sectors_lba28: ata_device_count is 0\n");
+        return false;
+    }
 
     uint16_t base = ATA_PRIMARY_BASE;
 
@@ -183,14 +189,17 @@ bool ata_read_sectors_lba28(uint32_t lba, uint8_t count, void *buf) {
     outb(base + ATA_REG_LBA1, (uint8_t)((lba >> 8) & 0xFF));
     outb(base + ATA_REG_LBA2, (uint8_t)((lba >> 16) & 0xFF));
 
-    if (!ata_wait_bsy_clear(base)) { printf("ata_read_sectors_lba28: device bsy not cleared\n"); return false; }
+    if (!ata_wait_bsy_clear(base)) { serial_printf("ata_read_sectors_lba28: device bsy not cleared (lba=%u)\n", lba); return false; }
 
     /* READ PIO */
     outb(base + ATA_REG_COMMAND, 0x20);
 
     uint16_t *wptr = (uint16_t *)buf;
     for (int s = 0; s < count; s++) {
-        if (!ata_wait_drq(base)) return false;
+        if (!ata_wait_drq(base)) {
+            serial_printf("ata_read_sectors_lba28: wait_drq failed (lba=%u sector=%d)\n", lba, s);
+            return false;
+        }
         insw(base + ATA_REG_DATA, wptr, 256);
         wptr += 256;
     }
@@ -366,13 +375,19 @@ bool ata_pool_read_sectors(uint64_t pool_lba, uint16_t count, void *buf) {
         if (curr_lba < dev->capacity_sectors) {
             uint64_t dev_avail = dev->capacity_sectors - curr_lba;
             uint16_t chunk = (remaining < dev_avail) ? remaining : (uint16_t)dev_avail;
-            if (!ata_read_sectors(curr_lba, chunk, curr_buf)) return false;
+            if (!ata_read_sectors(curr_lba, chunk, curr_buf)) {
+                serial_printf("ata_pool_read: ata_read_sectors failed (d=%u, curr_lba=%llu)\n", d, curr_lba);
+                return false;
+            }
             curr_lba = 0;
             curr_buf += (chunk * 512u);
             remaining -= chunk;
         } else {
             curr_lba -= dev->capacity_sectors;
         }
+    }
+    if (remaining > 0) {
+        serial_printf("ata_pool_read: remaining=%u (pool_lba=%llu)\n", remaining, pool_lba);
     }
     return (remaining == 0);
 }

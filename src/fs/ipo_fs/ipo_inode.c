@@ -6,12 +6,18 @@
 #define INODES_PER_BLOCK (IPO_FS_BLOCK_SIZE / INODE_SIZE)
 
 bool read_inode(uint32_t inode_no, struct ipo_inode *out) {
-    if (inode_no == 0 || (uint64_t)inode_no > sb.inode_count) return false;
+    if (inode_no == 0 || (uint64_t)inode_no > sb.inode_count) {
+        serial_printf("[ipo_fs] read_inode(%u) failed: inode_count=%llu\n", inode_no, sb.inode_count);
+        return false;
+    }
     uint32_t idx = inode_no - 1; /* inodes are numbered from 1 */
     uint64_t block = sb.inode_table_start + (idx / INODES_PER_BLOCK);
     uint32_t offset = (idx % INODES_PER_BLOCK) * INODE_SIZE;
     uint8_t buf[IPO_FS_BLOCK_SIZE];
-    if (!block_read(block, buf)) return false;
+    if (!block_read(block, buf)) {
+        serial_printf("[ipo_fs] read_inode(%u) failed: block_read(%llu) failed\n", inode_no, block);
+        return false;
+    }
     memcpy(out, buf + offset, sizeof(*out));
     return true;
 }

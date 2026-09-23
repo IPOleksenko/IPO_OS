@@ -105,6 +105,24 @@ void arp_send_request(ip4_addr_t target_ip) {
     eth_send(&broadcast_mac, ETHERTYPE_ARP, &pkt, sizeof(pkt));
 }
 
+void arp_send_gratuitous(void) {
+    net_if_t *netif = net_get_interface();
+    if (!netif || netif->ip == 0) return;
+
+    arp_packet_t pkt;
+    pkt.hw_type = htons(1);
+    pkt.proto_type = htons(0x0800);
+    pkt.hw_len = 6;
+    pkt.proto_len = 4;
+    pkt.opcode = htons(ARP_OP_REQUEST);
+    memcpy(&pkt.sender_mac, &netif->mac, sizeof(mac_addr_t));
+    pkt.sender_ip = htonl(netif->ip);
+    memset(&pkt.target_mac, 0xFF, sizeof(mac_addr_t));
+    pkt.target_ip = htonl(netif->ip);
+
+    eth_send(&broadcast_mac, ETHERTYPE_ARP, &pkt, sizeof(pkt));
+}
+
 void arp_receive(const void *data, uint16_t len) {
     if (!data || len < sizeof(arp_packet_t)) return;
 

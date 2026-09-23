@@ -8,7 +8,6 @@
 #include <driver/net/rtl8139.h>
 
 #define NET_SHARED_MAGIC 0x49504F4Eu /* "IPON" in ASCII */
-#define NET_SHARED_ADDR  0x00060000u
 
 #define ICMP_QUEUE_SIZE 8
 #define ARP_TABLE_SIZE  16
@@ -68,8 +67,10 @@ typedef struct {
     uint8_t loop_tail_idx;
 } net_shared_ctx_t;
 
+extern net_shared_ctx_t g_net_shared_ctx;
+
 static inline net_shared_ctx_t *net_get_shared_context(void) {
-    return (net_shared_ctx_t *)NET_SHARED_ADDR;
+    return &g_net_shared_ctx;
 }
 
 #endif /* IPO_NET_STATE_H */

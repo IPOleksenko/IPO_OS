@@ -39,6 +39,21 @@ fi
 # Bring up interface
 sudo ip link set dev "${TAP_DEV}" up
 
+# Ensure host routes guest IP directly into TAP interface
+sudo ip route replace "${GUEST_IP}/32" dev "${TAP_DEV}" 2>/dev/null || true
+
+# Enable IP forwarding and NAT so guest can access the internet
+sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+DEFAULT_IF=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1)
+if [ -n "$DEFAULT_IF" ]; then
+    sudo iptables -A FORWARD -i "${TAP_DEV}" -o "${DEFAULT_IF}" -j ACCEPT 2>/dev/null || true
+    sudo iptables -A FORWARD -i "${DEFAULT_IF}" -o "${TAP_DEV}" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    sudo iptables -t nat -A POSTROUTING -o "${DEFAULT_IF}" -j MASQUERADE 2>/dev/null || true
+fi
+
+# Forward DNS requests from guest to 8.8.8.8 if host doesn't listen on 53
+sudo iptables -t nat -A PREROUTING -i "${TAP_DEV}" -p udp --dport 53 -j DNAT --to-destination 8.8.8.8:53 2>/dev/null || true
+
 echo "[TAP] ✓ Interface ${TAP_DEV} is UP and active."
 echo "[TAP] Host IP           : ${HOST_IP}"
 echo "[TAP] Guest (IPO_OS) IP : ${GUEST_IP}"
