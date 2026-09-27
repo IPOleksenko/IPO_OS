@@ -48,12 +48,10 @@ Combines bootloader and kernel into a single OS image:
 make image
 ```
 
-#### `make applications` (alias `make apps`) — Build applications
+#### `make applications` — Build applications
 Builds userland applications from `applications/`:
 ```bash
 make applications
-# or
-make apps
 ```
 
 #### `make setup-tap` — Setup TAP Network Interface
@@ -93,7 +91,7 @@ Removes only the library build artifacts:
 make clean-lib
 ```
 
-#### `make clean-applications` (alias `make clean-apps`) — Clean Applications Only
+#### `make clean-applications` — Clean Applications Only
 Removes only the applications build artifacts:
 ```bash
 make clean-applications
@@ -210,17 +208,16 @@ make setup-tap
 # (or: sudo ./tools/setup-tap.sh tap0)
 
 # 2. Launch IPO_OS
-make run
+make run NET_MODE=user
 
 # 3. Inside IPO_OS: check or change IP configuration dynamically
 ifconfig
-# (or set custom: ifconfig 192.168.7.100 255.255.255.0 192.168.7.1)
 
 # 4. Inside IPO_OS: run the hosting server on any port
 hosting_server 8000
 
 # 5. Connect to server:
-curl http://192.168.7.2:8000/
+curl http://localhost:8000/
 
 # 6. Inside IPO_OS: fetch data from another host
 hosting_client 192.168.7.1 9000 /
