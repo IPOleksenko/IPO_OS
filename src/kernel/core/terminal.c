@@ -876,6 +876,7 @@ bool terminal_is_builtin(const char *name) {
         "cat", "type", "touch", "mkdir", "rm", "del", "rmdir",
         "cp", "copy", "mv", "move", "rename", "stat", "echo",
         "reboot", "restart", "shutdown", "poweroff", "exit", "halt",
+        "reinstall_fs",
         "ps", "tasks", "procs", "kill", "killall",
         "run",
         "df", "diskinfo", "meminfo", "free",
@@ -963,6 +964,8 @@ static void builtin_help(void) {
     printf("      - Reboot hardware via 8042 controller, port 0x92 or triple fault.\n");
     printf("    shutdown | poweroff | exit | halt\n");
     printf("      - Power off machine via ACPI/APM or halt CPU execution safely.\n");
+    printf("    reinstall_fs\n");
+    printf("      - Completely reinstall filesystem on disk (wipes FS and resets to defaults).\n");
     printf("    help | ?\n");
     printf("      - Display this system documentation and syntax reference.\n");
     printf("\n");
@@ -991,16 +994,33 @@ static void builtin_help(void) {
     printf("3. TERMINAL SHORTCUTS & KEYBOARD CONTROLS\n");
     printf("   - Ctrl + Page Up         : Switch to previous multitasking workspace.\n");
     printf("   - Ctrl + Page Down       : Switch to next multitasking workspace.\n");
-    printf("   - Ctrl + Left Shift      : Cycle active keyboard layout backwards (previous).\n");
-    printf("   - Ctrl + Right Shift     : Cycle active keyboard layout forwards (next).\n");
-    printf("   - Alt + Left/Right Shift : Cycle active keyboard layout backwards / forwards.\n");
-    printf("   - Ctrl + C               : Interrupt active task, or exit finished workspace.\n");
+    printf("   - Ctrl + Left/Right Shift: Cycle keyboard layout backwards / forwards.\n");
+    printf("   - Alt + Left/Right Shift : Cycle keyboard layout backwards / forwards.\n");
+    printf("   - Ctrl + C               : Interrupt active task or exit a finished workspace.\n");
     printf("   - Page Up / Page Down    : Scroll terminal output up / down.\n");
     printf("   - Up / Down Arrows       : Command history navigation.\n");
     printf("   - Left / Right Arrows    : Move cursor across current line.\n");
     printf("   - Home / End             : Move cursor to beginning / end of line.\n");
     printf("\n");
-    printf("4. SYSTEM STATUS & LANGUAGE BAR\n");
+    printf("4. WINDOW MANAGER SHORTCUTS & CONTROLS\n");
+    printf("   - Tab                    : Switch focus to next window.\n");
+    printf("   - Shift + Tab            : Switch focus to previous window.\n");
+    printf("   - Alt + F4               : Close currently focused window.\n");
+    printf("   - Ctrl + W               : Close currently focused window.\n");
+    printf("   - Ctrl + Arrow Keys      : Move focused window.\n");
+    printf("   - Ctrl + Page Up         : Switch to previous multitasking workspace.\n");
+    printf("   - Ctrl + Page Down       : Switch to next multitasking workspace.\n");
+    printf("   - F2                     : Cycle active keyboard layout.\n");
+    printf("   - Ctrl + Left/Right Shift: Cycle keyboard layout backwards / forwards.\n");
+    printf("   - Alt + Left/Right Shift : Cycle keyboard layout backwards / forwards.\n");;
+    printf("   - Window Buttons         : Minimize, Maximize/Restore, Close [X].\n");
+    printf("   - Window Titlebar Drag   : Move window.\n");
+    printf("   - Window Border Drag     : Resize window.\n");
+    printf("   - Taskbar [Close]        : Exit foreground application or stop WM.\n");
+    printf("   - Taskbar Tabs           : Click to focus/restore/minimize; [x] or right-click to close.\n");
+    printf("   - Taskbar Language Box   : Left click: next layout; right click: previous layout.\n");
+    printf("\n");
+    printf("5. SYSTEM STATUS & LANGUAGE BAR\n");
     printf("  [Top Language Bar Operation]\n");
     printf("    - Status bar displays currently active keyboard layout below system header.\n");
     printf("    - Automatically hidden when only one layout is enabled in the system.\n");
@@ -1439,6 +1459,100 @@ static void builtin_shutdown(void) {
     for (;;) {
         __asm__ volatile("cli; hlt");
     }
+}
+
+static void builtin_reinstall_fs(void) {
+    if (!fs_mounted) {
+        printf("reinstall_fs: no filesystem mounted\n");
+        return;
+    }
+
+    printf("=== Reinstalling Filesystem (IPO_FS) ===\n");
+    printf("WARNING: This will completely erase all data on the filesystem!\n");
+    printf("System directories (/applications, /autorun) will be re-initialized.\n\n");
+
+    /* 1. Kill all running processes */
+    printf("[1/5] Terminating all processes...\n");
+    process_kill_all();
+
+    /* 2. Close all open file descriptors */
+    printf("[2/5] Closing all file descriptors...\n");
+    if (fds) {
+        for (uint32_t i = 0; i < fds_capacity; i++) {
+            if (fds[i].used && i >= 3) {
+                fds[i].used = 0;
+                fds[i].inode = 0;
+                fds[i].offset = 0;
+                fds[i].flags = 0;
+            }
+        }
+    }
+
+    /* 3. Compute format parameters (same logic as kernel boot ensure_fs_mounted) */
+    printf("[3/5] Computing filesystem parameters...\n");
+
+    uint64_t pool_capacity = ata_get_pool_capacity();
+    if (pool_capacity == 0) {
+        printf("reinstall: disk not detected\n");
+        return;
+    }
+    if (pool_capacity < 10) {
+        printf("reinstall: disk too small for filesystem (< 5 KB)\n");
+        return;
+    }
+
+    /* Use the current fs_start_lba if the filesystem was already mounted,
+       otherwise fall back to the adaptive partition offset logic. */
+    uint64_t start_lba = fs_start_lba;
+    uint64_t available_sectors = pool_capacity;
+
+    if (start_lba > 0 && start_lba < pool_capacity) {
+        available_sectors = pool_capacity - start_lba;
+    } else {
+        /* Adaptive partition offset (same as kernel boot):
+         * - Disks > 1 MB use standard partition offset 2048
+         * - Disks <= 1 MB use LBA 0 (whole-disk / floppy mode) */
+        start_lba = 0;
+        if (pool_capacity > 2048 + 10) {
+            start_lba = 2048;
+            available_sectors = pool_capacity - 2048;
+        }
+    }
+
+    uint64_t total_blocks = available_sectors;
+    uint64_t total_inodes = total_blocks / 16;
+    if (total_inodes == 0) total_inodes = 1;
+
+    printf("  Storage Pool : %u sectors\n", (uint32_t)pool_capacity);
+    printf("  Start LBA    : %u\n", (uint32_t)start_lba);
+    printf("  Total Blocks : %u\n", (uint32_t)total_blocks);
+    printf("  Total Inodes : %u\n", (uint32_t)total_inodes);
+
+    /* 4. Unmount, format, remount */
+    printf("[4/5] Formatting filesystem...\n");
+    fs_mounted = false;
+
+    if (!ipo_fs_format(start_lba, total_blocks, total_inodes)) {
+        printf("reinstall_fs: ipo_fs_format FAILED\n");
+        printf("WARNING: Filesystem is now unmounted. Reboot recommended.\n");
+        return;
+    }
+
+    if (!ipo_fs_mount(start_lba)) {
+        printf("reinstall_fs: ipo_fs_mount FAILED after format\n");
+        printf("WARNING: Filesystem formatted but not mounted. Reboot recommended.\n");
+        return;
+    }
+
+    /* 5. Reset terminal state */
+    printf("[5/5] Resetting terminal state...\n");
+    strcpy(terminal_cwd, "/");
+
+    printf("\n=== Filesystem Reinstallation Complete ===\n");
+    printf("Fresh IPO_FS successfully reinstalled at LBA %u.\n", (uint32_t)start_lba);
+    printf("  %u blocks, %u inodes available.\n",
+           (uint32_t)total_blocks, (uint32_t)total_inodes);
+    printf("Note: /applications and /autorun have been recreated.\n");
 }
 
 static void builtin_ps(void) {
@@ -1994,13 +2108,25 @@ int try_execute_command(const char *cmdline) {
     if (*p == '\0') return 0;
 
 
-    size_t name_cap = 256u;
+    size_t name_cap = 64u;
     char *name = kmalloc(name_cap);
     if (name == NULL) {
         return -1;
     }
     size_t i = 0u;
-    while (*p && *p != ' ' && *p != '\t' && i + 1u < name_cap) {
+    while (*p && *p != ' ' && *p != '\t') {
+        if (i + 1u >= name_cap) {
+            size_t new_cap = name_cap * 2u;
+            char *new_name = kmalloc(new_cap);
+            if (new_name == NULL) {
+                kfree(name);
+                return -1;
+            }
+            memcpy(new_name, name, i);
+            kfree(name);
+            name = new_name;
+            name_cap = new_cap;
+        }
         name[i++] = *p++;
     }
     name[i] = '\0';
@@ -2214,6 +2340,9 @@ int try_execute_command(const char *cmdline) {
                strcmp(name, "exit") == 0 || strcmp(name, "halt") == 0) {
         builtin_shutdown();
         builtin_handled = 1;
+    } else if (strcmp(name, "reinstall_fs") == 0) {
+        builtin_reinstall_fs();
+        builtin_handled = 1;
     } else if (strcmp(name, "ps") == 0 || strcmp(name, "tasks") == 0 || strcmp(name, "procs") == 0) {
         builtin_ps();
         builtin_handled = 1;
@@ -2319,7 +2448,121 @@ int try_execute_command(const char *cmdline) {
     return result;
 }
 
+void terminal_poll_serial_commands(void) {
+    static bool serial_polling = false;
+    if (serial_polling) return;
+    serial_polling = true;
+
+    static char *serial_cmd_buf = NULL;
+    static size_t serial_cmd_cap = 0;
+    static size_t serial_cmd_len = 0;
+    static bool serial_wm_prompt_shown = false;
+
+    /* When WM session is active, show '> ' prompt via serial once per input cycle */
+    if (wm_session_active() && !serial_wm_prompt_shown && serial_cmd_len == 0) {
+        serial_printf("> ");
+        serial_wm_prompt_shown = true;
+    }
+    /* If WM session ended, reset prompt state */
+    if (!wm_session_active()) {
+        serial_wm_prompt_shown = false;
+    }
+
+    int ch;
+    while ((ch = serial_getc()) >= 0) {
+        if (ch == '\n' || ch == '\r') {
+            serial_putc('\n');
+            if (serial_cmd_len > 0 && serial_cmd_buf != NULL) {
+                serial_cmd_buf[serial_cmd_len] = '\0';
+                serial_printf("[serial] exec: %s\n", serial_cmd_buf);
+
+                push_command_history(serial_cmd_buf);
+
+                int exec = try_execute_command(serial_cmd_buf);
+                if (exec == 0) {
+                    serial_printf("Command not found: %s\n", serial_cmd_buf);
+                    if (!wm_session_active()) {
+                        printf("Command not found: %s\n", serial_cmd_buf);
+                    }
+                } else if (exec < 0) {
+                    serial_printf("Execution failed (error %d): %s\n", exec, serial_cmd_buf);
+                    if (!wm_session_active()) {
+                        printf("Execution failed (error %d): %s\n", exec, serial_cmd_buf);
+                    }
+                } else if (exec != 1000) {
+                    int ret = process_get_exit_code();
+                    if (terminal_get_show_return_value()) {
+                        serial_printf("Return value: %d\n", ret);
+                        if (!wm_session_active()) {
+                            printf("Return value: %d\n", ret);
+                        }
+                    }
+                }
+
+                serial_cmd_len = 0;
+                serial_cmd_buf[0] = '\0';
+                serial_wm_prompt_shown = false;
+
+                if (!wm_session_active()) {
+                    print_prompt();
+                }
+            } else {
+                serial_wm_prompt_shown = false;
+                if (!wm_session_active()) {
+                    print_prompt();
+                }
+            }
+        } else if (ch == 0x08 || ch == 0x7F) {
+            /* Backspace / DEL */
+            if (serial_cmd_len > 0) {
+                serial_cmd_len--;
+                if (serial_cmd_buf != NULL) {
+                    serial_cmd_buf[serial_cmd_len] = '\0';
+                }
+                serial_putc('\b');
+                serial_putc(' ');
+                serial_putc('\b');
+            }
+        } else if (ch == 0x03) {
+            /* Ctrl+C over serial */
+            serial_printf("^C\n");
+            sound_stop();
+            system_request_interrupt();
+            if (wm_session_active()) {
+                wm_session_stop();
+                print_prompt();
+            }
+            serial_cmd_len = 0;
+            if (serial_cmd_buf) serial_cmd_buf[0] = '\0';
+            serial_wm_prompt_shown = false;
+        } else if (ch >= 0x20 || ch == '\t') {
+            if (serial_cmd_buf == NULL || serial_cmd_len + 2u > serial_cmd_cap) {
+                size_t new_cap = (serial_cmd_cap == 0) ? 256u : serial_cmd_cap * 2u;
+                char *new_buf = (char *)kmalloc(new_cap);
+                if (new_buf != NULL) {
+                    if (serial_cmd_buf != NULL && serial_cmd_len > 0) {
+                        memcpy(new_buf, serial_cmd_buf, serial_cmd_len);
+                        kfree(serial_cmd_buf);
+                    }
+                    serial_cmd_buf = new_buf;
+                    serial_cmd_cap = new_cap;
+                }
+            }
+            if (serial_cmd_buf != NULL && serial_cmd_len + 1u < serial_cmd_cap) {
+                serial_cmd_buf[serial_cmd_len++] = (char)ch;
+                serial_cmd_buf[serial_cmd_len] = '\0';
+                serial_putc((char)ch); /* echo */
+            }
+        }
+    }
+
+    serial_polling = false;
+}
+
 void terminal_console(void){
+    /* Poll and process serial commands in all states, including active WM */
+    terminal_poll_serial_commands();
+
     if (terminal_input_locked || system_is_input_state() || system_get_state() == SYSTEM_STATE_PROCESS_RUNNING) {
         return;
     }

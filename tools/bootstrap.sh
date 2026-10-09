@@ -100,10 +100,10 @@ echo "[5/7] Building kernel, bootloader, and standard applications..."
 make kernel boot applications
 
 echo "[6/7] Populating IPO_OS 128MB filesystem disk image..."
-python3 load_applications.py
+python3 tools/load_applications.py
 
 echo "[7/7] Verifying filesystem contents..."
-python3 disk_editor.py -i build/disk.img ls /applications
+python3 tools/disk_editor.py -i build/disk.img ls /applications
 
 echo "================================================================="
 echo "✓ IPO_OS Developer Toolchain Bootstrap Completed Successfully!  "

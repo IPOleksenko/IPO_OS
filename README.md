@@ -107,20 +107,20 @@ make patch-config
 
 ## **load_applications.py**
 
-- **File:** [load_applications.py](load_applications.py)
+- **File:** [tools/load_applications.py](tools/load_applications.py)
 - **Purpose:** loads compiled applications into the OS disk image so they are available from `/applications` at runtime.
 
 ### Usage
 
 ```bash
-python3 load_applications.py
+python3 tools/load_applications.py
 ```
 
 It scans the built app binaries in `build/applications`, copies them into the filesystem image, and makes them executable from the shell.
 
 ## **Disk Editor**
 
-- **File:** [disk_editor.py](disk_editor.py)
+- **File:** [tools/disk_editor.py](tools/disk_editor.py)
 - **Purpose:** A utility for viewing and editing the contents of the IPO_FS filesystem inside a disk image. Allows listing directories, reading files, creating directories, writing text files, copying files from the host into the image, and deleting entries.
 
 ### Usage and options
@@ -128,7 +128,7 @@ It scans the built app binaries in `build/applications`, copies them into the fi
 General syntax:
 
 ```bash
-python3 disk_editor.py [-i IMAGE] [-s START_LBA] <command> [arguments]
+python3 tools/disk_editor.py [-i IMAGE] [-s START_LBA] <command> [arguments]
 ```
 
 - `-i, --image` — path to the disk image (default: `build/disk.img`).
@@ -149,38 +149,38 @@ Supported commands:
 - Clear the filesystem
 
 ```bash
-python3 disk_editor.py format
+python3 tools/disk_editor.py format
 ```
 
 - List the image root:
 
 ```bash
-python3 disk_editor.py ls /
+python3 tools/disk_editor.py ls /
 ```
 
 - Show a text file:
 
 ```bash
-python3 disk_editor.py cat /etc/example.txt
+python3 tools/disk_editor.py cat /etc/example.txt
 ```
 
 - Create a directory and copy a local file into it:
 
 ```bash
-python3 disk_editor.py mkdir /mydir
-python3 disk_editor.py put ./local.bin /mydir/remote.bin
+python3 tools/disk_editor.py mkdir /mydir
+python3 tools/disk_editor.py put ./local.bin /mydir/remote.bin
 ```
 
 - Create a file with text:
 
 ```bash
-python3 disk_editor.py touch /hello.txt "Hello IPO"
+python3 tools/disk_editor.py touch /hello.txt "Hello IPO"
 ```
 
 - Remove a file:
 
 ```bash
-python3 disk_editor.py rm /oldfile
+python3 tools/disk_editor.py rm /oldfile
 ```
 
 ## 🌐 Networking (TAP Mode & Direct Ports Access)

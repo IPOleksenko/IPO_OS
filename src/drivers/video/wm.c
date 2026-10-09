@@ -62,6 +62,7 @@
 #include <system/timer.h>
 #include <system/state.h>
 #include <ioport.h>
+#include <kernel/terminal.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -207,20 +208,54 @@ void wm_buf_draw_rect(uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, int 
     for(int cx=x;cx<x+w;cx++){wm_buf_put_pixel(buf,bw,bh,cx,y,c);wm_buf_put_pixel(buf,bw,bh,cx,y+h-1,c);}
     for(int cy=y;cy<y+h;cy++){wm_buf_put_pixel(buf,bw,bh,x,cy,c);wm_buf_put_pixel(buf,bw,bh,x+w-1,cy,c);}
 }
+/**
+ * Draw a single VGA font slot (0..255) at 6x8 into the buffer.
+ * For printable ASCII (0x20..0x7E) the fast built-in wm_font is used.
+ * For any other slot (Cyrillic, CJK, etc.) the 8x16 glyph from the VGA
+ * font cache is downscaled to 6x8 by sampling every other row and the
+ * six most significant columns.
+ */
+static void wm_buf_draw_glyph(uint8_t *buf, uint16_t bw, uint16_t bh,
+                               int x, int y, uint8_t slot, uint8_t c) {
+    if (slot >= 0x20 && slot <= 0x7E) {
+        /* Fast path: built-in 6x8 ASCII bitmap */
+        const uint8_t *g = wm_font[slot - 0x20];
+        for (int row = 0; row < WM_FONT_H; row++)
+            for (int col = 0; col < WM_FONT_W; col++)
+                if (g[row] & (0x80u >> col))
+                    wm_buf_put_pixel(buf, bw, bh, x + col, y + row, c);
+    } else {
+        /* Extended glyph: downsample 8x16 → 6x8 */
+        const uint8_t *bmp = vga_font_get_cached_glyph(slot);
+        if (!bmp) return;
+        for (int row = 0; row < WM_FONT_H; row++) {
+            /* Sample two source rows and OR them together */
+            uint8_t bits = bmp[row * 2] | bmp[row * 2 + 1];
+            /* Take columns 1..6 of the 8-wide source (skip leftmost and rightmost) */
+            for (int col = 0; col < WM_FONT_W; col++) {
+                if (bits & (0x40u >> col))
+                    wm_buf_put_pixel(buf, bw, bh, x + col, y + row, c);
+            }
+        }
+    }
+}
 void wm_buf_draw_char(uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, char ch, uint8_t c) {
     uint8_t u=(uint8_t)ch; if(u<0x20||u>0x7E) return;
-    const uint8_t *g=wm_font[u-0x20];
-    for(int row=0;row<WM_FONT_H;row++)
-        for(int col=0;col<WM_FONT_W;col++)
-            if(g[row]&(0x80u>>col)) wm_buf_put_pixel(buf,bw,bh,x+col,y+row,c);
+    wm_buf_draw_glyph(buf, bw, bh, x, y, u, c);
 }
 void wm_buf_draw_string(uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, const char *str, uint8_t c) {
     if(!str) return;
     int cx=x;
-    while(*str){
-        if(*str=='\n'){cx=x;y+=WM_FONT_H;}
-        else{wm_buf_draw_char(buf,bw,bh,cx,y,*str,c);cx+=WM_FONT_W;}
-        str++;
+    size_t len = strlen(str);
+    size_t i = 0;
+    while (i < len) {
+        if (str[i] == '\n') { cx = x; y += WM_FONT_H; i++; continue; }
+        size_t bytes = 0;
+        uint8_t slot = utf8_to_vga_glyph(&str[i], len - i, &bytes);
+        if (bytes == 0) { i++; continue; }
+        wm_buf_draw_glyph(buf, bw, bh, cx, y, slot, c);
+        cx += WM_FONT_W;
+        i += bytes;
     }
 }
 #ifdef IPO_APP
@@ -1086,31 +1121,68 @@ static void draw_taskbar(uint8_t *bb) {
     if (!lang_name || lang_name[0] == '\0') {
         lang_name = "English (US)";
     }
-    size_t lang_len = strlen(lang_name);
-    int vis_chars = 13; // (85 - 4) / 6 = 13 characters
-    char disp_buf[16];
+    size_t lang_byte_len = strlen(lang_name);
+    int vis_chars = 13; /* (85 - 4) / 6 = 13 character cells */
+    char disp_buf[64]; /* enough for 13 chars × up to 4 bytes each + NUL */
 
-    if ((int)lang_len <= vis_chars) {
-        strncpy(disp_buf, lang_name, sizeof(disp_buf) - 1);
-        disp_buf[sizeof(disp_buf) - 1] = '\0';
+    /* Count codepoints in lang_name */
+    size_t lang_cp_count = 0;
+    {
+        size_t pos = 0;
+        while (pos < lang_byte_len) {
+            size_t cb = 0;
+            utf8_to_vga_glyph(&lang_name[pos], lang_byte_len - pos, &cb);
+            if (cb == 0) { pos++; continue; }
+            pos += cb;
+            lang_cp_count++;
+        }
+    }
+
+    if ((int)lang_cp_count <= vis_chars) {
+        /* Fits entirely — just copy the whole string */
+        size_t copy_len = lang_byte_len < sizeof(disp_buf) - 1 ? lang_byte_len : sizeof(disp_buf) - 1;
+        memcpy(disp_buf, lang_name, copy_len);
+        disp_buf[copy_len] = '\0';
     } else {
+        /* Scrolling marquee by codepoints */
         const char sep[] = "   *   ";
-        size_t sep_len = strlen(sep);
-        size_t loop_len = lang_len + sep_len;
+        size_t sep_byte_len = strlen(sep);
+        size_t sep_cp_count = sep_byte_len; /* separator is ASCII, 1 byte = 1 cp */
+        size_t loop_cp_len = lang_cp_count + sep_cp_count;
         uint32_t now = timer_millis();
         if (now - wm_lang_last_tick >= 180u) {
             wm_lang_last_tick = now;
-            wm_lang_offset = (wm_lang_offset + 1u) % (uint32_t)loop_len;
+            wm_lang_offset = (wm_lang_offset + 1u) % (uint32_t)loop_cp_len;
         }
+        /* Build disp_buf: vis_chars codepoints starting at codepoint offset wm_lang_offset */
+        size_t out = 0;
         for (int c = 0; c < vis_chars; c++) {
-            size_t idx = (wm_lang_offset + (size_t)c) % loop_len;
-            if (idx < lang_len) {
-                disp_buf[c] = lang_name[idx];
+            size_t cp_idx = (wm_lang_offset + (size_t)c) % loop_cp_len;
+            if (cp_idx < lang_cp_count) {
+                /* Find byte offset of codepoint cp_idx in lang_name */
+                size_t pos = 0;
+                size_t cp_i = 0;
+                while (cp_i < cp_idx && pos < lang_byte_len) {
+                    size_t cb = 0;
+                    utf8_to_vga_glyph(&lang_name[pos], lang_byte_len - pos, &cb);
+                    if (cb == 0) { pos++; continue; }
+                    pos += cb;
+                    cp_i++;
+                }
+                /* Copy this codepoint's bytes */
+                size_t cb = 0;
+                utf8_to_vga_glyph(&lang_name[pos], lang_byte_len - pos, &cb);
+                if (cb == 0) cb = 1;
+                for (size_t b = 0; b < cb && out < sizeof(disp_buf) - 1; b++)
+                    disp_buf[out++] = lang_name[pos + b];
             } else {
-                disp_buf[c] = sep[idx - lang_len];
+                /* Inside separator (all ASCII) */
+                size_t sep_idx = cp_idx - lang_cp_count;
+                if (sep_idx < sep_byte_len && out < sizeof(disp_buf) - 1)
+                    disp_buf[out++] = sep[sep_idx];
             }
         }
-        disp_buf[vis_chars] = '\0';
+        disp_buf[out] = '\0';
     }
     wm_buf_draw_string(bb, VGA_GFX_WIDTH, VGA_GFX_HEIGHT, 198, TASKBAR_Y + 3, disp_buf, WIN_CLR_DKSHADOW);
 
@@ -1183,10 +1255,10 @@ bool wm_dispatch_key(uint8_t scancode) {
     if (keyboard_is_ctrl_pressed()) {
         wm_window_t *fw=wm_get_focused();
         if (fw) {
-            if(make==0x48){wm_move(fw,fw->x,(int16_t)(fw->y-4));return true;}
-            if(make==0x50){wm_move(fw,fw->x,(int16_t)(fw->y+4));return true;}
-            if(make==0x4B){wm_move(fw,(int16_t)(fw->x-4),fw->y);return true;}
-            if(make==0x4D){wm_move(fw,(int16_t)(fw->x+4),fw->y);return true;}
+            if(make==0x48){wm_move(fw,fw->x,(int16_t)(fw->y-1));return true;}
+            if(make==0x50){wm_move(fw,fw->x,(int16_t)(fw->y+1));return true;}
+            if(make==0x4B){wm_move(fw,(int16_t)(fw->x-1),fw->y);return true;}
+            if(make==0x4D){wm_move(fw,(int16_t)(fw->x+1),fw->y);return true;}
         }
     }
     wm_window_t *fw=wm_get_focused();
@@ -1209,6 +1281,7 @@ static uint16_t drag_start_w = 0, drag_start_h = 0;
 static int32_t drag_start_mx = 0, drag_start_my = 0;
 
 void wm_compositor_tick(void) {
+    terminal_poll_serial_commands();
     if (!wm_sess_active) return;
     if (process_is_batch_active() && process_get_separate_windows()) {
         process_t *cur_fg = process_get_foreground();

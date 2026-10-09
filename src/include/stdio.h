@@ -24,6 +24,12 @@ bool putchar_is_locked(void);
 void serial_putc(char c);
 
 /**
+ * Non-blocking serial input (COM1)
+ * @return Character read, or -1 if no data available
+ */
+int serial_getc(void);
+
+/**
  * Output a single character to VGA memory at cursor position
  * @param c Character to output
  */

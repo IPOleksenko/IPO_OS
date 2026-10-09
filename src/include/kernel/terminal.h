@@ -44,6 +44,7 @@ int terminal_set_cwd(const char *path);
 
 void terminal_inject_input(const char *text, bool auto_execute);
 void terminal_apply_pending_input(void);
+void terminal_poll_serial_commands(void);
 
 void terminal_render_language_bar(void);
 void terminal_language_bar_tick(void);

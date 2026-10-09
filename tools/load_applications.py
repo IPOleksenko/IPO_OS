@@ -47,10 +47,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Load all built applications, libraries, headers, toolchains, and tests into IPO_OS disk image."
     )
-    parser.add_argument("--project-root", type=Path, default=Path(__file__).resolve().parent)
-    parser.add_argument("--image", type=Path, default=Path(__file__).resolve().parent / "build" / "disk.img")
+    repo_root = Path(__file__).resolve().parent.parent
+    parser.add_argument("--project-root", type=Path, default=repo_root)
+    parser.add_argument("--image", type=Path, default=repo_root / "build" / "disk.img")
     parser.add_argument("--start-lba", type=int, default=2048)
-    parser.add_argument("--apps-dir", type=Path, default=Path(__file__).resolve().parent / "build" / "applications")
+    parser.add_argument("--apps-dir", type=Path, default=repo_root / "build" / "applications")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be copied without modifying the image")
     args = parser.parse_args()
 

@@ -107,10 +107,10 @@ def main():
         print(f"Warning: could not load Hanzi: {e}")
         hanzi = {}
 
-    # 1. Default font: Fixed16 (including ASCII) + Hanzi
-    default_records = dict(cyr_fixed)
-    default_records.update(hanzi)
-    write_ifnt(fonts_dir / "default.fnt", default_records)
+    # 1. Fixed font: FullCyrSlav-Fixed16 (including ASCII)
+    fixed_records = dict(cyr_fixed)
+    fixed_records.update(hanzi)
+    write_ifnt(fonts_dir / "fixed.fnt", fixed_records)
 
     # 2. Terminus font: FullCyrSlav-Terminus16 (including ASCII)
     print("Extracting Terminus console font...")

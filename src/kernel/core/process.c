@@ -1699,9 +1699,8 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
                     if (process_get_foreground() != fg) {
                         continue;
                     }
-                    /* Accept ESC (0x01), 'q' (0x10), Enter (0x1C), Space (0x39), or Ctrl+C */
-                    if (sc == 0x01 || sc == 0x10 || sc == 0x1C || sc == 0x39 ||
-                        ((sc == 0x2E || sc == 0xAE) && keyboard_is_ctrl_pressed())) {
+                    /* Accept only Ctrl+C to acknowledge and close finished workspace */
+                    if ((sc == 0x2E || sc == 0xAE) && keyboard_is_ctrl_pressed()) {
                         fg->completed_and_acknowledged = true;
                     } else if (sc == 0x49) { // Page Up
                         if (terminal_get_top_buffer_count() > 0) {
