@@ -27,6 +27,14 @@ typedef struct {
     bool        link_up;
 } net_if_t;
 
+typedef struct {
+    size_t icmp_queue_capacity;
+    size_t arp_table_capacity;
+    size_t udp_sockets_capacity;
+    size_t dns_queue_capacity;
+    size_t loopback_queue_capacity;
+} net_config_t;
+
 /* Byte order helpers */
 static inline uint16_t htons(uint16_t v) {
     return (uint16_t)((v << 8) | (v >> 8));
@@ -52,7 +60,7 @@ void ip_to_str(ip4_addr_t ip, char *buf, size_t size);
 bool str_to_ip(const char *str, ip4_addr_t *out_ip);
 
 /* Net initialization and polling */
-bool net_init(void);
+bool net_init(const net_config_t *config);
 void net_poll(void);
 net_if_t *net_get_interface(void);
 void net_set_ip(ip4_addr_t ip, ip4_addr_t netmask, ip4_addr_t gateway, ip4_addr_t dns);

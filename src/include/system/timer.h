@@ -5,6 +5,7 @@
 
 void timer_init(void);
 void timer_tick(void);
+void timer_update(void);
 uint32_t timer_millis(void);
 uint32_t timer_seconds(void);
 uint32_t timer_elapsed_ms(uint32_t start_ms);

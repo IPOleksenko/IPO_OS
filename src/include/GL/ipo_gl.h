@@ -125,6 +125,8 @@ typedef struct GLContext {
     GLenum           prim_mode;
     bool             in_begin;
     gl_vertex_buf_t  vert_buf;
+    gl_vertex_t     *clip_buf;
+    int              clip_capacity;
 
     /* Vertex Arrays state */
     GLboolean    va_vertex_enabled;
@@ -256,4 +258,3 @@ void gl_quantize_argb_to_palette_strided(const uint32_t *src, int src_stride, ui
 #endif
 
 #endif /* LIB_IPO_GL_H */
-

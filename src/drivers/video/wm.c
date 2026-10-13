@@ -260,12 +260,18 @@ void wm_buf_draw_string(uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, co
 }
 #ifdef IPO_APP
 /* =========================================================================
- * Application-side Window Manager API (Syscall stubs)
+ * Application-side Window Manager API (syscall wrappers)
  * =========================================================================
  * Applications invoke the OS API to create and manage windows.
  * The kernel hosts the actual window structures, compositor, and VRAM.
  */
 #include <syscall.h>
+
+static int wm_call_window(uint32_t syscall_num, wm_window_t *win) {
+    if (!win) return 0;
+    uint32_t args[1] = { (uint32_t)(uintptr_t)win };
+    return ipo_syscall(syscall_num, 1u, args);
+}
 
 wm_window_t *wm_create_window(const wm_window_options_t *opts) {
     uint32_t args[1];
@@ -302,8 +308,15 @@ int wm_get_window_count(void) {
     return (int)ipo_syscall(IPO_SYSCALL_WM_GET_COUNT, 0u, NULL);
 }
 
-int wm_get_window_count_for_pid(uint32_t pid) { (void)pid; return 0; }
-bool wm_has_windows_for_pid(uint32_t pid) { (void)pid; return false; }
+int wm_get_window_count_for_pid(uint32_t pid) {
+    uint32_t args[1] = { pid };
+    return ipo_syscall(IPO_SYSCALL_WM_GET_COUNT_PID, 1u, args);
+}
+
+bool wm_has_windows_for_pid(uint32_t pid) {
+    uint32_t args[1] = { pid };
+    return ipo_syscall(IPO_SYSCALL_WM_HAS_WINDOWS_PID, 1u, args) != 0;
+}
 
 wm_window_t *wm_get_focused(void) {
     return (wm_window_t *)(uintptr_t)ipo_syscall(IPO_SYSCALL_WM_GET_FOCUSED, 0u, NULL);
@@ -319,7 +332,10 @@ void wm_set_focus(wm_window_t *win) {
     ipo_syscall(IPO_SYSCALL_WM_SET_FOCUS, 1u, args);
 }
 
-void wm_focus_window_for_pid(uint32_t pid) { (void)pid; }
+void wm_focus_window_for_pid(uint32_t pid) {
+    uint32_t args[1] = { pid };
+    ipo_syscall(IPO_SYSCALL_WM_FOCUS_PID, 1u, args);
+}
 
 void wm_focus_next(void) {
     ipo_syscall(IPO_SYSCALL_WM_FOCUS_NEXT, 0u, NULL);
@@ -339,18 +355,39 @@ void wm_invalidate(wm_window_t *win) {
     ipo_syscall(IPO_SYSCALL_WM_INVALIDATE, 1u, args);
 }
 
-void wm_invalidate_all(void) {}
-void wm_init(void) {}
-void wm_set_fullscreen(wm_window_t *win, bool enable) { (void)win; (void)enable; }
-void wm_minimize(wm_window_t *win) { (void)win; }
-void wm_restore(wm_window_t *win) { (void)win; }
+void wm_invalidate_all(void) {
+    ipo_syscall(IPO_SYSCALL_WM_INVALIDATE_ALL, 0u, NULL);
+}
+
+void wm_init(void) {
+    ipo_syscall(IPO_SYSCALL_WM_INIT, 0u, NULL);
+}
+
+void wm_set_fullscreen(wm_window_t *win, bool enable) {
+    if (!win) return;
+    uint32_t args[2] = { (uint32_t)(uintptr_t)win, (uint32_t)enable };
+    ipo_syscall(IPO_SYSCALL_WM_SET_FULLSCREEN, 2u, args);
+}
+
+void wm_minimize(wm_window_t *win) {
+    wm_call_window(IPO_SYSCALL_WM_MINIMIZE, win);
+}
+
+void wm_restore(wm_window_t *win) {
+    wm_call_window(IPO_SYSCALL_WM_RESTORE, win);
+}
 void wm_toggle_maximize(wm_window_t *win) {
     if (!win) return;
     uint32_t args[1];
     args[0] = (uint32_t)(uintptr_t)win;
     ipo_syscall(IPO_SYSCALL_WM_TOGGLE_MAXIMIZE, 1u, args);
 }
-void wm_move(wm_window_t *win, int16_t nx, int16_t ny) { (void)win; (void)nx; (void)ny; }
+void wm_move(wm_window_t *win, int16_t nx, int16_t ny) {
+    if (!win) return;
+    uint32_t args[3] = { (uint32_t)(uintptr_t)win, (uint32_t)(int32_t)nx,
+                         (uint32_t)(int32_t)ny };
+    ipo_syscall(IPO_SYSCALL_WM_MOVE, 3u, args);
+}
 bool wm_resize(wm_window_t *win, uint16_t nw, uint16_t nh) {
     if (!win) return false;
     uint32_t args[3];
@@ -359,12 +396,37 @@ bool wm_resize(wm_window_t *win, uint16_t nw, uint16_t nh) {
     args[2] = (uint32_t)nh;
     return (bool)ipo_syscall(IPO_SYSCALL_WM_RESIZE, 3u, args);
 }
-void wm_set_title(wm_window_t *win, const char *title) { (void)win; (void)title; }
-void wm_set_shape(wm_window_t *win, const uint8_t *mask, uint16_t mw, uint16_t mh) { (void)win; (void)mask; (void)mw; (void)mh; }
-bool wm_dispatch_key(uint8_t scancode) { (void)scancode; return true; }
-void wm_compose(uint8_t *backbuf) { (void)backbuf; }
-void wm_compositor_tick(void) {}
-void wm_session_run(void) {}
+void wm_set_title(wm_window_t *win, const char *title) {
+    if (!win) return;
+    uint32_t args[2] = { (uint32_t)(uintptr_t)win, (uint32_t)(uintptr_t)title };
+    ipo_syscall(IPO_SYSCALL_WM_SET_TITLE, 2u, args);
+}
+
+void wm_set_shape(wm_window_t *win, const uint8_t *mask, uint16_t mw, uint16_t mh) {
+    if (!win) return;
+    uint32_t args[4] = { (uint32_t)(uintptr_t)win, (uint32_t)(uintptr_t)mask,
+                         (uint32_t)mw, (uint32_t)mh };
+    ipo_syscall(IPO_SYSCALL_WM_SET_SHAPE, 4u, args);
+}
+
+bool wm_dispatch_key(uint8_t scancode) {
+    uint32_t args[1] = { (uint32_t)scancode };
+    return ipo_syscall(IPO_SYSCALL_WM_DISPATCH_KEY, 1u, args) != 0;
+}
+
+void wm_compose(uint8_t *backbuf) {
+    if (!backbuf) return;
+    uint32_t args[1] = { (uint32_t)(uintptr_t)backbuf };
+    ipo_syscall(IPO_SYSCALL_WM_COMPOSE, 1u, args);
+}
+
+void wm_compositor_tick(void) {
+    ipo_syscall(IPO_SYSCALL_WM_COMPOSITOR_TICK, 0u, NULL);
+}
+
+void wm_session_run(void) {
+    ipo_syscall(IPO_SYSCALL_WM_SESSION_RUN, 0u, NULL);
+}
 
 wm_window_t *wm_register_window(const char *title, int16_t x, int16_t y, uint16_t w, uint16_t h,
                                   wm_draw_cb_t draw_cb, wm_event_cb_t event_cb, void *user_data) {
@@ -416,7 +478,7 @@ static bool wm_window_is_visible_for_fg(const wm_window_t *w) {
     if (!w) return false;
     if (!process_is_batch_active()) return true;
     if (!process_get_separate_windows()) return true; /* For single desktop batch: all windows visible */
-    process_t *fg = process_get_foreground();
+    process_t *fg = process_get_displayed_foreground();
     if (!fg) return false;
     if (w->owner_pid != 0) {
         process_t *owner = process_find_by_pid(w->owner_pid);
@@ -827,24 +889,81 @@ void wm_set_title(wm_window_t *win, const char *title) {
         win->title=kmalloc(tl+1);
         if (win->title) memcpy(win->title, title, tl+1);
     }
+    win->dirty = true;
 }
 
 void wm_set_shape(wm_window_t *win, const uint8_t *mask, uint16_t mw, uint16_t mh) {
     if (!win) return;
-    win->shape_mask=mask; win->mask_w=mw; win->mask_h=mh;
+    uint8_t *mask_copy = NULL;
+    if (mask && mw > 0 && mh > 0) {
+        size_t mask_size = (size_t)mw * mh;
+        mask_copy = kmalloc(mask_size);
+        if (!mask_copy) return;
+        memcpy(mask_copy, mask, mask_size);
+    }
+    if (win->shape_mask_owned && win->shape_mask) {
+        kfree((void *)win->shape_mask);
+    }
+    win->shape_mask = mask_copy;
+    win->mask_w = mask_copy ? mw : 0;
+    win->mask_h = mask_copy ? mh : 0;
+    win->shape_mask_owned = mask_copy != NULL;
+    win->dirty = true;
 }
 
 void wm_set_fullscreen(wm_window_t *win, bool enable) {
     if (!win || win->fullscreen==enable) return;
-    win->fullscreen=enable;
     if (enable) {
-        win->x=0; win->y=0;
-        if (win->framebuf_owned) {
-            uint8_t *nb=kmalloc(VGA_GFX_SIZE);
-            if (nb) { if(win->framebuf) kfree(win->framebuf); win->framebuf=nb; memset(nb,win->bg_color,VGA_GFX_SIZE); }
+        uint8_t *new_framebuf = kmalloc(VGA_GFX_SIZE);
+        if (!new_framebuf) return;
+        memset(new_framebuf, win->bg_color, VGA_GFX_SIZE);
+        if (win->framebuf) {
+            int copy_w = win->w < VGA_GFX_WIDTH ? win->w : VGA_GFX_WIDTH;
+            int copy_h = win->h < VGA_GFX_HEIGHT ? win->h : VGA_GFX_HEIGHT;
+            for (int y = 0; y < copy_h; y++) {
+                memcpy(new_framebuf + (size_t)y * VGA_GFX_WIDTH,
+                       win->framebuf + (size_t)y * win->w,
+                       (size_t)copy_w);
+            }
         }
-        win->w=VGA_GFX_WIDTH; win->h=VGA_GFX_HEIGHT;
+        win->fullscreen_saved_x = win->x;
+        win->fullscreen_saved_y = win->y;
+        win->fullscreen_saved_w = win->w;
+        win->fullscreen_saved_h = win->h;
+        if (win->framebuf_owned && win->framebuf) kfree(win->framebuf);
+        win->framebuf = new_framebuf;
+        win->framebuf_owned = true;
+        win->x = 0;
+        win->y = 0;
+        win->w = VGA_GFX_WIDTH;
+        win->h = VGA_GFX_HEIGHT;
+        win->fullscreen = true;
+    } else {
+        uint16_t width = win->fullscreen_saved_w ? win->fullscreen_saved_w : 80;
+        uint16_t height = win->fullscreen_saved_h ? win->fullscreen_saved_h : 50;
+        uint8_t *new_framebuf = kmalloc((size_t)width * height);
+        if (!new_framebuf) return;
+        memset(new_framebuf, win->bg_color, (size_t)width * height);
+        if (win->framebuf && win->w > 0 && win->h > 0) {
+            for (uint16_t y = 0; y < height; y++) {
+                uint16_t src_y = (uint16_t)(((uint32_t)y * win->h) / height);
+                for (uint16_t x = 0; x < width; x++) {
+                    uint16_t src_x = (uint16_t)(((uint32_t)x * win->w) / width);
+                    new_framebuf[(size_t)y * width + x] =
+                        win->framebuf[(size_t)src_y * win->w + src_x];
+                }
+            }
+        }
+        if (win->framebuf_owned && win->framebuf) kfree(win->framebuf);
+        win->framebuf = new_framebuf;
+        win->framebuf_owned = true;
+        win->x = win->fullscreen_saved_x;
+        win->y = win->fullscreen_saved_y;
+        win->w = width;
+        win->h = height;
+        win->fullscreen = false;
     }
+    win->dirty = true;
     wm_dispatch_window_event(win, WM_EVENT_RESIZE, 0);
 }
 
@@ -1357,11 +1476,15 @@ void wm_compositor_tick(void) {
     mouse_get_state(&ms);
     bool left_now = ms.left_button;
     bool right_now = ms.right_button;
+    bool left_pressed = left_now && !wm_prev_left;
+    bool right_pressed = right_now && !wm_prev_right;
+    wm_prev_left = left_now;
+    wm_prev_right = right_now;
 
     wm_window_t *top_win = wm_get_focused();
     bool top_fullscreen = (top_win && top_win->fullscreen && !top_win->minimized);
 
-    if (right_now && !wm_prev_right) {
+    if (right_pressed) {
         if (ms.y >= TASKBAR_Y && !top_fullscreen) {
             /* 1. Window tabs right-click (ПКМ - close clicked window directly!) */
             if (ms.x >= 54 && ms.x <= 182) {
@@ -1389,9 +1512,7 @@ void wm_compositor_tick(void) {
             }
         }
     }
-    wm_prev_right = right_now;
-
-    if (left_now && !wm_prev_left) {
+    if (left_pressed) {
         bool handled = false;
 
         /* 1. Check Taskbar */
@@ -1399,16 +1520,17 @@ void wm_compositor_tick(void) {
             /* Start / Exit button */
             if (ms.x >= 2 && ms.x <= 42) {
                 if (process_is_batch_active() && process_get_separate_windows()) {
-                    process_t *fg = process_get_foreground();
+                    process_t *fg = process_get_displayed_foreground();
                     if (fg) {
                         int wid = fg->window_id;
                         wm_window_t *w = wm_head;
                         while (w) {
                             wm_window_t *next = w->next;
-                            if (w->window_id == wid || (fg->pid && w->owner_pid == fg->pid)) {
+                            process_t *owner = w->owner_pid ? process_find_by_pid(w->owner_pid) : NULL;
+                            int window_id = owner ? owner->window_id : w->window_id;
+                            if (window_id == wid) {
                                 if (w->owner_pid) {
-                                    process_t *op = process_find_by_pid(w->owner_pid);
-                                    if (op) op->completed_and_acknowledged = true;
+                                    if (owner) owner->completed_and_acknowledged = true;
                                 }
                                 wm_destroy_window(w);
                             }
@@ -1429,7 +1551,7 @@ void wm_compositor_tick(void) {
                         return;
                     }
                 }
-                process_t *fg = process_get_foreground();
+                process_t *fg = process_get_displayed_foreground();
                 if (fg) {
                     fg->completed_and_acknowledged = true;
                 }
@@ -1639,29 +1761,9 @@ void wm_compositor_tick(void) {
         drag_win = NULL;
     }
 
-    bool mouse_clicked = (left_now != wm_prev_left);
-    wm_prev_left = left_now;
-
-    /* Check if anything needs recomposition / screen update */
-    static int prev_mx = -1, prev_my = -1;
-    static uint32_t last_clock_tick = 0;
-    uint32_t now_ms = timer_millis();
-    bool mouse_moved = (ms.x != prev_mx || ms.y != prev_my);
-    prev_mx = ms.x; prev_my = ms.y;
-
-    bool clock_tick = (now_ms - last_clock_tick >= 1000u);
-    if (clock_tick) last_clock_tick = now_ms;
-
-    bool any_dirty = mouse_moved || mouse_clicked || (drag_win != NULL) || clock_tick;
+    /* Keep invalidation state current, but redraw every compositor tick. */
     for (wm_window_t *w = wm_head; w; w = w->next) {
-        if (w->dirty) {
-            any_dirty = true;
-            w->dirty = false;
-        }
-    }
-
-    if (!any_dirty) {
-        return;
+        w->dirty = false;
     }
 
     if (!vga_is_graphics_mode()) {

@@ -15,6 +15,10 @@
 #include <vga.h>
 #include <vga_gfx.h>
 #include <wm.h>
+#include <net/dns.h>
+#include <net/icmp.h>
+#include <net/net.h>
+#include <net/socket.h>
 
 #define IPO_IDT_ENTRY_FLAGS 0xEEu
 #define IPO_KERNEL_CODE_SEG 0x08u
@@ -1488,12 +1492,234 @@ static uint32_t syscall_builtin_getpid(uint32_t num, uint32_t argc, uint32_t *ar
 
 static uint32_t syscall_builtin_time(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num;
+    timer_update();
     uint32_t secs = timer_seconds();
     if (argc >= 1u && argv != NULL && argv[0] != 0u) {
         uint32_t *out = (uint32_t *)(uintptr_t)argv[0];
         *out = secs;
     }
     return secs;
+}
+
+static uint32_t syscall_builtin_millis(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    timer_update();
+    return timer_millis();
+}
+
+static uint32_t syscall_builtin_elapsed_ms(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || argv == NULL) {
+        return 0u;
+    }
+    timer_update();
+    return timer_elapsed_ms(argv[0]);
+}
+
+static uint32_t syscall_builtin_timer_after(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 2u || argv == NULL) {
+        return 0u;
+    }
+    timer_update();
+    return (uint32_t)timer_after(argv[0], argv[1]);
+}
+
+static uint32_t syscall_builtin_net_dns_resolve(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 3u || !argv || !argv[0] || !argv[1]) {
+        return 0u;
+    }
+    char hostname[256];
+    const char *user_hostname = (const char *)(uintptr_t)argv[0];
+    size_t i = 0;
+    for (; i < sizeof(hostname) - 1u && user_hostname[i] != '\0'; i++) {
+        hostname[i] = user_hostname[i];
+    }
+    if (i == sizeof(hostname) - 1u && user_hostname[i] != '\0') {
+        return 0u;
+    }
+    hostname[i] = '\0';
+
+    ip4_addr_t resolved_ip;
+    if (!dns_resolve(hostname, &resolved_ip, argv[2])) {
+        return 0u;
+    }
+    *(ip4_addr_t *)(uintptr_t)argv[1] = resolved_ip;
+    return 1u;
+}
+
+static uint32_t syscall_builtin_net_icmp_send(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 6u || !argv || (argv[5] > 0u && !argv[4]) || argv[5] > UINT16_MAX) {
+        return (uint32_t)-1;
+    }
+    return (uint32_t)icmp_send_echo(argv[0], (uint16_t)argv[1], (uint16_t)argv[2],
+                                    (uint8_t)argv[3], (const void *)(uintptr_t)argv[4],
+                                    (uint16_t)argv[5]);
+}
+
+static uint32_t syscall_builtin_net_icmp_poll(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 4u || !argv || !argv[2]) {
+        return 0u;
+    }
+    return icmp_poll_reply((uint16_t)argv[0], (uint16_t)argv[1],
+                           (icmp_echo_reply_t *)(uintptr_t)argv[2], argv[3]) ? 1u : 0u;
+}
+
+static uint32_t syscall_builtin_net_socket(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 3u || !argv) {
+        return (uint32_t)-1;
+    }
+    return (uint32_t)socket((int)argv[0], (int)argv[1], (int)argv[2]);
+}
+
+static uint32_t syscall_builtin_net_bind(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 3u || !argv || !argv[1] || argv[2] < sizeof(struct sockaddr_in)) {
+        return (uint32_t)-1;
+    }
+    struct sockaddr_in address;
+    memcpy(&address, (const void *)(uintptr_t)argv[1], sizeof(address));
+    return (uint32_t)bind((int)argv[0], (const struct sockaddr *)&address, sizeof(address));
+}
+
+static uint32_t syscall_builtin_net_listen(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 2u || !argv) {
+        return (uint32_t)-1;
+    }
+    return (uint32_t)listen((int)argv[0], (int)argv[1]);
+}
+
+static uint32_t syscall_builtin_net_accept(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 4u || !argv) {
+        return (uint32_t)-1;
+    }
+    struct sockaddr_in address;
+    socklen_t address_len = sizeof(address);
+    int client_fd = accept_timeout((int)argv[0],
+                                   argv[1] ? (struct sockaddr *)&address : NULL,
+                                   argv[1] ? &address_len : NULL,
+                                   argv[3]);
+    if (client_fd >= 0 && argv[1]) {
+        memcpy((void *)(uintptr_t)argv[1], &address, sizeof(address));
+        if (argv[2]) {
+            *(socklen_t *)(uintptr_t)argv[2] = address_len;
+        }
+    }
+    return (uint32_t)client_fd;
+}
+
+static uint32_t syscall_builtin_net_connect(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 3u || !argv || !argv[1] || argv[2] < sizeof(struct sockaddr_in)) {
+        return (uint32_t)-1;
+    }
+    struct sockaddr_in address;
+    memcpy(&address, (const void *)(uintptr_t)argv[1], sizeof(address));
+    return (uint32_t)connect((int)argv[0], (const struct sockaddr *)&address, sizeof(address));
+}
+
+static uint32_t syscall_builtin_net_connect_endpoint(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 3u || !argv || !argv[1] || argv[2] > UINT16_MAX) {
+        return (uint32_t)-1;
+    }
+    char host[256];
+    const char *user_host = (const char *)(uintptr_t)argv[1];
+    size_t i = 0;
+    for (; i < sizeof(host) - 1u && user_host[i] != '\0'; i++) {
+        host[i] = user_host[i];
+    }
+    if (i == sizeof(host) - 1u && user_host[i] != '\0') {
+        return (uint32_t)-1;
+    }
+    host[i] = '\0';
+    return (uint32_t)connect_endpoint((int)argv[0], host, (uint16_t)argv[2]);
+}
+
+static uint32_t syscall_builtin_net_send(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 4u || !argv || !argv[1] || argv[2] == 0u) {
+        return (uint32_t)-1;
+    }
+    void *buffer = kmalloc(argv[2]);
+    if (!buffer) {
+        return (uint32_t)-1;
+    }
+    memcpy(buffer, (const void *)(uintptr_t)argv[1], argv[2]);
+    ssize_t result = send((int)argv[0], buffer, argv[2], (int)argv[3]);
+    kfree(buffer);
+    return (uint32_t)result;
+}
+
+static uint32_t syscall_builtin_net_recv(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 4u || !argv || !argv[1] || argv[2] == 0u) {
+        return (uint32_t)-1;
+    }
+    void *buffer = kmalloc(argv[2]);
+    if (!buffer) {
+        return (uint32_t)-1;
+    }
+    ssize_t result = recv((int)argv[0], buffer, argv[2], (int)argv[3]);
+    if (result > 0) {
+        memcpy((void *)(uintptr_t)argv[1], buffer, (size_t)result);
+    }
+    kfree(buffer);
+    return (uint32_t)result;
+}
+
+static uint32_t syscall_builtin_net_close(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv) {
+        return (uint32_t)-1;
+    }
+    return (uint32_t)socket_close((int)argv[0]);
+}
+
+static uint32_t syscall_builtin_net_poll(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    (void)argc;
+    (void)argv;
+    net_poll();
+    return 0u;
+}
+
+static uint32_t syscall_builtin_net_get_interface(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv || !argv[0]) {
+        return 0u;
+    }
+    net_if_t *netif = net_get_interface();
+    if (!netif) {
+        return 0u;
+    }
+    memcpy((void *)(uintptr_t)argv[0], netif, sizeof(*netif));
+    return 1u;
+}
+
+static uint32_t syscall_builtin_net_init(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv || !argv[0]) {
+        return 0u;
+    }
+    net_config_t config;
+    memcpy(&config, (const void *)(uintptr_t)argv[0], sizeof(config));
+    return net_init(&config) ? 1u : 0u;
+}
+
+static uint32_t syscall_builtin_net_set_ip(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 4u || !argv) {
+        return (uint32_t)-1;
+    }
+    net_set_ip(argv[0], argv[1], argv[2], argv[3]);
+    return 0u;
 }
 
 static uint32_t syscall_builtin_free(uint32_t num, uint32_t argc, uint32_t *argv) {
@@ -1617,6 +1843,117 @@ static uint32_t syscall_builtin_wm_resize(uint32_t num, uint32_t argc, uint32_t 
     (void)num; (void)argc;
     if (!argv || argc < 3 || !argv[0]) return 0;
     return wm_resize((wm_window_t *)(uintptr_t)argv[0], (uint16_t)argv[1], (uint16_t)argv[2]) ? 1u : 0u;
+}
+
+static wm_window_t *syscall_wm_window_arg(uint32_t argc, uint32_t *argv) {
+    if (argc < 1u || !argv || !argv[0]) return NULL;
+    wm_window_t *win = (wm_window_t *)(uintptr_t)argv[0];
+    return wm_is_window_valid(win) ? win : NULL;
+}
+
+static uint32_t syscall_builtin_wm_init(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    if (wm_get_window_count() == 0) wm_init();
+    return 0;
+}
+
+static uint32_t syscall_builtin_wm_invalidate_all(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    wm_invalidate_all();
+    return 0;
+}
+
+static uint32_t syscall_builtin_wm_set_fullscreen(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    wm_window_t *win = syscall_wm_window_arg(argc, argv);
+    if (win && argc >= 2u) wm_set_fullscreen(win, argv[1] != 0u);
+    return 0;
+}
+
+static uint32_t syscall_builtin_wm_minimize(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    wm_window_t *win = syscall_wm_window_arg(argc, argv);
+    if (win) wm_minimize(win);
+    return 0;
+}
+
+static uint32_t syscall_builtin_wm_restore(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    wm_window_t *win = syscall_wm_window_arg(argc, argv);
+    if (win) wm_restore(win);
+    return 0;
+}
+
+static uint32_t syscall_builtin_wm_move(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    wm_window_t *win = syscall_wm_window_arg(argc, argv);
+    if (win && argc >= 3u) {
+        wm_move(win, (int16_t)argv[1], (int16_t)argv[2]);
+    }
+    return 0;
+}
+
+static uint32_t syscall_builtin_wm_set_title(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    wm_window_t *win = syscall_wm_window_arg(argc, argv);
+    if (win && argc >= 2u) {
+        wm_set_title(win, (const char *)(uintptr_t)argv[1]);
+    }
+    return 0;
+}
+
+static uint32_t syscall_builtin_wm_set_shape(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    wm_window_t *win = syscall_wm_window_arg(argc, argv);
+    if (win && argc >= 4u) {
+        wm_set_shape(win, (const uint8_t *)(uintptr_t)argv[1],
+                     (uint16_t)argv[2], (uint16_t)argv[3]);
+    }
+    return 0;
+}
+
+static uint32_t syscall_builtin_wm_dispatch_key(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv) return 0;
+    return wm_dispatch_key((uint8_t)argv[0]) ? 1u : 0u;
+}
+
+static uint32_t syscall_builtin_wm_compose(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc >= 1u && argv && argv[0]) {
+        wm_compose((uint8_t *)(uintptr_t)argv[0]);
+    }
+    return 0;
+}
+
+static uint32_t syscall_builtin_wm_compositor_tick(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    wm_compositor_tick();
+    return 0;
+}
+
+static uint32_t syscall_builtin_wm_session_run(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    wm_session_run();
+    return 0;
+}
+
+static uint32_t syscall_builtin_wm_get_count_for_pid(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv) return 0;
+    return (uint32_t)wm_get_window_count_for_pid(argv[0]);
+}
+
+static uint32_t syscall_builtin_wm_has_windows_for_pid(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv) return 0;
+    return wm_has_windows_for_pid(argv[0]) ? 1u : 0u;
+}
+
+static uint32_t syscall_builtin_wm_focus_window_for_pid(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc >= 1u && argv) wm_focus_window_for_pid(argv[0]);
+    return 0;
 }
 
 static uint32_t syscall_builtin_process_yield(uint32_t num, uint32_t argc, uint32_t *argv) {
@@ -1822,6 +2159,46 @@ void syscall_init(void) {
         syscall_builtin_time);
 
     ipo_register_syscall(
+        IPO_SYSCALL_MILLIS,
+        syscall_builtin_millis);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_ELAPSED_MS,
+        syscall_builtin_elapsed_ms);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_TIMER_AFTER,
+        syscall_builtin_timer_after);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_NET_DNS_RESOLVE,
+        syscall_builtin_net_dns_resolve);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_NET_ICMP_SEND,
+        syscall_builtin_net_icmp_send);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_NET_ICMP_POLL,
+        syscall_builtin_net_icmp_poll);
+
+    ipo_register_syscall(IPO_SYSCALL_NET_SOCKET, syscall_builtin_net_socket);
+    ipo_register_syscall(IPO_SYSCALL_NET_BIND, syscall_builtin_net_bind);
+    ipo_register_syscall(IPO_SYSCALL_NET_LISTEN, syscall_builtin_net_listen);
+    ipo_register_syscall(IPO_SYSCALL_NET_ACCEPT, syscall_builtin_net_accept);
+    ipo_register_syscall(IPO_SYSCALL_NET_CONNECT, syscall_builtin_net_connect);
+    ipo_register_syscall(IPO_SYSCALL_NET_SEND, syscall_builtin_net_send);
+    ipo_register_syscall(IPO_SYSCALL_NET_RECV, syscall_builtin_net_recv);
+    ipo_register_syscall(IPO_SYSCALL_NET_CLOSE, syscall_builtin_net_close);
+    ipo_register_syscall(IPO_SYSCALL_NET_CONNECT_ENDPOINT,
+                         syscall_builtin_net_connect_endpoint);
+    ipo_register_syscall(IPO_SYSCALL_NET_POLL, syscall_builtin_net_poll);
+    ipo_register_syscall(IPO_SYSCALL_NET_GET_INTERFACE,
+                         syscall_builtin_net_get_interface);
+    ipo_register_syscall(IPO_SYSCALL_NET_INIT, syscall_builtin_net_init);
+    ipo_register_syscall(IPO_SYSCALL_NET_SET_IP, syscall_builtin_net_set_ip);
+
+    ipo_register_syscall(
         IPO_SYSCALL_FREE,
         syscall_builtin_free);
 
@@ -1980,6 +2357,22 @@ void syscall_init(void) {
     ipo_register_syscall(
         IPO_SYSCALL_WM_RESIZE,
         syscall_builtin_wm_resize);
+
+    ipo_register_syscall(IPO_SYSCALL_WM_INIT, syscall_builtin_wm_init);
+    ipo_register_syscall(IPO_SYSCALL_WM_INVALIDATE_ALL, syscall_builtin_wm_invalidate_all);
+    ipo_register_syscall(IPO_SYSCALL_WM_SET_FULLSCREEN, syscall_builtin_wm_set_fullscreen);
+    ipo_register_syscall(IPO_SYSCALL_WM_MINIMIZE, syscall_builtin_wm_minimize);
+    ipo_register_syscall(IPO_SYSCALL_WM_RESTORE, syscall_builtin_wm_restore);
+    ipo_register_syscall(IPO_SYSCALL_WM_MOVE, syscall_builtin_wm_move);
+    ipo_register_syscall(IPO_SYSCALL_WM_SET_TITLE, syscall_builtin_wm_set_title);
+    ipo_register_syscall(IPO_SYSCALL_WM_SET_SHAPE, syscall_builtin_wm_set_shape);
+    ipo_register_syscall(IPO_SYSCALL_WM_DISPATCH_KEY, syscall_builtin_wm_dispatch_key);
+    ipo_register_syscall(IPO_SYSCALL_WM_COMPOSE, syscall_builtin_wm_compose);
+    ipo_register_syscall(IPO_SYSCALL_WM_COMPOSITOR_TICK, syscall_builtin_wm_compositor_tick);
+    ipo_register_syscall(IPO_SYSCALL_WM_SESSION_RUN, syscall_builtin_wm_session_run);
+    ipo_register_syscall(IPO_SYSCALL_WM_GET_COUNT_PID, syscall_builtin_wm_get_count_for_pid);
+    ipo_register_syscall(IPO_SYSCALL_WM_HAS_WINDOWS_PID, syscall_builtin_wm_has_windows_for_pid);
+    ipo_register_syscall(IPO_SYSCALL_WM_FOCUS_PID, syscall_builtin_wm_focus_window_for_pid);
 
     ipo_register_syscall(
         IPO_SYSCALL_GETPID,

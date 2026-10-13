@@ -124,7 +124,16 @@ void kmain(void) {
 
     mouse_init();
 
-    net_init();
+    const net_config_t net_config = {
+        .icmp_queue_capacity = 8,
+        .arp_table_capacity = 16,
+        .udp_sockets_capacity = 16,
+        .dns_queue_capacity = 8,
+        .loopback_queue_capacity = 4
+    };
+    if (!net_init(&net_config)) {
+        printf("[net] Failed to initialize network buffers\n");
+    }
 
     driver_init_system_drivers();
 

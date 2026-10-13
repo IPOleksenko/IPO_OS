@@ -2,6 +2,22 @@
 
 lib: $(LIB_A) $(USER_LIBC_A) $(USER_LIBM_A) $(USER_LIBCXX_A) $(USER_CRT0) $(USER_CRTI) $(USER_CRTN) build/lib/crt1.o build/lib/libtcc1.a
 
+APP_LIB_A := $(LIB_BUILD_DIR)/libapp.a
+APP_LIB_OBJS := $(filter-out \
+	$(BUILD)/kernel/kernel/syscall/syscall.o \
+	$(BUILD)/kernel/net/net.o \
+	$(BUILD)/kernel/net/socket.o \
+	$(BUILD)/kernel/net/tcp.o \
+	$(BUILD)/kernel/net/udp.o \
+	$(BUILD)/kernel/net/arp.o \
+	$(BUILD)/kernel/net/dns.o \
+	$(BUILD)/kernel/net/icmp.o \
+	$(BUILD)/kernel/net/ipv4.o \
+	$(BUILD)/kernel/net/ethernet.o \
+	$(BUILD)/kernel/net/loopback.o \
+	$(BUILD)/kernel/drivers/net/rtl8139.o, \
+	$(LIB_OBJS))
+
 USER_LIBC_OBJS := \
 	$(LIB_BUILD_DIR)/libc/string.o \
 	$(LIB_BUILD_DIR)/libc/unistd.o \
@@ -73,6 +89,11 @@ $(LIB_A): $(LIB_OBJS)
 	rm -f $@
 	$(AR) rcs $@ $^
 
+$(APP_LIB_A): $(APP_LIB_OBJS)
+	@mkdir -p $(dir $@)
+	rm -f $@
+	$(AR) rcs $@ $^
+
 clean-lib:
 	rm -rf $(LIB_BUILD_DIR)
-	rm -f $(LIB_A) $(USER_LIBC_A) $(USER_LIBM_A) $(USER_LIBCXX_A)
+	rm -f $(LIB_A) $(APP_LIB_A) $(USER_LIBC_A) $(USER_LIBM_A) $(USER_LIBCXX_A)

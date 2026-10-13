@@ -11,7 +11,9 @@
 
 void icmp_init(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
-    memset(ctx->icmp_queue, 0, sizeof(ctx->icmp_queue));
+    if (ctx->icmp_queue_capacity > 0) {
+        memset(ctx->icmp_queue, 0, ctx->icmp_queue_capacity * sizeof(*ctx->icmp_queue));
+    }
     ctx->icmp_q_idx = 0;
 }
 
@@ -75,7 +77,10 @@ void icmp_receive(ip4_addr_t src_ip, uint8_t ttl, const void *data, uint16_t len
         
         /* Store reply in circular queue */
         net_shared_ctx_t *ctx = net_get_shared_context();
-        uint8_t q_idx = ctx->icmp_q_idx;
+        if (ctx->icmp_queue_capacity == 0) {
+            return;
+        }
+        size_t q_idx = ctx->icmp_q_idx;
         icmp_echo_reply_t *slot = &ctx->icmp_queue[q_idx];
         slot->src_ip = src_ip;
         slot->ttl = ttl;
@@ -94,7 +99,7 @@ void icmp_receive(ip4_addr_t src_ip, uint8_t ttl, const void *data, uint16_t len
             memcpy(slot->data, (const uint8_t *)data + sizeof(icmp_header_t), payload_len);
         }
 
-        ctx->icmp_q_idx = (q_idx + 1) % ICMP_QUEUE_SIZE;
+        ctx->icmp_q_idx = (q_idx + 1) % ctx->icmp_queue_capacity;
     }
 }
 
@@ -105,7 +110,7 @@ bool icmp_poll_reply(uint16_t id, uint16_t seq, icmp_echo_reply_t *out_reply, ui
         net_poll();
 
         net_shared_ctx_t *ctx = net_get_shared_context();
-        for (int i = 0; i < ICMP_QUEUE_SIZE; i++) {
+        for (size_t i = 0; i < ctx->icmp_queue_capacity; i++) {
             if (ctx->icmp_queue[i].id == id && ctx->icmp_queue[i].seq == seq) {
                 if (out_reply) {
                     memcpy(out_reply, &ctx->icmp_queue[i], sizeof(icmp_echo_reply_t));

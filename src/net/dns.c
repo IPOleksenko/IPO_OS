@@ -74,11 +74,14 @@ void dns_process_response_packet(const void *data, uint16_t len) {
             /* Type A, Class IN, 4 bytes IPv4 */
             ip4_addr_t resolved_ip = IP4_ADDR(p[0], p[1], p[2], p[3]);
             net_shared_ctx_t *ctx = net_get_shared_context();
-            uint8_t slot = ctx->dns_q_idx % DNS_QUEUE_SIZE;
+            if (ctx->dns_queue_capacity == 0) {
+                return;
+            }
+            size_t slot = ctx->dns_q_idx % ctx->dns_queue_capacity;
             ctx->dns_queue[slot].id = ntohs(hdr->id);
             ctx->dns_queue[slot].ip = resolved_ip;
             ctx->dns_queue[slot].valid = true;
-            ctx->dns_q_idx = (slot + 1) % DNS_QUEUE_SIZE;
+            ctx->dns_q_idx = (slot + 1) % ctx->dns_queue_capacity;
             return;
         }
 
@@ -157,7 +160,7 @@ bool dns_resolve(const char *hostname, ip4_addr_t *out_ip, uint32_t timeout_ms) 
         net_poll();
 
         net_shared_ctx_t *ctx = net_get_shared_context();
-        for (int i = 0; i < DNS_QUEUE_SIZE; i++) {
+        for (size_t i = 0; i < ctx->dns_queue_capacity; i++) {
             if (ctx->dns_queue[i].valid && ctx->dns_queue[i].id == query_id) {
                 *out_ip = ctx->dns_queue[i].ip;
                 ctx->dns_queue[i].valid = false;
@@ -181,11 +184,6 @@ bool dns_resolve(const char *hostname, ip4_addr_t *out_ip, uint32_t timeout_ms) 
 
         ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
         io_wait();
-    }
-
-    if (strcmp(hostname, "google.com") == 0 || strcmp(hostname, "www.google.com") == 0) {
-        *out_ip = IP4_ADDR(142, 250, 180, 206);
-        return true;
     }
 
     return false;

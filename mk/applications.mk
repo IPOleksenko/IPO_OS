@@ -11,6 +11,13 @@ APP_ENTRY_OBJ   := $(APPS_BUILD)/entry.o
 APP_PRINTF_OBJ  := $(APPS_BUILD)/app_printf.o
 APP_KMALLOC_OBJ := $(APPS_BUILD)/app_kmalloc.o
 APP_WM_OBJ      := $(APPS_BUILD)/app_wm.o
+APP_TIMER_OBJ   := $(APPS_BUILD)/app_timer.o
+APP_NET_SOCKET_OBJ := $(APPS_BUILD)/app_net_socket.o
+APP_NET_API_OBJ := $(APPS_BUILD)/app_net_api.o
+APP_SYSCALL_OBJ := $(APPS_BUILD)/app_syscall.o
+
+NETWORK_APPS := hosting_client hosting_server browser
+NETWORK_APP_BINS := $(foreach app,$(NETWORK_APPS),$(APPS_BUILD)/$(app)/$(notdir $(app)).bin)
 
 # Applications are compiled as Position Independent Code (PIC).
 # This allows them to run from any memory address dynamically allocated
@@ -56,6 +63,24 @@ $(APP_WM_OBJ): src/drivers/video/wm.c
 	@mkdir -p $(dir $@)
 	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS) -DIPO_APP
 
+$(APP_TIMER_OBJ): src/kernel/arch/x86/timer.c
+	@mkdir -p $(dir $@)
+	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS) -DIPO_APP
+
+$(APP_NET_SOCKET_OBJ): src/userland/lib/net_socket.c
+	@mkdir -p $(dir $@)
+	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS)
+
+$(APP_NET_API_OBJ): src/userland/lib/net_api.c
+	@mkdir -p $(dir $@)
+	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS)
+
+$(APP_SYSCALL_OBJ): src/userland/lib/syscall.c
+	@mkdir -p $(dir $@)
+	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS)
+
+$(NETWORK_APP_BINS): $(APP_NET_SOCKET_OBJ)
+
 $(APPS_BUILD)/tcc/setjmp.o: $(APPS_DIR)/tcc/setjmp.s
 	@mkdir -p $(dir $@)
 	$(ASM) -f elf32 $< -o $@
@@ -68,11 +93,11 @@ $(APPS_BUILD)/tcc/tcc.o: $(APPS_DIR)/tcc/tcc.c $(APPS_DIR)/tcc/libtcc.c $(APPS_D
 	@mkdir -p $(dir $@)
 	$(CC) -c $< -o $@ -std=gnu11 $(TCC_CFLAGS)
 
-$(APPS_BUILD)/tcc/tcc.bin: $(APPS_BUILD)/tcc/tcc.o $(APPS_BUILD)/tcc/libc_shim.o $(APPS_BUILD)/tcc/setjmp.o $(APP_ENTRY_OBJ) $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) $(LIB_A)
+$(APPS_BUILD)/tcc/tcc.bin: $(APPS_BUILD)/tcc/tcc.o $(APPS_BUILD)/tcc/libc_shim.o $(APPS_BUILD)/tcc/setjmp.o $(APP_ENTRY_OBJ) $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) $(APP_TIMER_OBJ) $(APP_SYSCALL_OBJ) $(APP_NET_API_OBJ) $(APP_LIB_A)
 	@mkdir -p $(dir $@)
 	@echo "[applications] Building official TinyCC: $(APPS_DIR)/tcc/tcc.c → $@"
 	@$(CC) $(APPS_CFLAGS) -Wl,-T,$(APPS_DIR)/app.ld \
-		$(APP_ENTRY_OBJ) $(APPS_BUILD)/tcc/tcc.o $(APPS_BUILD)/tcc/libc_shim.o $(APPS_BUILD)/tcc/setjmp.o $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) -Wl,--start-group $(LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
+		$(APP_ENTRY_OBJ) $(APPS_BUILD)/tcc/tcc.o $(APPS_BUILD)/tcc/libc_shim.o $(APPS_BUILD)/tcc/setjmp.o $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) $(APP_TIMER_OBJ) $(APP_SYSCALL_OBJ) $(APP_NET_API_OBJ) -Wl,--start-group $(APP_LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
 	@$(OBJCOPY) --set-section-flags .bss=alloc,load,contents \
 		-j .text -j .rodata -j .data -j .bss -O binary $@.elf $@
 	@rm -f $@.elf
@@ -107,11 +132,11 @@ $(APPS_BUILD)/browser/crc32.o: $(APPS_DIR)/micropython/lib/uzlib/crc32.c
 	@mkdir -p $(dir $@)
 	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS)
 
-$(APPS_BUILD)/browser/browser.bin: $(BROWSER_OBJS) $(APP_ENTRY_OBJ) $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) $(APP_WM_OBJ) $(LIB_A)
+$(APPS_BUILD)/browser/browser.bin: $(BROWSER_OBJS) $(APP_ENTRY_OBJ) $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) $(APP_WM_OBJ) $(APP_TIMER_OBJ) $(APP_SYSCALL_OBJ) $(APP_NET_API_OBJ) $(APP_NET_SOCKET_OBJ) $(APP_LIB_A)
 	@mkdir -p $(dir $@)
 	@echo "[applications] Building Web Browser: $(APPS_DIR)/browser → $@"
 	@$(CC) $(APPS_CFLAGS) -Wl,-T,$(APPS_DIR)/app.ld \
-		$(APP_ENTRY_OBJ) $(BROWSER_OBJS) $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) $(APP_WM_OBJ) -Wl,--start-group $(LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
+		$(APP_ENTRY_OBJ) $(BROWSER_OBJS) $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) $(APP_WM_OBJ) $(APP_TIMER_OBJ) $(APP_SYSCALL_OBJ) $(APP_NET_API_OBJ) $(APP_NET_SOCKET_OBJ) -Wl,--start-group $(APP_LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
 	@$(OBJCOPY) --set-section-flags .bss=alloc,load,contents \
 		-j .text -j .rodata -j .data -j .bss -O binary $@.elf $@
 	@rm -f $@.elf
@@ -212,13 +237,13 @@ $(APPS_BUILD)/doom/%.o: $(APPS_DIR)/doom/%.c
 	@mkdir -p $(dir $@)
 	$(CC) -c $< -o $@ $(DOOM_CFLAGS)
 
-$(APPS_BUILD)/doom/doom.bin: $(DOOM_OBJS) $(APP_ENTRY_OBJ) $(LIB_A)
+$(APPS_BUILD)/doom/doom.bin: $(DOOM_OBJS) $(APP_ENTRY_OBJ) $(APP_TIMER_OBJ) $(APP_SYSCALL_OBJ) $(APP_NET_API_OBJ) $(APP_LIB_A)
 	@mkdir -p $(dir $@)
 	@echo "[applications] Building DOOM: $(DOOM_DIR) → $@"
 	@$(CC) $(DOOM_CFLAGS) -Wl,-T,$(APPS_DIR)/app.ld \
-		$(APP_ENTRY_OBJ) $(DOOM_OBJS) \
+		$(APP_ENTRY_OBJ) $(DOOM_OBJS) $(APP_TIMER_OBJ) $(APP_SYSCALL_OBJ) $(APP_NET_API_OBJ) \
 		-Wl,--allow-multiple-definition \
-		-Wl,--start-group build/lib/libc.a build/lib/libm.a $(LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
+		-Wl,--start-group build/lib/libc.a build/lib/libm.a $(APP_LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
 	@$(OBJCOPY) --set-section-flags .bss=alloc,load,contents \
 		-j .text -j .rodata -j .data -j .bss -O binary $@.elf $@
 	@rm -f $@.elf
@@ -232,11 +257,11 @@ $(APPS_BUILD)/%.o: $(APPS_DIR)/%.c
 	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS)
 
 # Rule: Create executable binary from object file
-$(APPS_BUILD)/%.bin: $(APPS_BUILD)/%.o $(APP_ENTRY_OBJ) $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) $(APP_WM_OBJ) $(LIB_A)
+$(APPS_BUILD)/%.bin: $(APPS_BUILD)/%.o $(APP_ENTRY_OBJ) $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) $(APP_WM_OBJ) $(APP_TIMER_OBJ) $(APP_SYSCALL_OBJ) $(APP_NET_API_OBJ) $(APP_LIB_A)
 	@mkdir -p $(dir $@)
 	@echo "[applications] Building: $*.c → $@"
 	@$(CC) $(APPS_CFLAGS) -Wl,-T,$(APPS_DIR)/app.ld \
-		$(APP_ENTRY_OBJ) $< $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) $(APP_WM_OBJ) -Wl,--start-group $(LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
+		$(APP_ENTRY_OBJ) $< $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) $(APP_WM_OBJ) $(APP_TIMER_OBJ) $(APP_SYSCALL_OBJ) $(APP_NET_API_OBJ) $(if $(filter $(notdir $(@D)),$(NETWORK_APPS)),$(APP_NET_SOCKET_OBJ),) -Wl,--start-group $(APP_LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
 	@$(OBJCOPY) --set-section-flags .bss=alloc,load,contents \
 		-j .text -j .rodata -j .data -j .bss -O binary $@.elf $@
 	@rm -f $@.elf
@@ -251,4 +276,3 @@ clean-applications:
 clean-apps: clean-applications
 
 clean: clean-applications
-

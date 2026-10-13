@@ -15,7 +15,7 @@ static const mac_addr_t broadcast_mac = {
 static void arp_cache_prune(void) {
     uint32_t now = timer_millis();
     net_shared_ctx_t *ctx = net_get_shared_context();
-    for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+    for (size_t i = 0; i < ctx->arp_table_capacity; i++) {
         if (ctx->arp_table[i].in_use && (now - ctx->arp_table[i].last_seen_ms >= ARP_ENTRY_TIMEOUT_MS)) {
             ctx->arp_table[i].in_use = false;
         }
@@ -32,7 +32,7 @@ static void arp_cache_insert(ip4_addr_t ip, const mac_addr_t *mac) {
     net_shared_ctx_t *ctx = net_get_shared_context();
 
     /* 1. Update existing entry if present */
-    for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+    for (size_t i = 0; i < ctx->arp_table_capacity; i++) {
         if (ctx->arp_table[i].in_use && ctx->arp_table[i].ip == ip) {
             memcpy(&ctx->arp_table[i].mac, mac, sizeof(mac_addr_t));
             ctx->arp_table[i].last_seen_ms = now;
@@ -41,8 +41,8 @@ static void arp_cache_insert(ip4_addr_t ip, const mac_addr_t *mac) {
     }
 
     /* 2. Find free slot */
-    int slot = -1;
-    for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+    size_t slot = ctx->arp_table_capacity;
+    for (size_t i = 0; i < ctx->arp_table_capacity; i++) {
         if (!ctx->arp_table[i].in_use) {
             slot = i;
             break;
@@ -50,10 +50,13 @@ static void arp_cache_insert(ip4_addr_t ip, const mac_addr_t *mac) {
     }
 
     /* 3. If full, find oldest slot to replace */
-    if (slot < 0) {
+    if (slot == ctx->arp_table_capacity) {
+        if (ctx->arp_table_capacity == 0) {
+            return;
+        }
         uint32_t oldest_time = 0xFFFFFFFF;
         slot = 0;
-        for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+        for (size_t i = 0; i < ctx->arp_table_capacity; i++) {
             if (ctx->arp_table[i].last_seen_ms < oldest_time) {
                 oldest_time = ctx->arp_table[i].last_seen_ms;
                 slot = i;
@@ -71,7 +74,7 @@ static bool arp_cache_lookup(ip4_addr_t ip, mac_addr_t *out_mac) {
     arp_cache_prune();
     net_shared_ctx_t *ctx = net_get_shared_context();
 
-    for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+    for (size_t i = 0; i < ctx->arp_table_capacity; i++) {
         if (ctx->arp_table[i].in_use && ctx->arp_table[i].ip == ip) {
             if (out_mac) {
                 memcpy(out_mac, &ctx->arp_table[i].mac, sizeof(mac_addr_t));
@@ -84,7 +87,9 @@ static bool arp_cache_lookup(ip4_addr_t ip, mac_addr_t *out_mac) {
 
 void arp_init(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
-    memset(ctx->arp_table, 0, sizeof(ctx->arp_table));
+    if (ctx->arp_table_capacity > 0) {
+        memset(ctx->arp_table, 0, ctx->arp_table_capacity * sizeof(*ctx->arp_table));
+    }
 }
 
 void arp_send_request(ip4_addr_t target_ip) {

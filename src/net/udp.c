@@ -6,20 +6,22 @@
 
 void udp_init(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
-    memset(ctx->udp_table, 0, sizeof(ctx->udp_table));
+    if (ctx->udp_table_capacity > 0) {
+        memset(ctx->udp_table, 0, ctx->udp_table_capacity * sizeof(*ctx->udp_table));
+    }
 }
 
 bool udp_bind(uint16_t port, udp_callback_t callback) {
     net_shared_ctx_t *ctx = net_get_shared_context();
 
-    for (int i = 0; i < UDP_SOCKETS_MAX; i++) {
+    for (size_t i = 0; i < ctx->udp_table_capacity; i++) {
         if (ctx->udp_table[i].in_use && ctx->udp_table[i].port == port) {
             ctx->udp_table[i].callback = callback;
             return true;
         }
     }
 
-    for (int i = 0; i < UDP_SOCKETS_MAX; i++) {
+    for (size_t i = 0; i < ctx->udp_table_capacity; i++) {
         if (!ctx->udp_table[i].in_use) {
             ctx->udp_table[i].port = port;
             ctx->udp_table[i].callback = callback;
@@ -33,7 +35,7 @@ bool udp_bind(uint16_t port, udp_callback_t callback) {
 
 void udp_unbind(uint16_t port) {
     net_shared_ctx_t *ctx = net_get_shared_context();
-    for (int i = 0; i < UDP_SOCKETS_MAX; i++) {
+    for (size_t i = 0; i < ctx->udp_table_capacity; i++) {
         if (ctx->udp_table[i].in_use && ctx->udp_table[i].port == port) {
             ctx->udp_table[i].in_use = false;
             ctx->udp_table[i].callback = NULL;
@@ -90,7 +92,7 @@ void udp_receive(ip4_addr_t src_ip, const void *data, uint16_t len) {
     }
 
     net_shared_ctx_t *ctx = net_get_shared_context();
-    for (int i = 0; i < UDP_SOCKETS_MAX; i++) {
+    for (size_t i = 0; i < ctx->udp_table_capacity; i++) {
         if (ctx->udp_table[i].in_use && ctx->udp_table[i].port == dst_port) {
             if (ctx->udp_table[i].callback) {
                 ctx->udp_table[i].callback(src_ip, src_port, payload, payload_len);

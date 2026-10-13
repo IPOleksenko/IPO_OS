@@ -6,7 +6,6 @@
 #include <stddef.h>
 
 #define IPO_FS_BLOCK_SIZE 512
-#define IPO_FS_MAX_NAME 64
 #define IPO_FS_MAGIC_STR "IPO_FS"
 
 #define IPO_INODE_EXTENTS 4

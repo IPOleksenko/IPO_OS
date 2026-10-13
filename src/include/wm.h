@@ -129,6 +129,8 @@ struct wm_window {
     bool     maximized;
     int16_t  saved_x, saved_y;
     uint16_t saved_w, saved_h;
+    int16_t  fullscreen_saved_x, fullscreen_saved_y;
+    uint16_t fullscreen_saved_w, fullscreen_saved_h;
 
     char *title;
 
@@ -143,7 +145,7 @@ struct wm_window {
 
     const uint8_t *shape_mask;
     uint16_t mask_w, mask_h;
-    bool     shape_mask_owned;  /* true if shape_mask was kmalloc'd by wm_create_window */
+    bool     shape_mask_owned;  /* true if the WM owns a copied shape mask */
 
     wm_draw_cb_t  draw_cb;
     wm_event_cb_t event_cb;

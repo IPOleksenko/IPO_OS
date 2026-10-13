@@ -55,10 +55,42 @@ static void wait_with_interrupt(uint32_t wait_ms) {
         if (check_user_interrupted()) {
             return;
         }
-        net_poll();
         ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
         io_wait();
     }
+}
+
+static bool ping_resolve(const char *hostname, ip4_addr_t *out_ip, uint32_t timeout_ms) {
+    uint32_t args[3] = {
+        (uint32_t)(uintptr_t)hostname,
+        (uint32_t)(uintptr_t)out_ip,
+        timeout_ms
+    };
+    return ipo_syscall(IPO_SYSCALL_NET_DNS_RESOLVE, 3u, args) != 0;
+}
+
+static int ping_send_echo(ip4_addr_t dst_ip, uint16_t id, uint16_t seq,
+                          uint8_t ttl, const void *payload, uint16_t len) {
+    uint32_t args[6] = {
+        dst_ip,
+        id,
+        seq,
+        ttl,
+        (uint32_t)(uintptr_t)payload,
+        len
+    };
+    return ipo_syscall(IPO_SYSCALL_NET_ICMP_SEND, 6u, args);
+}
+
+static bool ping_poll_reply(uint16_t id, uint16_t seq, icmp_echo_reply_t *reply,
+                            uint32_t timeout_ms) {
+    uint32_t args[4] = {
+        id,
+        seq,
+        (uint32_t)(uintptr_t)reply,
+        timeout_ms
+    };
+    return ipo_syscall(IPO_SYSCALL_NET_ICMP_POLL, 4u, args) != 0;
 }
 
 int main(int argc, char **argv) {
@@ -139,12 +171,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Initialize network stack */
-    net_init();
-
     /* Resolve destination to IPv4 */
     ip4_addr_t dest_ip = 0;
-    if (!dns_resolve(dest_name, &dest_ip, 3000)) {
+    if (!ping_resolve(dest_name, &dest_ip, 3000)) {
         printf("ping: %s: Name or service not known\n", dest_name);
         return 2;
     }
@@ -182,14 +211,14 @@ int main(int argc, char **argv) {
         uint64_t tsc_start = read_tsc();
         transmitted++;
 
-        int send_err = icmp_send_echo(dest_ip, ping_id, seq, ttl, payload, (uint16_t)packet_size);
+        int send_err = ping_send_echo(dest_ip, ping_id, seq, ttl, payload, (uint16_t)packet_size);
         if (send_err < 0) {
             if (!quiet) {
                 printf("From %s icmp_seq=%u Destination Host Unreachable\n", ip_str, (unsigned int)seq);
             }
         } else {
             icmp_echo_reply_t reply;
-            bool ok = icmp_poll_reply(ping_id, seq, &reply, timeout_ms);
+            bool ok = ping_poll_reply(ping_id, seq, &reply, timeout_ms);
             uint64_t tsc_end = read_tsc();
 
             if (ok && reply.type == ICMP_TYPE_ECHO_REPLY) {

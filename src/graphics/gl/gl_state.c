@@ -75,6 +75,26 @@ void glGetBooleanv(GLenum pname, GLboolean *params) {
     *params = glIsEnabled(pname);
 }
 
-void glFlush(void) {}
-void glFinish(void) {}
+void glFlush(void) {
+    GLContext *ctx = gl_get_current_context();
+    if (!ctx) return;
+    if (ctx->in_begin) {
+        if (ctx->error_flag == GL_NO_ERROR) ctx->error_flag = GL_INVALID_OPERATION;
+        return;
+    }
 
+    /* The software rasterizer executes every command synchronously. */
+    __sync_synchronize();
+}
+
+void glFinish(void) {
+    GLContext *ctx = gl_get_current_context();
+    if (!ctx) return;
+    if (ctx->in_begin) {
+        if (ctx->error_flag == GL_NO_ERROR) ctx->error_flag = GL_INVALID_OPERATION;
+        return;
+    }
+
+    /* Rendering is immediate; the full barrier makes framebuffer writes visible. */
+    __sync_synchronize();
+}

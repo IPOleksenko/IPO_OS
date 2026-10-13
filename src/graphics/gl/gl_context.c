@@ -167,6 +167,7 @@ void gl_destroy_context(GLContext *ctx) {
     gl_matrix_free_stack(&ctx->texture_stack);
 
     if (ctx->vert_buf.data) kfree(ctx->vert_buf.data);
+    if (ctx->clip_buf) kfree(ctx->clip_buf);
 
     if (ctx->textures) {
         for (int i = 0; i < ctx->texture_count; i++) {
@@ -417,4 +418,3 @@ GLboolean glIsEnabled(GLenum cap) {
             return GL_FALSE;
     }
 }
-

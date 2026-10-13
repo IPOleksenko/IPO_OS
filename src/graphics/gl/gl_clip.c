@@ -1,7 +1,8 @@
 #include <GL/gl.h>
 #include <GL/ipo_gl.h>
-
-#define MAX_CLIP_VERTS 32
+#include <memory/kmalloc.h>
+#include <stdint.h>
+#include <limits.h>
 
 /* Interpolate between two vertices with parameter t in [0.0, 1.0] */
 static void interpolate_vertex(gl_vertex_t *out, const gl_vertex_t *v0, const gl_vertex_t *v1, float t) {
@@ -41,20 +42,14 @@ static int clip_against_plane(const gl_vertex_t *in, int n_in, gl_vertex_t *out,
         bool in1 = (d1 >= 0.0f);
 
         if (in0 && in1) {
-            if (n_out < MAX_CLIP_VERTS) out[n_out++] = *v1;
+            out[n_out++] = *v1;
         } else if (in0 && !in1) {
             float t = d0 / (d0 - d1);
-            if (n_out < MAX_CLIP_VERTS) {
-                interpolate_vertex(&out[n_out++], v0, v1, t);
-            }
+            interpolate_vertex(&out[n_out++], v0, v1, t);
         } else if (!in0 && in1) {
             float t = d0 / (d0 - d1);
-            if (n_out < MAX_CLIP_VERTS) {
-                interpolate_vertex(&out[n_out++], v0, v1, t);
-            }
-            if (n_out < MAX_CLIP_VERTS) {
-                out[n_out++] = *v1;
-            }
+            interpolate_vertex(&out[n_out++], v0, v1, t);
+            out[n_out++] = *v1;
         }
     }
     return n_out;
@@ -131,10 +126,32 @@ void gl_clip_and_render_polygon(GLContext *ctx, gl_vertex_t *verts, int nverts) 
         }
     }
 
-    gl_vertex_t buf0[MAX_CLIP_VERTS];
-    gl_vertex_t buf1[MAX_CLIP_VERTS];
+    if (nverts > INT_MAX - 6) {
+        if (ctx->error_flag == GL_NO_ERROR) ctx->error_flag = GL_OUT_OF_MEMORY;
+        return;
+    }
 
-    int count = nverts > MAX_CLIP_VERTS ? MAX_CLIP_VERTS : nverts;
+    int required_capacity = nverts + 6;
+    if (ctx->clip_capacity < required_capacity) {
+        size_t capacity = (size_t)required_capacity;
+        if (capacity > SIZE_MAX / (2 * sizeof(gl_vertex_t))) {
+            if (ctx->error_flag == GL_NO_ERROR) ctx->error_flag = GL_OUT_OF_MEMORY;
+            return;
+        }
+
+        gl_vertex_t *new_buf = (gl_vertex_t *)krealloc(
+            ctx->clip_buf, capacity * 2 * sizeof(gl_vertex_t));
+        if (!new_buf) {
+            if (ctx->error_flag == GL_NO_ERROR) ctx->error_flag = GL_OUT_OF_MEMORY;
+            return;
+        }
+        ctx->clip_buf = new_buf;
+        ctx->clip_capacity = required_capacity;
+    }
+
+    gl_vertex_t *buf0 = ctx->clip_buf;
+    gl_vertex_t *buf1 = ctx->clip_buf + ctx->clip_capacity;
+    int count = nverts;
     for (int i = 0; i < count; i++) buf0[i] = verts[i];
 
     gl_vertex_t *curr_in = buf0;
@@ -183,4 +200,3 @@ void gl_clip_and_render_polygon(GLContext *ctx, gl_vertex_t *verts, int nverts) 
         gl_rasterize_triangle(ctx, &curr_in[0], &curr_in[i], &curr_in[i + 1]);
     }
 }
-

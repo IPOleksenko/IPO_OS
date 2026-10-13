@@ -9,12 +9,6 @@
 
 #define NET_SHARED_MAGIC 0x49504F4Eu /* "IPON" in ASCII */
 
-#define ICMP_QUEUE_SIZE 8
-#define ARP_TABLE_SIZE  16
-#define UDP_SOCKETS_MAX 16
-#define DNS_QUEUE_SIZE  8
-#define LOOPBACK_QUEUE_SIZE 4
-
 /* Forward declarations */
 struct arp_entry;
 struct udp_socket;
@@ -54,17 +48,22 @@ typedef struct {
     uint8_t tx_buffers[4][RTL8139_TX_BUFFER_SIZE] __attribute__((aligned(4)));
     struct arp_entry *arp_cache;
     struct udp_socket *udp_sockets;
-    arp_entry_t arp_table[ARP_TABLE_SIZE];
-    udp_socket_t udp_table[UDP_SOCKETS_MAX];
-    dns_reply_entry_t dns_queue[DNS_QUEUE_SIZE];
-    uint8_t dns_q_idx;
-    icmp_echo_reply_t icmp_queue[ICMP_QUEUE_SIZE];
-    uint8_t icmp_q_idx;
+    arp_entry_t *arp_table;
+    size_t arp_table_capacity;
+    udp_socket_t *udp_table;
+    size_t udp_table_capacity;
+    dns_reply_entry_t *dns_queue;
+    size_t dns_queue_capacity;
+    size_t dns_q_idx;
+    icmp_echo_reply_t *icmp_queue;
+    size_t icmp_queue_capacity;
+    size_t icmp_q_idx;
     struct loopback_packet *loop_head;
     struct loopback_packet *loop_tail;
-    loopback_slot_t loop_slots[LOOPBACK_QUEUE_SIZE];
-    uint8_t loop_head_idx;
-    uint8_t loop_tail_idx;
+    loopback_slot_t *loop_slots;
+    size_t loopback_queue_capacity;
+    size_t loop_head_idx;
+    size_t loop_tail_idx;
 } net_shared_ctx_t;
 
 extern net_shared_ctx_t g_net_shared_ctx;

@@ -1,4 +1,37 @@
 #include <system/timer.h>
+#ifdef IPO_APP
+#include <syscall.h>
+
+uint64_t read_tsc(void) {
+    uint32_t lo;
+    uint32_t hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+}
+
+void timer_init(void) {}
+void timer_tick(void) {}
+void timer_update(void) {}
+
+uint32_t timer_millis(void) {
+    return (uint32_t)ipo_syscall(IPO_SYSCALL_MILLIS, 0u, NULL);
+}
+
+uint32_t timer_seconds(void) {
+    return ipo_time(NULL);
+}
+
+uint32_t timer_elapsed_ms(uint32_t start_ms) {
+    uint32_t args[1] = { start_ms };
+    return (uint32_t)ipo_syscall(IPO_SYSCALL_ELAPSED_MS, 1u, args);
+}
+
+int timer_after(uint32_t start_ms, uint32_t delay_ms) {
+    uint32_t args[2] = { start_ms, delay_ms };
+    return (int)ipo_syscall(IPO_SYSCALL_TIMER_AFTER, 2u, args);
+}
+
+#else
 #include <system/pit.h>
 #include <kernel/terminal.h>
 #include <kernel/process.h>
@@ -27,7 +60,7 @@ void timer_init(void) {
     pit_init(1000u);
 }
 
-void timer_tick(void) {
+void timer_update(void) {
     uint64_t now_tsc = read_tsc();
     if (last_tsc_value == 0ULL) {
         last_tsc_value = now_tsc;
@@ -43,7 +76,10 @@ void timer_tick(void) {
     timer_ms += delta_ms;
     timer_ticks += delta_ms;
     last_tsc_value += (uint64_t)delta_ms * TSC_PER_MS;
+}
 
+void timer_tick(void) {
+    timer_update();
     if (process_is_batch_active() && process_in_process_context() && !putchar_is_locked()) {
         if (timer_ms - last_slice_yield_ms >= 10u) {
             last_slice_yield_ms = timer_ms;
@@ -53,21 +89,19 @@ void timer_tick(void) {
 }
 
 uint32_t timer_millis(void) {
-    timer_tick();
+    timer_update();
     return timer_ms;
 }
 
 uint32_t timer_seconds(void) {
-    timer_tick();
-    return timer_ms / 1000u;
+    return timer_millis() / 1000u;
 }
 
 uint32_t timer_elapsed_ms(uint32_t start_ms) {
-    timer_tick();
-    return timer_ms - start_ms;
+    return timer_millis() - start_ms;
 }
 
 int timer_after(uint32_t start_ms, uint32_t delay_ms) {
-    timer_tick();
-    return (int)(timer_ms - start_ms >= delay_ms);
+    return (int)(timer_millis() - start_ms >= delay_ms);
 }
+#endif
