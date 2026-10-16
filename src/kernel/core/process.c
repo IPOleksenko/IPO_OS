@@ -4,6 +4,7 @@
 #include <system/state.h>
 #include <file_system/ipo_fs.h>
 #include <memory/kmalloc.h>
+#include <memory/memory_map.h>
 #include <driver/input/keymap/keymap.h>
 #include <driver/input/keymap/dynamic_keymap.h>
 #include <driver/input/keyboard.h>
@@ -221,6 +222,17 @@ static void process_switch_workspace_screen(process_t *old_fg, process_t *new_fg
             if (old_fg->gfx_vram_backup) {
                 memcpy(old_fg->gfx_vram_backup, (const void *)VGA_GFX_VRAM_ADDR, VGA_GFX_SIZE);
             }
+            if (!old_fg->gfx_palette_backup) {
+                old_fg->gfx_palette_backup = (uint8_t *)kmalloc(768);
+            }
+            if (old_fg->gfx_palette_backup) {
+                for (int i = 0; i < 256; i++) {
+                    outb(0x3C7, (uint8_t)i);
+                    old_fg->gfx_palette_backup[i * 3 + 0] = inb(0x3C9);
+                    old_fg->gfx_palette_backup[i * 3 + 1] = inb(0x3C9);
+                    old_fg->gfx_palette_backup[i * 3 + 2] = inb(0x3C9);
+                }
+            }
         } else {
             if (old_fg->scroll_bottom_count > 0) {
                 terminal_return_to_present();
@@ -262,7 +274,16 @@ static void process_switch_workspace_screen(process_t *old_fg, process_t *new_fg
             wm_compositor_tick();
         } else if (new_fg->wants_graphics) {
             vga_set_mode_13h_hardware();
-            vga_gfx_init_default_palette();
+            if (new_fg->gfx_palette_backup) {
+                for (int i = 0; i < 256; i++) {
+                    outb(0x3C8, (uint8_t)i);
+                    outb(0x3C9, new_fg->gfx_palette_backup[i * 3 + 0]);
+                    outb(0x3C9, new_fg->gfx_palette_backup[i * 3 + 1]);
+                    outb(0x3C9, new_fg->gfx_palette_backup[i * 3 + 2]);
+                }
+            } else {
+                vga_gfx_init_default_palette();
+            }
             mouse_set_bounds_from_display();
             if (new_fg->gfx_vram_backup) {
                 memcpy((void *)VGA_GFX_VRAM_ADDR, new_fg->gfx_vram_backup, VGA_GFX_SIZE);
@@ -334,9 +355,19 @@ void process_init_text_screen(process_t *proc) {
 
     if (!proc->scroll_top_buffer) {
         proc->scroll_top_buffer = (uint16_t *)kmalloc(TERMINAL_SCROLL_HISTORY_SIZE * 80 * sizeof(uint16_t));
+        if (proc->scroll_top_buffer) {
+            for (int i = 0; i < TERMINAL_SCROLL_HISTORY_SIZE * 80; i++) {
+                proc->scroll_top_buffer[i] = 0x0720;
+            }
+        }
     }
     if (!proc->scroll_bottom_buffer) {
         proc->scroll_bottom_buffer = (uint16_t *)kmalloc(TERMINAL_SCROLL_HISTORY_SIZE * 80 * sizeof(uint16_t));
+        if (proc->scroll_bottom_buffer) {
+            for (int i = 0; i < TERMINAL_SCROLL_HISTORY_SIZE * 80; i++) {
+                proc->scroll_bottom_buffer[i] = 0x0720;
+            }
+        }
     }
     proc->scroll_top_count = 0;
     proc->scroll_bottom_count = 0;
@@ -374,11 +405,9 @@ void process_workspace_auto_scroll(process_t *proc) {
         if (proc->scroll_top_count >= TERMINAL_SCROLL_HISTORY_SIZE) {
             int keep = TERMINAL_SCROLL_HISTORY_SIZE / 2;
             int remove = proc->scroll_top_count - keep;
-            for (int i = 0; i < keep; i++) {
-                memcpy(&proc->scroll_top_buffer[i * 80],
-                       &proc->scroll_top_buffer[(i + remove) * 80],
-                       80 * sizeof(uint16_t));
-            }
+            memmove(&proc->scroll_top_buffer[0],
+                    &proc->scroll_top_buffer[remove * 80],
+                    (size_t)keep * 80 * sizeof(uint16_t));
             proc->scroll_top_count = keep;
         }
         memcpy(&proc->scroll_top_buffer[proc->scroll_top_count * 80],
@@ -404,7 +433,8 @@ void process_switch_foreground_next(void) {
     process_t *cur_fg = process_get_foreground();
 
     /* 1. Collect all distinct active workspace IDs (window_id) in order */
-    int unique_wins[16];
+    int *unique_wins = (int *)kmalloc((size_t)batch_proc_count * sizeof(int));
+    if (!unique_wins) return;
     int unique_count = 0;
     for (int i = 0; i < batch_proc_count; i++) {
         if (batch_procs && batch_procs[i] && process_is_active_or_has_windows(batch_procs[i])) {
@@ -416,13 +446,16 @@ void process_switch_foreground_next(void) {
                     break;
                 }
             }
-            if (!exists && unique_count < 16) {
+            if (!exists) {
                 unique_wins[unique_count++] = wid;
             }
         }
     }
 
-    if (unique_count <= 1) return;
+    if (unique_count <= 1) {
+        kfree(unique_wins);
+        return;
+    }
 
     /* 2. Find index of current workspace */
     int cur_wid = cur_fg ? cur_fg->window_id : unique_wins[0];
@@ -438,6 +471,7 @@ void process_switch_foreground_next(void) {
     /* 3. Determine next workspace */
     int next_win_idx = (cur_win_idx + 1) % unique_count;
     int target_wid = unique_wins[next_win_idx];
+    kfree(unique_wins);
 
     /* 4. Pick canonical foreground process for target workspace */
     process_t *target_proc = NULL;
@@ -470,7 +504,8 @@ void process_switch_foreground_prev(void) {
     process_t *cur_fg = process_get_foreground();
 
     /* 1. Collect all distinct active workspace IDs (window_id) in order */
-    int unique_wins[16];
+    int *unique_wins = (int *)kmalloc((size_t)batch_proc_count * sizeof(int));
+    if (!unique_wins) return;
     int unique_count = 0;
     for (int i = 0; i < batch_proc_count; i++) {
         if (batch_procs && batch_procs[i] && process_is_active_or_has_windows(batch_procs[i])) {
@@ -482,13 +517,16 @@ void process_switch_foreground_prev(void) {
                     break;
                 }
             }
-            if (!exists && unique_count < 16) {
+            if (!exists) {
                 unique_wins[unique_count++] = wid;
             }
         }
     }
 
-    if (unique_count <= 1) return;
+    if (unique_count <= 1) {
+        kfree(unique_wins);
+        return;
+    }
 
     /* 2. Find index of current workspace */
     int cur_wid = cur_fg ? cur_fg->window_id : unique_wins[0];
@@ -504,6 +542,7 @@ void process_switch_foreground_prev(void) {
     /* 3. Determine previous workspace */
     int prev_win_idx = (cur_win_idx - 1 + unique_count) % unique_count;
     int target_wid = unique_wins[prev_win_idx];
+    kfree(unique_wins);
 
     /* 4. Pick canonical foreground process for target workspace */
     process_t *target_proc = NULL;
@@ -613,6 +652,10 @@ static int max_blocks = 0;
 static uint64_t global_process_heap_used = 0;
 
 static uint64_t get_process_heap_capacity(void) {
+    uint64_t total = memory_map_get_total_ram();
+    if (total > 0) {
+        return total;
+    }
     volatile uint32_t *ram_size_ptr = (volatile uint32_t *)0x8FF0;
     uint32_t detected = *ram_size_ptr;
     return (uint64_t)detected;
@@ -711,7 +754,7 @@ void process_init(void) {
     allocated_blocks = NULL;
     process_sync_shared_context();
     
-    printf("Process manager initialized\n");
+    serial_printf("[process] Process manager initialized (capacity: %llu MB).\n", get_process_heap_capacity() / (1024 * 1024));
 }
 
 /**
@@ -984,16 +1027,19 @@ static int load_binary_file(const char *path, void **data_out) {
     struct ipo_inode stat;
     if (!ipo_fs_stat(path, &stat)) {
         printf("File not found: %s\n", path);
+        process_set_last_exit_code(127);
         return -1;  // File not found
     }
     
     if ((stat.mode & IPO_INODE_TYPE_DIR) != 0) {
-        printf("Path is a directory: %s\n", path);
+        printf("Cannot execute '%s': is a directory\n", path);
+        process_set_last_exit_code(126);
         return -1;  // Path is a directory
     }
     
     if (stat.size == 0) {
-        printf("File is empty: %s\n", path);
+        printf("Cannot execute '%s': file is empty\n", path);
+        process_set_last_exit_code(126);
         return -1;
     }
     
@@ -1003,18 +1049,11 @@ static int load_binary_file(const char *path, void **data_out) {
     void *binary_image = kmalloc(stat.size);
     if (binary_image == NULL) {
         printf("Memory allocation failed for size: %d\n", stat.size);
+        process_set_last_exit_code(126);
         return -3;  // Memory allocation failed
     }
     
-    // Open the file
-    int fd = ipo_fs_open(path);
-    if (fd < 0) {
-        kfree(binary_image);
-        printf("Failed to open file: %s\n", path);
-        return -4;  // File open failed
-    }
-    
-    // Read the file in parts if it is large
+    // Read the file in 64KB chunks directly using inode metadata
     uint32_t total_read = 0;
     uint32_t chunk_size = 64 * 1024;  // 64KB
     
@@ -1024,31 +1063,23 @@ static int load_binary_file(const char *path, void **data_out) {
             to_read = chunk_size;
         }
         
-        int bytes_read = ipo_fs_read(fd, (uint8_t*)binary_image + total_read, to_read, total_read);
+        int bytes_read = inode_read_bytes(&stat, (uint8_t*)binary_image + total_read, to_read, total_read);
         
         if (bytes_read <= 0) {
-            ipo_fs_close(fd);
             kfree(binary_image);
             printf("Read failed at offset %d, read %d bytes\n", total_read, bytes_read);
             return -4;  // Read failed
         }
         
-        total_read += bytes_read;
+        total_read += (uint32_t)bytes_read;
         serial_printf("Read chunk: %d bytes, total: %d/%d\n", bytes_read, total_read, stat.size);
     }
 
-    ipo_fs_close(fd);
     *data_out = binary_image;
     serial_printf("File loaded successfully (%d bytes)\n", stat.size);
     return (int)stat.size;
 }
 
-/**
- * relocate_binary - Relocates the binary if necessary
- */
-static int relocate_binary(void *binary, uint32_t load_address, uint32_t size) {
-    return 0;
-}
 
 /**
  * process_cleanup - Frees up process resources
@@ -1111,6 +1142,11 @@ void process_cleanup(process_t *proc) {
     if (proc->gfx_vram_backup) {
         kfree(proc->gfx_vram_backup);
         proc->gfx_vram_backup = NULL;
+    }
+
+    if (proc->gfx_palette_backup) {
+        kfree(proc->gfx_palette_backup);
+        proc->gfx_palette_backup = NULL;
     }
 
     if (proc->text_output_buf) {
@@ -1229,6 +1265,49 @@ typedef struct {
  * and zeroing .bss sections so that memory swaps between processes preserve
  * complete process state and global data.
  */
+static bool is_text_file(const uint8_t *data, uint32_t size) {
+    if (!data || size == 0) return true;
+    uint32_t check_len = size < 512 ? size : 512;
+    uint32_t i = 0;
+    while (i < check_len) {
+        uint8_t c = data[i];
+        if (c == 0x00) {
+            return false;
+        }
+        if (c == '\r' || c == '\n' || c == '\t' || c == '\f') {
+            i++;
+            continue;
+        }
+        if (c >= 0x20 && c <= 0x7E) {
+            i++;
+            continue;
+        }
+        if (c >= 0xC2 && c <= 0xDF) {
+            if (i + 1 < check_len && (data[i + 1] & 0xC0) == 0x80) {
+                i += 2;
+                continue;
+            }
+            return false;
+        }
+        if (c >= 0xE0 && c <= 0xEF) {
+            if (i + 2 < check_len && (data[i + 1] & 0xC0) == 0x80 && (data[i + 2] & 0xC0) == 0x80) {
+                i += 3;
+                continue;
+            }
+            return false;
+        }
+        if (c >= 0xF0 && c <= 0xF4) {
+            if (i + 3 < check_len && (data[i + 1] & 0xC0) == 0x80 && (data[i + 2] & 0xC0) == 0x80 && (data[i + 3] & 0xC0) == 0x80) {
+                i += 4;
+                continue;
+            }
+            return false;
+        }
+        return false;
+    }
+    return true;
+}
+
 static int universal_exec_load(process_t *proc, const uint8_t *file_data, uint32_t file_size) {
     if (!proc || !file_data || file_size == 0) {
         return -1;
@@ -1239,6 +1318,12 @@ static int universal_exec_load(process_t *proc, const uint8_t *file_data, uint32
     bool is_elf = (file_size >= sizeof(elf32_header_t) &&
                    file_data[0] == 0x7F && file_data[1] == 'E' &&
                    file_data[2] == 'L'  && file_data[3] == 'F');
+
+    if (!is_elf && is_text_file(file_data, file_size)) {
+        serial_printf("[universal_exec_load] Rejected text file '%s' (not an executable binary)\n",
+                      proc->name ? proc->name : "unknown");
+        return -1;
+    }
 
     if (is_elf) {
         const elf32_header_t *elf = (const elf32_header_t *)file_data;
@@ -1339,6 +1424,94 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
         return NULL;
     }
 
+    // Check for shebang (#!) script
+    static int shebang_depth = 0;
+    if (size >= 2 && ((const uint8_t *)binary_image)[0] == '#' && ((const uint8_t *)binary_image)[1] == '!') {
+        if (shebang_depth >= 4) {
+            printf("Cannot execute '%s': too many levels of interpreter recursion\n", actual_path);
+            kfree(binary_image);
+            if (resolved != NULL) kfree(resolved);
+            return NULL;
+        }
+
+        const char *data = (const char *)binary_image;
+        size_t line_len = 0;
+        while (2 + line_len < (size_t)size && data[2 + line_len] != '\r' && data[2 + line_len] != '\n') {
+            line_len++;
+        }
+        char *line = kmalloc(line_len + 1);
+        if (!line) {
+            kfree(binary_image);
+            if (resolved != NULL) kfree(resolved);
+            return NULL;
+        }
+        memcpy(line, data + 2, line_len);
+        line[line_len] = '\0';
+        kfree(binary_image);
+
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0') {
+            printf("Cannot execute '%s': empty interpreter in shebang\n", actual_path);
+            kfree(line);
+            if (resolved != NULL) kfree(resolved);
+            return NULL;
+        }
+
+        char *interp = p;
+        char *interp_arg = NULL;
+        while (*p && *p != ' ' && *p != '\t') p++;
+        if (*p) {
+            *p++ = '\0';
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p) {
+                interp_arg = p;
+                char *end = interp_arg + strlen(interp_arg) - 1;
+                while (end >= interp_arg && (*end == ' ' || *end == '\t')) {
+                    *end-- = '\0';
+                }
+            }
+        }
+
+        char *interp_path = resolve_command_path(interp);
+        if (!interp_path) {
+            printf("Interpreter '%s' not found for '%s'\n", interp, actual_path);
+            kfree(line);
+            if (resolved != NULL) kfree(resolved);
+            return NULL;
+        }
+
+        int new_cap = argc + 4;
+        char **new_argv = kmalloc((size_t)new_cap * sizeof(char *));
+        if (!new_argv) {
+            kfree(interp_path);
+            kfree(line);
+            if (resolved != NULL) kfree(resolved);
+            return NULL;
+        }
+
+        int new_argc = 0;
+        new_argv[new_argc++] = interp;
+        if (interp_arg && *interp_arg) {
+            new_argv[new_argc++] = interp_arg;
+        }
+        new_argv[new_argc++] = (char *)actual_path;
+        for (int i = 1; i < argc; i++) {
+            new_argv[new_argc++] = argv[i];
+        }
+        new_argv[new_argc] = NULL;
+
+        shebang_depth++;
+        process_t *proc = process_spawn(interp_path, new_argc, new_argv);
+        shebang_depth--;
+
+        kfree(interp_path);
+        kfree(new_argv);
+        kfree(line);
+        if (resolved != NULL) kfree(resolved);
+        return proc;
+    }
+
     if (process_list == NULL) {
         global_process_heap_used = 0;
         block_count = 0;
@@ -1360,7 +1533,7 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
     proc->is_running = 1;
     proc->name = kstrdup(actual_path);
     proc->wants_graphics = false;
-    proc->user_heap_break = 0x08000000u + (proc->pid > 0 ? (proc->pid - 1) : 0) * 0x04000000u; /* Isolated 64MB slice per PID */
+    proc->user_heap_break = 0x08000000u + (proc->pid > 0 ? (proc->pid - 1) : 0) * 0x20000000u; /* Isolated 512MB slice per PID */
 
     proc->next = process_list;
     process_list = proc;
@@ -1371,7 +1544,8 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
     if (resolved != NULL) kfree(resolved);
 
     if (load_res < 0) {
-        printf("Cannot execute '%s': failed to load image\n", actual_path);
+        printf("Cannot execute '%s': not an executable format\n", actual_path);
+        process_set_last_exit_code(126);
         process_cleanup(proc);
         return NULL;
     }
@@ -1380,6 +1554,7 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
     uint32_t argv_addr = 0;
     if (setup_arguments(proc, argc, argv, &argv_addr) < 0) {
         printf("Failed to setup arguments\n");
+        process_set_last_exit_code(126);
         process_cleanup(proc);
         return NULL;
     }
@@ -1387,6 +1562,7 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
     // Setting up the stack for calling main()
     if (setup_stack(proc) == 0) {
         printf("Failed to allocate process stack\n");
+        process_set_last_exit_code(126);
         process_cleanup(proc);
         return NULL;
     }
@@ -1395,6 +1571,7 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
     if (proc->binary_base == NULL || proc->binary_size == 0 ||
         proc->entry_point < PROCESS_HEAP_START) {
         printf("[process] pid=%u: invalid app image, closing process safely\n", proc->pid);
+        process_set_last_exit_code(126);
         process_cleanup(proc);
         return NULL;
     }
@@ -1466,6 +1643,7 @@ int process_run_batch_windows(process_t **procs, int count, const int *window_id
             /* Share buffers from the owner */
             procs[i]->text_vram_backup = owner->text_vram_backup;
             procs[i]->gfx_vram_backup = owner->gfx_vram_backup;
+            procs[i]->gfx_palette_backup = owner->gfx_palette_backup;
             procs[i]->text_cursor_pos = owner->text_cursor_pos;
             procs[i]->text_cursor_visible = owner->text_cursor_visible;
             procs[i]->scroll_top_buffer = owner->scroll_top_buffer;
@@ -1600,6 +1778,9 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
                     if (fg->gfx_vram_backup) {
                         kfree(fg->gfx_vram_backup);
                     }
+                    if (fg->gfx_palette_backup) {
+                        kfree(fg->gfx_palette_backup);
+                    }
                 }
                 fg->text_vram_backup = NULL;
                 fg->scroll_top_buffer = NULL;
@@ -1607,6 +1788,7 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
                 fg->scroll_top_count = 0;
                 fg->scroll_bottom_count = 0;
                 fg->gfx_vram_backup = NULL;
+                fg->gfx_palette_backup = NULL;
                 process_t *next_fg = NULL;
                 for (int i = 0; i < count; i++) {
                     if (procs[i] && procs[i] != fg && process_is_active_or_has_windows(procs[i])) {
@@ -1688,76 +1870,121 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
             break;
         }
 
-        if (separate_windows && fg && !fg->is_running && !fg->is_wm_app && !fg->wants_graphics) {
-            keyboard_set_app_input_mode(true);
-            if (!fg->completed_and_acknowledged) {
-                if (system_is_interrupted()) {
-                    system_clear_interrupt();
-                    fg->completed_and_acknowledged = true;
-                } else {
-                    uint8_t sc = keyboard_get_scancode();
-                    if (process_get_foreground() != fg) {
-                        continue;
-                    }
-                    /* Accept only Ctrl+C to acknowledge and close finished workspace */
-                    if ((sc == 0x2E || sc == 0xAE) && keyboard_is_ctrl_pressed()) {
-                        fg->completed_and_acknowledged = true;
-                    } else if (sc == 0x49) { // Page Up
-                        if (terminal_get_top_buffer_count() > 0) {
-                            terminal_scroll_up();
-                        }
-                    } else if (sc == 0x51) { // Page Down
-                        if (terminal_get_bottom_buffer_count() > 0) {
-                            terminal_scroll_down();
-                        }
-                    } else if (sc == 0x48) { // Up arrow
-                        if (terminal_get_top_buffer_count() > 0) {
-                            terminal_scroll_up();
-                        }
-                    } else if (sc == 0x50) { // Down arrow
-                        if (terminal_get_bottom_buffer_count() > 0) {
-                            terminal_scroll_down();
-                        }
-                    }
+        if (separate_windows && fg && !fg->is_running) {
+            /* Check if any other process in the batch is still running */
+            process_t *running_proc = NULL;
+            for (int i = 0; i < count; i++) {
+                if (procs[i] && procs[i] != fg && procs[i]->is_running) {
+                    running_proc = procs[i];
+                    break;
                 }
             }
-            if (fg->completed_and_acknowledged) {
+
+            if (running_proc) {
+                /* Immediately acknowledge and auto-switch to the living process */
+                fg->completed_and_acknowledged = true;
                 async_stop_tasks_by_owner(fg);
                 if (separate_windows && !fg->text_screen_shared) {
-                    if (fg->text_vram_backup) {
-                        kfree(fg->text_vram_backup);
-                    }
-                    if (fg->scroll_top_buffer) {
-                        kfree(fg->scroll_top_buffer);
-                    }
-                    if (fg->scroll_bottom_buffer) {
-                        kfree(fg->scroll_bottom_buffer);
-                    }
-                    if (fg->gfx_vram_backup) {
-                        kfree(fg->gfx_vram_backup);
+                    if (fg->text_vram_backup) { kfree(fg->text_vram_backup); fg->text_vram_backup = NULL; }
+                    if (fg->scroll_top_buffer) { kfree(fg->scroll_top_buffer); fg->scroll_top_buffer = NULL; }
+                    if (fg->scroll_bottom_buffer) { kfree(fg->scroll_bottom_buffer); fg->scroll_bottom_buffer = NULL; }
+                    if (fg->gfx_vram_backup) { kfree(fg->gfx_vram_backup); fg->gfx_vram_backup = NULL; }
+                    if (fg->gfx_palette_backup) { kfree(fg->gfx_palette_backup); fg->gfx_palette_backup = NULL; }
+                }
+                fg->scroll_top_count = 0;
+                fg->scroll_bottom_count = 0;
+                serial_printf("[proc] fg %s exited, auto-switching to running %s\n", fg->name, running_proc->name);
+                process_set_foreground(running_proc);
+                continue;
+            } else if (fg->wants_graphics || fg->is_wm_app) {
+                /* A graphics app or WM app that exited with no other running processes closes immediately */
+                fg->completed_and_acknowledged = true;
+                async_stop_tasks_by_owner(fg);
+                if (separate_windows && !fg->text_screen_shared) {
+                    if (fg->text_vram_backup) { kfree(fg->text_vram_backup); fg->text_vram_backup = NULL; }
+                    if (fg->scroll_top_buffer) { kfree(fg->scroll_top_buffer); fg->scroll_top_buffer = NULL; }
+                    if (fg->scroll_bottom_buffer) { kfree(fg->scroll_bottom_buffer); fg->scroll_bottom_buffer = NULL; }
+                    if (fg->gfx_vram_backup) { kfree(fg->gfx_vram_backup); fg->gfx_vram_backup = NULL; }
+                    if (fg->gfx_palette_backup) { kfree(fg->gfx_palette_backup); fg->gfx_palette_backup = NULL; }
+                }
+                fg->scroll_top_count = 0;
+                fg->scroll_bottom_count = 0;
+                serial_printf("[proc] graphics fg %s exited, batch finished\n", fg->name);
+                break;
+            } else {
+                /* CLI program in separate workspace with no other running processes: allow reading text or scrolling before Ctrl+C */
+                keyboard_set_app_input_mode(true);
+                if (!fg->completed_and_acknowledged) {
+                    if (system_is_interrupted()) {
+                        system_clear_interrupt();
+                        fg->completed_and_acknowledged = true;
+                    } else {
+                        uint8_t sc = keyboard_get_scancode();
+                        if (process_get_foreground() != fg) {
+                            continue;
+                        }
+                        /* Accept Ctrl+C or Escape to close finished workspace */
+                        if (sc == 0x01 || ((sc == 0x2E || sc == 0xAE) && keyboard_is_ctrl_pressed())) {
+                            fg->completed_and_acknowledged = true;
+                        } else if (sc == 0x49) { // Page Up
+                            if (terminal_get_top_buffer_count() > 0) {
+                                terminal_scroll_up();
+                            }
+                        } else if (sc == 0x51) { // Page Down
+                            if (terminal_get_bottom_buffer_count() > 0) {
+                                terminal_scroll_down();
+                            }
+                        } else if (sc == 0x48) { // Up arrow
+                            if (terminal_get_top_buffer_count() > 0) {
+                                terminal_scroll_up();
+                            }
+                        } else if (sc == 0x50) { // Down arrow
+                            if (terminal_get_bottom_buffer_count() > 0) {
+                                terminal_scroll_down();
+                            }
+                        }
                     }
                 }
-                if (separate_windows) {
+                if (fg->completed_and_acknowledged) {
+                    async_stop_tasks_by_owner(fg);
+                    if (separate_windows && !fg->text_screen_shared) {
+                        if (fg->text_vram_backup) {
+                            kfree(fg->text_vram_backup);
+                        }
+                        if (fg->scroll_top_buffer) {
+                            kfree(fg->scroll_top_buffer);
+                        }
+                        if (fg->scroll_bottom_buffer) {
+                            kfree(fg->scroll_bottom_buffer);
+                        }
+                        if (fg->gfx_vram_backup) {
+                            kfree(fg->gfx_vram_backup);
+                        }
+                        if (fg->gfx_palette_backup) {
+                            kfree(fg->gfx_palette_backup);
+                        }
+                    }
                     fg->text_vram_backup = NULL;
                     fg->scroll_top_buffer = NULL;
                     fg->scroll_bottom_buffer = NULL;
                     fg->scroll_top_count = 0;
                     fg->scroll_bottom_count = 0;
                     fg->gfx_vram_backup = NULL;
-                }
-                process_t *next_fg = NULL;
-                for (int i = 0; i < count; i++) {
-                    if (procs[i] && process_is_active_or_has_windows(procs[i])) {
-                        next_fg = procs[i];
+                    fg->gfx_palette_backup = NULL;
+                    process_t *next_fg = NULL;
+                    for (int i = 0; i < count; i++) {
+                        if (procs[i] && process_is_active_or_has_windows(procs[i])) {
+                            next_fg = procs[i];
+                            break;
+                        }
+                    }
+                    if (next_fg) {
+                        serial_printf("[proc] fg %s closed, auto-switching to %s\n", fg->name, next_fg->name);
+                        process_set_foreground(next_fg);
+                        continue;
+                    } else {
                         break;
                     }
-                }
-                if (next_fg) {
-                    serial_printf("[proc] fg %s closed, auto-switching to %s\n", fg->name, next_fg->name);
-                    process_set_foreground(next_fg);
-                    continue;
-                } else {
-                    break;
                 }
             }
         }
@@ -1779,6 +2006,9 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
                         if (procs[i]->gfx_vram_backup) {
                             kfree(procs[i]->gfx_vram_backup);
                         }
+                        if (procs[i]->gfx_palette_backup) {
+                            kfree(procs[i]->gfx_palette_backup);
+                        }
                     }
                     procs[i]->text_vram_backup = NULL;
                     procs[i]->scroll_top_buffer = NULL;
@@ -1786,6 +2016,7 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
                     procs[i]->scroll_top_count = 0;
                     procs[i]->scroll_bottom_count = 0;
                     procs[i]->gfx_vram_backup = NULL;
+                    procs[i]->gfx_palette_backup = NULL;
                 }
             }
         }
@@ -1810,7 +2041,7 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
             int idx = (batch_current_idx + step) % count;
             process_t *p = procs[idx];
             if (p && p->is_running) {
-                if (p->waiting_for_input && p != fg && !wm_session_active()) {
+                if (p->waiting_for_input && p != fg && !wm_session_active() && fg && fg->is_running) {
                     continue;
                 }
                 found = idx;
@@ -1827,6 +2058,14 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
                     }
                 }
                 io_wait();
+            }
+            if (found == -1) {
+                for (int i = 0; i < count; i++) {
+                    if (procs[i] && procs[i]->is_running) {
+                        found = i;
+                        break;
+                    }
+                }
             }
             if (found == -1) {
                 if (fg) {
@@ -1969,9 +2208,12 @@ int process_run_batch(process_t **procs, int count) {
 }
 
 /**
- * process_exec - The main function for executing a process with arguments
+ * universal_process_execute - The single universal function for launching ANY program
+ * regardless of file format, headers, or lack of headers.
+ * If the file is not an executable file (plain text, empty, directory, invalid),
+ * exits cleanly at the launch moment without hanging or crashing.
  */
-int process_exec(const char *path, int argc, char **argv) {
+int universal_process_execute(const char *path, int argc, char **argv) {
     process_t *proc = process_spawn(path, argc, argv);
     if (!proc) {
         return -1;
@@ -1980,6 +2222,10 @@ int process_exec(const char *path, int argc, char **argv) {
     process_t *batch[1] = { proc };
     process_run_batch(batch, 1);
     return (int)pid;
+}
+
+int process_exec(const char *path, int argc, char **argv) {
+    return universal_process_execute(path, argc, argv);
 }
 
 /**

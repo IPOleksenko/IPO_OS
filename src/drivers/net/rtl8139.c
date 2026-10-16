@@ -103,7 +103,39 @@ int rtl8139_send_packet(const void *data, uint16_t len) {
     return (int)len;
 }
 
-int rtl8139_receive_packet(void *buf, uint16_t max_len) {
+int rtl8139_peek_packet_size(void) {
+    net_shared_ctx_t *ctx = net_get_shared_context();
+    if (!ctx->rtl_dev.initialized) {
+        return 0;
+    }
+
+    uint16_t io = ctx->rtl_dev.io_base;
+
+    uint8_t cr = inb(io + 0x37);
+    uint16_t isr = inw(io + 0x3E);
+    uint16_t capr = inw(io + 0x38);
+    uint16_t cbr = inw(io + 0x3A);
+
+    /* If CR says empty and ISR does not report ROK and CAPR == CBR - 0x10 */
+    if ((cr & 0x01) && (isr & 0x01) == 0 && capr == (uint16_t)(cbr - 0x10)) {
+        return 0;
+    }
+
+    uint16_t offset = ctx->rtl_dev.rx_offset;
+    uint8_t *rx_ptr = ctx->rx_buffer + offset;
+
+    uint16_t status = *(uint16_t *)rx_ptr;
+    uint16_t length = *(uint16_t *)(rx_ptr + 2);
+
+    /* Check for Receive OK bit (bit 0 of status) and packet length bounds */
+    if ((status & 0x01) == 0 || length < 4 || length > RTL8139_RX_BUFFER_SIZE) {
+        return 0;
+    }
+
+    return (int)(length - 4);
+}
+
+int rtl8139_receive_packet(void *buf, uint32_t max_len) {
     net_shared_ctx_t *ctx = net_get_shared_context();
     if (!ctx->rtl_dev.initialized || !buf || max_len == 0) {
         return 0;
@@ -128,15 +160,15 @@ int rtl8139_receive_packet(void *buf, uint16_t max_len) {
     uint16_t length = *(uint16_t *)(rx_ptr + 2);
 
     /* Check for Receive OK bit (bit 0 of status) */
-    if ((status & 0x01) == 0 || length < 4 || length > 1536) {
+    if ((status & 0x01) == 0 || length < 4 || length > RTL8139_RX_BUFFER_SIZE) {
         /* Packet bad, reset receiver offset */
         ctx->rtl_dev.rx_offset = 0;
         outw(io + 0x38, (uint16_t)-0x10);
         return 0;
     }
 
-    uint16_t packet_len = length - 4; // Exclude 4-byte CRC
-    uint16_t copy_len = packet_len < max_len ? packet_len : max_len;
+    uint32_t packet_len = (uint32_t)(length - 4); // Exclude 4-byte CRC
+    uint32_t copy_len = packet_len < max_len ? packet_len : max_len;
 
     memcpy(buf, rx_ptr + 4, copy_len);
 

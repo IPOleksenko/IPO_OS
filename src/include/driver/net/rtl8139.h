@@ -23,6 +23,7 @@ bool rtl8139_is_present(void);
 const uint8_t *rtl8139_get_mac(void);
 
 int rtl8139_send_packet(const void *data, uint16_t len);
-int rtl8139_receive_packet(void *buf, uint16_t max_len);
+int rtl8139_receive_packet(void *buf, uint32_t max_len);
+int rtl8139_peek_packet_size(void);
 
 #endif /* IPO_DRIVER_NET_RTL8139_H */

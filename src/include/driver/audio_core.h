@@ -56,6 +56,7 @@ void            audio_tick(void);
 
 /* Stops Sound Blaster 16 DMA output immediately */
 void            sb16_stop(void);
+bool            sb16_get_dsp_version(uint8_t *major, uint8_t *minor);
 
 /* Stops all audio playback across all hardware backends */
 void            audio_stop_all(void);

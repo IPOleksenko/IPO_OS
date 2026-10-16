@@ -222,6 +222,9 @@ static inline void ac_write(uint8_t index, uint8_t val) {
 }
 
 void vga_save_text_state(void) {
+#ifdef IPO_APP
+    return;
+#else
     /* If graphics mode is active or text VRAM was already saved, NEVER read 0xB8000!
      * In Mode 13h, 0xB8000 is unmapped by hardware and reading it yields 0x2020 bus float. */
     if (vga_is_graphics_mode() || has_saved_text_vram) {
@@ -288,6 +291,9 @@ void vga_save_text_state(void) {
     }
 
     /* Save Plane 2 Font (8KB: 256 glyphs * 32 bytes) */
+    uint32_t font_flags;
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(font_flags));
+
     outb(0x3C4, 0x00); outb(0x3C5, 0x01);
     outb(0x3C4, 0x02); outb(0x3C5, 0x04); // Plane 2
     outb(0x3C4, 0x04); outb(0x3C5, 0x07); // Sequential addressing (disable odd/even)
@@ -298,7 +304,7 @@ void vga_save_text_state(void) {
     outb(0x3CE, 0x03); outb(0x3CF, 0x00);
     outb(0x3CE, 0x04); outb(0x3CF, 0x02); // Read map = Plane 2
     outb(0x3CE, 0x05); outb(0x3CF, 0x00); // Write mode 0
-    outb(0x3CE, 0x06); outb(0x3CF, 0x00); // Map memory to 0xA0000
+    outb(0x3CE, 0x06); outb(0x3CF, 0x04); // Map 64KB memory to 0xA0000 only
     outb(0x3CE, 0x08); outb(0x3CF, 0xFF);
 
     volatile uint8_t *font_vram = (volatile uint8_t *)0xA0000;
@@ -315,11 +321,16 @@ void vga_save_text_state(void) {
     outb(0x3CE, 0x00); outb(0x3CF, 0x00);
     outb(0x3CE, 0x01); outb(0x3CF, 0x00);
     outb(0x3CE, 0x03); outb(0x3CF, 0x00);
+    outb(0x3CE, 0x04); outb(0x3CF, 0x00);
     outb(0x3CE, 0x05); outb(0x3CF, 0x10);
     outb(0x3CE, 0x06); outb(0x3CF, 0x0E); // 0xB8000
     outb(0x3CE, 0x08); outb(0x3CF, 0xFF);
 
+    __asm__ volatile("push %0; popf" : : "r"(font_flags));
+
     text_state_saved = true;
+    serial_printf("[vga] Text mode hardware state saved (cursor_pos=%u, visible=%d).\n", saved_cursor_pos, (int)saved_cursor_visible);
+#endif
 }
 
 void vga_set_mode_13h_hardware(void) {
@@ -421,6 +432,8 @@ void vga_set_mode_text_hardware(void) {
     outb(0x3D4, 0x11);
     outb(0x3D5, inb(0x3D5) & ~0x80);
 
+    uint16_t saved_cur_pos = vga_get_cursor_position();
+
     /* CRTC (Standard 80x25 text mode) */
     static const uint8_t text_crtc[25] = {
         0x5F, 0x4F, 0x50, 0x82, 0x55, 0x81, 0xBF, 0x1F,
@@ -429,7 +442,13 @@ void vga_set_mode_text_hardware(void) {
         0xFF
     };
     for (uint8_t i = 0; i < 25; i++) {
-        crtc_write(i, text_crtc[i]);
+        if (i == 0x0E) {
+            crtc_write(i, (saved_cur_pos >> 8) & 0xFF);
+        } else if (i == 0x0F) {
+            crtc_write(i, saved_cur_pos & 0xFF);
+        } else {
+            crtc_write(i, text_crtc[i]);
+        }
     }
 
     /* GC (Standard text mode) */
@@ -462,6 +481,9 @@ void vga_set_mode_text_hardware(void) {
     }
 
     /* Restore Plane 2 Font */
+    uint32_t font_flags;
+    __asm__ volatile("pushf; pop %0; cli" : "=r"(font_flags));
+
     outb(0x3C4, 0x00); outb(0x3C5, 0x01);
     outb(0x3C4, 0x02); outb(0x3C5, 0x04); // Write only to Plane 2
     outb(0x3C4, 0x04); outb(0x3C5, 0x07); // Sequential addressing
@@ -472,7 +494,7 @@ void vga_set_mode_text_hardware(void) {
     outb(0x3CE, 0x03); outb(0x3CF, 0x00);
     outb(0x3CE, 0x04); outb(0x3CF, 0x02); // Read map = Plane 2
     outb(0x3CE, 0x05); outb(0x3CF, 0x00); // Write mode 0
-    outb(0x3CE, 0x06); outb(0x3CF, 0x00); // Map memory to 0xA0000
+    outb(0x3CE, 0x06); outb(0x3CF, 0x04); // Map 64KB memory to 0xA0000 only
     outb(0x3CE, 0x08); outb(0x3CF, 0xFF);
 
     volatile uint8_t *dest = (volatile uint8_t *)0xA0000;
@@ -494,6 +516,8 @@ void vga_set_mode_text_hardware(void) {
     outb(0x3CE, 0x05); outb(0x3CF, 0x10); // Normal host mode
     outb(0x3CE, 0x06); outb(0x3CF, 0x0E); // Map memory back to 0xB8000
     outb(0x3CE, 0x08); outb(0x3CF, 0xFF);
+
+    __asm__ volatile("push %0; popf" : : "r"(font_flags));
 
     /* Re-apply active custom glyphs directly from source bitmaps to eliminate any mode 13h residues */
     vga_font_reapply_active();

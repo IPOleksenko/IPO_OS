@@ -6,6 +6,10 @@
 #include <string.h>
 #include <stdlib.h>
 
+#ifndef IPO_INODE_FLAG_PROTECTED
+#define IPO_INODE_FLAG_PROTECTED 0x80000000u
+#endif
+
 int errno = 0;
 
 int open(const char *pathname, int flags, ...) {
@@ -14,14 +18,31 @@ int open(const char *pathname, int flags, ...) {
         return -1;
     }
 
+    struct ipo_inode st;
+    int exists = (ipo_stat(pathname, &st) == 0);
+
+    if (exists && (flags & (O_WRONLY | O_RDWR | O_TRUNC)) && (st.mode & IPO_INODE_FLAG_PROTECTED)) {
+        errno = EACCES;
+        return -1;
+    }
+
     if (flags & O_CREAT) {
-        struct ipo_inode st;
-        if (ipo_stat(pathname, &st) != 0) {
+        if (!exists) {
             ipo_create(pathname, 0x2 /* IPO_INODE_TYPE_FILE */);
+        } else if (flags & O_EXCL) {
+            errno = EEXIST;
+            return -1;
         } else if (flags & O_TRUNC) {
             ipo_delete(pathname);
             ipo_create(pathname, 0x2);
         }
+    } else if (flags & O_TRUNC) {
+        if (!exists) {
+            errno = ENOENT;
+            return -1;
+        }
+        ipo_delete(pathname);
+        ipo_create(pathname, 0x2);
     }
 
     int fd = ipo_open(pathname);
@@ -47,7 +68,12 @@ int close(int fd) {
     if (fd < 3) {
         return 0;
     }
-    return ipo_close(fd);
+    int res = ipo_close(fd);
+    if (res < 0) {
+        uint32_t args[1] = { (uint32_t)fd };
+        res = ipo_syscall(IPO_SYSCALL_NET_CLOSE, 1u, args);
+    }
+    return res;
 }
 
 static char *stdin_line_buf = NULL;
@@ -209,17 +235,24 @@ int chdir(const char *path) {
 }
 
 int access(const char *pathname, int mode) {
-    (void)mode;
     if (!pathname) {
         errno = EINVAL;
         return -1;
     }
-    struct ipo_inode st;
-    if (ipo_stat(pathname, &st) == 0) {
-        return 0;
+    if ((mode & ~(F_OK | R_OK | W_OK | X_OK)) != 0) {
+        errno = EINVAL;
+        return -1;
     }
-    errno = ENOENT;
-    return -1;
+    struct ipo_inode st;
+    if (ipo_stat(pathname, &st) != 0) {
+        errno = ENOENT;
+        return -1;
+    }
+    if ((mode & W_OK) && (st.mode & IPO_INODE_FLAG_PROTECTED)) {
+        errno = EACCES;
+        return -1;
+    }
+    return 0;
 }
 
 int isatty(int fd) {
@@ -251,7 +284,20 @@ void *sbrk(intptr_t increment) {
 }
 
 int brk(void *addr) {
-    (void)addr;
+    if (!addr) {
+        errno = EINVAL;
+        return -1;
+    }
+    void *current_brk = sbrk(0);
+    if (current_brk == (void *)-1) {
+        return -1;
+    }
+    intptr_t inc = (char *)addr - (char *)current_brk;
+    if (inc == 0) return 0;
+    void *res = sbrk(inc);
+    if (res == (void *)-1) {
+        return -1;
+    }
     return 0;
 }
 

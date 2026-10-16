@@ -168,9 +168,14 @@ static uint32_t sample_tex2d(const gl_texture_t *tex, float s, float t) {
     float g = ((c00 >> 8)  & 0xFF) * w00 + ((c10 >> 8)  & 0xFF) * w10 + ((c01 >> 8)  & 0xFF) * w01 + ((c11 >> 8)  & 0xFF) * w11;
     float b = (c00         & 0xFF) * w00 + (c10         & 0xFF) * w10 + (c01         & 0xFF) * w01 + (c11         & 0xFF) * w11;
 
-    uint32_t ia = (uint32_t)a; uint32_t ir = (uint32_t)r;
-    uint32_t ig = (uint32_t)g; uint32_t ib = (uint32_t)b;
-    if (ia > 255) ia = 255; if (ir > 255) ir = 255; if (ig > 255) ig = 255; if (ib > 255) ib = 255;
+    uint32_t ia = (uint32_t)a;
+    uint32_t ir = (uint32_t)r;
+    uint32_t ig = (uint32_t)g;
+    uint32_t ib = (uint32_t)b;
+    if (ia > 255) ia = 255;
+    if (ir > 255) ir = 255;
+    if (ig > 255) ig = 255;
+    if (ib > 255) ib = 255;
 
     return (ia << 24) | (ir << 16) | (ig << 8) | ib;
 }
@@ -337,9 +342,15 @@ static void write_fragment(GLContext *ctx, int x, int y, uint16_t z_val, float r
         } else if (ctx->blend_equation == GL_FUNC_REVERSE_SUBTRACT) {
             r = rd * fdr - r * fsr; g = gd * fdr - g * fsg; b = bd * fdb - b * fsb; a = ad * fda - a * fsa;
         } else if (ctx->blend_equation == GL_MIN) {
-            if (rd < r) r = rd; if (gd < g) g = gd; if (bd < b) b = bd; if (ad < a) a = ad;
+            if (rd < r) r = rd;
+            if (gd < g) g = gd;
+            if (bd < b) b = bd;
+            if (ad < a) a = ad;
         } else if (ctx->blend_equation == GL_MAX) {
-            if (rd > r) r = rd; if (gd > g) g = gd; if (bd > b) b = bd; if (ad > a) a = ad;
+            if (rd > r) r = rd;
+            if (gd > g) g = gd;
+            if (bd > b) b = bd;
+            if (ad > a) a = ad;
         } else {
             /* GL_FUNC_ADD */
             r = r * fsr + rd * fdr; g = g * fsg + gd * fdr; b = b * fsb + bd * fdb; a = a * fsa + ad * fda;
@@ -404,8 +415,10 @@ void gl_rasterize_triangle(GLContext *ctx, gl_vertex_t *v0, gl_vertex_t *v1, gl_
     int min_y = gl_floor_to_int(gl_minf(y0, gl_minf(y1, y2)));
     int max_y = gl_ceil_to_int(gl_maxf(y0, gl_maxf(y1, y2)));
 
-    if (min_x < 0) min_x = 0; if (max_x >= ctx->width)  max_x = ctx->width - 1;
-    if (min_y < 0) min_y = 0; if (max_y >= ctx->height) max_y = ctx->height - 1;
+    if (min_x < 0) min_x = 0;
+    if (max_x >= ctx->width)  max_x = ctx->width - 1;
+    if (min_y < 0) min_y = 0;
+    if (max_y >= ctx->height) max_y = ctx->height - 1;
 
     float area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
     if (area == 0.0f) return;

@@ -4,13 +4,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#ifndef TERMINAL_SCROLL_HISTORY_SIZE
-#define TERMINAL_SCROLL_HISTORY_SIZE 1024
-#endif
+#define TERMINAL_SCROLL_HISTORY_SIZE 40960
 
 void print_header(void);
 
 void terminal_initialize(void);
+void terminal_clear_command_history(void);
 void terminal_lock_input(void);
 void terminal_unlock_input(void);
 bool terminal_is_input_locked(void);

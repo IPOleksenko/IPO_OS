@@ -1,4 +1,7 @@
 #include <driver/ata/ata.h>
+#include <driver/storage/block_dev.h>
+#include <storage/storage_pool.h>
+#include <memory/kmalloc.h>
 #include <ioport.h>
 #include <stdio.h>
 #include <string.h>
@@ -24,20 +27,116 @@
 #define ATA_SR_DRQ  0x08
 #define ATA_SR_ERR  0x01
 
-#define ATA_MAX_DEVICES 4
+/* Dynamic self-expanding array for ATA devices (unlimited capacity) */
+static ata_device_t *ata_devices = NULL;
+static uint32_t ata_device_count = 0;
+static uint32_t ata_device_capacity = 0;
 
-static ata_device_t ata_devices[ATA_MAX_DEVICES];
-static uint8_t ata_device_count = 0;
+/* Dynamic self-expanding buffer for ATA IDENTIFY words */
+static uint16_t *identify_buf = NULL;
+static size_t identify_buf_capacity = 0;
+static size_t identify_buf_size = 0;
 
-static uint16_t identify_buf[256];
+/* Dynamic self-expanding array for ATA controller channels */
+typedef struct {
+    uint16_t base;
+    uint16_t ctrl;
+} ata_channel_info_t;
+
+static ata_channel_info_t *ata_channels = NULL;
+static uint32_t ata_channel_count = 0;
+static uint32_t ata_channel_capacity = 0;
+
+static bool identify_buf_ensure_capacity(size_t needed) {
+    if (needed <= identify_buf_capacity && identify_buf != NULL) {
+        return true;
+    }
+    size_t new_cap = (identify_buf_capacity == 0) ? 64 : identify_buf_capacity;
+    while (new_cap < needed) {
+        new_cap = (new_cap * 3) / 2 + 32;
+    }
+    uint16_t *new_buf = (uint16_t *)krealloc(identify_buf, new_cap * sizeof(uint16_t));
+    if (!new_buf) {
+        serial_printf("ATA: failed to expand identify_buf (cap=%u -> %u)\n",
+                      (unsigned)identify_buf_capacity, (unsigned)new_cap);
+        return false;
+    }
+    identify_buf = new_buf;
+    identify_buf_capacity = new_cap;
+    return true;
+}
+
+static bool identify_buf_append(uint16_t val) {
+    if (!identify_buf_ensure_capacity(identify_buf_size + 1)) {
+        return false;
+    }
+    identify_buf[identify_buf_size++] = val;
+    return true;
+}
+
+static inline uint16_t identify_buf_get(size_t idx) {
+    if (identify_buf && idx < identify_buf_size) {
+        return identify_buf[idx];
+    }
+    return 0;
+}
+
+static bool ata_register_channel(uint16_t base, uint16_t ctrl) {
+    if (ata_channel_count >= ata_channel_capacity) {
+        uint32_t new_cap = (ata_channel_capacity == 0) ? 4 : (ata_channel_capacity * 2);
+        ata_channel_info_t *new_arr = (ata_channel_info_t *)krealloc(ata_channels, new_cap * sizeof(ata_channel_info_t));
+        if (!new_arr) return false;
+        ata_channels = new_arr;
+        ata_channel_capacity = new_cap;
+    }
+    ata_channels[ata_channel_count].base = base;
+    ata_channels[ata_channel_count].ctrl = ctrl;
+    ata_channel_count++;
+    return true;
+}
+
+static inline uint16_t ata_channel_base(uint8_t channel) {
+    if (channel < ata_channel_count && ata_channels) {
+        return ata_channels[channel].base;
+    }
+    return (channel == 0) ? ATA_PRIMARY_BASE : 0x170;
+}
+
+static inline uint16_t ata_channel_ctrl(uint8_t channel) {
+    if (channel < ata_channel_count && ata_channels) {
+        return ata_channels[channel].ctrl;
+    }
+    return (channel == 0) ? ATA_PRIMARY_CTRL : 0x376;
+}
+
+static ata_device_t *ata_device_allocate(void) {
+    if (ata_device_count >= ata_device_capacity) {
+        uint32_t new_cap = (ata_device_capacity == 0) ? 4 : (ata_device_capacity * 2);
+        ata_device_t *new_devs = (ata_device_t *)krealloc(ata_devices, new_cap * sizeof(ata_device_t));
+        if (!new_devs) {
+            serial_printf("ATA: failed to expand device array (cap=%u -> %u)\n",
+                          (unsigned)ata_device_capacity, (unsigned)new_cap);
+            return NULL;
+        }
+        ata_devices = new_devs;
+        ata_device_capacity = new_cap;
+    }
+    ata_device_t *dev = &ata_devices[ata_device_count++];
+    memset(dev, 0, sizeof(*dev));
+    return dev;
+}
 
 /* -------------------------------------------------- */
 
-static void ata_io_wait(void) {
-    inb(ATA_PRIMARY_CTRL);
-    inb(ATA_PRIMARY_CTRL);
-    inb(ATA_PRIMARY_CTRL);
-    inb(ATA_PRIMARY_CTRL);
+static inline void ata_io_wait_port(uint16_t ctrl) {
+    inb(ctrl);
+    inb(ctrl);
+    inb(ctrl);
+    inb(ctrl);
+}
+
+static inline void ata_io_wait(void) {
+    ata_io_wait_port(ATA_PRIMARY_CTRL);
 }
 
 static bool ata_wait_bsy_clear(uint16_t base) {
@@ -60,10 +159,12 @@ static bool ata_wait_drq(uint16_t base) {
     return false;
 }
 
-static void ata_read_string(char *dst, int offset, int words) {
+static char *ata_read_string(int offset, int words) {
+    char *dst = (char *)kmalloc((size_t)words * 2 + 1);
+    if (!dst) return NULL;
     int p = 0;
     for (int i = 0; i < words; i++) {
-        uint16_t w = identify_buf[offset + i];
+        uint16_t w = identify_buf_get((size_t)(offset + i));
         dst[p++] = (w >> 8) & 0xFF;
         dst[p++] = w & 0xFF;
     }
@@ -71,16 +172,18 @@ static void ata_read_string(char *dst, int offset, int words) {
 
     for (int i = p - 1; i >= 0 && dst[i] == ' '; i--)
         dst[i] = 0;
+    return dst;
 }
 
 /* -------------------------------------------------- */
 
-static bool ata_identify(uint8_t drive) {
-    uint16_t base = ATA_PRIMARY_BASE;
+static bool ata_identify(uint8_t channel, uint8_t drive) {
+    uint16_t base = ata_channel_base(channel);
+    uint16_t ctrl = ata_channel_ctrl(channel);
     uint8_t devsel = drive ? 0xB0 : 0xA0;
 
     outb(base + ATA_REG_HDDEVSEL, devsel);
-    ata_io_wait();
+    ata_io_wait_port(ctrl);
 
     outb(base + ATA_REG_SECCOUNT0, 0);
     outb(base + ATA_REG_LBA0, 0);
@@ -88,7 +191,7 @@ static bool ata_identify(uint8_t drive) {
     outb(base + ATA_REG_LBA2, 0);
 
     outb(base + ATA_REG_COMMAND, ATA_CMD_IDENTIFY);
-    ata_io_wait();
+    ata_io_wait_port(ctrl);
 
     uint8_t status = inb(base + ATA_REG_STATUS);
     if (status == 0 || status == 0xFF)
@@ -100,56 +203,101 @@ static bool ata_identify(uint8_t drive) {
     if (!ata_wait_drq(base))
         return false;
 
-    for (int i = 0; i < 256; i++)
-        identify_buf[i] = inw(base + ATA_REG_DATA);
+    identify_buf_size = 0;
+    for (int i = 0; i < 256; i++) {
+        uint16_t val = inw(base + ATA_REG_DATA);
+        if (!identify_buf_append(val))
+            return false;
+    }
 
-    ata_device_t *dev = &ata_devices[ata_device_count];
-    memset(dev, 0, sizeof(*dev));
+    ata_device_t *dev = ata_device_allocate();
+    if (!dev)
+        return false;
 
     dev->present = 1;
-    dev->channel = 0;
+    dev->channel = channel;
     dev->drive = drive;
     dev->type = ATA_DEVICE_PATA;
 
-    ata_read_string(dev->serial, 10, 10);
-    ata_read_string(dev->model, 27, 20);
+    dev->serial = ata_read_string(10, 10);
+    dev->model = ata_read_string(27, 20);
 
-    if (identify_buf[83] & (1 << 10)) {
+    if (identify_buf_get(83) & (1 << 10)) {
         dev->capacity_sectors =
-            ((uint64_t)identify_buf[100]) |
-            ((uint64_t)identify_buf[101] << 16) |
-            ((uint64_t)identify_buf[102] << 32) |
-            ((uint64_t)identify_buf[103] << 48);
+            ((uint64_t)identify_buf_get(100)) |
+            ((uint64_t)identify_buf_get(101) << 16) |
+            ((uint64_t)identify_buf_get(102) << 32) |
+            ((uint64_t)identify_buf_get(103) << 48);
     } else {
         dev->capacity_sectors =
-            ((uint32_t)identify_buf[60]) |
-            ((uint32_t)identify_buf[61] << 16);
+            ((uint32_t)identify_buf_get(60)) |
+            ((uint32_t)identify_buf_get(61) << 16);
     }
 
-    ata_device_count++;
     return true;
 }
 
 /* -------------------------------------------------- */
 
+static bool ata_bdev_read(block_device_t *bdev, uint64_t lba, uint16_t count, void *buf);
+static bool ata_bdev_write(block_device_t *bdev, uint64_t lba, uint16_t count, const void *buf);
+static bool ata_bdev_flush(block_device_t *bdev);
+
+static const block_device_ops_t s_ata_bdev_ops = {
+    .read_sectors = ata_bdev_read,
+    .write_sectors = ata_bdev_write,
+    .flush = ata_bdev_flush,
+    .ioctl = NULL
+};
+
+static void ata_register_block_devices(void) {
+    for (uint32_t i = 0; i < ata_device_count; i++) {
+        ata_device_t *d = &ata_devices[i];
+        if (!d->present) continue;
+
+        char dev_name[64];
+        snprintf(dev_name, sizeof(dev_name), "ata%u", (unsigned)i);
+
+        block_device_t bdev;
+        memset(&bdev, 0, sizeof(bdev));
+        bdev.name = dev_name;
+        bdev.total_sectors = d->capacity_sectors;
+        bdev.sector_size = 512;
+        bdev.flags = (i == 0) ? BLOCK_DEV_BOOTABLE : 0;
+        bdev.ops = &s_ata_bdev_ops;
+        bdev.priv_data = (void *)(uintptr_t)i;
+        block_dev_register(&bdev);
+    }
+}
+
 void ata_init(void) {
     ata_device_count = 0;
 
-    serial_printf("ATA: scanning primary channel...\n");
+    if (ata_channel_count == 0) {
+        ata_register_channel(ATA_PRIMARY_BASE, ATA_PRIMARY_CTRL);
+        ata_register_channel(0x170, 0x376);
+    }
 
-    ata_identify(0); /* primary master */
-    ata_identify(1); /* primary slave */
+    for (uint32_t c = 0; c < ata_channel_count; c++) {
+        const char *ch_name = (c == 0) ? "primary" : (c == 1) ? "secondary" : "extended";
+        serial_printf("ATA: scanning %s channel (base=0x%x, ctrl=0x%x)...\n",
+                      ch_name, (unsigned)ata_channels[c].base, (unsigned)ata_channels[c].ctrl);
+        ata_identify((uint8_t)c, 0); /* master */
+        ata_identify((uint8_t)c, 1); /* slave */
+    }
 
-    serial_printf("ATA: found %d device(s)\n", ata_device_count);
+    serial_printf("ATA: found %u device(s)\n", (unsigned)ata_device_count);
     ata_print_devices();
+
+    ata_register_block_devices();
 }
 
-uint8_t ata_get_device_count(void) {
+uint32_t ata_get_device_count(void) {
     return ata_device_count;
 }
 
-ata_device_t *ata_get_device(uint8_t index) {
-    if (index >= ata_device_count)
+ata_device_t *ata_get_device(uint32_t index) {
+    if (index >= ata_device_count || !ata_devices)
         return NULL;
     return &ata_devices[index];
 }
@@ -157,49 +305,39 @@ ata_device_t *ata_get_device(uint8_t index) {
 void ata_print_devices(void) {
     serial_printf("=== ATA DEVICES ===\n");
 
-    for (uint8_t i = 0; i < ata_device_count; i++) {
+    for (uint32_t i = 0; i < ata_device_count; i++) {
         ata_device_t *d = &ata_devices[i];
-        serial_printf("Device %d:\n", i);
-        serial_printf("  Model: %s\n", d->model);
-        serial_printf("  Serial: %s\n", d->serial);
+        serial_printf("Device %u:\n", (unsigned)i);
+        serial_printf("  Model: %s\n", d->model ? d->model : "");
+        serial_printf("  Serial: %s\n", d->serial ? d->serial : "");
         serial_printf("  Sectors: %llu\n", d->capacity_sectors);
         serial_printf("  Size: %llu MB\n", d->capacity_sectors / 2048);
     }
 }
 
-bool ata_read_sectors_lba28(uint32_t lba, uint8_t count, void *buf) {
-    if (count == 0 || buf == NULL) {
-        serial_printf("ata_read_sectors_lba28: invalid count or buf\n");
-        return false;
-    }
-    if (ata_device_count == 0) {
-        serial_printf("ata_read_sectors_lba28: ata_device_count is 0\n");
-        return false;
-    }
+bool ata_read_drive_sectors_lba28(uint32_t drive_idx, uint32_t lba, uint8_t count, void *buf) {
+    if (count == 0 || buf == NULL) return false;
+    if (drive_idx >= ata_device_count || !ata_devices || !ata_devices[drive_idx].present) return false;
 
-    uint16_t base = ATA_PRIMARY_BASE;
+    uint16_t base = ata_channel_base(ata_devices[drive_idx].channel);
+    uint16_t ctrl = ata_channel_ctrl(ata_devices[drive_idx].channel);
+    uint8_t drive_bit = ata_devices[drive_idx].drive ? 0x10 : 0x00;
 
-    /* select device (master/slave based on ata_device_count), set LBA high bits */
-    uint8_t drive_bit = (ata_device_count > 1) ? 0x10 : 0x00;
     outb(base + ATA_REG_HDDEVSEL, 0xE0 | drive_bit | ((lba >> 24) & 0x0F));
-    ata_io_wait();
+    ata_io_wait_port(ctrl);
 
     outb(base + ATA_REG_SECCOUNT0, count);
     outb(base + ATA_REG_LBA0, (uint8_t)(lba & 0xFF));
     outb(base + ATA_REG_LBA1, (uint8_t)((lba >> 8) & 0xFF));
     outb(base + ATA_REG_LBA2, (uint8_t)((lba >> 16) & 0xFF));
 
-    if (!ata_wait_bsy_clear(base)) { serial_printf("ata_read_sectors_lba28: device bsy not cleared (lba=%u)\n", lba); return false; }
+    if (!ata_wait_bsy_clear(base)) return false;
 
-    /* READ PIO */
     outb(base + ATA_REG_COMMAND, 0x20);
 
     uint16_t *wptr = (uint16_t *)buf;
     for (int s = 0; s < count; s++) {
-        if (!ata_wait_drq(base)) {
-            serial_printf("ata_read_sectors_lba28: wait_drq failed (lba=%u sector=%d)\n", lba, s);
-            return false;
-        }
+        if (!ata_wait_drq(base)) return false;
         insw(base + ATA_REG_DATA, wptr, 256);
         wptr += 256;
     }
@@ -207,60 +345,57 @@ bool ata_read_sectors_lba28(uint32_t lba, uint8_t count, void *buf) {
     return true;
 }
 
-bool ata_write_sectors_lba28(uint32_t lba, uint8_t count, const void *buf) {
+bool ata_write_drive_sectors_lba28(uint32_t drive_idx, uint32_t lba, uint8_t count, const void *buf) {
     if (count == 0 || buf == NULL) return false;
-    if (ata_device_count == 0) return false;
+    if (drive_idx >= ata_device_count || !ata_devices || !ata_devices[drive_idx].present) return false;
 
-    uint16_t base = ATA_PRIMARY_BASE;
+    uint16_t base = ata_channel_base(ata_devices[drive_idx].channel);
+    uint16_t ctrl = ata_channel_ctrl(ata_devices[drive_idx].channel);
+    uint8_t drive_bit = ata_devices[drive_idx].drive ? 0x10 : 0x00;
 
-    /* select device (master/slave based on ata_device_count), set LBA high bits */
-    uint8_t drive_bit = (ata_device_count > 1) ? 0x10 : 0x00;
     outb(base + ATA_REG_HDDEVSEL, 0xE0 | drive_bit | ((lba >> 24) & 0x0F));
-    ata_io_wait();
+    ata_io_wait_port(ctrl);
 
     outb(base + ATA_REG_SECCOUNT0, count);
     outb(base + ATA_REG_LBA0, (uint8_t)(lba & 0xFF));
     outb(base + ATA_REG_LBA1, (uint8_t)((lba >> 8) & 0xFF));
     outb(base + ATA_REG_LBA2, (uint8_t)((lba >> 16) & 0xFF));
 
-    /* Ensure device is ready */
-    if (!ata_wait_bsy_clear(base)) { printf("ata_write_sectors_lba28: device bsy not cleared\n"); return false; }
+    if (!ata_wait_bsy_clear(base)) return false;
 
-    /* WRITE PIO */
     outb(base + ATA_REG_COMMAND, 0x30);
 
     const uint16_t *wptr = (const uint16_t *)buf;
     for (int s = 0; s < count; s++) {
         if (!ata_wait_drq(base)) {
-            /* small retry attempts */
             int retry = 0;
-            while (retry < 5 && !ata_wait_drq(base)) { ata_io_wait(); retry++; }
-            if (retry == 5) { printf("ata_write_sectors_lba28: ata_wait_drq failed for sector %d after retries\n", s); return false; }
+            while (retry < 5 && !ata_wait_drq(base)) { ata_io_wait_port(ctrl); retry++; }
+            if (retry == 5) return false;
         }
         outsw(base + ATA_REG_DATA, wptr, 256);
         wptr += 256;
-        ata_io_wait();
+        ata_io_wait_port(ctrl);
     }
 
-    /* flush cache */
     outb(base + ATA_REG_COMMAND, 0xE7);
-    ata_io_wait();
-    if (!ata_wait_bsy_clear(base)) { printf("ata_write_sectors_lba28: flush bsy not cleared\n"); return false; }
+    ata_io_wait_port(ctrl);
+    if (!ata_wait_bsy_clear(base)) return false;
     uint8_t st = inb(base + ATA_REG_STATUS);
-    if (st & ATA_SR_ERR) { printf("ata_write_sectors_lba28: status error after flush=%u\n", (unsigned)st); return false; }
+    if (st & ATA_SR_ERR) return false;
 
     return true;
 }
 
-bool ata_read_sectors_lba48(uint64_t lba, uint16_t count, void *buf) {
+bool ata_read_drive_sectors_lba48(uint32_t drive_idx, uint64_t lba, uint16_t count, void *buf) {
     if (count == 0 || buf == NULL) return false;
-    if (ata_device_count == 0) return false;
+    if (drive_idx >= ata_device_count || !ata_devices || !ata_devices[drive_idx].present) return false;
 
-    uint16_t base = ATA_PRIMARY_BASE;
-    uint8_t drive_bit = (ata_device_count > 1) ? 0x10 : 0x00;
+    uint16_t base = ata_channel_base(ata_devices[drive_idx].channel);
+    uint16_t ctrl = ata_channel_ctrl(ata_devices[drive_idx].channel);
+    uint8_t drive_bit = ata_devices[drive_idx].drive ? 0x10 : 0x00;
 
     outb(base + ATA_REG_HDDEVSEL, 0x40 | drive_bit);
-    ata_io_wait();
+    ata_io_wait_port(ctrl);
 
     /* Write high bytes first */
     outb(base + ATA_REG_SECCOUNT0, (uint8_t)((count >> 8) & 0xFF));
@@ -276,7 +411,6 @@ bool ata_read_sectors_lba48(uint64_t lba, uint16_t count, void *buf) {
 
     if (!ata_wait_bsy_clear(base)) return false;
 
-    /* READ SECTORS EXT */
     outb(base + ATA_REG_COMMAND, 0x24);
 
     uint16_t *wptr = (uint16_t *)buf;
@@ -289,15 +423,16 @@ bool ata_read_sectors_lba48(uint64_t lba, uint16_t count, void *buf) {
     return true;
 }
 
-bool ata_write_sectors_lba48(uint64_t lba, uint16_t count, const void *buf) {
+bool ata_write_drive_sectors_lba48(uint32_t drive_idx, uint64_t lba, uint16_t count, const void *buf) {
     if (count == 0 || buf == NULL) return false;
-    if (ata_device_count == 0) return false;
+    if (drive_idx >= ata_device_count || !ata_devices || !ata_devices[drive_idx].present) return false;
 
-    uint16_t base = ATA_PRIMARY_BASE;
-    uint8_t drive_bit = (ata_device_count > 1) ? 0x10 : 0x00;
+    uint16_t base = ata_channel_base(ata_devices[drive_idx].channel);
+    uint16_t ctrl = ata_channel_ctrl(ata_devices[drive_idx].channel);
+    uint8_t drive_bit = ata_devices[drive_idx].drive ? 0x10 : 0x00;
 
     outb(base + ATA_REG_HDDEVSEL, 0x40 | drive_bit);
-    ata_io_wait();
+    ata_io_wait_port(ctrl);
 
     /* Write high bytes first */
     outb(base + ATA_REG_SECCOUNT0, (uint8_t)((count >> 8) & 0xFF));
@@ -313,48 +448,93 @@ bool ata_write_sectors_lba48(uint64_t lba, uint16_t count, const void *buf) {
 
     if (!ata_wait_bsy_clear(base)) return false;
 
-    /* WRITE SECTORS EXT */
     outb(base + ATA_REG_COMMAND, 0x34);
 
     const uint16_t *wptr = (const uint16_t *)buf;
     for (int s = 0; s < count; s++) {
         if (!ata_wait_drq(base)) {
             int retry = 0;
-            while (retry < 5 && !ata_wait_drq(base)) { ata_io_wait(); retry++; }
+            while (retry < 5 && !ata_wait_drq(base)) { ata_io_wait_port(ctrl); retry++; }
             if (retry == 5) return false;
         }
         outsw(base + ATA_REG_DATA, wptr, 256);
         wptr += 256;
-        ata_io_wait();
+        ata_io_wait_port(ctrl);
     }
 
-    /* FLUSH CACHE EXT */
     outb(base + ATA_REG_COMMAND, 0xEA);
-    ata_io_wait();
+    ata_io_wait_port(ctrl);
     if (!ata_wait_bsy_clear(base)) return false;
 
     return true;
 }
 
-bool ata_read_sectors(uint64_t lba, uint16_t count, void *buf) {
-    if (lba + count < 0x10000000ULL && count <= 256) {
-        return ata_read_sectors_lba28((uint32_t)lba, (uint8_t)count, buf);
+bool ata_read_drive_sectors(uint32_t drive_idx, uint64_t lba, uint16_t count, void *buf) {
+    if (lba + count < 0x10000000ULL && count <= 255) {
+        return ata_read_drive_sectors_lba28(drive_idx, (uint32_t)lba, (uint8_t)count, buf);
     }
-    return ata_read_sectors_lba48(lba, count, buf);
+    return ata_read_drive_sectors_lba48(drive_idx, lba, count, buf);
+}
+
+bool ata_write_drive_sectors(uint32_t drive_idx, uint64_t lba, uint16_t count, const void *buf) {
+    if (lba + count < 0x10000000ULL && count <= 255) {
+        return ata_write_drive_sectors_lba28(drive_idx, (uint32_t)lba, (uint8_t)count, buf);
+    }
+    return ata_write_drive_sectors_lba48(drive_idx, lba, count, buf);
+}
+
+static inline uint32_t ata_get_default_target_drive(void) {
+    if (ata_device_count > 0 && ata_devices && ata_devices[0].present && ata_devices[0].capacity_sectors >= 2048 + 10) {
+        return 0;
+    }
+    return (ata_device_count > 1) ? 1 : 0;
+}
+
+/* Backward-compatible wrappers with portable boot-drive priority */
+bool ata_read_sectors_lba28(uint32_t lba, uint8_t count, void *buf) {
+    uint32_t target = ata_get_default_target_drive();
+    return ata_read_drive_sectors_lba28(target, lba, count, buf);
+}
+
+bool ata_write_sectors_lba28(uint32_t lba, uint8_t count, const void *buf) {
+    uint32_t target = ata_get_default_target_drive();
+    return ata_write_drive_sectors_lba28(target, lba, count, buf);
+}
+
+bool ata_read_sectors_lba48(uint64_t lba, uint16_t count, void *buf) {
+    uint32_t target = ata_get_default_target_drive();
+    return ata_read_drive_sectors_lba48(target, lba, count, buf);
+}
+
+bool ata_write_sectors_lba48(uint64_t lba, uint16_t count, const void *buf) {
+    uint32_t target = ata_get_default_target_drive();
+    return ata_write_drive_sectors_lba48(target, lba, count, buf);
+}
+
+bool ata_read_sectors(uint64_t lba, uint16_t count, void *buf) {
+    if (storage_pool_is_initialized()) {
+        return storage_pool_read(lba, count, buf);
+    }
+    uint32_t target = ata_get_default_target_drive();
+    return ata_read_drive_sectors(target, lba, count, buf);
 }
 
 bool ata_write_sectors(uint64_t lba, uint16_t count, const void *buf) {
-    if (lba + count < 0x10000000ULL && count <= 256) {
-        return ata_write_sectors_lba28((uint32_t)lba, (uint8_t)count, buf);
+    if (storage_pool_is_initialized()) {
+        return storage_pool_write(lba, count, buf);
     }
-    return ata_write_sectors_lba48(lba, count, buf);
+    uint32_t target = ata_get_default_target_drive();
+    return ata_write_drive_sectors(target, lba, count, buf);
 }
 
 uint64_t ata_get_pool_capacity(void) {
-    uint8_t start_dev = (ata_device_count > 1) ? 1 : 0;
+    if (storage_pool_is_initialized()) {
+        return storage_pool_get_capacity();
+    }
+    uint32_t start_dev = ata_get_default_target_drive();
     uint64_t total = 0;
-    for (uint8_t d = start_dev; d < ata_device_count; d++) {
-        if (ata_devices[d].present) {
+    for (uint32_t d = start_dev; d < ata_device_count; d++) {
+        if (ata_devices && ata_devices[d].present) {
             total += ata_devices[d].capacity_sectors;
         }
     }
@@ -363,20 +543,21 @@ uint64_t ata_get_pool_capacity(void) {
 
 bool ata_pool_read_sectors(uint64_t pool_lba, uint16_t count, void *buf) {
     if (count == 0 || buf == NULL) return false;
-    uint8_t start_dev = (ata_device_count > 1) ? 1 : 0;
+    uint32_t start_dev = ata_get_default_target_drive();
     uint64_t curr_lba = pool_lba;
     uint8_t *curr_buf = (uint8_t *)buf;
     uint16_t remaining = count;
 
-    for (uint8_t d = start_dev; d < ata_device_count && remaining > 0; d++) {
+    for (uint32_t d = start_dev; d < ata_device_count && remaining > 0; d++) {
+        if (!ata_devices) break;
         ata_device_t *dev = &ata_devices[d];
         if (!dev->present || dev->capacity_sectors == 0) continue;
 
         if (curr_lba < dev->capacity_sectors) {
             uint64_t dev_avail = dev->capacity_sectors - curr_lba;
             uint16_t chunk = (remaining < dev_avail) ? remaining : (uint16_t)dev_avail;
-            if (!ata_read_sectors(curr_lba, chunk, curr_buf)) {
-                serial_printf("ata_pool_read: ata_read_sectors failed (d=%u, curr_lba=%llu)\n", d, curr_lba);
+            if (!ata_read_drive_sectors(d, curr_lba, chunk, curr_buf)) {
+                serial_printf("ata_pool_read: ata_read_drive_sectors failed (d=%u, curr_lba=%llu)\n", (unsigned)d, curr_lba);
                 return false;
             }
             curr_lba = 0;
@@ -387,26 +568,27 @@ bool ata_pool_read_sectors(uint64_t pool_lba, uint16_t count, void *buf) {
         }
     }
     if (remaining > 0) {
-        serial_printf("ata_pool_read: remaining=%u (pool_lba=%llu)\n", remaining, pool_lba);
+        serial_printf("ata_pool_read: remaining=%u (pool_lba=%llu)\n", (unsigned)remaining, pool_lba);
     }
     return (remaining == 0);
 }
 
 bool ata_pool_write_sectors(uint64_t pool_lba, uint16_t count, const void *buf) {
     if (count == 0 || buf == NULL) return false;
-    uint8_t start_dev = (ata_device_count > 1) ? 1 : 0;
+    uint32_t start_dev = ata_get_default_target_drive();
     uint64_t curr_lba = pool_lba;
     const uint8_t *curr_buf = (const uint8_t *)buf;
     uint16_t remaining = count;
 
-    for (uint8_t d = start_dev; d < ata_device_count && remaining > 0; d++) {
+    for (uint32_t d = start_dev; d < ata_device_count && remaining > 0; d++) {
+        if (!ata_devices) break;
         ata_device_t *dev = &ata_devices[d];
         if (!dev->present || dev->capacity_sectors == 0) continue;
 
         if (curr_lba < dev->capacity_sectors) {
             uint64_t dev_avail = dev->capacity_sectors - curr_lba;
             uint16_t chunk = (remaining < dev_avail) ? remaining : (uint16_t)dev_avail;
-            if (!ata_write_sectors(curr_lba, chunk, curr_buf)) return false;
+            if (!ata_write_drive_sectors(d, curr_lba, chunk, curr_buf)) return false;
             curr_lba = 0;
             curr_buf += (chunk * 512u);
             remaining -= chunk;
@@ -416,3 +598,19 @@ bool ata_pool_write_sectors(uint64_t pool_lba, uint16_t count, const void *buf) 
     }
     return (remaining == 0);
 }
+
+static bool ata_bdev_read(block_device_t *bdev, uint64_t lba, uint16_t count, void *buf) {
+    uint32_t drive_idx = (uint32_t)(uintptr_t)bdev->priv_data;
+    return ata_read_drive_sectors(drive_idx, lba, count, buf);
+}
+
+static bool ata_bdev_write(block_device_t *bdev, uint64_t lba, uint16_t count, const void *buf) {
+    uint32_t drive_idx = (uint32_t)(uintptr_t)bdev->priv_data;
+    return ata_write_drive_sectors(drive_idx, lba, count, buf);
+}
+
+static bool ata_bdev_flush(block_device_t *bdev) {
+    (void)bdev;
+    return true;
+}
+

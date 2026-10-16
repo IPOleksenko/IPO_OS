@@ -58,6 +58,7 @@ void timer_init(void) {
     last_tsc_value = read_tsc();
     last_slice_yield_ms = 0;
     pit_init(1000u);
+    serial_printf("[timer] Programmable Interval Timer (PIT) initialized at 1000 Hz.\n");
 }
 
 void timer_update(void) {

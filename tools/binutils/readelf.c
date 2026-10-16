@@ -116,12 +116,17 @@ static void dump_syms(const uint8_t *raw, const Elf32_Ehdr *e) {
     const Elf32_Shdr *s = (const Elf32_Shdr *)(raw + e->e_shoff);
     for (uint16_t i = 0; i < e->e_shnum; i++) {
         if (s[i].sh_type == SHT_SYMTAB || s[i].sh_type == SHT_DYNSYM) {
+            if (s[i].sh_link >= e->e_shnum) continue;
             const char *strtab = (const char *)(raw + s[s[i].sh_link].sh_offset);
             const Elf32_Sym *sym = (const Elf32_Sym *)(raw + s[i].sh_offset);
             uint32_t count = s[i].sh_size / sizeof(Elf32_Sym);
 
-            printf("Symbol table '%s' contains %u entries:\n",
-                   (const char *)(raw + s[e->e_shstrndx].sh_offset + s[i].sh_name), count);
+            const char *sec_name = "";
+            if (e->e_shstrndx < e->e_shnum) {
+                sec_name = (const char *)(raw + s[e->e_shstrndx].sh_offset + s[i].sh_name);
+            }
+
+            printf("Symbol table '%s' contains %u entries:\n", sec_name, count);
             printf("   Num:    Value  Size Type    Bind   Vis      Ndx Name\n");
             for (uint32_t j = 0; j < count; j++) {
                 const char *type = "NOTYPE";
@@ -195,9 +200,19 @@ int main(int argc, char **argv) {
     }
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
+    if (size < (long)sizeof(Elf32_Ehdr)) {
+        fprintf(stderr, "readelf: Error: File too short\n");
+        fclose(f);
+        return 1;
+    }
     fseek(f, 0, SEEK_SET);
 
     uint8_t *raw = (uint8_t *)malloc(size);
+    if (!raw) {
+        fprintf(stderr, "readelf: Error: Out of memory\n");
+        fclose(f);
+        return 1;
+    }
     if (fread(raw, 1, size, f) != (size_t)size) {
         fclose(f);
         free(raw);

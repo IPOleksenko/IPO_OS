@@ -10,43 +10,85 @@
 #include <wm.h>
 #include <stdio.h>
 #include <kernel/driver.h>
+#include <memory/kmalloc.h>
+#include <string.h>
 
-#define KEYBOARD_QUEUE_SIZE 256
+/* Dynamic Self-Expanding Keyboard Queue (no fixed size limit) */
+#define KEYBOARD_QUEUE_INITIAL 32
 
 struct keyboard_queue {
-    volatile uint8_t data[KEYBOARD_QUEUE_SIZE];
-    volatile uint32_t head;
-    volatile uint32_t tail;
+    uint8_t  *data;     /* Heap-allocated scancode buffer                  */
+    uint32_t  cap;      /* Current allocated capacity (number of entries)  */
+    uint32_t  head;     /* Write index (next slot to write)                */
+    uint32_t  tail;     /* Read index  (next slot to read)                 */
 };
 
-static struct keyboard_queue shell_queue = { {0}, 0, 0 };
-static struct keyboard_queue app_queue = { {0}, 0, 0 };
+static struct keyboard_queue shell_queue = { NULL, 0, 0, 0 };
+static struct keyboard_queue app_queue   = { NULL, 0, 0, 0 };
 static bool keyboard_app_input_mode = false;
+
+/* Ensure the queue has an allocated buffer (lazy init on first push) */
+static void keyboard_queue_ensure_init(struct keyboard_queue *queue) {
+    if (queue->data == NULL) {
+        queue->data = (uint8_t *)kmalloc(KEYBOARD_QUEUE_INITIAL);
+        if (queue->data) {
+            queue->cap  = KEYBOARD_QUEUE_INITIAL;
+            queue->head = 0;
+            queue->tail = 0;
+        }
+    }
+}
+
+/* Number of scancodes currently stored */
+static uint32_t keyboard_queue_len(const struct keyboard_queue *queue) {
+    if (queue->cap == 0) return 0u;
+    return (queue->head - queue->tail + queue->cap) % queue->cap;
+}
 
 static void keyboard_queue_push(struct keyboard_queue *queue, uint8_t scancode) {
     if (scancode == 0x00u) {
         return;
     }
 
-    uint32_t next = (queue->head + 1u) % KEYBOARD_QUEUE_SIZE;
-    if (next == queue->tail) {
-        // Queue is full, drop oldest
-        queue->tail = (queue->tail + 1u) % KEYBOARD_QUEUE_SIZE;
+    keyboard_queue_ensure_init(queue);
+    if (queue->data == NULL) return; /* OOM - silently drop */
+
+    /* Grow when full (head+1 == tail) */
+    if ((queue->head + 1u) % queue->cap == queue->tail) {
+        uint32_t old_cap = queue->cap;
+        uint32_t new_cap = old_cap * 2u;
+        uint8_t *new_data = (uint8_t *)kmalloc(new_cap);
+        if (new_data == NULL) {
+            /* OOM: no growth - drop the oldest entry to make room */
+            queue->tail = (queue->tail + 1u) % old_cap;
+        } else {
+            /* Linearize the ring into the new buffer */
+            uint32_t len = keyboard_queue_len(queue);
+            for (uint32_t i = 0; i < len; i++) {
+                new_data[i] = queue->data[(queue->tail + i) % old_cap];
+            }
+            kfree(queue->data);
+            queue->data = new_data;
+            queue->tail = 0;
+            queue->head = len;
+            queue->cap  = new_cap;
+        }
     }
 
     queue->data[queue->head] = scancode;
-    queue->head = next;
+    queue->head = (queue->head + 1u) % queue->cap;
 }
 
 static uint8_t keyboard_queue_pop(struct keyboard_queue *queue) {
-    if (queue->head == queue->tail) {
+    if (queue->data == NULL || queue->cap == 0 || queue->head == queue->tail) {
         return 0x00u;
     }
 
     uint8_t scancode = queue->data[queue->tail];
-    queue->tail = (queue->tail + 1u) % KEYBOARD_QUEUE_SIZE;
+    queue->tail = (queue->tail + 1u) % queue->cap;
     return scancode;
 }
+
 
 static bool is_batch_running(void) {
     if (process_is_batch_active()) {
@@ -71,14 +113,6 @@ static bool is_wm_active(void) {
 }
 
 static void trigger_switch_fg(bool prev) {
-    if (process_is_batch_active()) {
-        if (prev) {
-            process_switch_foreground_prev();
-        } else {
-            process_switch_foreground_next();
-        }
-        return;
-    }
     uint32_t arg = prev ? 1 : 0;
     ipo_syscall(IPO_SYSCALL_PROCESS_SWITCH_FG, 1, &arg);
 }
@@ -130,7 +164,6 @@ void keyboard_poll(void) {
             }
             if (scancode == 0x2E && keyboard_is_ctrl_pressed() && !wm_active_and_focused) {
                 system_request_interrupt();
-                continue;
                 /* When an app or batch process is active, consume the key
                  * so the running app gets interrupted via system_is_interrupted().
                  * When the terminal shell prompt is active, let the scancode
@@ -140,9 +173,9 @@ void keyboard_poll(void) {
                 }
             }
 
-            /* Ctrl + PageUp: Switch to previous process / window */
-            if ((scancode == 0x49 || scancode == 0xC9) && keyboard_is_ctrl_pressed() && is_batch_running()) {
-                serial_printf("[kbd] Ctrl+PageUp detected! sc=0x%x\n", scancode);
+            /* Ctrl / Alt + PageUp: Switch to previous process / window */
+            if ((scancode == 0x49 || scancode == 0xC9) && (keyboard_is_ctrl_pressed() || keyboard_is_alt_pressed()) && is_batch_running()) {
+                serial_printf("[kbd] PageUp switch detected! sc=0x%x\n", scancode);
                 pending_e0 = false;
                 if (scancode == 0x49) {
                     trigger_switch_fg(true);
@@ -150,9 +183,9 @@ void keyboard_poll(void) {
                 continue;
             }
 
-            /* Ctrl + PageDown: Switch to next process / window */
-            if ((scancode == 0x51 || scancode == 0xD1) && keyboard_is_ctrl_pressed() && is_batch_running()) {
-                serial_printf("[kbd] Ctrl+PageDown detected! sc=0x%x\n", scancode);
+            /* Ctrl / Alt + PageDown: Switch to next process / window */
+            if ((scancode == 0x51 || scancode == 0xD1) && (keyboard_is_ctrl_pressed() || keyboard_is_alt_pressed()) && is_batch_running()) {
+                serial_printf("[kbd] PageDown switch detected! sc=0x%x\n", scancode);
                 pending_e0 = false;
                 if (scancode == 0x51) {
                     trigger_switch_fg(false);
@@ -160,9 +193,9 @@ void keyboard_poll(void) {
                 continue;
             }
 
-            /* Alt + Tab: Switch to next process / window */
-            if ((scancode == 0x0F || scancode == 0x8F) && keyboard_is_alt_pressed() && is_batch_running() && !is_wm_active()) {
-                serial_printf("[kbd] Alt+Tab detected! sc=0x%x\n", scancode);
+            /* Alt + Tab or Ctrl + Tab: Switch to next process / window */
+            if ((scancode == 0x0F || scancode == 0x8F) && (keyboard_is_alt_pressed() || keyboard_is_ctrl_pressed()) && is_batch_running() && !is_wm_active()) {
+                serial_printf("[kbd] Tab switch detected! sc=0x%x\n", scancode);
                 pending_e0 = false;
                 if (scancode == 0x0F) {
                     trigger_switch_fg(false);
@@ -189,8 +222,8 @@ void keyboard_flush_hardware(void) {
 void keyboard_flush_queue(void) {
     shell_queue.head = 0;
     shell_queue.tail = 0;
-    app_queue.head = 0;
-    app_queue.tail = 0;
+    app_queue.head   = 0;
+    app_queue.tail   = 0;
 }
 
 void keyboard_flush_app_queue(void) {

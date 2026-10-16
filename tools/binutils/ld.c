@@ -245,8 +245,9 @@ static void load_archive_needed(const char *ar_path, const uint8_t *ar_data, uin
                     if (!already) {
                         char full_name[256];
                         snprintf(full_name, sizeof(full_name), "%s(%s)", ar_path, name_buf);
-                        uint8_t *copy = (uint8_t *)malloc(member_size);
-                        memcpy(copy, member_data, member_size);
+                        uint8_t *copy = (uint8_t *)malloc(member_size > 0 ? member_size : 1);
+                        if (!copy) continue;
+                        if (member_size > 0) memcpy(copy, member_data, member_size);
                         add_input_object(full_name, copy, member_size);
                         added_any = 1;
 
@@ -284,11 +285,16 @@ static void load_file(const char *filename) {
     }
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
+    if (sz <= 0) {
+        fclose(f);
+        return;
+    }
     fseek(f, 0, SEEK_SET);
 
     uint8_t *data = (uint8_t *)malloc(sz);
     if (!data || fread(data, 1, sz, f) != (size_t)sz) {
         fprintf(stderr, "ld: failed to read %s\n", filename);
+        if (data) free(data);
         fclose(f);
         exit(1);
     }
@@ -438,6 +444,10 @@ int main(int argc, char **argv) {
         const Elf32_Shdr *shdrs = (const Elf32_Shdr *)(obj->data + eh->e_shoff);
         const char *shstrtab = (const char *)(obj->data + shdrs[eh->e_shstrndx].sh_offset);
         obj->sec_map = (int *)malloc(eh->e_shnum * sizeof(int));
+        if (!obj->sec_map) {
+            fprintf(stderr, "ld: out of memory allocating sec_map\n");
+            exit(1);
+        }
         for (uint16_t s = 0; s < eh->e_shnum; s++) obj->sec_map[s] = -1;
 
         for (uint16_t s = 0; s < eh->e_shnum; s++) {
@@ -681,6 +691,7 @@ int main(int argc, char **argv) {
                         }
                     }
 
+                    if (rel->r_offset + sizeof(uint32_t) > target_sec->size) continue;
                     uint8_t *patch_ptr = target_sec->data + rel->r_offset;
                     uint32_t ref_addr = target_sec->vaddr + rel->r_offset;
 
@@ -831,9 +842,20 @@ int main(int argc, char **argv) {
     }
     shstrtab_cap += sizeof(".shstrtab") + 16;
     char *shstrtab = (char *)calloc(1, shstrtab_cap);
+    if (!shstrtab) {
+        fprintf(stderr, "ld: out of memory allocating shstrtab\n");
+        fclose(fout);
+        return 1;
+    }
     size_t shstrtab_len = 1; // shstrtab[0] is '\0'
 
     uint32_t *sec_name_offsets = (uint32_t *)malloc(num_sections * sizeof(uint32_t));
+    if (!sec_name_offsets) {
+        fprintf(stderr, "ld: out of memory allocating sec_name_offsets\n");
+        free(shstrtab);
+        fclose(fout);
+        return 1;
+    }
     for (size_t i = 0; i < num_sections; i++) {
         sec_name_offsets[i] = (uint32_t)shstrtab_len;
         size_t nlen = strlen(sections[i].name);

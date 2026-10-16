@@ -51,6 +51,10 @@ static void add_member(const char *name, uint32_t date, uint32_t uid, uint32_t g
         curr = &(*curr)->next;
     }
     ar_member_t *m = (ar_member_t *)malloc(sizeof(ar_member_t));
+    if (!m) {
+        free(data);
+        return;
+    }
     strncpy(m->name, name, sizeof(m->name) - 1);
     m->name[sizeof(m->name) - 1] = '\0';
     m->date = date;
@@ -93,8 +97,9 @@ static int read_archive(const char *path) {
         uint32_t gid = (uint32_t)strtoul(hdr.ar_gid, NULL, 10);
         uint32_t mode = (uint32_t)strtoul(hdr.ar_mode, NULL, 8);
 
-        uint8_t *data = (uint8_t *)malloc(size);
-        if (fread(data, 1, size, f) != size) {
+        uint8_t *data = (uint8_t *)malloc(size > 0 ? size : 1);
+        if (!data) break;
+        if (size > 0 && fread(data, 1, size, f) != size) {
             free(data);
             break;
         }
@@ -120,9 +125,17 @@ static int add_file(const char *path) {
     }
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
+    if (size < 0) {
+        fclose(f);
+        return -1;
+    }
     fseek(f, 0, SEEK_SET);
 
     uint8_t *data = (uint8_t *)malloc(size > 0 ? size : 1);
+    if (!data) {
+        fclose(f);
+        return -1;
+    }
     if (size > 0 && fread(data, 1, size, f) != (size_t)size) {
         free(data);
         fclose(f);
@@ -151,7 +164,7 @@ static int write_archive(const char *path) {
         memset(&hdr, ' ', sizeof(hdr));
 
         char name_slash[17];
-        snprintf(name_slash, sizeof(name_slash), "%s/", m->name);
+        snprintf(name_slash, sizeof(name_slash), "%.15s/", m->name);
         size_t nlen = strlen(name_slash);
         memcpy(hdr.ar_name, name_slash, nlen > 16 ? 16 : nlen);
 

@@ -32,6 +32,22 @@ static void write_dir_dots(uint32_t inode_no, uint32_t parent, uint64_t block) {
     block_write(block, buf);
 }
 
+static bool zero_blocks(uint64_t start_block, uint64_t num_blocks) {
+    #define ZERO_CHUNK_BLOCKS 64
+    static uint8_t zero_chunk[ZERO_CHUNK_BLOCKS * IPO_FS_BLOCK_SIZE];
+    uint64_t remaining = num_blocks;
+    uint64_t curr = start_block;
+    while (remaining > 0) {
+        uint16_t chunk = (remaining > ZERO_CHUNK_BLOCKS) ? ZERO_CHUNK_BLOCKS : (uint16_t)remaining;
+        if (!block_write_multi(curr, chunk, zero_chunk)) {
+            return false;
+        }
+        curr += chunk;
+        remaining -= chunk;
+    }
+    return true;
+}
+
 bool ipo_fs_format(uint64_t disk_start_lba, uint64_t total_blocks, uint64_t total_inodes) {
     if (total_blocks < 10) { printf("ipo_fs_format: too few blocks\n"); return false; }
     uint64_t inode_table_blocks = (total_inodes * sizeof(struct ipo_inode) + IPO_FS_BLOCK_SIZE - 1) / IPO_FS_BLOCK_SIZE;
@@ -62,23 +78,13 @@ bool ipo_fs_format(uint64_t disk_start_lba, uint64_t total_blocks, uint64_t tota
     s.data_blocks_start = s.inode_table_start + inode_table_blocks;
 
     fs_start_lba = disk_start_lba;
+    memcpy(&sb, &s, sizeof(sb));
 
     if (!ata_pool_write_sectors(fs_start_lba + 0, 1, &s)) { printf("ipo_fs_format: write super failed\n"); return false; }
 
-    uint8_t zero[IPO_FS_BLOCK_SIZE]; memset(zero,0,sizeof(zero));
-    for (uint64_t i = 0; i < inode_bitmap_blocks; i++) {
-        if (!block_write(s.inode_bitmap_start + i, zero)) return false;
-    }
-    for (uint64_t i = 0; i < block_bitmap_blocks; i++) {
-        if (!block_write(s.block_bitmap_start + i, zero)) return false;
-    }
-    for (uint64_t i = 0; i < inode_table_blocks; i++) {
-        if (!block_write(s.inode_table_start + i, zero)) return false;
-    }
-
-    /* initialize superblock and root */
-    memcpy(&sb, &s, sizeof(sb));
-    fs_start_lba = disk_start_lba;
+    if (!zero_blocks(s.inode_bitmap_start, inode_bitmap_blocks)) return false;
+    if (!zero_blocks(s.block_bitmap_start, block_bitmap_blocks)) return false;
+    if (!zero_blocks(s.inode_table_start, inode_table_blocks)) return false;
 
     /* mark inode 1 as used */
     bitmap_set(sb.inode_bitmap_start, 0, true);
@@ -217,12 +223,24 @@ int ipo_fs_open(const char *path) {
     if (!read_inode(ino, &inode)) return -1;
     if ((inode.mode & IPO_INODE_TYPE_DIR) != 0) return -1;
 
-    for (uint32_t i = 3; i < fds_capacity; i++) {
-        if (!fds[i].used) {
-            fds[i].used = 1;
-            fds[i].inode = ino;
-            fds[i].offset = 0;
-            return (int)i;
+    if (!fds || fds_capacity == 0) {
+        fds_capacity = 32;
+        fds = (struct ipo_fd *)kmalloc(fds_capacity * sizeof(struct ipo_fd));
+        if (fds) {
+            memset(fds, 0, fds_capacity * sizeof(struct ipo_fd));
+            fds[0].used = fds[1].used = fds[2].used = 1;
+        }
+    }
+
+    if (fds) {
+        for (uint32_t i = 3; i < fds_capacity; i++) {
+            if (!fds[i].used) {
+                fds[i].used = 1;
+                fds[i].inode = ino;
+                fds[i].offset = 0;
+                fds[i].flags = 0;
+                return (int)i;
+            }
         }
     }
 
@@ -243,11 +261,12 @@ int ipo_fs_open(const char *path) {
     fds[old_cap].used = 1;
     fds[old_cap].inode = ino;
     fds[old_cap].offset = 0;
+    fds[old_cap].flags = 0;
     return (int)old_cap;
 }
 
 int ipo_fs_close(int fd) {
-    if (fd < 3 || (uint32_t)fd >= fds_capacity || !fds) return -1;
+    if (fd < 3 || !fds || (uint32_t)fd >= fds_capacity) return -1;
     if (!fds[fd].used) return -1;
 
     fds[fd].used = 0;
@@ -258,7 +277,7 @@ int ipo_fs_close(int fd) {
 }
 
 int ipo_fs_read(int fd, void *buffer, uint32_t size, uint32_t offset) {
-    if (fd < 0 || (uint32_t)fd >= fds_capacity || !fds) return -1;
+    if (fd < 0 || !fds || (uint32_t)fd >= fds_capacity) return -1;
     if (!fds[fd].used) return -1;
     struct ipo_inode inode;
     if (!read_inode(fds[fd].inode, &inode)) return -1;
@@ -266,7 +285,7 @@ int ipo_fs_read(int fd, void *buffer, uint32_t size, uint32_t offset) {
 }
 
 int ipo_fs_write(int fd, const void *buffer, uint32_t size, uint32_t offset) {
-    if (fd < 0 || (uint32_t)fd >= fds_capacity || !fds) return -1;
+    if (fd < 0 || !fds || (uint32_t)fd >= fds_capacity) return -1;
     if (!fds[fd].used) return -1;
     struct ipo_inode inode;
     if (!read_inode(fds[fd].inode, &inode)) return -1;
@@ -348,6 +367,13 @@ bool ipo_fs_write_text(const char *path, const char *text, bool append) {
     if (fd < 0) { printf("ipo_fs_write_text: failed to open %s\n", path); return false; }
     int len = strlen(text);
     int written = ipo_fs_write(fd, text, len, offset);
+    if (!append && written >= 0) {
+        if (read_inode(fds[fd].inode, &inode)) {
+            inode.size = (uint64_t)written;
+            write_inode(fds[fd].inode, &inode);
+        }
+    }
+    ipo_fs_close(fd);
     if (written != len) { printf("ipo_fs_write_text: write failed: wrote %d of %d to %s\n", written, len, path); }
     return written == len;
 }

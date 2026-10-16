@@ -23,25 +23,30 @@ FILE *stdin  = &_stdin_obj;
 FILE *stdout = &_stdout_obj;
 FILE *stderr = &_stderr_obj;
 
-#define MAX_SHIM_FDS 64
+#define INITIAL_SHIM_FDS 64
 typedef struct {
     int in_use;
     int ipo_fd;
     uint32_t offset;
-    char path[128];
+    char *path;
 } shim_fd_t;
 
-static shim_fd_t shim_fds[MAX_SHIM_FDS];
+static shim_fd_t *shim_fds = NULL;
+static int shim_fds_capacity = 0;
 
 static void init_shim_fds(void) {
-    static int init = 0;
-    if (init) return;
-    init = 1;
-    for (int i = 0; i < MAX_SHIM_FDS; i++) {
+    if (shim_fds) return;
+    shim_fds_capacity = INITIAL_SHIM_FDS;
+    shim_fds = (shim_fd_t *)malloc(shim_fds_capacity * sizeof(shim_fd_t));
+    if (!shim_fds) {
+        shim_fds_capacity = 0;
+        return;
+    }
+    for (int i = 0; i < shim_fds_capacity; i++) {
         shim_fds[i].in_use = 0;
         shim_fds[i].ipo_fd = -1;
         shim_fds[i].offset = 0;
-        shim_fds[i].path[0] = '\0';
+        shim_fds[i].path = NULL;
     }
     shim_fds[0].in_use = 1; /* stdin */
     shim_fds[1].in_use = 1; /* stdout */
@@ -54,7 +59,7 @@ static void init_shim_fds(void) {
 
 int open(const char *pathname, int flags, ...) {
     init_shim_fds();
-    if (!pathname) {
+    if (!pathname || !shim_fds) {
         errno = EINVAL;
         return -1;
     }
@@ -73,15 +78,36 @@ int open(const char *pathname, int flags, ...) {
         return -1;
     }
 
-    for (int i = 3; i < MAX_SHIM_FDS; i++) {
+    for (int i = 3; i < shim_fds_capacity; i++) {
         if (!shim_fds[i].in_use) {
             shim_fds[i].in_use = 1;
             shim_fds[i].ipo_fd = ipo_fd;
             shim_fds[i].offset = 0;
-            strncpy(shim_fds[i].path, pathname, sizeof(shim_fds[i].path) - 1);
-            shim_fds[i].path[sizeof(shim_fds[i].path) - 1] = '\0';
+            if (shim_fds[i].path) free(shim_fds[i].path);
+            shim_fds[i].path = strdup(pathname);
             return i;
         }
+    }
+
+    /* Dynamically double capacity */
+    int new_cap = shim_fds_capacity * 2;
+    shim_fd_t *new_fds = (shim_fd_t *)realloc(shim_fds, new_cap * sizeof(shim_fd_t));
+    if (new_fds) {
+        for (int i = shim_fds_capacity; i < new_cap; i++) {
+            new_fds[i].in_use = 0;
+            new_fds[i].ipo_fd = -1;
+            new_fds[i].offset = 0;
+            new_fds[i].path = NULL;
+        }
+        int allocated_fd = shim_fds_capacity;
+        shim_fds = new_fds;
+        shim_fds_capacity = new_cap;
+
+        shim_fds[allocated_fd].in_use = 1;
+        shim_fds[allocated_fd].ipo_fd = ipo_fd;
+        shim_fds[allocated_fd].offset = 0;
+        shim_fds[allocated_fd].path = strdup(pathname);
+        return allocated_fd;
     }
 
     ipo_close(ipo_fd);
@@ -91,7 +117,7 @@ int open(const char *pathname, int flags, ...) {
 
 int close(int fd) {
     init_shim_fds();
-    if (fd < 0 || fd >= MAX_SHIM_FDS || !shim_fds[fd].in_use) {
+    if (fd < 0 || fd >= shim_fds_capacity || !shim_fds || !shim_fds[fd].in_use) {
         errno = EINVAL;
         return -1;
     }
@@ -99,13 +125,17 @@ int close(int fd) {
         ipo_close(shim_fds[fd].ipo_fd);
         shim_fds[fd].in_use = 0;
         shim_fds[fd].ipo_fd = -1;
+        if (shim_fds[fd].path) {
+            free(shim_fds[fd].path);
+            shim_fds[fd].path = NULL;
+        }
     }
     return 0;
 }
 
 int read(int fd, void *buf, size_t count) {
     init_shim_fds();
-    if (fd < 0 || fd >= MAX_SHIM_FDS || !shim_fds[fd].in_use) {
+    if (fd < 0 || fd >= shim_fds_capacity || !shim_fds || !shim_fds[fd].in_use) {
         errno = EINVAL;
         return -1;
     }
@@ -126,7 +156,7 @@ int read(int fd, void *buf, size_t count) {
 
 int write(int fd, const void *buf, size_t count) {
     init_shim_fds();
-    if (fd < 0 || fd >= MAX_SHIM_FDS || !shim_fds[fd].in_use) {
+    if (fd < 0 || fd >= shim_fds_capacity || !shim_fds || !shim_fds[fd].in_use) {
         errno = EINVAL;
         return -1;
     }
@@ -149,7 +179,7 @@ int write(int fd, const void *buf, size_t count) {
 
 long lseek(int fd, long offset, int whence) {
     init_shim_fds();
-    if (fd < 0 || fd >= MAX_SHIM_FDS || !shim_fds[fd].in_use) {
+    if (fd < 0 || fd >= shim_fds_capacity || !shim_fds || !shim_fds[fd].in_use) {
         errno = EINVAL;
         return -1;
     }
@@ -161,7 +191,7 @@ long lseek(int fd, long offset, int whence) {
         shim_fds[fd].offset += (uint32_t)offset;
     } else if (whence == SEEK_END) {
         struct ipo_inode st;
-        if (ipo_stat(shim_fds[fd].path, &st) == 0) {
+        if (shim_fds[fd].path && ipo_stat(shim_fds[fd].path, &st) == 0) {
             shim_fds[fd].offset = (uint32_t)(st.size + offset);
         }
     } else {
@@ -188,9 +218,19 @@ int remove(const char *pathname) {
 }
 
 char *getcwd(char *buf, size_t size) {
-    if (size < 2) return NULL;
-    buf[0] = '/';
-    buf[1] = '\0';
+    if (!buf || size == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+    if (ipo_getcwd(buf, (uint32_t)size) == 0) {
+        if (size >= 2) {
+            buf[0] = '/';
+            buf[1] = '\0';
+            return buf;
+        }
+        errno = ERANGE;
+        return NULL;
+    }
     return buf;
 }
 
@@ -211,9 +251,16 @@ int stat(const char *pathname, struct stat *statbuf) {
 
 int fstat(int fd, struct stat *statbuf) {
     init_shim_fds();
-    if (fd < 0 || fd >= MAX_SHIM_FDS || !shim_fds[fd].in_use) {
+    if (fd < 0 || fd >= shim_fds_capacity || !shim_fds || !shim_fds[fd].in_use) {
         errno = EINVAL;
         return -1;
+    }
+    if (fd < 3 || !shim_fds[fd].path) {
+        if (statbuf) {
+            statbuf->st_size = 0;
+            statbuf->st_mode = S_IFCHR | 0666;
+        }
+        return 0;
     }
     return stat(shim_fds[fd].path, statbuf);
 }
@@ -503,6 +550,14 @@ int sprintf(char *str, const char *format, ...) {
     return res;
 }
 
+int snprintf(char *str, size_t size, const char *format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    int res = vsnprintf(str, size, format, ap);
+    va_end(ap);
+    return res;
+}
+
 int vprintf(const char *format, va_list ap) {
     return vfprintf(stdout, format, ap);
 }
@@ -683,11 +738,138 @@ void qsort(void *base, size_t nmemb, size_t size, int (*compar)(const void *, co
 }
 
 char *realpath(const char *path, char *resolved_path) {
-    if (!path) return NULL;
-    if (!resolved_path) resolved_path = (char *)malloc(128);
-    if (!resolved_path) return NULL;
-    strncpy(resolved_path, path, 127);
-    resolved_path[127] = '\0';
+    if (!path) {
+        errno = EINVAL;
+        return NULL;
+    }
+    if (path[0] == '\0') {
+        errno = ENOENT;
+        return NULL;
+    }
+
+    char *abs_path = NULL;
+    if (path[0] != '/') {
+        uint32_t cwd_cap = 256;
+        char *cwd_buf = (char *)malloc(cwd_cap);
+        while (cwd_buf) {
+            if (ipo_getcwd(cwd_buf, cwd_cap) != 0) {
+                break;
+            }
+            cwd_cap *= 2;
+            char *new_buf = (char *)realloc(cwd_buf, cwd_cap);
+            if (!new_buf) {
+                free(cwd_buf);
+                cwd_buf = NULL;
+                break;
+            }
+            cwd_buf = new_buf;
+        }
+        if (!cwd_buf || cwd_buf[0] == '\0') {
+            if (cwd_buf) free(cwd_buf);
+            cwd_buf = strdup("/");
+        }
+
+        size_t clen = strlen(cwd_buf);
+        size_t plen = strlen(path);
+        size_t needed = clen + 1 + plen + 1;
+        abs_path = (char *)malloc(needed);
+        if (!abs_path) {
+            free(cwd_buf);
+            errno = ENOMEM;
+            return NULL;
+        }
+        if (clen == 1 && cwd_buf[0] == '/') {
+            snprintf(abs_path, needed, "/%s", path);
+        } else {
+            snprintf(abs_path, needed, "%s/%s", cwd_buf, path);
+        }
+        free(cwd_buf);
+    } else {
+        abs_path = strdup(path);
+        if (!abs_path) {
+            errno = ENOMEM;
+            return NULL;
+        }
+    }
+
+    size_t cap = 16;
+    size_t count = 0;
+    char **tokens = (char **)malloc(cap * sizeof(char *));
+    if (!tokens) {
+        free(abs_path);
+        errno = ENOMEM;
+        return NULL;
+    }
+
+    char *curr = abs_path;
+    while (*curr) {
+        while (*curr == '/') curr++;
+        if (!*curr) break;
+        char *start = curr;
+        while (*curr && *curr != '/') curr++;
+        if (*curr) {
+            *curr = '\0';
+            curr++;
+        }
+
+        if (strcmp(start, ".") == 0) {
+            continue;
+        }
+        if (strcmp(start, "..") == 0) {
+            if (count > 0) count--;
+            continue;
+        }
+
+        if (count >= cap) {
+            size_t new_cap = cap * 2;
+            char **new_tokens = (char **)realloc(tokens, new_cap * sizeof(char *));
+            if (!new_tokens) {
+                free(tokens);
+                free(abs_path);
+                errno = ENOMEM;
+                return NULL;
+            }
+            tokens = new_tokens;
+            cap = new_cap;
+        }
+        tokens[count++] = start;
+    }
+
+    size_t out_len = 0;
+    if (count == 0) {
+        out_len = 1; /* "/" */
+    } else {
+        for (size_t i = 0; i < count; i++) {
+            out_len += 1 + strlen(tokens[i]);
+        }
+    }
+
+    if (!resolved_path) {
+        resolved_path = (char *)malloc(out_len + 1);
+        if (!resolved_path) {
+            free(tokens);
+            free(abs_path);
+            errno = ENOMEM;
+            return NULL;
+        }
+    }
+
+    if (count == 0) {
+        resolved_path[0] = '/';
+        resolved_path[1] = '\0';
+    } else {
+        char *p = resolved_path;
+        for (size_t i = 0; i < count; i++) {
+            *p++ = '/';
+            size_t slen = strlen(tokens[i]);
+            memcpy(p, tokens[i], slen);
+            p += slen;
+        }
+        *p = '\0';
+    }
+
+    free(tokens);
+    free(abs_path);
     return resolved_path;
 }
 

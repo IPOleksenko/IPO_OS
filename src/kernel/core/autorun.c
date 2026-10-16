@@ -8,20 +8,6 @@
 
 #define AUTORUN_PATH "/autorun"
 
-/**
- * Extract first token from line
- */
-static void extract_token(const char *line, char *token_out, size_t max_len) {
-    // Skip leading whitespace
-    while (*line && (*line == ' ' || *line == '\t')) line++;
-    
-    // Extract token
-    size_t pos = 0;
-    while (*line && *line != ' ' && *line != '\t' && *line != '\n' && pos < max_len - 1) {
-        token_out[pos++] = *line++;
-    }
-    token_out[pos] = '\0';
-}
 
 /**
  * Skip rest of line
@@ -65,6 +51,7 @@ void autorun_init(void) {
     }
     
     int bytes_read = ipo_fs_read(fd, autorun_buf, stat.size, 0);
+    ipo_fs_close(fd);
     if (bytes_read < (int)stat.size) {
         serial_printf("[autorun] Failed to read /autorun (read %d of %d bytes)\n", bytes_read, stat.size);
         kfree(autorun_buf);
@@ -116,16 +103,7 @@ void autorun_init(void) {
         // Skip newline
         if (*ptr == '\n') ptr++;
         
-        // Get just command name for logging
-        const char *space = strchr(full_line, ' ');
-        int cmd_len = space ? (int)(space - full_line) : line_len;
-        char *cmd_name = kmalloc(cmd_len + 1);
-        if (cmd_name) {
-            memcpy(cmd_name, full_line, cmd_len);
-            cmd_name[cmd_len] = '\0';
-            serial_printf("[autorun] Line %d: executing '%s'\n", line_num, cmd_name);
-            kfree(cmd_name);
-        }
+        serial_printf("[autorun] Line %d: executing '%s'\n", line_num, full_line);
         
         // Try to execute with full line (including arguments)
         int exec_result = try_execute_command(full_line);

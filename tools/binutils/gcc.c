@@ -104,7 +104,9 @@ static void print_verbose_info(void) {
 }
 
 static char *replace_extension(const char *path, const char *new_ext) {
+    if (!path || !new_ext) return NULL;
     char *res = (char *)malloc(strlen(path) + strlen(new_ext) + 2);
+    if (!res) return NULL;
     strcpy(res, path);
     char *dot = strrchr(res, '.');
     if (dot) *dot = '\0';
@@ -193,7 +195,14 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        char *target_obj = (flag_compile_only && outfile) ? (char *)outfile : replace_extension(in, ".o");
+        char *allocated_obj = NULL;
+        char *target_obj;
+        if (flag_compile_only && outfile) {
+            target_obj = (char *)outfile;
+        } else {
+            allocated_obj = replace_extension(in, ".o");
+            target_obj = allocated_obj ? allocated_obj : "a.o";
+        }
 
         dyn_str_t cmd;
         dyn_str_init(&cmd);
@@ -208,7 +217,17 @@ int main(int argc, char **argv) {
             if (flag_verbose) printf("%s\n", cmd.data);
             int ret = system(cmd.data);
             dyn_str_free(&cmd);
-            if (ret != 0) return ret;
+            if (ret != 0) {
+                free(allocated_obj);
+                dyn_str_free(&inc_str);
+                str_list_free(&in_files);
+                str_list_free(&include_dirs);
+                str_list_free(&lib_dirs);
+                str_list_free(&libs);
+                str_list_free(&cflags);
+                str_list_free(&obj_files);
+                return ret;
+            }
         } else {
             // C or C++ source file
             dyn_str_append(&cmd, "tcc -c ");
@@ -234,6 +253,14 @@ int main(int argc, char **argv) {
                 dyn_str_free(&fallback);
                 if (ret != 0) {
                     dyn_str_free(&cmd);
+                    free(allocated_obj);
+                    dyn_str_free(&inc_str);
+                    str_list_free(&in_files);
+                    str_list_free(&include_dirs);
+                    str_list_free(&lib_dirs);
+                    str_list_free(&libs);
+                    str_list_free(&cflags);
+                    str_list_free(&obj_files);
                     return ret;
                 }
             }
@@ -241,10 +268,17 @@ int main(int argc, char **argv) {
         }
 
         str_list_push(&obj_files, target_obj);
+        free(allocated_obj);
     }
     dyn_str_free(&inc_str);
 
     if (flag_compile_only) {
+        str_list_free(&in_files);
+        str_list_free(&include_dirs);
+        str_list_free(&lib_dirs);
+        str_list_free(&libs);
+        str_list_free(&cflags);
+        str_list_free(&obj_files);
         return 0;
     }
 

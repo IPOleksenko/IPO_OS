@@ -34,6 +34,18 @@ void *malloc(size_t size) {
     while (curr) {
         if (curr->magic == BLOCK_MAGIC && curr->is_free && curr->size >= size) {
             curr->is_free = 0;
+            if (curr->size >= size + HDR_SIZE + 16) {
+                size_t rem_size = curr->size - size - HDR_SIZE;
+                block_hdr_t *rem = (block_hdr_t *)((uint8_t *)curr + HDR_SIZE + size);
+                rem->magic = BLOCK_MAGIC;
+                rem->size = rem_size;
+                rem->is_free = 1;
+                rem->next = curr->next;
+                rem->prev = curr;
+                if (curr->next) curr->next->prev = rem;
+                curr->next = rem;
+                curr->size = size;
+            }
             return (void *)((uint8_t *)curr + HDR_SIZE);
         }
         curr = curr->next;
@@ -201,7 +213,7 @@ void __assert_fail(const char *assertion, const char *file, unsigned int line, c
 static char *env[] = {
     NULL
 };
-extern char **environ;
+__attribute__((weak)) char **environ = NULL;
 
 static bool env_is_allocated = false;
 static size_t env_cap = 0;
@@ -593,10 +605,137 @@ void *bsearch(const void *key, const void *base, size_t nmemb, size_t size, int 
 }
 
 char *realpath(const char *path, char *resolved_path) {
-    if (!path) return NULL;
-    if (!resolved_path) resolved_path = (char *)malloc(1024);
-    if (!resolved_path) return NULL;
-    strncpy(resolved_path, path, 1023);
-    resolved_path[1023] = '\0';
+    if (!path) {
+        errno = EINVAL;
+        return NULL;
+    }
+    if (path[0] == '\0') {
+        errno = ENOENT;
+        return NULL;
+    }
+
+    char *abs_path = NULL;
+    if (path[0] != '/') {
+        uint32_t cwd_cap = 256;
+        char *cwd_buf = (char *)malloc(cwd_cap);
+        while (cwd_buf) {
+            if (ipo_getcwd(cwd_buf, cwd_cap) != 0) {
+                break;
+            }
+            cwd_cap *= 2;
+            char *new_buf = (char *)realloc(cwd_buf, cwd_cap);
+            if (!new_buf) {
+                free(cwd_buf);
+                cwd_buf = NULL;
+                break;
+            }
+            cwd_buf = new_buf;
+        }
+        if (!cwd_buf || cwd_buf[0] == '\0') {
+            if (cwd_buf) free(cwd_buf);
+            cwd_buf = strdup("/");
+        }
+
+        size_t clen = strlen(cwd_buf);
+        size_t plen = strlen(path);
+        size_t needed = clen + 1 + plen + 1;
+        abs_path = (char *)malloc(needed);
+        if (!abs_path) {
+            free(cwd_buf);
+            errno = ENOMEM;
+            return NULL;
+        }
+        if (clen == 1 && cwd_buf[0] == '/') {
+            snprintf(abs_path, needed, "/%s", path);
+        } else {
+            snprintf(abs_path, needed, "%s/%s", cwd_buf, path);
+        }
+        free(cwd_buf);
+    } else {
+        abs_path = strdup(path);
+        if (!abs_path) {
+            errno = ENOMEM;
+            return NULL;
+        }
+    }
+
+    size_t cap = 16;
+    size_t count = 0;
+    char **tokens = (char **)malloc(cap * sizeof(char *));
+    if (!tokens) {
+        free(abs_path);
+        errno = ENOMEM;
+        return NULL;
+    }
+
+    char *curr = abs_path;
+    while (*curr) {
+        while (*curr == '/') curr++;
+        if (!*curr) break;
+        char *start = curr;
+        while (*curr && *curr != '/') curr++;
+        if (*curr) {
+            *curr = '\0';
+            curr++;
+        }
+
+        if (strcmp(start, ".") == 0) {
+            continue;
+        }
+        if (strcmp(start, "..") == 0) {
+            if (count > 0) count--;
+            continue;
+        }
+
+        if (count >= cap) {
+            size_t new_cap = cap * 2;
+            char **new_tokens = (char **)realloc(tokens, new_cap * sizeof(char *));
+            if (!new_tokens) {
+                free(tokens);
+                free(abs_path);
+                errno = ENOMEM;
+                return NULL;
+            }
+            tokens = new_tokens;
+            cap = new_cap;
+        }
+        tokens[count++] = start;
+    }
+
+    size_t out_len = 0;
+    if (count == 0) {
+        out_len = 1; /* "/" */
+    } else {
+        for (size_t i = 0; i < count; i++) {
+            out_len += 1 + strlen(tokens[i]);
+        }
+    }
+
+    if (!resolved_path) {
+        resolved_path = (char *)malloc(out_len + 1);
+        if (!resolved_path) {
+            free(tokens);
+            free(abs_path);
+            errno = ENOMEM;
+            return NULL;
+        }
+    }
+
+    if (count == 0) {
+        resolved_path[0] = '/';
+        resolved_path[1] = '\0';
+    } else {
+        char *p = resolved_path;
+        for (size_t i = 0; i < count; i++) {
+            *p++ = '/';
+            size_t slen = strlen(tokens[i]);
+            memcpy(p, tokens[i], slen);
+            p += slen;
+        }
+        *p = '\0';
+    }
+
+    free(tokens);
+    free(abs_path);
     return resolved_path;
 }

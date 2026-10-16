@@ -203,7 +203,11 @@ void vga_clear(enum vga_color fg, enum vga_color bg, bool show_cursor, int curso
     vga_hide_cursor();
 
     volatile uint16_t* vga = VGA_MEMORY;
-    uint16_t blank = vga_entry(0x00, fg, bg);
+    if (fg == bg) {
+        fg = VGA_COLOR_LIGHT_GREY;
+        bg = VGA_COLOR_BLACK;
+    }
+    uint16_t blank = vga_entry(' ', fg, bg);
 
     for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
         vga[i] = blank;
@@ -264,10 +268,14 @@ void vga_sanitize_text_vram(void) {
     volatile uint16_t *vga = VGA_MEMORY;
     for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
         uint16_t entry = vga[i];
-        uint8_t bg = (uint8_t)((entry >> 12) & 0x07);
         uint8_t ch = (uint8_t)(entry & 0xFF);
         uint8_t attr = (uint8_t)(entry >> 8);
-        if (entry == 0xFFFF || attr == 0xFF || attr == 0x20 || bg == 2 || ((ch == ' ' || ch == 0x00) && bg != 0)) {
+        uint8_t fg = attr & 0x0F;
+        uint8_t bg_attr = (attr >> 4) & 0x0F;
+
+        if (ch == 0x00) {
+            vga[i] = (attr != 0 && fg != bg_attr) ? (((uint16_t)attr << 8) | ' ') : 0x0720;
+        } else if (entry == 0xFFFF || attr == 0xFF || fg == bg_attr) {
             vga[i] = 0x0720;
         } else if (ch == VGA_CURSOR_GLYPH_SLOT && (!cursor_is_rendered || i != cursor_rendered_offset)) {
             vga[i] = ((uint16_t)attr << 8) | ' ';

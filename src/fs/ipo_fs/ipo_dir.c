@@ -85,9 +85,9 @@ int inode_write_bytes(uint32_t inode_no, struct ipo_inode *inode, const void *bu
 
     if (offset + written > inode->size) {
         inode->size = offset + written;
-        if (inode_no > 0) {
-            write_inode(inode_no, inode);
-        }
+    }
+    if (written > 0 && inode_no > 0) {
+        write_inode(inode_no, inode);
     }
     return (int)written;
 }

@@ -32,8 +32,8 @@ typedef struct {
     uint64_t capacity_sectors; /* Total sectors (LBA28 / LBA48) */
 
     /* Identification strings */
-    char model[41];    /* 40 chars + NULL */
-    char serial[21];   /* 20 chars + NULL */
+    char *model;       /* Dynamically allocated, NUL-terminated */
+    char *serial;      /* Dynamically allocated, NUL-terminated */
 
 } ata_device_t;
 
@@ -45,20 +45,28 @@ void ata_init(void);
 /**
  * Get number of detected devices
  */
-uint8_t ata_get_device_count(void);
+uint32_t ata_get_device_count(void);
 
 /**
  * Get device info
  */
-ata_device_t* ata_get_device(uint8_t index);
+ata_device_t* ata_get_device(uint32_t index);
 
 /**
  * Print all detected devices
  */
 void ata_print_devices(void);
 
+/* Parameterized drive access (drive_idx: 0 = primary master, 1 = primary slave, ...) */
+bool ata_read_drive_sectors_lba28(uint32_t drive_idx, uint32_t lba, uint8_t count, void *buf);
+bool ata_write_drive_sectors_lba28(uint32_t drive_idx, uint32_t lba, uint8_t count, const void *buf);
+bool ata_read_drive_sectors_lba48(uint32_t drive_idx, uint64_t lba, uint16_t count, void *buf);
+bool ata_write_drive_sectors_lba48(uint32_t drive_idx, uint64_t lba, uint16_t count, const void *buf);
+bool ata_read_drive_sectors(uint32_t drive_idx, uint64_t lba, uint16_t count, void *buf);
+bool ata_write_drive_sectors(uint32_t drive_idx, uint64_t lba, uint16_t count, const void *buf);
+
 /* Read/write sectors using PIO (LBA28). Buffer is 512 * count bytes.
- * Returns true on success. Simple implementation for primary channel.
+ * Returns true on success. Uses default target drive (slave if count > 1, else master).
  */
 bool ata_read_sectors_lba28(uint32_t lba, uint8_t count, void *buf);
 bool ata_write_sectors_lba28(uint32_t lba, uint8_t count, const void *buf);

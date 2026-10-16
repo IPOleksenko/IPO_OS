@@ -37,7 +37,7 @@ static uint32_t keymap_storage_count = 0;
 static uint32_t active_storage_index = 0;
 static bool storage_initialized = false;
 
-static char default_symbol_buf[16] = DEFAULT_OS_KEY_SYMBOL;
+static char default_symbol_buf[16] = "";
 
 static void register_slot_fonts(keymap_slot_t *slot) {
     if (slot == NULL || !slot->is_custom || slot->entries == NULL || slot->count == 0) {
@@ -276,18 +276,29 @@ static int find_slot_by_name_or_id(const char *name_or_id) {
         return -1;
     }
 
-    /* 2. Direct name or substring match */
+    /* 2. Direct name, case-insensitive match, or substring match */
     for (uint32_t i = 0; i < keymap_storage_count; i++) {
-        if (keymap_storage[i].name != NULL) {
-            if (strcmp(keymap_storage[i].name, name_or_id) == 0) return (int)i;
-            if ((strcmp(name_or_id, "ru") == 0 || strcmp(name_or_id, "russian") == 0) &&
-                strstr(keymap_storage[i].name, "Russian") != NULL) return (int)i;
-            if ((strcmp(name_or_id, "ua") == 0 || strcmp(name_or_id, "ukrainian") == 0) &&
-                strstr(keymap_storage[i].name, "Ukrainian") != NULL) return (int)i;
-            if ((strcmp(name_or_id, "zh") == 0 || strcmp(name_or_id, "chinese") == 0) &&
-                strstr(keymap_storage[i].name, "Chinese") != NULL) return (int)i;
-            if ((strcmp(name_or_id, "en") == 0 || strcmp(name_or_id, "english") == 0) &&
-                strstr(keymap_storage[i].name, "English") != NULL) return (int)i;
+        if (!keymap_storage[i].name) continue;
+        if (strcmp(keymap_storage[i].name, name_or_id) == 0) return (int)i;
+
+        /* Case-insensitive prefix/substring search */
+        const char *haystack = keymap_storage[i].name;
+        const char *needle = name_or_id;
+        size_t nlen = strlen(needle);
+        size_t hlen = strlen(haystack);
+        if (nlen > 0 && nlen <= hlen) {
+            for (size_t h = 0; h <= hlen - nlen; h++) {
+                size_t k = 0;
+                while (k < nlen) {
+                    char c1 = haystack[h + k];
+                    char c2 = needle[k];
+                    if (c1 >= 'A' && c1 <= 'Z') c1 = (char)(c1 + ('a' - 'A'));
+                    if (c2 >= 'A' && c2 <= 'Z') c2 = (char)(c2 + ('a' - 'A'));
+                    if (c1 != c2) break;
+                    k++;
+                }
+                if (k == nlen) return (int)i;
+            }
         }
     }
     return -1;
@@ -446,7 +457,7 @@ void dynamic_keymap_set_default_symbol(const char *symbol) {
         strncpy(default_symbol_buf, symbol, sizeof(default_symbol_buf) - 1u);
         default_symbol_buf[sizeof(default_symbol_buf) - 1u] = '\0';
     } else {
-        strcpy(default_symbol_buf, DEFAULT_OS_KEY_SYMBOL);
+        default_symbol_buf[0] = '\0';
     }
 }
 

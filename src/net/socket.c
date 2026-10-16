@@ -287,12 +287,8 @@ int connect_endpoint(int sockfd, const char *host_or_ip, uint16_t port) {
     if (!str_to_ip(host_or_ip, &target_ip)) {
         /* Resolving domain name via DNS */
         if (!dns_resolve(host_or_ip, &target_ip, 3000)) {
-            if (strcmp(host_or_ip, "google.com") == 0 || strcmp(host_or_ip, "www.google.com") == 0) {
-                target_ip = IP4_ADDR(142, 250, 180, 206);
-            } else {
-                serial_printf("[socket] Failed to resolve host '%s'\n", host_or_ip);
-                return -1;
-            }
+            serial_printf("[socket] Failed to resolve host '%s'\n", host_or_ip);
+            return -1;
         }
     }
 
@@ -306,7 +302,6 @@ int connect_endpoint(int sockfd, const char *host_or_ip, uint16_t port) {
 }
 
 ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
-    (void)flags;
     socket_t *s = get_socket(sockfd);
     if (!s || !s->tcb || !buf || len == 0) return -1;
 
@@ -322,12 +317,14 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
             return (total_sent > 0) ? (ssize_t)total_sent : -1;
         }
 
-        /* TCP sliding-window flow control:
-         * Wait while unacknowledged in-flight data exceeds the peer's window
-         * OR pending tx_buf exceeds safe threshold (16 KB)
-         */
+        /* TCP sliding-window flow control */
         uint32_t wait_start = timer_millis();
         uint32_t wnd = s->tcb->snd_wnd ? s->tcb->snd_wnd : 1460;
+        if ((flags & 0x40 /* MSG_DONTWAIT */) &&
+            ((s->tcb->tx_buf.size >= 16384) || ((s->tcb->snd_nxt - s->tcb->snd_una) >= wnd))) {
+            return (total_sent > 0) ? (ssize_t)total_sent : -1;
+        }
+
         while ((s->tcb->tx_buf.size >= 16384) || ((s->tcb->snd_nxt - s->tcb->snd_una) >= wnd)) {
             if (s->tcb->state != TCP_STATE_ESTABLISHED && s->tcb->state != TCP_STATE_CLOSE_WAIT) {
                 return (total_sent > 0) ? (ssize_t)total_sent : -1;
@@ -365,12 +362,16 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
 }
 
 ssize_t recv(int sockfd, void *buf, size_t len, int flags) {
-    (void)flags;
     socket_t *s = get_socket(sockfd);
     if (!s || !s->tcb || !buf || len == 0) return -1;
 
     /* If data is available in self-expanding dynamic rx_buf, return it immediately */
     if (s->tcb->rx_buf.size > 0) {
+        if (flags & 0x02 /* MSG_PEEK */) {
+            size_t peek_len = (len < s->tcb->rx_buf.size) ? len : s->tcb->rx_buf.size;
+            memcpy(buf, s->tcb->rx_buf.data, peek_len);
+            return (ssize_t)peek_len;
+        }
         size_t consumed = dyn_buf_consume(&s->tcb->rx_buf, buf, len);
         if (s->tcb->rcv_wnd < 32768) {
             uint32_t new_wnd = (s->tcb->rx_buf.size < 65535) ? (65535 - s->tcb->rx_buf.size) : 0;
@@ -380,6 +381,16 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags) {
             }
         }
         return (ssize_t)consumed;
+    }
+
+    /* If non-blocking requested and no data available */
+    if (flags & 0x40 /* MSG_DONTWAIT */) {
+        if (s->tcb->state == TCP_STATE_CLOSE_WAIT ||
+            s->tcb->state == TCP_STATE_CLOSED ||
+            s->tcb->state == TCP_STATE_TIME_WAIT) {
+            return 0;
+        }
+        return -1;
     }
 
     /* If connection closed by remote, return 0 (EOF) */
@@ -404,6 +415,11 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags) {
         net_poll();
 
         if (s->tcb->rx_buf.size > 0) {
+            if (flags & 0x02 /* MSG_PEEK */) {
+                size_t peek_len = (len < s->tcb->rx_buf.size) ? len : s->tcb->rx_buf.size;
+                memcpy(buf, s->tcb->rx_buf.data, peek_len);
+                return (ssize_t)peek_len;
+            }
             size_t consumed = dyn_buf_consume(&s->tcb->rx_buf, buf, len);
             if (s->tcb->rcv_wnd < 32768) {
                 uint32_t new_wnd = (s->tcb->rx_buf.size < 65535) ? (65535 - s->tcb->rx_buf.size) : 0;

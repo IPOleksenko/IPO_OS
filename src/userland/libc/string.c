@@ -308,8 +308,13 @@ static struct lconv default_lconv = {
 
 char *setlocale(int category, const char *locale) {
     (void)category;
-    (void)locale;
-    return "C";
+    if (locale == NULL) {
+        return "C";
+    }
+    if (strcmp(locale, "") == 0 || strcmp(locale, "C") == 0 || strcmp(locale, "POSIX") == 0) {
+        return "C";
+    }
+    return NULL;
 }
 
 struct lconv *localeconv(void) {

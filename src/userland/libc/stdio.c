@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <ctype.h>
 #include <math.h>
+#include <syscall.h>
 
 static FILE **file_pool = NULL;
 static size_t file_pool_count = 0;
@@ -42,7 +43,12 @@ FILE *fopen(const char *pathname, const char *mode) {
     int fd = open(pathname, flags, 0666);
     if (fd < 0) return NULL;
 
-    return fdopen(fd, mode);
+    FILE *f = fdopen(fd, mode);
+    if (!f) {
+        close(fd);
+        return NULL;
+    }
+    return f;
 }
 
 FILE *fdopen(int fd, const char *mode) {
@@ -157,6 +163,9 @@ int fseek(FILE *stream, long offset, int whence) {
         errno = EBADF;
         return -1;
     }
+    if (whence == SEEK_CUR && stream->has_ungot) {
+        offset--;
+    }
     stream->has_ungot = 0;
     off_t res = lseek(stream->fd, offset, whence);
     if (res == (off_t)-1) {
@@ -189,12 +198,16 @@ off_t ftello(FILE *stream) {
 FILE *popen(const char *command, const char *type) {
     (void)command;
     (void)type;
+    errno = ENOSYS;
     return NULL;
 }
 
 int pclose(FILE *stream) {
-    (void)stream;
-    return 0;
+    if (!stream) {
+        errno = EBADF;
+        return -1;
+    }
+    return fclose(stream);
 }
 
 void rewind(FILE *stream) {
@@ -300,12 +313,26 @@ void clearerr(FILE *stream) {
 }
 
 int fflush(FILE *stream) {
-    (void)stream;
+    if (stream != NULL) {
+        if (stream->fd < 0) {
+            errno = EBADF;
+            return EOF;
+        }
+    }
     return 0;
 }
 
 int setvbuf(FILE *stream, char *buf, int mode, size_t size) {
-    (void)stream; (void)buf; (void)mode; (void)size;
+    if (!stream) {
+        errno = EBADF;
+        return -1;
+    }
+    if (mode != _IOFBF && mode != _IOLBF && mode != _IONBF) {
+        errno = EINVAL;
+        return -1;
+    }
+    (void)buf;
+    (void)size;
     return 0;
 }
 
@@ -329,9 +356,19 @@ int remove(const char *pathname) {
 }
 
 int rename(const char *oldpath, const char *newpath) {
-    (void)oldpath; (void)newpath;
-    errno = ENOSYS;
-    return -1;
+    if (!oldpath || !newpath) {
+        errno = EINVAL;
+        return -1;
+    }
+    uint32_t args[2];
+    args[0] = (uint32_t)(uintptr_t)oldpath;
+    args[1] = (uint32_t)(uintptr_t)newpath;
+    int res = ipo_syscall(IPO_SYSCALL_FS_RENAME, 2u, args);
+    if (res != 0) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
 }
 
 void perror(const char *s) {
@@ -345,25 +382,18 @@ void perror(const char *s) {
 
 /* Printf implementations */
 
-static void int_to_str(long long val, int base, int uppercase, char *buf, int *len) {
+static void uint_to_str(unsigned long long uval, int base, int uppercase, char *buf, int *len) {
     char digits[] = "0123456789abcdef0123456789ABCDEF";
     char *d = uppercase ? &digits[16] : &digits[0];
     char temp[64];
     int tlen = 0;
-    unsigned long long uval;
-
-    if (val < 0 && base == 10) {
-        uval = (unsigned long long)(-val);
-    } else {
-        uval = (unsigned long long)val;
-    }
 
     if (uval == 0) {
         temp[tlen++] = '0';
     } else {
         while (uval > 0) {
-            temp[tlen++] = d[uval % base];
-            uval /= base;
+            temp[tlen++] = d[uval % (unsigned int)base];
+            uval /= (unsigned int)base;
         }
     }
 
@@ -372,6 +402,16 @@ static void int_to_str(long long val, int base, int uppercase, char *buf, int *l
         buf[i] = temp[tlen - 1 - i];
     }
     buf[tlen] = '\0';
+}
+
+static void int_to_str(long long val, int base, int uppercase, char *buf, int *len) {
+    unsigned long long uval;
+    if (val < 0 && base == 10) {
+        uval = 0ULL - (unsigned long long)val;
+    } else {
+        uval = (unsigned long long)val;
+    }
+    uint_to_str(uval, base, uppercase, buf, len);
 }
 
 static void float_to_str(double val, int prec, char *buf) {
@@ -537,7 +577,7 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap) {
             case 'u': {
                 unsigned long long val = is_long_long ? va_arg(ap, unsigned long long) :
                                          (is_long ? va_arg(ap, unsigned long) : va_arg(ap, unsigned int));
-                int_to_str((long long)val, 10, 0, buf, &num_len);
+                uint_to_str(val, 10, 0, buf, &num_len);
                 append_str(buf, width, prec, left_align, pad_char);
                 break;
             }
@@ -545,20 +585,20 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap) {
             case 'X': {
                 unsigned long long val = is_long_long ? va_arg(ap, unsigned long long) :
                                          (is_long ? va_arg(ap, unsigned long) : va_arg(ap, unsigned int));
-                int_to_str((long long)val, 16, (spec == 'X'), buf, &num_len);
+                uint_to_str(val, 16, (spec == 'X'), buf, &num_len);
                 append_str(buf, width, prec, left_align, pad_char);
                 break;
             }
             case 'o': {
                 unsigned long long val = is_long_long ? va_arg(ap, unsigned long long) :
                                          (is_long ? va_arg(ap, unsigned long) : va_arg(ap, unsigned int));
-                int_to_str((long long)val, 8, 0, buf, &num_len);
+                uint_to_str(val, 8, 0, buf, &num_len);
                 append_str(buf, width, prec, left_align, pad_char);
                 break;
             }
             case 'p': {
                 void *ptr = va_arg(ap, void *);
-                int_to_str((uintptr_t)ptr, 16, 0, buf, &num_len);
+                uint_to_str((uintptr_t)ptr, 16, 0, buf, &num_len);
                 char pbuf[64] = "0x";
                 strcat(pbuf, buf);
                 append_str(pbuf, width, prec, left_align, ' ');
@@ -625,11 +665,14 @@ int vsprintf(char *str, const char *format, va_list ap) {
 }
 
 int vfprintf(FILE *stream, const char *format, va_list ap) {
+    if (!stream) return -1;
     char buf[1024];
     va_list aq;
     va_copy(aq, ap);
     int len = vsnprintf(buf, sizeof(buf), format, aq);
     va_end(aq);
+
+    if (len < 0) return -1;
 
     if (len < (int)sizeof(buf)) {
         return (int)fwrite(buf, 1, len, stream);

@@ -115,11 +115,6 @@ const char* dynamic_keymap_translate_local(uint8_t scancode, bool shift);
 bool dynamic_keymap_is_active(void);
 bool dynamic_keymap_is_active_local(void);
 
-/**
- * Default fallback symbol for unmapped keys when a custom keymap is active.
- */
-#define DEFAULT_OS_KEY_SYMBOL "?"
-
 void dynamic_keymap_set_default_symbol(const char *symbol);
 const char* dynamic_keymap_get_default_symbol(void);
 

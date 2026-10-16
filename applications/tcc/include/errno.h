@@ -10,5 +10,7 @@ extern int errno;
 #define EACCES  13
 #define EEXIST  17
 #define EINVAL  22
+#define EMFILE  24
+#define ERANGE  34
 
 #endif

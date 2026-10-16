@@ -82,7 +82,7 @@ static void mouse_flush(void) {
 void mouse_init(void) {
     if (mouse_initialized) return;
 
-    serial_printf("[mouse] Initializing PS/2 mouse (with IntelliMouse wheel detection)...\n");
+    serial_printf("[mouse] Initializing PS/2 mouse...\n");
 
     // Flush any pending data from 8042 controller
     mouse_flush();
@@ -165,6 +165,7 @@ void mouse_init(void) {
     mouse_cycle = 0;
     mouse_initialized = true;
     mouse_set_bounds_from_display();
+    serial_printf("[mouse] PS/2 mouse initialization complete.\n");
 }
 
 static void mouse_process_packet(void) {

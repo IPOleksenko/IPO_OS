@@ -1,6 +1,7 @@
 #include <file_system/ipo_fs.h>
 #include <string.h>
 #include <memory/kmalloc.h>
+#include <stdio.h>
 
 struct ipo_superblock sb;
 uint64_t fs_start_lba = 0;
@@ -23,4 +24,5 @@ void ipo_fs_init(void) {
             fds[i].flags = 0;
         }
     }
+    serial_printf("[ipo_fs] Filesystem state initialized (%u dynamic fds, ptr=%p).\n", fds_capacity, fds);
 }

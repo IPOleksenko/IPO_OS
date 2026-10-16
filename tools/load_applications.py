@@ -64,32 +64,30 @@ def main():
             apps_dir = fallback_apps
 
     if not image.exists():
-        print(f"Creating disk image {image} (128MB)...")
-        image.parent.mkdir(parents=True, exist_ok=True)
-        with open(image, "wb") as f:
-            f.seek(128 * 1024 * 1024 - 1)
-            f.write(b"\0")
-        disk = DiskImage(str(image), start_lba=args.start_lba, require_format=True)
-        disk.format_disk()
-        disk.close()
+        raise FileNotFoundError(f"Disk image {image} does not exist. Run 'make disks' or 'make format-disk' first.")
 
-    # Check if format is needed
+    # Open existing filesystem (formatted by OS)
     try:
-        disk = DiskImage(str(image), start_lba=args.start_lba)
-    except DiskError:
-        print(f"Formatting {image}...")
-        disk = DiskImage(str(image), start_lba=args.start_lba, require_format=True)
-        disk.format_disk()
+        disk = DiskImage(str(image), start_lba=args.start_lba, require_format=False)
+    except DiskError as e:
+        raise RuntimeError(
+            f"Filesystem on {image} is not mounted/formatted ({e}). "
+            f"Please run 'make format-disk' to format it via the IPO_OS kernel."
+        )
 
     # Mandatory OS registered components: only /applications and /autorun
     safe_mkdir(disk, "/applications")
-    try:
-        disk.cat("/autorun")
-    except Exception:
+    autorun_file = repo_root / "autorun"
+    if autorun_file.exists():
+        safe_put(disk, autorun_file, "/autorun")
+    else:
         try:
-            disk.write_text("/autorun", "")
+            disk.cat("/autorun")
         except Exception:
-            pass
+            try:
+                disk.write_text("/autorun", "")
+            except Exception:
+                pass
 
     # 1. Upload applications to /applications
     if apps_dir.exists():

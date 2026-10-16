@@ -98,7 +98,7 @@ static bool lex_cmdline(const char *src, token_list_t *out) {
             have_content = true; continue;
         }
         if (in_single) {
-            if (c == '\\' && *src == '\'') { if (!cbuf_append(&cb, '\'')) goto oom; src++; }
+            if (c == '\\' && *src && (*src == '\'' || *src == '\\')) { if (!cbuf_append(&cb, *src++)) goto oom; }
             else if (c == '\'') { in_single = false; }
             else { if (!cbuf_append(&cb, c)) goto oom; }
             have_content = true; continue;
@@ -448,35 +448,27 @@ static int exec_one_pid(int argc, char **argv) {
     char *path = resolve_command_path(argv[0]);
     if (!path) {
         printf("run: program not found: %s\n", argv[0]);
+        process_set_last_exit_code(127);
         return RUN_NOT_FOUND;
     }
-    int ret = process_exec(path, argc, argv);
+    int ret = universal_process_execute(path, argc, argv);
     kfree(path);
     return ret; /* = PID on success (or negative on error) */
 }
 
 /**
- * wait_for_command — spin until the process with @pid is no longer alive,
- * and if a window manager (WM) session is active, wait until the user exits
- * the WM session (e.g. by clicking [Exit] on the taskbar).
- *
- * This ensures sequential operators (';' and '|') wait for the GUI / command
- * to finish before launching subsequent commands, rather than executing them
- * simultaneously.
+ * wait_for_command — spin until the process with @pid is no longer active
  */
 static void wait_for_command(int pid) {
-    while (pid > 0 && pid != 1000 && process_is_alive((uint32_t)pid)) {
+    while (pid > 0 && pid != 1000) {
+        process_t *proc = process_find_by_pid((uint32_t)pid);
+        if (!proc || !process_is_active_or_has_windows(proc)) {
+            break;
+        }
         async_scheduler_tick();
         if (wm_session_active()) {
             wm_compositor_tick();
         }
-        if (system_is_interrupted()) break;
-        io_wait();
-    }
-
-    while (wm_session_active()) {
-        async_scheduler_tick();
-        wm_compositor_tick();
         if (system_is_interrupted()) break;
         io_wait();
     }
@@ -611,14 +603,6 @@ static int exec_stage(const run_stage_t *stage) {
             }
         }
         stage_exit = process_get_batch_exit_code(total_procs - 1);
-    } else {
-        /* If no external processes were spawned but WM session is active, wait until exit */
-        while (wm_session_active()) {
-            async_scheduler_tick();
-            wm_compositor_tick();
-            if (system_is_interrupted()) break;
-            io_wait();
-        }
     }
 
     kfree(wins);

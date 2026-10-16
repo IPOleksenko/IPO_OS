@@ -30,6 +30,23 @@ bool udp_bind(uint16_t port, udp_callback_t callback) {
         }
     }
 
+    /* Dynamically expand UDP table when capacity is reached */
+    size_t new_cap = (ctx->udp_table_capacity == 0) ? 16 : (ctx->udp_table_capacity * 2);
+    if (new_cap > ctx->udp_table_capacity && new_cap <= (SIZE_MAX / sizeof(udp_socket_t))) {
+        udp_socket_t *new_table = (udp_socket_t *)krealloc(ctx->udp_table, new_cap * sizeof(udp_socket_t));
+        if (new_table) {
+            memset(new_table + ctx->udp_table_capacity, 0, (new_cap - ctx->udp_table_capacity) * sizeof(udp_socket_t));
+            size_t slot = ctx->udp_table_capacity;
+            ctx->udp_table = new_table;
+            ctx->udp_table_capacity = new_cap;
+
+            ctx->udp_table[slot].port = port;
+            ctx->udp_table[slot].callback = callback;
+            ctx->udp_table[slot].in_use = true;
+            return true;
+        }
+    }
+
     return false;
 }
 

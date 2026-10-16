@@ -52,7 +52,9 @@ static void evaluate_vertex_lighting(GLContext *ctx, gl_vertex_t *v) {
         b += l->ambient[2] * ctx->front_material.ambient[2] + l->diffuse[2] * ctx->front_material.diffuse[2] * n_dot_l;
     }
 
-    if (r > 1.0f) r = 1.0f; if (g > 1.0f) g = 1.0f; if (b > 1.0f) b = 1.0f;
+    if (r > 1.0f) r = 1.0f;
+    if (g > 1.0f) g = 1.0f;
+    if (b > 1.0f) b = 1.0f;
     v->color[0] = r; v->color[1] = g; v->color[2] = b; v->color[3] = a;
 }
 
@@ -264,7 +266,7 @@ void glVertexPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *poin
     if (!ctx) return;
     ctx->va_vertex_size   = size;
     ctx->va_vertex_type   = type;
-    ctx->va_vertex_stride = stride ? stride : (size * sizeof(GLfloat));
+    ctx->va_vertex_stride = stride ? stride : (GLsizei)(size * sizeof(GLfloat));
     ctx->va_vertex_ptr    = pointer;
 }
 
@@ -273,7 +275,7 @@ void glColorPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *point
     if (!ctx) return;
     ctx->va_color_size   = size;
     ctx->va_color_type   = type;
-    ctx->va_color_stride = stride ? stride : (size * (type == GL_UNSIGNED_BYTE ? sizeof(GLubyte) : sizeof(GLfloat)));
+    ctx->va_color_stride = stride ? stride : (GLsizei)(size * (type == GL_UNSIGNED_BYTE ? sizeof(GLubyte) : sizeof(GLfloat)));
     ctx->va_color_ptr    = pointer;
 }
 
@@ -281,7 +283,7 @@ void glNormalPointer(GLenum type, GLsizei stride, const GLvoid *pointer) {
     GLContext *ctx = gl_get_current_context();
     if (!ctx) return;
     ctx->va_normal_type   = type;
-    ctx->va_normal_stride = stride ? stride : (3 * sizeof(GLfloat));
+    ctx->va_normal_stride = stride ? stride : (GLsizei)(3 * sizeof(GLfloat));
     ctx->va_normal_ptr    = pointer;
 }
 
@@ -290,7 +292,7 @@ void glTexCoordPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *po
     if (!ctx) return;
     ctx->va_texcoord_size   = size;
     ctx->va_texcoord_type   = type;
-    ctx->va_texcoord_stride = stride ? stride : (size * sizeof(GLfloat));
+    ctx->va_texcoord_stride = stride ? stride : (GLsizei)(size * sizeof(GLfloat));
     ctx->va_texcoord_ptr    = pointer;
 }
 

@@ -5,6 +5,7 @@ lib: $(LIB_A) $(USER_LIBC_A) $(USER_LIBM_A) $(USER_LIBCXX_A) $(USER_CRT0) $(USER
 APP_LIB_A := $(LIB_BUILD_DIR)/libapp.a
 APP_LIB_OBJS := $(filter-out \
 	$(BUILD)/kernel/kernel/syscall/syscall.o \
+	$(BUILD)/kernel/kernel/mm/kmalloc.o \
 	$(BUILD)/kernel/net/net.o \
 	$(BUILD)/kernel/net/socket.o \
 	$(BUILD)/kernel/net/tcp.o \
@@ -16,7 +17,8 @@ APP_LIB_OBJS := $(filter-out \
 	$(BUILD)/kernel/net/ethernet.o \
 	$(BUILD)/kernel/net/loopback.o \
 	$(BUILD)/kernel/drivers/net/rtl8139.o, \
-	$(LIB_OBJS))
+	$(LIB_OBJS)) \
+	$(LIB_BUILD_DIR)/app_kmalloc.o
 
 USER_LIBC_OBJS := \
 	$(LIB_BUILD_DIR)/libc/string.o \
@@ -56,6 +58,10 @@ build/lib/libtcc1.o: $(APPS_DIR)/tcc/crt/libtcc1.c
 build/lib/libtcc1.a: build/lib/libtcc1.o
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $<
+
+$(LIB_BUILD_DIR)/app_kmalloc.o: $(SRC)/kernel/mm/kmalloc.c
+	@mkdir -p $(dir $@)
+	$(CC) -c $< -o $@ -std=gnu11 -m32 -ffreestanding -fno-pic -fno-pie -fno-builtin -nostdlib -nostartfiles -I$(SRC)/include -DIPO_APP
 
 $(LIB_BUILD_DIR)/libc/setjmp.o: $(SRC)/userland/libc/setjmp.s
 	@mkdir -p $(dir $@)

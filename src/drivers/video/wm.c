@@ -197,9 +197,12 @@ void wm_buf_draw_line(uint8_t *buf, uint16_t bw, uint16_t bh, int x0, int y0, in
 }
 void wm_buf_fill_rect(uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, int w, int h, uint8_t c) {
     if(w<=0||h<=0) return;
-    int x2=x+w, y2=y+h;
-    if(x<0) x=0; if(y<0) y=0;
-    if(x2>(int)bw) x2=(int)bw; if(y2>(int)bh) y2=(int)bh;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    int x2 = x + w;
+    int y2 = y + h;
+    if (x2 > (int)bw) x2 = (int)bw;
+    if (y2 > (int)bh) y2 = (int)bh;
     if(x2<=x || y2<=y) return;
     for(int cy=y;cy<y2;cy++) memset(buf+(size_t)cy*bw+x,c,(size_t)(x2-x));
 }
@@ -461,7 +464,9 @@ static void list_remove(wm_window_t *w) {
     w->prev=w->next=NULL; wm_count--;
 }
 static void list_front(wm_window_t *w) {
-    if(wm_tail==w) return; list_remove(w); list_append(w);
+    if (wm_tail == w) return;
+    list_remove(w);
+    list_append(w);
 }
 
 /* =========================================================================
@@ -573,6 +578,11 @@ wm_window_t *wm_create_window(const wm_window_options_t *opts) {
             win->mask_w           = opts->mask_w;
             win->mask_h           = opts->mask_h;
             win->shape_mask_owned = true;
+        } else {
+            win->shape_mask       = NULL;
+            win->mask_w           = 0;
+            win->mask_h           = 0;
+            win->shape_mask_owned = false;
         }
         /* if kmalloc fails, fall through with no mask (window still shows) */
     }
@@ -976,7 +986,7 @@ void wm_set_fullscreen(wm_window_t *win, bool enable) {
 #define TASKBAR_Y    186
 #define TASKBAR_H    14
 
-#define WIN_CLR_DESKTOP        3    /* Windows 95 Teal / Cyan */
+#define WIN_CLR_DESKTOP        3    /* Teal / Cyan */
 #define WIN_CLR_FACE           7    /* Light Gray */
 #define WIN_CLR_HILIGHT        15   /* White */
 #define WIN_CLR_SHADOW         8    /* Dark Gray */
@@ -1363,8 +1373,7 @@ bool wm_dispatch_key(uint8_t scancode) {
         if(keyboard_is_shift_pressed()) wm_focus_prev(); else wm_focus_next();
         return true;
     }
-    if ((keyboard_is_alt_pressed() && make == 0x3E /* F4 */) ||
-        (keyboard_is_ctrl_pressed() && make == 0x11 /* W */)) {
+    if (keyboard_is_ctrl_pressed() && make == 0x11 /* W */) {
         wm_window_t *fw = wm_get_focused();
         if (fw) {
             wm_destroy_window(fw);
@@ -1418,8 +1427,7 @@ void wm_compositor_tick(void) {
                 dynamic_keymap_cycle_next();
             } else if (make == 0x0F) { /* Tab / Shift+Tab */
                 if(keyboard_is_shift_pressed()) wm_focus_prev(); else wm_focus_next();
-            } else if ((keyboard_is_alt_pressed() && make == 0x3E /* F4 */) ||
-                       (keyboard_is_ctrl_pressed() && make == 0x11 /* W */)) {
+            } else if (keyboard_is_ctrl_pressed() && make == 0x11 /* W */) {
                 /* Close focused window */
                 wm_window_t *fw = wm_get_focused();
                 if (fw) {
@@ -1486,7 +1494,6 @@ void wm_compositor_tick(void) {
 
     if (right_pressed) {
         if (ms.y >= TASKBAR_Y && !top_fullscreen) {
-            /* 1. Window tabs right-click (ПКМ - close clicked window directly!) */
             if (ms.x >= 54 && ms.x <= 182) {
                 int rel_x = (int)ms.x - 54;
                 int tab_idx = rel_x / 43;
@@ -1506,7 +1513,6 @@ void wm_compositor_tick(void) {
                     }
                 }
             }
-            /* 2. Language box right click (ПКМ - previous layout) */
             else if (ms.x >= 195 && ms.x <= 279) {
                 dynamic_keymap_cycle_prev();
             }
@@ -1610,7 +1616,7 @@ void wm_compositor_tick(void) {
                     }
                 }
             }
-            /* Language box click (ЛКМ - next layout) */
+            /* Language box click */
             if (!handled && ms.x >= 195 && ms.x <= 279) {
                 dynamic_keymap_cycle_next();
                 handled = true;
@@ -1734,18 +1740,22 @@ void wm_compositor_tick(void) {
         } else if (drag_mode == DRAG_RESIZE_BR) {
             int nw = (int)drag_start_w + ((int)ms.x - (int)drag_start_mx);
             int nh = (int)drag_start_h + ((int)ms.y - (int)drag_start_my);
-            if (nw < 40) nw = 40; if (nw > 316) nw = 316;
-            if (nh < 20) nh = 20; if (nh > 165) nh = 165;
+            if (nw < 40) nw = 40;
+            if (nw > 316) nw = 316;
+            if (nh < 20) nh = 20;
+            if (nh > 165) nh = 165;
             drag_win->maximized = false;
             wm_resize(drag_win, (uint16_t)nw, (uint16_t)nh);
         } else if (drag_mode == DRAG_RESIZE_R) {
             int nw = (int)drag_start_w + ((int)ms.x - (int)drag_start_mx);
-            if (nw < 40) nw = 40; if (nw > 316) nw = 316;
+            if (nw < 40) nw = 40;
+            if (nw > 316) nw = 316;
             drag_win->maximized = false;
             wm_resize(drag_win, (uint16_t)nw, drag_win->h);
         } else if (drag_mode == DRAG_RESIZE_B) {
             int nh = (int)drag_start_h + ((int)ms.y - (int)drag_start_my);
-            if (nh < 20) nh = 20; if (nh > 165) nh = 165;
+            if (nh < 20) nh = 20;
+            if (nh > 165) nh = 165;
             drag_win->maximized = false;
             wm_resize(drag_win, drag_win->w, (uint16_t)nh);
         }

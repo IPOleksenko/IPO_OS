@@ -11,6 +11,7 @@ extern func_ptr __fini_array_end[] __attribute__((weak));
 
 extern void _init(void) __attribute__((weak));
 extern void _fini(void) __attribute__((weak));
+extern void __cxa_finalize(void *dso_handle) __attribute__((weak));
 
 void __libc_init_array(void) {
     size_t count;
@@ -50,6 +51,10 @@ void __libc_fini_array(void) {
                 __fini_array_start[i - 1]();
             }
         }
+    }
+
+    if (__cxa_finalize) {
+        __cxa_finalize(NULL);
     }
 
     if (_fini) {

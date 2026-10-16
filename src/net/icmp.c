@@ -75,13 +75,40 @@ void icmp_receive(ip4_addr_t src_ip, uint8_t ttl, const void *data, uint16_t len
         hdr->type == ICMP_TYPE_DEST_UNREACH ||
         hdr->type == ICMP_TYPE_TIME_EXCEED) {
         
-        /* Store reply in circular queue */
+        /* Store reply in queue with dynamic expansion */
         net_shared_ctx_t *ctx = net_get_shared_context();
         if (ctx->icmp_queue_capacity == 0) {
             return;
         }
-        size_t q_idx = ctx->icmp_q_idx;
-        icmp_echo_reply_t *slot = &ctx->icmp_queue[q_idx];
+        size_t free_slot = ctx->icmp_queue_capacity;
+        for (size_t i = 0; i < ctx->icmp_queue_capacity; i++) {
+            if (ctx->icmp_queue[i].id == 0xFFFF || (ctx->icmp_queue[i].id == 0 && ctx->icmp_queue[i].seq == 0)) {
+                free_slot = i;
+                break;
+            }
+        }
+        if (free_slot == ctx->icmp_queue_capacity) {
+            /* Queue full of unconsumed replies -> dynamically double capacity */
+            size_t old_cap = ctx->icmp_queue_capacity;
+            size_t new_cap = (old_cap == 0) ? 8 : (old_cap * 2);
+            if (new_cap > old_cap && new_cap <= (SIZE_MAX / sizeof(icmp_echo_reply_t))) {
+                icmp_echo_reply_t *new_q = (icmp_echo_reply_t *)krealloc(ctx->icmp_queue, new_cap * sizeof(icmp_echo_reply_t));
+                if (new_q) {
+                    for (size_t i = old_cap; i < new_cap; i++) {
+                        new_q[i].id = 0xFFFF;
+                        new_q[i].seq = 0xFFFF;
+                    }
+                    free_slot = old_cap;
+                    ctx->icmp_queue = new_q;
+                    ctx->icmp_queue_capacity = new_cap;
+                }
+            }
+        }
+        if (free_slot == ctx->icmp_queue_capacity) {
+            /* Fallback circular overwrite if reallocation failed */
+            free_slot = ctx->icmp_q_idx % ctx->icmp_queue_capacity;
+        }
+        icmp_echo_reply_t *slot = &ctx->icmp_queue[free_slot];
         slot->src_ip = src_ip;
         slot->ttl = ttl;
         slot->type = hdr->type;
@@ -99,7 +126,7 @@ void icmp_receive(ip4_addr_t src_ip, uint8_t ttl, const void *data, uint16_t len
             memcpy(slot->data, (const uint8_t *)data + sizeof(icmp_header_t), payload_len);
         }
 
-        ctx->icmp_q_idx = (q_idx + 1) % ctx->icmp_queue_capacity;
+        ctx->icmp_q_idx = (free_slot + 1) % ctx->icmp_queue_capacity;
     }
 }
 

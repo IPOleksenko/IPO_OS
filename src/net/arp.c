@@ -3,6 +3,7 @@
 #include <net/ethernet.h>
 #include <system/timer.h>
 #include <string.h>
+#include <memory/kmalloc.h>
 #include <ioport.h>
 #include <syscall.h>
 
@@ -49,17 +50,30 @@ static void arp_cache_insert(ip4_addr_t ip, const mac_addr_t *mac) {
         }
     }
 
-    /* 3. If full, find oldest slot to replace */
+    /* 3. If full, dynamically expand table capacity; fallback to oldest slot only on OOM */
     if (slot == ctx->arp_table_capacity) {
-        if (ctx->arp_table_capacity == 0) {
-            return;
+        size_t new_cap = (ctx->arp_table_capacity == 0) ? 16 : (ctx->arp_table_capacity * 2);
+        if (new_cap > ctx->arp_table_capacity && new_cap <= (SIZE_MAX / sizeof(arp_entry_t))) {
+            arp_entry_t *new_table = (arp_entry_t *)krealloc(ctx->arp_table, new_cap * sizeof(arp_entry_t));
+            if (new_table) {
+                memset(new_table + ctx->arp_table_capacity, 0, (new_cap - ctx->arp_table_capacity) * sizeof(arp_entry_t));
+                slot = ctx->arp_table_capacity;
+                ctx->arp_table = new_table;
+                ctx->arp_table_capacity = new_cap;
+            }
         }
-        uint32_t oldest_time = 0xFFFFFFFF;
-        slot = 0;
-        for (size_t i = 0; i < ctx->arp_table_capacity; i++) {
-            if (ctx->arp_table[i].last_seen_ms < oldest_time) {
-                oldest_time = ctx->arp_table[i].last_seen_ms;
-                slot = i;
+
+        if (slot == ctx->arp_table_capacity) {
+            if (ctx->arp_table_capacity == 0) {
+                return;
+            }
+            uint32_t oldest_time = 0xFFFFFFFF;
+            slot = 0;
+            for (size_t i = 0; i < ctx->arp_table_capacity; i++) {
+                if (ctx->arp_table[i].last_seen_ms < oldest_time) {
+                    oldest_time = ctx->arp_table[i].last_seen_ms;
+                    slot = i;
+                }
             }
         }
     }

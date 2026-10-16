@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <dirent.h>
 
 #include <syscall.h>
 
@@ -248,7 +249,7 @@ size_t strftime(char *s, size_t max, const char *format, const struct tm *tm) {
     return written;
 }
 
-int gettimeofday(struct timeval *tv, void *tz) {
+int gettimeofday(struct timeval *tv, struct timezone *tz) {
     (void)tz;
     if (tv) {
         tv->tv_sec = time(NULL);
@@ -296,7 +297,7 @@ pid_t waitpid(pid_t pid, int *wstatus, int options) {
         int code = ipo_get_exit_code();
         *wstatus = (code << 8);
     }
-    return pid;
+    return (pid == -1) ? 1 : pid;
 }
 
 void *__memcpy_chk(void *dest, const void *src, size_t len, size_t destlen) {
@@ -443,7 +444,26 @@ int __vfprintf_chk(FILE *fp, int flag, const char *fmt, va_list ap) {
 }
 
 int ftruncate64(int fd, off_t length) {
-    (void)fd; (void)length;
+    if (fd < 0 || length < 0) {
+        errno = (fd < 0) ? EBADF : EINVAL;
+        return -1;
+    }
+    return 0;
+}
+
+int ftruncate(int fd, off_t length) {
+    return ftruncate64(fd, length);
+}
+
+int truncate(const char *path, off_t length) {
+    if (!path || length < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        return -1;
+    }
     return 0;
 }
 
@@ -458,13 +478,28 @@ int fileno(FILE *stream) {
 }
 
 long sysconf(int name) {
-    (void)name;
-    return 4096;
+    switch (name) {
+    case 30: /* _SC_PAGESIZE / _SC_PAGE_SIZE */
+        return 4096;
+    case 2:  /* _SC_CLK_TCK */
+        return 1000;
+    case 4:  /* _SC_OPEN_MAX */
+        return 256;
+    case 83: /* _SC_NPROCESSORS_CONF */
+    case 84: /* _SC_NPROCESSORS_ONLN */
+        return 1;
+    case 8:  /* _SC_CHILD_MAX */
+        return 32;
+    default:
+        if (name >= 0) return 4096;
+        errno = EINVAL;
+        return -1;
+    }
 }
 
 char *canonicalize_file_name(const char *path) {
     if (!path) return NULL;
-    return strdup(path);
+    return realpath(path, NULL);
 }
 
 unsigned long __isoc23_strtoul(const char *nptr, char **endptr, int base) {
@@ -476,12 +511,43 @@ long __isoc23_strtol(const char *nptr, char **endptr, int base) {
 }
 
 void *mmap64(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
-    (void)addr; (void)prot; (void)flags; (void)fd; (void)offset;
-    return malloc(length);
+    (void)addr; (void)prot; (void)flags;
+    if (length == 0) {
+        errno = EINVAL;
+        return (void *)-1;
+    }
+    void *ptr = malloc(length);
+    if (!ptr) {
+        errno = ENOMEM;
+        return (void *)-1;
+    }
+    memset(ptr, 0, length);
+    if (fd >= 0) {
+        off_t cur = lseek(fd, 0, SEEK_CUR);
+        if (cur != (off_t)-1) {
+            lseek(fd, offset, SEEK_SET);
+            ssize_t n = read(fd, ptr, length);
+            lseek(fd, cur, SEEK_SET);
+            if (n < 0) {
+                free(ptr);
+                errno = ENOENT;
+                return (void *)-1;
+            }
+        }
+    }
+    return ptr;
+}
+
+void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
+    return mmap64(addr, length, prot, flags, fd, offset);
 }
 
 int munmap(void *addr, size_t length) {
     (void)length;
+    if (!addr || addr == (void *)-1) {
+        errno = EINVAL;
+        return -1;
+    }
     free(addr);
     return 0;
 }
@@ -495,12 +561,28 @@ int open64(const char *pathname, int flags, ...) {
 }
 
 int fsync(int fd) {
-    (void)fd;
+    if (fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
     return 0;
 }
 
 int statvfs64(const char *path, void *buf) {
-    (void)path; (void)buf;
+    if (!path || !buf) {
+        errno = (!path) ? ENOENT : EFAULT;
+        return -1;
+    }
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        return -1;
+    }
+    memset(buf, 0, sizeof(uint32_t) * 16);
+    uint32_t args[1] = { (uint32_t)(uintptr_t)buf };
+    if (ipo_syscall(IPO_SYSCALL_FS_STATVFS, 1u, args) != 0) {
+        errno = ENOENT;
+        return -1;
+    }
     return 0;
 }
 
@@ -508,23 +590,132 @@ int __stat64_time64(const char *path, void *buf) {
     return stat64(path, (struct stat *)buf);
 }
 
-void *opendir(const char *name) {
-    (void)name;
+typedef struct {
+    int fd;
+    int index;
+    struct dirent ent;
+    char *buf;
+    int buf_len;
+    int buf_pos;
+} ipo_dir_stream_t;
+
+DIR *opendir(const char *name) {
+    if (!name) {
+        errno = ENOENT;
+        return NULL;
+    }
+    struct stat st;
+    if (stat(name, &st) != 0) {
+        errno = ENOENT;
+        return NULL;
+    }
+    if (!(st.st_mode & S_IFDIR)) {
+        errno = ENOTDIR;
+        return NULL;
+    }
+
+    ipo_dir_stream_t *d = (ipo_dir_stream_t *)malloc(sizeof(ipo_dir_stream_t));
+    if (!d) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    memset(d, 0, sizeof(*d));
+    d->buf = (char *)malloc(8192);
+    if (!d->buf) {
+        free(d);
+        errno = ENOMEM;
+        return NULL;
+    }
+    int count = ipo_list_dir(name, d->buf, 8192);
+    if (count < 0) {
+        free(d->buf);
+        free(d);
+        errno = ENOENT;
+        return NULL;
+    }
+    d->buf_len = count;
+    d->buf_pos = 0;
+    d->fd = 3;
+    d->index = 0;
+    return (DIR *)d;
+}
+
+struct dirent *readdir(DIR *dirp) {
+    if (!dirp) {
+        errno = EBADF;
+        return NULL;
+    }
+    ipo_dir_stream_t *d = (ipo_dir_stream_t *)dirp;
+    while (d->buf_pos < d->buf_len) {
+        int start = d->buf_pos;
+        while (d->buf_pos < d->buf_len && d->buf[d->buf_pos] != '\n' && d->buf[d->buf_pos] != '\0') {
+            d->buf_pos++;
+        }
+
+        int len = d->buf_pos - start;
+        if (d->buf_pos < d->buf_len && d->buf[d->buf_pos] == '\n') {
+            d->buf_pos++;
+        }
+        if (len <= 0) {
+            continue;
+        }
+
+        memset(&d->ent, 0, sizeof(struct dirent));
+        if (len > 0 && d->buf[start + len - 1] == '/') {
+            d->ent.d_type = DT_DIR;
+            len--;
+        } else {
+            d->ent.d_type = DT_REG;
+        }
+
+        if (len > 255) len = 255;
+        memcpy(d->ent.d_name, d->buf + start, (size_t)len);
+        d->ent.d_name[len] = '\0';
+        d->ent.d_ino = (ino_t)(++d->index);
+        d->ent.d_off = (off_t)d->buf_pos;
+        d->ent.d_reclen = sizeof(struct dirent);
+
+        return &d->ent;
+    }
     return NULL;
 }
 
-int closedir(void *dirp) {
-    (void)dirp;
+struct dirent *readdir64(DIR *dirp) {
+    return readdir(dirp);
+}
+
+void rewinddir(DIR *dirp) {
+    if (!dirp) return;
+    ipo_dir_stream_t *d = (ipo_dir_stream_t *)dirp;
+    d->buf_pos = 0;
+    d->index = 0;
+}
+
+int closedir(DIR *dirp) {
+    if (!dirp) {
+        errno = EBADF;
+        return -1;
+    }
+    ipo_dir_stream_t *d = (ipo_dir_stream_t *)dirp;
+    if (d->buf) {
+        free(d->buf);
+        d->buf = NULL;
+    }
+    free(d);
     return 0;
 }
 
-void *readdir64(void *dirp) {
-    (void)dirp;
-    return NULL;
-}
-
 int mkdir(const char *pathname, mode_t mode) {
-    (void)pathname; (void)mode;
+    (void)mode;
+    if (!pathname) {
+        errno = EINVAL;
+        return -1;
+    }
+    int ret = ipo_create(pathname, 0x1 /* IPO_INODE_TYPE_DIR */);
+    if (ret < 0) {
+        errno = (ret == -2) ? EEXIST : EIO;
+        return -1;
+    }
     return 0;
 }
 
@@ -534,16 +725,50 @@ int sigemptyset(sigset_t *set) {
 }
 
 int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact) {
-    (void)signum; (void)act; (void)oldact;
+    if (signum < 0 || signum >= 32) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (oldact) {
+        memset(oldact, 0, sizeof(struct sigaction));
+        oldact->sa_handler = signal_handlers[signum];
+    }
+    if (act) {
+        signal_handlers[signum] = act->sa_handler;
+    }
     return 0;
 }
 
 int __clock_gettime64(int clk_id, void *tp) {
-    (void)clk_id;
-    if (tp) {
-        long long *p = (long long *)tp;
+    if (!tp) {
+        errno = EFAULT;
+        return -1;
+    }
+    uint32_t ms = (uint32_t)ipo_syscall(IPO_SYSCALL_MILLIS, 0u, NULL);
+    long long *p = (long long *)tp;
+    if (clk_id == 0 || clk_id == 5) { /* CLOCK_REALTIME */
         p[0] = (long long)time(NULL);
-        p[1] = 0;
+        p[1] = (long long)((ms % 1000u) * 1000000ULL);
+    } else { /* CLOCK_MONOTONIC and others */
+        p[0] = (long long)(ms / 1000u);
+        p[1] = (long long)((ms % 1000u) * 1000000ULL);
+    }
+    return 0;
+}
+
+int clock_gettime(int clk_id, void *tp) {
+    if (!tp) {
+        errno = EFAULT;
+        return -1;
+    }
+    uint32_t ms = (uint32_t)ipo_syscall(IPO_SYSCALL_MILLIS, 0u, NULL);
+    long *p = (long *)tp;
+    if (clk_id == 0 || clk_id == 5) {
+        p[0] = (long)time(NULL);
+        p[1] = (long)((ms % 1000u) * 1000000UL);
+    } else {
+        p[0] = (long)(ms / 1000u);
+        p[1] = (long)((ms % 1000u) * 1000000UL);
     }
     return 0;
 }

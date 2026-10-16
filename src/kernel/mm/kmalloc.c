@@ -4,6 +4,9 @@
 #include <stdio.h>
 #ifdef IPO_APP
 #include <syscall.h>
+#else
+#include <kernel/smp.h>
+static spinlock_t s_kmalloc_lock = {0};
 #endif
 
 #ifdef IPO_APP
@@ -11,7 +14,7 @@
 #define KMALLOC_HEAP_SIZE   (0x4000000)  // 64 MB per application
 #else
 #define KMALLOC_HEAP_START  (0x1000000)  // 16 MB kernel heap start
-#define KMALLOC_HEAP_SIZE   (0x1000000)  // 16 MB max heap
+#define KMALLOC_HEAP_SIZE   (0x4000000)  // 64 MB kernel heap
 #endif
 #define KMALLOC_MAGIC       (0xDEADBEEF)
 #define KMALLOC_FREED_MAGIC (0xDEADC0DE)
@@ -146,6 +149,10 @@ void* kmalloc(size_t size) {
     // Align request size to 16 bytes
     size = (size + 15u) & ~15u;
 
+#ifndef IPO_APP
+    spin_lock(&s_kmalloc_lock);
+#endif
+
     if (heap_start == NULL) {
         kmalloc_init();
     }
@@ -158,6 +165,9 @@ void* kmalloc(size_t size) {
         size_t total_needed = (size + BLOCK_HEADER_SIZE + 15u) & ~15u;
 
         if (heap_used + total_needed >= KMALLOC_HEAP_SIZE) {
+#ifndef IPO_APP
+            spin_unlock(&s_kmalloc_lock);
+#endif
             return NULL;  // Out of memory
         }
 
@@ -175,6 +185,10 @@ void* kmalloc(size_t size) {
         block->is_free = 0;
     }
 
+#ifndef IPO_APP
+    spin_unlock(&s_kmalloc_lock);
+#endif
+
     // Zero-initialize the allocated memory
     void *user_ptr = (void *)((uint8_t *)block + BLOCK_HEADER_SIZE);
     memset(user_ptr, 0, size);
@@ -189,16 +203,33 @@ void kfree(void* ptr) {
     if (ptr == NULL) {
         return;
     }
+
+#ifndef IPO_APP
+    spin_lock(&s_kmalloc_lock);
+#endif
+
+    if (heap_start == NULL) {
+#ifndef IPO_APP
+        spin_unlock(&s_kmalloc_lock);
+#endif
+        return;
+    }
     
     // Get the block header (located before user data)
     kmalloc_block_t *block = (kmalloc_block_t *)ptr - 1;
     
     // Validate block
     if (block->magic != KMALLOC_MAGIC) {
+#ifndef IPO_APP
+        spin_unlock(&s_kmalloc_lock);
+#endif
         return;  // Invalid pointer or already freed
     }
     
     if (block->is_free) {
+#ifndef IPO_APP
+        spin_unlock(&s_kmalloc_lock);
+#endif
         return;  // Already freed
     }
     
@@ -207,6 +238,10 @@ void kfree(void* ptr) {
     block->magic = KMALLOC_FREED_MAGIC;
 
     kmalloc_coalesce_and_shrink();
+
+#ifndef IPO_APP
+    spin_unlock(&s_kmalloc_lock);
+#endif
 }
 
 /**
@@ -243,6 +278,10 @@ void* krealloc(void* ptr, size_t size) {
 void kmalloc_get_stats(kmalloc_stats_t *out) {
     if (out == NULL) return;
 
+#ifndef IPO_APP
+    spin_lock(&s_kmalloc_lock);
+#endif
+
     out->heap_total   = KMALLOC_HEAP_SIZE;
     out->heap_used    = heap_used;
     out->alloc_bytes  = 0;
@@ -251,13 +290,21 @@ void kmalloc_get_stats(kmalloc_stats_t *out) {
     out->free_blocks  = 0;
     out->block_header = BLOCK_HEADER_SIZE;
 
-    if (heap_start == NULL) return;
+    if (heap_start == NULL) {
+#ifndef IPO_APP
+        spin_unlock(&s_kmalloc_lock);
+#endif
+        return;
+    }
 
     uint8_t *ptr = heap_start;
     while ((size_t)(ptr - heap_start) < heap_used) {
         kmalloc_block_t *block = (kmalloc_block_t *)ptr;
         if (block->magic != KMALLOC_MAGIC && block->magic != KMALLOC_FREED_MAGIC) {
             break; /* corruption guard */
+        }
+        if (block->size < BLOCK_HEADER_SIZE) {
+            break; /* invalid size guard against infinite loop */
         }
         size_t user_size = block->size > BLOCK_HEADER_SIZE
                            ? block->size - BLOCK_HEADER_SIZE : 0;
@@ -270,4 +317,8 @@ void kmalloc_get_stats(kmalloc_stats_t *out) {
         }
         ptr += block->size;
     }
+
+#ifndef IPO_APP
+    spin_unlock(&s_kmalloc_lock);
+#endif
 }

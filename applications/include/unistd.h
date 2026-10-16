@@ -48,6 +48,16 @@ int execvp(const char *file, char *const argv[]);
 int execl(const char *path, const char *arg, ...);
 int execlp(const char *file, const char *arg, ...);
 
+pid_t fork(void);
+int pipe(int pipefd[2]);
+int dup(int oldfd);
+int dup2(int oldfd, int newfd);
+int fsync(int fd);
+int ftruncate(int fd, off_t length);
+int truncate(const char *path, off_t length);
+ssize_t readlink(const char *pathname, char *buf, size_t bufsiz);
+int symlink(const char *target, const char *linkpath);
+
 #ifdef __cplusplus
 }
 #endif

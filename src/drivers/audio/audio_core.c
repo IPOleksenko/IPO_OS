@@ -64,6 +64,16 @@ typedef struct {
 } sb16_hw_state_t;
 #define SB16_HW_STATE ((volatile sb16_hw_state_t *)0x5FE000)
 
+bool sb16_get_dsp_version(uint8_t *major, uint8_t *minor) {
+    if (g_active_backend != AUDIO_BACKEND_SB16) return false;
+    sb16_dsp_write(0xE1);
+    uint8_t maj = sb16_dsp_read();
+    uint8_t min = sb16_dsp_read();
+    if (major) *major = maj;
+    if (minor) *minor = min;
+    return true;
+}
+
 void sb16_stop(void) {
     if (g_active_backend == AUDIO_BACKEND_SB16) {
         sb16_dsp_write(0xD5); // Pause 16-bit DMA

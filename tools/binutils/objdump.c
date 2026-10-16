@@ -70,7 +70,8 @@ static void dump_symbols(const uint8_t *raw, const Elf32_Ehdr *eh) {
                 if (sym->st_shndx == SHN_ABS) sec_name = "*ABS*";
                 else if (sym->st_shndx == SHN_COMMON) sec_name = "*COM*";
                 else if (sym->st_shndx < eh->e_shnum) {
-                    sec_name = &shstrtab[shdrs[sym->st_shndx].sh_name];
+                    sec_name = (shdrs[sym->st_shndx].sh_name < shdrs[eh->e_shstrndx].sh_size) ?
+                               &shstrtab[shdrs[sym->st_shndx].sh_name] : "";
                 }
                 printf("%08x %c %c      %-8s %08x %s\n",
                        sym->st_value, bind, type, sec_name, sym->st_size, sname);
@@ -470,6 +471,11 @@ int main(int argc, char **argv) {
     }
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
+    if (sz <= 0) {
+        fprintf(stderr, "objdump: %s: file empty\n", target_file);
+        fclose(f);
+        return 1;
+    }
     fseek(f, 0, SEEK_SET);
 
     uint8_t *raw = (uint8_t *)malloc(sz);

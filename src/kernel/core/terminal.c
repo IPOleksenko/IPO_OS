@@ -22,6 +22,15 @@
 #include <string.h>
 #include <stdio.h>
 #include <net/net.h>
+#include <kernel/device.h>
+#include <kernel/smp.h>
+#include <memory/memory_map.h>
+#include <driver/net/pci.h>
+#include <driver/net/rtl8139.h>
+#include <driver/storage/block_dev.h>
+#include <driver/storage/partition.h>
+#include <storage/storage_pool.h>
+#include <kernel/kmod.h>
 
 /* Terminal input locking */
 static bool terminal_input_locked = false;
@@ -72,27 +81,64 @@ static char **command_history = NULL;
 static int command_history_capacity = 0;
 static int command_history_count = 0;
 static int command_history_index = -1;
+static uint32_t s_terminal_init_count = 0;
+static char *s_serial_cmd_buf = NULL;
+static size_t s_serial_cmd_cap = 0;
+static size_t s_serial_cmd_len = 0;
+static char *pending_terminal_input = NULL;
+static bool pending_terminal_auto_exec = false;
 static char *current_input_snapshot = NULL;
 static uint8_t last_terminal_scancode = 0;
 static uint32_t last_terminal_key_ms = 0;
 static uint32_t last_history_action_ms = 0;
 
-static char terminal_cwd[1024] = "/";
-#define SCROLL_HISTORY_SIZE 128
+static char *terminal_cwd = NULL;
+
+/* Replace terminal_cwd with a heap copy of 'path'.  Never fails silently —
+ * on allocation failure the old value is preserved. */
+static void terminal_cwd_set(const char *path) {
+    if (!path || !*path) path = "/";
+    size_t len = strlen(path);
+    char *buf = kmalloc(len + 1u);
+    if (!buf) return;   /* keep old value on OOM */
+    memcpy(buf, path, len + 1u);
+    kfree(terminal_cwd);
+    terminal_cwd = buf;
+}
+
+/* Ensure terminal_cwd is initialised (called once from terminal_init). */
+static void terminal_cwd_init(void) {
+    if (!terminal_cwd) terminal_cwd_set("/");
+}
+#define SCROLL_HISTORY_SIZE TERMINAL_SCROLL_HISTORY_SIZE
 #define SCROLL_HISTORY_CLEAR_THRESHOLD (SCROLL_HISTORY_SIZE * 3 / 4)
 #define SCROLL_HISTORY_KEEP_SIZE (SCROLL_HISTORY_SIZE / 2)
-static uint16_t terminal_top_buffer[SCROLL_HISTORY_SIZE][VGA_WIDTH];
-static uint16_t terminal_bottom_buffer[SCROLL_HISTORY_SIZE][VGA_WIDTH];
+static uint16_t (*terminal_top_buffer)[VGA_WIDTH] = NULL;
+static uint16_t (*terminal_bottom_buffer)[VGA_WIDTH] = NULL;
 
 /* Scroll state */
 static int top_buffer_count = 0;
 static int bottom_buffer_count = 0;
+
+static inline void init_scroll_buffer(uint16_t (*buf)[VGA_WIDTH]) {
+    if (!buf) return;
+    uint16_t blank = vga_entry(' ', VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+    for (size_t i = 0; i < SCROLL_HISTORY_SIZE * VGA_WIDTH; i++) {
+        ((uint16_t *)buf)[i] = blank;
+    }
+}
 
 static inline uint16_t (*active_top_buffer(void))[VGA_WIDTH] {
     if (process_is_batch_active() && process_get_separate_windows()) {
         process_t *fg = process_get_foreground();
         if (fg && fg->scroll_top_buffer) {
             return (uint16_t (*)[VGA_WIDTH])fg->scroll_top_buffer;
+        }
+    }
+    if (!terminal_top_buffer) {
+        terminal_top_buffer = (uint16_t (*)[VGA_WIDTH])kmalloc(SCROLL_HISTORY_SIZE * VGA_WIDTH * sizeof(uint16_t));
+        if (terminal_top_buffer) {
+            init_scroll_buffer(terminal_top_buffer);
         }
     }
     return terminal_top_buffer;
@@ -113,6 +159,12 @@ static inline uint16_t (*active_bottom_buffer(void))[VGA_WIDTH] {
         process_t *fg = process_get_foreground();
         if (fg && fg->scroll_bottom_buffer) {
             return (uint16_t (*)[VGA_WIDTH])fg->scroll_bottom_buffer;
+        }
+    }
+    if (!terminal_bottom_buffer) {
+        terminal_bottom_buffer = (uint16_t (*)[VGA_WIDTH])kmalloc(SCROLL_HISTORY_SIZE * VGA_WIDTH * sizeof(uint16_t));
+        if (terminal_bottom_buffer) {
+            init_scroll_buffer(terminal_bottom_buffer);
         }
     }
     return terminal_bottom_buffer;
@@ -218,6 +270,10 @@ void print_header(void) {
 
     for (uint8_t i = 0; i < os_name_length; i++) {
         vga[i] = vga_entry(os_name[i], VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+    }
+
+    for (uint8_t i = os_name_length; i < VGA_WIDTH - created_by_length; i++) {
+        vga[i] = vga_entry(' ', VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
     }
 
     for (uint8_t i = 0; i < created_by_length; i++) {
@@ -326,10 +382,15 @@ static void read_line_from_vga(uint16_t row, uint16_t *buffer) {
     
     for (uint16_t col = 0; col < VGA_WIDTH; col++) {
         uint16_t val = vga[offset + col];
-        if ((val & 0xFF) == VGA_CURSOR_GLYPH_SLOT) {
-            val = ((val >> 8) << 8) | ' ';
+        uint8_t ch = val & 0xFF;
+        uint8_t attr = (uint8_t)(val >> 8);
+        if (ch == VGA_CURSOR_GLYPH_SLOT || ch == 0x00) {
+            ch = ' ';
         }
-        buffer[col] = val;
+        if (attr == 0 || (attr & 0x0F) == ((attr >> 4) & 0x0F)) {
+            attr = 0x07;
+        }
+        buffer[col] = ((uint16_t)attr << 8) | ch;
     }
 }
 
@@ -339,7 +400,16 @@ static void write_line_to_vga(uint16_t row, const uint16_t *buffer) {
     uint16_t offset = row * VGA_WIDTH;
     
     for (uint16_t col = 0; col < VGA_WIDTH; col++) {
-        vga[offset + col] = buffer[col];  // Restore full value with colors
+        uint16_t val = buffer[col];
+        uint8_t ch = val & 0xFF;
+        uint8_t attr = (uint8_t)(val >> 8);
+        if (ch == VGA_CURSOR_GLYPH_SLOT || ch == 0x00) {
+            ch = ' ';
+        }
+        if (attr == 0 || (attr & 0x0F) == ((attr >> 4) & 0x0F)) {
+            attr = 0x07;
+        }
+        vga[offset + col] = ((uint16_t)attr << 8) | ch;
     }
 }
 
@@ -453,7 +523,7 @@ void terminal_on_external_output(void) {
     }
 
     volatile uint16_t *vga = VGA_MEMORY;
-    uint16_t blank = vga_entry(0x00, VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+    uint16_t blank = vga_entry(' ', VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 
     int32_t start_clear = prompt_start_cursor >= VGA_START_CURSOR_POSITION ? prompt_start_cursor : VGA_START_CURSOR_POSITION;
     int32_t vis_extra = (int32_t)(previous_rendered_vis_len > input_len ? previous_rendered_vis_len : input_len);
@@ -488,6 +558,22 @@ static void ensure_input_buffer(size_t needed) {
         input_buf = new_buf;
         input_capacity = new_capacity;
     }
+}
+
+void terminal_clear_command_history(void) {
+    if (command_history != NULL) {
+        for (int i = 0; i < command_history_count; i++) {
+            if (command_history[i] != NULL) {
+                kfree(command_history[i]);
+                command_history[i] = NULL;
+            }
+        }
+        kfree(command_history);
+        command_history = NULL;
+        command_history_capacity = 0;
+    }
+    command_history_count = 0;
+    command_history_index = -1;
 }
 
 static void ensure_history_storage(void) {
@@ -556,10 +642,12 @@ static void load_history_command(int index) {
 
     size_t old_len = input_len;
     ensure_input_buffer(strlen(command_history[index]));
-    strcpy(input_buf, command_history[index]);
-    input_len = strlen(input_buf);
-    cursor_pos = input_len;
-    render_input_line(old_len);
+    if (input_buf != NULL) {
+        strcpy(input_buf, command_history[index]);
+        input_len = strlen(input_buf);
+        cursor_pos = input_len;
+        render_input_line(old_len);
+    }
 }
 
 static void apply_history_position(void) {
@@ -583,17 +671,19 @@ static void restore_snapshot_input(void) {
         return;
     }
     ensure_input_buffer(strlen(current_input_snapshot));
-    strcpy(input_buf, current_input_snapshot);
-    input_len = strlen(input_buf);
-    cursor_pos = input_len;
-    render_input_line(old_len);
+    if (input_buf != NULL) {
+        strcpy(input_buf, current_input_snapshot);
+        input_len = strlen(input_buf);
+        cursor_pos = input_len;
+        render_input_line(old_len);
+    }
 }
 
 static void trim_top_buffer(void) {
     int *top_cnt = active_top_count();
     uint16_t (*top_buf)[VGA_WIDTH] = active_top_buffer();
 
-    if (*top_cnt < SCROLL_HISTORY_CLEAR_THRESHOLD) {
+    if (!top_buf || !top_cnt || *top_cnt < SCROLL_HISTORY_CLEAR_THRESHOLD) {
         return;
     }
 
@@ -602,13 +692,11 @@ static void trim_top_buffer(void) {
         return;
     }
 
-    for (int i = 0; i < SCROLL_HISTORY_KEEP_SIZE; i++) {
-        memcpy(
-            top_buf[i],
-            top_buf[i + remove_count],
-            VGA_WIDTH * sizeof(uint16_t)
-        );
-    }
+    memmove(
+        top_buf,
+        &top_buf[remove_count],
+        (size_t)SCROLL_HISTORY_KEEP_SIZE * VGA_WIDTH * sizeof(uint16_t)
+    );
 
     *top_cnt = SCROLL_HISTORY_KEEP_SIZE;
 }
@@ -616,6 +704,10 @@ static void trim_top_buffer(void) {
 static void save_top_line(uint16_t row) {
     int *top_cnt = active_top_count();
     uint16_t (*top_buf)[VGA_WIDTH] = active_top_buffer();
+
+    if (!top_buf || !top_cnt) {
+        return;
+    }
 
     if (*top_cnt >= SCROLL_HISTORY_SIZE) {
         trim_top_buffer();
@@ -634,7 +726,7 @@ void terminal_scroll_down(void) {
     uint16_t (*bot_buf)[VGA_WIDTH] = active_bottom_buffer();
     uint16_t (*top_buf)[VGA_WIDTH] = active_top_buffer();
 
-    if (*bot_cnt == 0) {
+    if (!bot_buf || !top_buf || !bot_cnt || !top_cnt || *bot_cnt == 0) {
         return;
     }
 
@@ -710,7 +802,7 @@ void terminal_scroll_up(void) {
     uint16_t (*top_buf)[VGA_WIDTH] = active_top_buffer();
     uint16_t (*bot_buf)[VGA_WIDTH] = active_bottom_buffer();
 
-    if (*top_cnt == 0) {
+    if (!top_buf || !bot_buf || !top_cnt || !bot_cnt || *top_cnt == 0) {
         return;
     }
 
@@ -762,20 +854,22 @@ void terminal_scroll_up(void) {
 }
 
 const char *terminal_get_cwd(void) {
-    return terminal_cwd;
+    if (!terminal_cwd) terminal_cwd_init();
+    return terminal_cwd ? terminal_cwd : "/";
 }
 
 int terminal_set_cwd(const char *path) {
     if (!path || !*path) return -1;
-    char target[1024];
-    make_abs_path(path, target, sizeof(target));
+    char *target = make_abs_path_dyn(path);
+    if (!target) return -1;
     uint32_t ino;
     struct ipo_inode st;
     if (path_resolve(target, &ino) < 0 || !ipo_fs_stat(target, &st) || (st.mode & IPO_INODE_TYPE_DIR) == 0) {
+        kfree(target);
         return -1;
     }
-    strncpy(terminal_cwd, target, sizeof(terminal_cwd) - 1);
-    terminal_cwd[sizeof(terminal_cwd) - 1] = '\0';
+    terminal_cwd_set(target);
+    kfree(target);
     return 0;
 }
 
@@ -872,19 +966,38 @@ char* resolve_command_path(const char *cmd) {
 bool terminal_is_builtin(const char *name) {
     if (!name || !*name) return false;
     static const char * const builtins[] = {
-        "help", "?", "clear", "cls", "pwd", "cd", "ls", "dir",
-        "cat", "type", "touch", "mkdir", "rm", "del", "rmdir",
-        "cp", "copy", "mv", "move", "rename", "stat", "echo",
-        "reboot", "restart", "shutdown", "poweroff", "exit", "halt",
+        "help",
+        "clear",
+        "pwd",
+        "cd",
+        "ls",
+        "cat",
+        "touch",
+        "mkdir",
+        "rm",
+        "cp",
+        "mv",
+        "stat",
+        "echo",
+        "reboot",
+        "shutdown",
         "reinstall_fs",
-        "ps", "tasks", "procs", "kill", "killall",
+        "ps",
+        "kill",
+        "killall",
         "run",
-        "df", "diskinfo", "meminfo", "free",
-        "driver", "drivers", "lsmod",
-        "keymap", "layout", "keymaps",
-        "return", "retval", "show_return", "return_val", "ret",
-        "ifconfig", "ipconfig", "ip",
-        "startx", "stopx",
+        "df",
+        "free",
+        "drivers",
+        "symbols",
+        "ksyms",
+        "storage",
+        "keymap",
+        "return",
+        "ifconfig",
+        "hardware",
+        "startx",
+        "stopx",
         NULL
     };
     for (int i = 0; builtins[i] != NULL; i++) {
@@ -897,14 +1010,14 @@ static void builtin_help(void) {
     printf("======================= IPO_OS SYSTEM HELP =======================\n");
     printf("\n");
     printf("1. BUILTIN SHELL COMMANDS & SYNTAX\n");
-    printf("  [Navigation]\n");
+    printf("  [Navigation & Paths]\n");
     printf("    pwd\n");
     printf("      - Print absolute path of current working directory.\n");
-    printf("    cd [path | ~ | .. | .]\n");
-    printf("      - Change working directory to target path, root (~), or parent (..).\n");
+    printf("    cd [path]\n");
+    printf("      - Change working directory to target path.\n");
     printf("\n");
     printf("  [File & Directory Operations]\n");
-    printf("    ls [path] | dir [path]\n");
+    printf("    ls [path]\n");
     printf("      - List directory contents showing item type and file size.\n");
     printf("    cat <file...>\n");
     printf("      - Display contents of one or multiple files sequentially.\n");
@@ -912,17 +1025,17 @@ static void builtin_help(void) {
     printf("      - Create one or multiple new empty files.\n");
     printf("    mkdir <dir...>\n");
     printf("      - Create one or multiple new directories.\n");
-    printf("    rm <path...> | del <path...> | rmdir <path...>\n");
+    printf("    rm <path...>\n");
     printf("      - Delete one or multiple files or empty directories.\n");
-    printf("    cp <src> <dst> | copy <src> <dst>\n");
+    printf("    cp <src> <dst>\n");
     printf("      - Copy file to destination path or into destination directory.\n");
-    printf("    mv <src> <dst> | move <src> <dst> | rename <src> <dst>\n");
+    printf("    mv <src> <dst>\n");
     printf("      - Move or rename a file or directory.\n");
     printf("    stat <path...>\n");
     printf("      - Display inode number, type, size, protection and extents info.\n");
     printf("\n");
     printf("  [Process & Task Management]\n");
-    printf("    ps | tasks | procs\n");
+    printf("    ps\n");
     printf("      - List all active and background processes with PID, state, memory.\n");
     printf("    kill <pid>\n");
     printf("      - Terminate a running or background process and free its resources.\n");
@@ -930,14 +1043,13 @@ static void builtin_help(void) {
     printf("      - Terminate all active processes and stop background async tasks.\n");
     printf("    run <prog> [args] [OP <prog> [args] ...]\n");
     printf("      - Launch executables with multitasking batch operators:\n");
-    printf("          &   — run each program in a separate workspace\n");
+    printf("          &   - run each program in a separate workspace\n");
     printf("                (separate text buffers / separate startx workspaces).\n");
-    printf("          &&  — run programs asynchronously in a single shared workspace\n");
+    printf("          &&  - run programs asynchronously in a single shared workspace\n");
     printf("                (main terminal / same startx desktop with all windows open).\n");
-    printf("          |   — wait for left program to complete and pass return code to right.\n");
-    printf("          ;   — wait until program completes, then run next program.\n");
+    printf("          |   - wait for left program to complete and pass return code to right.\n");
+    printf("          ;   - wait until program completes, then run next program.\n");
     printf("        Switch workspaces: Ctrl + Page Up / Ctrl + Page Down; exit: Ctrl + C.\n");
-    printf("        Supports quoting ('...'/\"...\") and escaping (\\x).\n");
     printf("    startx\n");
     printf("      - Enter VGA Mode 13h (320x200) and start the window manager compositor\n");
     printf("        as a background async task. Returns to the shell immediately.\n");
@@ -950,48 +1062,65 @@ static void builtin_help(void) {
     printf("      - Print text to stdout, overwrite to file (>), or append (>>).\n");
     printf("\n");
     printf("  [Networking]\n");
-    printf("    ifconfig | ip [<new_ip> [netmask] [gateway] [dns]]\n");
-    printf("      - Display or configure device IP address, netmask, gateway and MAC.\n");
+    printf("    ifconfig [<new_ip> [netmask] [gateway] [dns]]\n");
+    printf("      - Query or configure device IP address, netmask, gateway and MAC.\n");
     printf("\n");
-    printf("  [External Drivers Subsystem]\n");
-    printf("    driver | drivers | lsmod\n");
-    printf("      - List registered external device drivers and active hooks.\n");
+    printf("  [Drivers & Kernel Modules]\n");
+    printf("    drivers [list | info <id/name> | load <path> | unload <id/name> | status]\n");
+    printf("      - Manage kernel drivers and dynamic runtime modules (KMOD ABI 0x0100).\n");
+    printf("    symbols [filter]\n");
+    printf("      - Inspect all exported kernel function symbols, memory addresses, and OS entry points.\n");
     printf("\n");
-    printf("  [System & Power Controls]\n");
-    printf("    clear | cls\n");
-    printf("      - Clear terminal screen and reset VGA scrollback buffer.\n");
-    printf("    reboot | restart\n");
-    printf("      - Reboot hardware via 8042 controller, port 0x92 or triple fault.\n");
-    printf("    shutdown | poweroff | exit | halt\n");
-    printf("      - Power off machine via ACPI/APM or halt CPU execution safely.\n");
-    printf("    reinstall_fs\n");
-    printf("      - Completely reinstall filesystem on disk (wipes FS and resets to defaults).\n");
-    printf("    help | ?\n");
-    printf("      - Display this system documentation and syntax reference.\n");
+    printf("  [Hardware Resources & Infrastructure]\n");
+    printf("    hardware [overview | list | cpu | memory | pci | storage | network | usb | refresh | info <id> | status]\n");
+    printf("      - Inspect detected hardware resources: CPU/SMP cores, BIOS E820 RAM, PCI bus, ATA storage pool, network, USB.\n");
+    printf("    storage [list | status | usage | check | create [uuid] [dev] | add <dev> | recover | save]\n");
+    printf("      - Manage multi-disk storage pool, persistent superblocks, WAL journal consistency, and crash recovery.\n");
     printf("\n");
     printf("  [Disk & Memory Info]\n");
-    printf("    df | diskinfo\n");
+    printf("    df\n");
     printf("      - Show storage pool capacity: total, used, free blocks, inodes, drives.\n");
-    printf("    meminfo | free\n");
+    printf("    free\n");
     printf("      - Show kernel heap stats: total, used, free, block count, overhead.\n");
     printf("    keymap [list | on <id/name> | off <id/name> | rm <id/name>]\n");
     printf("      - Manage keyboard layouts: list registered layouts, enable (on), disable (off), or remove (rm).\n");
-    printf("        (Aliases: layout, keymaps)\n");
-    printf("    return | retval | show_return [on | off]\n");
+    printf("    return [on | off]\n");
     printf("      - Toggle display of process exit return value (Return value: X).\n");
     printf("\n");
-    printf("2. APPLICATION EXECUTION (Launch Methods & Resolution)\n");
+    printf("  [System & Power Controls]\n");
+    printf("    clear\n");
+    printf("      - Clear terminal screen and reset VGA scrollback buffer.\n");
+    printf("    reboot\n");
+    printf("      - Reboot hardware via 8042 controller, port 0x92 or triple fault.\n");
+    printf("    shutdown\n");
+    printf("      - Power off machine via ACPI/APM or halt CPU execution safely.\n");
+    printf("    reinstall_fs\n");
+    printf("      - Completely reinstall filesystem on disk (wipes FS and resets to defaults).\n");
+    printf("    help\n");
+    printf("      - Display this system documentation and syntax reference.\n");
+    printf("\n");
+    printf("2. FILE & DIRECTORY PATH SYNTAX\n");
+    printf("  IPO_OS uses unified path resolution across all shell commands and applications:\n");
+    printf("  - Absolute paths : Start with '/' (e.g. /applications/edit, /fonts/default.fnt).\n");
+    printf("  - Relative paths : Relative to current working directory (e.g. file.txt, dir/sub.txt).\n");
+    printf("  - Current dir    : '.' refers to current directory (e.g. ./prog, ./data).\n");
+    printf("  - Parent dir     : '..' ascends to parent directory (e.g. ../file, ../../dir).\n");
+    printf("  - Root / Home    : '~' represents the root directory '/' (e.g. cd ~).\n");
+    printf("  - Redundant '/'  : Multiple slashes '//', '///' are automatically collapsed to a single '/'.\n");
+    printf("  - Paths w/spaces : Wrap path in quotes (\"my file.txt\", 'my file.txt') or escape with '\\' (my\\ file.txt).\n");
+    printf("\n");
+    printf("3. APPLICATION EXECUTION (Launch Methods & Resolution)\n");
     printf("  IPO_OS executes Position Independent Executables via three methods:\n");
     printf("  [Method 1: Direct Name (Automatic PATH Resolution)]\n");
     printf("    Syntax: <command> [arguments...]\n");
     printf("    - Searches current directory, /applications directory, then root directory.\n");
-    printf("  [Method 2: Explicit Relative or Absolute Path]\n");
-    printf("    Syntax: <path/to/binary> [arguments...]\n");
-    printf("    - Resolves absolute paths starting with '/' or relative paths.\n");
+    printf("  [Method 2: Explicit Path]\n");
+    printf("    Syntax: <path/to/application> [arguments...]\n");
+    printf("    - Execute application specifying a path.\n");
     printf("  [Method 3: Batch Startup Script]\n");
     printf("    - Reads commands line-by-line from '/autorun' during kernel boot.\n");
     printf("\n");
-    printf("3. TERMINAL SHORTCUTS & KEYBOARD CONTROLS\n");
+    printf("4. TERMINAL SHORTCUTS & KEYBOARD CONTROLS\n");
     printf("   - Ctrl + Page Up         : Switch to previous multitasking workspace.\n");
     printf("   - Ctrl + Page Down       : Switch to next multitasking workspace.\n");
     printf("   - Ctrl + Left/Right Shift: Cycle keyboard layout backwards / forwards.\n");
@@ -1002,17 +1131,16 @@ static void builtin_help(void) {
     printf("   - Left / Right Arrows    : Move cursor across current line.\n");
     printf("   - Home / End             : Move cursor to beginning / end of line.\n");
     printf("\n");
-    printf("4. WINDOW MANAGER SHORTCUTS & CONTROLS\n");
+    printf("5. WINDOW MANAGER SHORTCUTS & CONTROLS\n");
     printf("   - Tab                    : Switch focus to next window.\n");
     printf("   - Shift + Tab            : Switch focus to previous window.\n");
-    printf("   - Alt + F4               : Close currently focused window.\n");
     printf("   - Ctrl + W               : Close currently focused window.\n");
     printf("   - Ctrl + Arrow Keys      : Move focused window.\n");
     printf("   - Ctrl + Page Up         : Switch to previous multitasking workspace.\n");
     printf("   - Ctrl + Page Down       : Switch to next multitasking workspace.\n");
     printf("   - F2                     : Cycle active keyboard layout.\n");
     printf("   - Ctrl + Left/Right Shift: Cycle keyboard layout backwards / forwards.\n");
-    printf("   - Alt + Left/Right Shift : Cycle keyboard layout backwards / forwards.\n");;
+    printf("   - Alt + Left/Right Shift : Cycle keyboard layout backwards / forwards.\n");
     printf("   - Window Buttons         : Minimize, Maximize/Restore, Close [X].\n");
     printf("   - Window Titlebar Drag   : Move window.\n");
     printf("   - Window Border Drag     : Resize window.\n");
@@ -1020,7 +1148,7 @@ static void builtin_help(void) {
     printf("   - Taskbar Tabs           : Click to focus/restore/minimize; [x] or right-click to close.\n");
     printf("   - Taskbar Language Box   : Left click: next layout; right click: previous layout.\n");
     printf("\n");
-    printf("5. SYSTEM STATUS & LANGUAGE BAR\n");
+    printf("6. SYSTEM STATUS & LANGUAGE BAR\n");
     printf("  [Top Language Bar Operation]\n");
     printf("    - Status bar displays currently active keyboard layout below system header.\n");
     printf("    - Automatically hidden when only one layout is enabled in the system.\n");
@@ -1036,6 +1164,8 @@ static void builtin_clear(void) {
         VGA_START_CURSOR_POSITION
     );
     print_header();
+    *active_top_count() = 0;
+    *active_bottom_count() = 0;
     top_buffer_count = 0;
     bottom_buffer_count = 0;
     input_start_cursor = VGA_START_CURSOR_POSITION;
@@ -1050,47 +1180,53 @@ static void builtin_pwd(void) {
 
 static void builtin_cd(int argc, char **argv) {
     if (argc < 2 || strcmp(argv[1], "~") == 0) {
-        strcpy(terminal_cwd, "/");
+        terminal_cwd_set("/");
         return;
     }
-    char target[1024];
-    make_abs_path(argv[1], target, sizeof(target));
+    char *target = make_abs_path_dyn(argv[1]);
+    if (!target) { printf("cd: out of memory\n"); return; }
     struct ipo_inode stat;
     if (!ipo_fs_stat(target, &stat)) {
         printf("cd: %s: No such directory\n", argv[1]);
+        kfree(target);
         return;
     }
     if ((stat.mode & IPO_INODE_TYPE_DIR) == 0) {
         printf("cd: %s: Not a directory\n", argv[1]);
+        kfree(target);
         return;
     }
-    strncpy(terminal_cwd, target, sizeof(terminal_cwd) - 1);
-    terminal_cwd[sizeof(terminal_cwd) - 1] = '\0';
+    terminal_cwd_set(target);
+    kfree(target);
 }
 
 static void builtin_ls(int argc, char **argv) {
-    char target[1024];
+    char *target;
     if (argc >= 2) {
-        make_abs_path(argv[1], target, sizeof(target));
+        target = make_abs_path_dyn(argv[1]);
     } else {
-        strncpy(target, terminal_cwd, sizeof(target) - 1);
-        target[sizeof(target) - 1] = '\0';
+        target = make_abs_path_dyn(terminal_cwd ? terminal_cwd : "/");
     }
+    if (!target) { printf("ls: out of memory\n"); return; }
 
     uint32_t ino;
     if (path_resolve(target, &ino) < 0) {
         printf("ls: cannot access '%s': No such file or directory\n", target);
+        kfree(target);
         return;
     }
     struct ipo_inode din;
     if (!read_inode(ino, &din)) {
         printf("ls: cannot read inode for '%s'\n", target);
+        kfree(target);
         return;
     }
     if ((din.mode & IPO_INODE_TYPE_DIR) == 0) {
         printf("  [FILE] %s  (%u B)\n", target, din.size);
+        kfree(target);
         return;
     }
+    kfree(target);
 
     uint64_t offset = 0;
     while (offset < din.size) {
@@ -1196,6 +1332,7 @@ static void builtin_mkdir(int argc, char **argv) {
 
         int ino = ipo_fs_create(target, IPO_INODE_TYPE_DIR);
         if (ino < 0) {
+            printf("mkdir: cannot create directory '%s'\n", argv[a]);
         }
     }
 }
@@ -1546,7 +1683,7 @@ static void builtin_reinstall_fs(void) {
 
     /* 5. Reset terminal state */
     printf("[5/5] Resetting terminal state...\n");
-    strcpy(terminal_cwd, "/");
+    terminal_cwd_set("/");
 
     printf("\n=== Filesystem Reinstallation Complete ===\n");
     printf("Fresh IPO_FS successfully reinstalled at LBA %u.\n", (uint32_t)start_lba);
@@ -1632,7 +1769,7 @@ static void builtin_df(void) {
     uint32_t used_pct = blk_total ? (blk_used * 100u) / blk_total : 0;
 
     uint64_t pool_cap = ata_get_pool_capacity();
-    uint8_t dev_cnt = ata_get_device_count();
+    uint32_t dev_cnt = ata_get_device_count();
 
     printf("Storage Pool : %u physical ATA drive(s), %u sectors pool capacity\n",
            dev_cnt, (uint32_t)pool_cap);
@@ -1655,7 +1792,7 @@ static void builtin_keymap(int argc, char **argv) {
         return;
     }
 
-    if (strcmp(argv[1], "list") == 0 || strcmp(argv[1], "дшые") == 0) {
+    if (strcmp(argv[1], "list") == 0) {
         uint32_t total = dynamic_keymap_get_count();
         uint32_t active = dynamic_keymap_get_active_index();
         printf("=== Registered Keyboard Layouts (%u) ===\n", total);
@@ -1679,24 +1816,21 @@ static void builtin_keymap(int argc, char **argv) {
     }
 
     const char *target = argv[2];
-    if (strcmp(action, "off") == 0 || strcmp(action, "disable") == 0 ||
-        strcmp(action, "щаа") == 0 || strcmp(action, "выкл") == 0 || strcmp(action, "откл") == 0) {
+    if (strcmp(action, "off") == 0) {
         int res = dynamic_keymap_disable(target);
         if (res == 0) {
             printf("Layout '%s' disabled.\n", target);
         } else {
             printf("Failed to disable layout '%s' (not found).\n", target);
         }
-    } else if (strcmp(action, "on") == 0 || strcmp(action, "enable") == 0 ||
-               strcmp(action, "щт") == 0 || strcmp(action, "вкл") == 0) {
+    } else if (strcmp(action, "on") == 0) {
         int res = dynamic_keymap_enable(target);
         if (res == 0) {
             printf("Layout '%s' enabled.\n", target);
         } else {
             printf("Failed to enable layout '%s' (not found).\n", target);
         }
-    } else if (strcmp(action, "rm") == 0 || strcmp(action, "del") == 0 || strcmp(action, "remove") == 0 ||
-               strcmp(action, "кь") == 0 || strcmp(action, "уд") == 0) {
+    } else if (strcmp(action, "rm") == 0) {
         int res = dynamic_keymap_remove(target);
         if (res == 0) {
             printf("Layout '%s' removed.\n", target);
@@ -1763,6 +1897,9 @@ bool terminal_get_show_return_value(void) {
 }
 
 void terminal_initialize(void) {
+    s_terminal_init_count++;
+    terminal_cwd_init();
+
     vga_init_font_cache();
 
     vga_clear(
@@ -1777,6 +1914,8 @@ void terminal_initialize(void) {
     /* Flush any scancodes that accumulated during boot */
     keyboard_flush_hardware();
     keyboard_flush_queue();
+    keyboard_flush_app_queue();
+    keyboard_clear_key_state();
 
     input_len = 0;
     cursor_pos = 0;
@@ -1786,13 +1925,29 @@ void terminal_initialize(void) {
 
     ensure_input_buffer(0);
     if (input_buf != NULL) {
-        input_buf[0] = '\0';
+        memset(input_buf, 0, input_capacity);
     }
 
     input_start_cursor = 0;
 
-    command_history_count = 0;
-    command_history_index = -1;
+    /* Erase past commands history buffer (especially on repeated initialization) */
+    terminal_clear_command_history();
+
+    /* Allocate or clear scrollback buffers */
+    if (!terminal_top_buffer) {
+        terminal_top_buffer = (uint16_t (*)[VGA_WIDTH])kmalloc(SCROLL_HISTORY_SIZE * VGA_WIDTH * sizeof(uint16_t));
+    }
+    if (terminal_top_buffer) {
+        init_scroll_buffer(terminal_top_buffer);
+    }
+
+    if (!terminal_bottom_buffer) {
+        terminal_bottom_buffer = (uint16_t (*)[VGA_WIDTH])kmalloc(SCROLL_HISTORY_SIZE * VGA_WIDTH * sizeof(uint16_t));
+    }
+    if (terminal_bottom_buffer) {
+        init_scroll_buffer(terminal_bottom_buffer);
+    }
+
     top_buffer_count = 0;
     bottom_buffer_count = 0;
 
@@ -1800,14 +1955,27 @@ void terminal_initialize(void) {
         current_input_snapshot = kmalloc(256u);
     }
     if (current_input_snapshot != NULL) {
-        current_input_snapshot[0] = '\0';
+        memset(current_input_snapshot, 0, 256u);
     }
 
     last_terminal_scancode = 0;
     last_terminal_key_ms = 0;
     last_history_action_ms = 0;
 
+    /* Erase pending injected commands and serial input buffers */
+    if (pending_terminal_input != NULL) {
+        kfree(pending_terminal_input);
+        pending_terminal_input = NULL;
+    }
+    pending_terminal_auto_exec = false;
+
+    s_serial_cmd_len = 0;
+    if (s_serial_cmd_buf != NULL) {
+        s_serial_cmd_buf[0] = '\0';
+    }
+
     load_command_history_from_file();
+    serial_printf("[terminal] Terminal interface initialized (call #%u, VGA 80x25 text mode, font cache ready).\n", s_terminal_init_count);
 }
 
 /* Print the command prompt */
@@ -1862,9 +2030,6 @@ static void print_prompt(void) {
     terminal_apply_pending_input();
 }
 
-static char *pending_terminal_input = NULL;
-static bool pending_terminal_auto_exec = false;
-
 void terminal_inject_input(const char *text, bool auto_execute) {
     if (pending_terminal_input != NULL) {
         kfree(pending_terminal_input);
@@ -1911,7 +2076,9 @@ void terminal_apply_pending_input(void) {
             if (exec == 0) {
                 printf("Command not found: %s\n", input_buf);
             } else if (exec < 0) {
-                printf("Execution failed (error %d): %s\n", exec, input_buf);
+                if (process_get_exit_code() != 126) {
+                    printf("Execution failed (error %d): %s\n", exec, input_buf);
+                }
             } else if (exec != 1000) {
                 int ret = process_get_exit_code();
                 if (terminal_show_return_value) {
@@ -1932,110 +2099,6 @@ void terminal_apply_pending_input(void) {
         }
     }
     kfree(text);
-}
-
-static int terminal_try_execute_script(const char *path, int argc, char **argv) {
-    int fd = ipo_fs_open(path);
-    if (fd < 0) return -1;
-
-    char magic[2];
-    int read_bytes = ipo_fs_read(fd, magic, 2, 0);
-    if (read_bytes != 2 || magic[0] != '#' || magic[1] != '!') {
-        ipo_fs_close(fd);
-        return -1;
-    }
-
-    size_t cap = 128;
-    char *line = kmalloc(cap);
-    if (!line) {
-        ipo_fs_close(fd);
-        return -1;
-    }
-
-    size_t len = 0;
-    uint32_t offset = 2;
-    char ch;
-    while (ipo_fs_read(fd, &ch, 1, offset++) == 1) {
-        if (ch == '\r' || ch == '\n') break;
-        if (len + 2 >= cap) {
-            size_t new_cap = cap * 2;
-            char *expanded = kmalloc(new_cap);
-            if (!expanded) {
-                kfree(line);
-                ipo_fs_close(fd);
-                return -1;
-            }
-            memcpy(expanded, line, len);
-            kfree(line);
-            line = expanded;
-            cap = new_cap;
-        }
-        line[len++] = ch;
-    }
-    line[len] = '\0';
-    ipo_fs_close(fd);
-
-    char *p = line;
-    while (*p == ' ' || *p == '\t') p++;
-    if (*p == '\0') {
-        kfree(line);
-        return -1;
-    }
-
-    char *interp = p;
-    char *interp_arg = NULL;
-    while (*p && *p != ' ' && *p != '\t') p++;
-    if (*p) {
-        *p++ = '\0';
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p) {
-            interp_arg = p;
-            char *end = interp_arg + strlen(interp_arg) - 1;
-            while (end >= interp_arg && (*end == ' ' || *end == '\t')) {
-                *end-- = '\0';
-            }
-        }
-    }
-
-    int new_cap = argc + 4;
-    char **new_argv = kmalloc((size_t)new_cap * sizeof(char *));
-    if (!new_argv) {
-        kfree(line);
-        return -1;
-    }
-
-    int new_argc = 0;
-    new_argv[new_argc++] = interp;
-    if (interp_arg && *interp_arg) {
-        new_argv[new_argc++] = interp_arg;
-    }
-    new_argv[new_argc++] = (char *)path;
-    for (int i = 1; i < argc; i++) {
-        if (new_argc + 1 >= new_cap) {
-            new_cap *= 2;
-            char **expanded = kmalloc((size_t)new_cap * sizeof(char *));
-            if (expanded) {
-                memcpy(expanded, new_argv, (size_t)new_argc * sizeof(char *));
-                kfree(new_argv);
-                new_argv = expanded;
-            }
-        }
-        new_argv[new_argc++] = argv[i];
-    }
-    new_argv[new_argc] = NULL;
-
-    char *interp_path = resolve_command_path(interp);
-    int res = -1;
-    if (interp_path) {
-        res = process_exec(interp_path, new_argc, new_argv);
-        kfree(interp_path);
-    } else {
-        printf("Interpreter '%s' not found for '%s'\n", interp, path);
-    }
-
-    kfree(new_argv);
-    kfree(line);
-    return res;
 }
 
 static void builtin_ifconfig(int argc, char **argv) {
@@ -2099,205 +2162,613 @@ static void builtin_ifconfig(int argc, char **argv) {
            netif->mac.mac[3], netif->mac.mac[4], netif->mac.mac[5]);
 }
 
+static void builtin_hardware(int argc, char **argv) {
+    if (argc < 2 || strcmp(argv[1], "overview") == 0) {
+        printf("================ IPO_OS Hardware Resources Overview ================\n");
+        char vendor[32], brand[64];
+        smp_get_cpu_vendor(vendor, sizeof(vendor));
+        smp_get_cpu_brand(brand, sizeof(brand));
+        printf("  CPU:       %u core(s) detected (%u active online)\n",
+               smp_get_cpu_count(), smp_get_active_cpu_count());
+        printf("             Vendor: %s, Model: %s\n", vendor, brand);
+
+        uint64_t total_ram = memory_map_get_total_ram();
+        char size_buf[32];
+        format_size(total_ram, size_buf, sizeof(size_buf));
+        printf("  Memory:    Total RAM: %s (%u usable regions)\n",
+               size_buf, memory_map_get_region_count());
+
+        printf("  PCI:       %u PCI device(s) detected on bus\n", pci_get_count());
+        printf("  Storage:   %u ATA/IDE drive(s) present, pool capacity: %u MB\n",
+               ata_get_device_count(), (uint32_t)(ata_get_pool_capacity() / 2048ull));
+
+        uint32_t net_devs = device_get_count_by_type(DEVICE_TYPE_NETWORK);
+        printf("  Network:   %u network interface(s) registered\n", net_devs);
+
+        printf("  Registry:  Total devices: %u (ACTIVE: %u, INITIALIZED: %u)\n",
+               device_get_count(),
+               device_get_count_by_state(DEVICE_STATE_ACTIVE),
+               device_get_count_by_state(DEVICE_STATE_INITIALIZED));
+        printf("--------------------------------------------------------------------\n");
+        printf("Commands: hardware list | cpu | memory | pci | storage | network | usb | smp\n");
+        printf("          hardware refresh | info <id> | status\n");
+        printf("====================================================================\n");
+        return;
+    }
+
+    if (strcmp(argv[1], "list") == 0) {
+        printf(" ID  TYPE     STATE        NAME         RESOURCES            DESCRIPTION\n");
+        printf(" -----------------------------------------------------------------------------\n");
+        const device_node_t *curr = device_get_list();
+        while (curr) {
+            printf(" %2u  ", curr->id);
+            print_padded(device_type_to_string(curr->type), 9);
+            print_padded(device_state_to_string(curr->state), 13);
+            print_padded(curr->name ? curr->name : "", 13);
+
+            char res_str[24];
+            if (curr->res.bus_type == BUS_TYPE_PCI) {
+                snprintf(res_str, sizeof(res_str), "PCI %02x:%02x.%x",
+                         curr->res.pci_bus, curr->res.pci_slot, curr->res.pci_func);
+            } else if (curr->res.io_base != 0) {
+                if (curr->res.irq != 0) {
+                    snprintf(res_str, sizeof(res_str), "IO 0x%x, IRQ %u", curr->res.io_base, curr->res.irq);
+                } else {
+                    snprintf(res_str, sizeof(res_str), "IO 0x%x", curr->res.io_base);
+                }
+            } else if (curr->res.mmio_base != 0) {
+                snprintf(res_str, sizeof(res_str), "MMIO 0x%x", curr->res.mmio_base);
+            } else {
+                snprintf(res_str, sizeof(res_str), "-");
+            }
+            print_padded(res_str, 21);
+
+            printf("%.20s\n", curr->description ? curr->description : "");
+            curr = curr->next;
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "cpu") == 0) {
+        printf("=== Central Processing Unit (CPU & SMP) ===\n");
+        char vendor[32], brand[64], features[256];
+        smp_get_cpu_vendor(vendor, sizeof(vendor));
+        smp_get_cpu_brand(brand, sizeof(brand));
+        smp_get_cpu_features_str(features, sizeof(features));
+        uint32_t fam = 0, mod = 0, step = 0;
+        smp_get_cpu_model_info(&fam, &mod, &step);
+
+        printf("  Vendor:           %s\n", vendor);
+        printf("  Model / Brand:    %s\n", brand);
+        printf("  Family/Model/Stp: Family %u, Model %u, Stepping %u\n", fam, mod, step);
+        printf("  Detected Cores:   %u logical core(s)\n", smp_get_cpu_count());
+        printf("  Active Cores:     %u online core(s)\n", smp_get_active_cpu_count());
+        printf("  CPUID Features:   %s\n", features);
+
+        printf("\n  Logical Cores Table:\n");
+        printf("  CORE  LAPIC  ROLE     STATUS   TICKS       STACK TOP   STACK BASE\n");
+        printf("  --------------------------------------------------------------------\n");
+        for (uint32_t i = 0; i < smp_get_cpu_count(); i++) {
+            const cpu_info_t *c = smp_get_cpu_info(i);
+            if (!c) continue;
+            printf("  %-4u  %-5u  %-7s  %-7s  %-10u  0x%08x  0x%08x\n",
+                   c->cpu_id, c->lapic_id,
+                   c->is_bsp ? "BSP" : "AP",
+                   c->is_online ? "ONLINE" : "OFFLINE",
+                   c->ticks,
+                   c->stack_top, c->stack_base);
+        }
+
+        const smp_architecture_status_t *as = smp_get_architecture_status();
+        printf("\n  SMP Architectural Components Status:\n");
+        #define SMP_STAT_STR(s) ((s) == SMP_STATUS_ACTIVE ? "ACTIVE" : ((s) == SMP_STATUS_INACTIVE ? "INACTIVE" : "BLOCKED"))
+        printf("    CPUID Capability Detection:    %s\n", SMP_STAT_STR(as->cpu_capability_detection));
+        printf("    ACPI MADT Enumeration:         %s\n", SMP_STAT_STR(as->acpi_madt_enumeration));
+        printf("    MP Table Discovery Fallback:   %s\n", SMP_STAT_STR(as->mp_table_fallback));
+        printf("    Per-CPU Stacks & Structures:   %s\n", SMP_STAT_STR(as->per_cpu_structures));
+        printf("    Atomic Bus-Locked Spinlocks:   %s\n", SMP_STAT_STR(as->atomic_spinlocks));
+        printf("    AP Startup Sequence (ICR):     %s\n", SMP_STAT_STR(as->ap_boot_sequence));
+        printf("    Driver Subsystem Reentrancy:   %s\n", SMP_STAT_STR(as->driver_reentrancy));
+        printf("    IPI Cross-Core Rescheduling:   %s\n", SMP_STAT_STR(as->ipi_cross_core_reschedule));
+        printf("    Preemptive Multi-Core Sched:   %s\n", SMP_STAT_STR(as->cross_core_scheduler));
+        #undef SMP_STAT_STR
+        return;
+    }
+
+    if (strcmp(argv[1], "memory") == 0) {
+        printf("=== Physical Memory & Address Map (BIOS E820) ===\n");
+        uint64_t total = memory_map_get_total_ram();
+        char size_buf[32];
+        format_size(total, size_buf, sizeof(size_buf));
+        printf("  Total Detected RAM: %s (%llu bytes)\n", size_buf, total);
+
+        uint32_t raw_e820_count = memory_map_get_raw_e820_count();
+        if (raw_e820_count > 0) {
+            printf("\n  Raw BIOS E820 Memory Map (%u entries):\n", raw_e820_count);
+            printf("  #   BASE ADDRESS        LENGTH              TYPE\n");
+            printf("  --------------------------------------------------------------\n");
+            for (uint32_t i = 0; i < raw_e820_count; i++) {
+                const e820_entry_t *e = memory_map_get_raw_e820_entry(i);
+                if (!e) continue;
+                char esize[32];
+                format_size(e->length, esize, sizeof(esize));
+                printf("  %-2u  0x%08llx - 0x%08llx  %-14s  %s\n",
+                       i, e->base, e->base + e->length, esize,
+                       memory_map_e820_type_name(e->type));
+            }
+        }
+
+        printf("\n  Allocatable & Managed Memory Pools (%u pools):\n", memory_map_get_region_count());
+        printf("  #   BASE ADDRESS  POOL SIZE     RESERVED      STATUS\n");
+        printf("  ---------------------------------------------------------\n");
+        for (uint32_t i = 0; i < memory_map_get_region_count(); i++) {
+            const memory_region_t *r = memory_map_get_region(i);
+            if (!r) continue;
+            char rsize[32], used_str[32];
+            format_size((uint64_t)r->size, rsize, sizeof(rsize));
+            format_size((uint64_t)r->used, used_str, sizeof(used_str));
+            printf("  %-2u  0x%08x    %-12s  %-12s  %s\n",
+                   i, r->base, rsize,
+                   r->used ? used_str : "None",
+                   r->is_usable ? "ACTIVE" : "INITIALIZED");
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "pci") == 0) {
+        printf("=== Peripheral Component Interconnect (PCI Bus) ===\n");
+        uint32_t count = pci_get_count();
+        printf("  Discovered %u PCI device(s):\n\n", count);
+        printf("  B:S.F   VENDOR:DEV   VENDOR                  CLASS [CODE:SUBCLASS]\n");
+        printf("  -------------------------------------------------------------------------\n");
+        for (uint32_t i = 0; i < count; i++) {
+            const pci_device_t *p = pci_get_device(i);
+            if (!p) continue;
+            printf("  %02x:%02x.%x  %04x:%04x     ", p->bus, p->slot, p->func, p->vendor_id, p->device_id);
+            print_padded(pci_vendor_name(p->vendor_id), 24);
+            printf("%s", pci_class_name(p->class_code, p->subclass));
+            if (p->irq > 0 && p->irq < 255) {
+                printf(" (IRQ %u)", p->irq);
+            }
+            putchar('\n');
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "storage") == 0) {
+        printf("=== ATA/IDE Storage Subsystem ===\n");
+        uint32_t count = ata_get_device_count();
+        printf("  Detected ATA Drive(s): %u\n", count);
+        uint64_t pool_sec = ata_get_pool_capacity();
+        char pool_sz[32];
+        format_size(pool_sec * 512ull, pool_sz, sizeof(pool_sz));
+        printf("  Multi-Drive Storage Pool Capacity: %s (%llu sectors)\n\n", pool_sz, pool_sec);
+
+        printf("  DRIVE  CHANNEL  ROLE    MODEL                     SERIAL           CAPACITY\n");
+        printf("  -----------------------------------------------------------------------------\n");
+        for (uint32_t i = 0; i < count; i++) {
+            ata_device_t *d = ata_get_device(i);
+            if (!d || !d->present) continue;
+            char cap_buf[32];
+            format_size(d->capacity_sectors * 512ull, cap_buf, sizeof(cap_buf));
+            printf("  %-5u  Pri/%-4u  %-6s  ", i, d->channel, d->drive ? "Slave" : "Master");
+            print_padded((d->model && d->model[0]) ? d->model : "N/A", 26);
+            print_padded((d->serial && d->serial[0]) ? d->serial : "N/A", 17);
+            printf("%s\n", cap_buf);
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "network") == 0) {
+        printf("=== Network Interfaces & Controllers ===\n");
+        uint32_t net_pci_count = 0;
+        uint32_t count = pci_get_count();
+        for (uint32_t i = 0; i < count; i++) {
+            const pci_device_t *p = pci_get_device(i);
+            if (!p || p->class_code != 0x02) continue;
+            net_pci_count++;
+            printf("  Controller #%u: PCI Network Device [0x%04X:0x%04X]\n",
+                   net_pci_count, p->vendor_id, p->device_id);
+            printf("     Location:  PCI %02x:%02x.%x, IRQ: %u\n",
+                   p->bus, p->slot, p->func, p->irq);
+            if (p->bar0 & 1) {
+                printf("     I/O Port:  0x%x\n", (unsigned int)(p->bar0 & ~3u));
+            } else if (p->bar0 != 0) {
+                printf("     MMIO:      0x%08x\n", (unsigned int)(p->bar0 & ~0xFu));
+            }
+
+            if (p->vendor_id == RTL8139_VENDOR_ID && p->device_id == RTL8139_DEVICE_ID && rtl8139_is_present()) {
+                const uint8_t *m = rtl8139_get_mac();
+                if (m) {
+                    printf("     MAC:       %02x:%02x:%02x:%02x:%02x:%02x\n",
+                           m[0], m[1], m[2], m[3], m[4], m[5]);
+                }
+                uint16_t io = (uint16_t)(p->bar0 & ~3u);
+                uint8_t msr = inb(io + 0x58);
+                bool link_up = (msr & 0x04) == 0;
+                int speed = (msr & 0x08) ? 10 : 100;
+                printf("     Hardware:  Link %s (%d Mbps)\n", link_up ? "UP" : "DOWN", speed);
+            }
+        }
+        if (net_pci_count == 0) {
+            printf("  No physical PCI network controllers detected.\n");
+        }
+        printf("  Virtual:   lo0 (127.0.0.1/8, MTU 65536, Interface UP)\n");
+        return;
+    }
+
+    if (strcmp(argv[1], "usb") == 0) {
+        printf("=== Universal Serial Bus (USB Subsystem) ===\n");
+        uint32_t count = pci_get_count();
+        int usb_found = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            const pci_device_t *p = pci_get_device(i);
+            if (!p) continue;
+            if (p->class_code == 0x0C && p->subclass == 0x03) {
+                usb_found++;
+                printf("  Controller #%d: USB Host Controller (ProgIF 0x%02X)\n", usb_found, p->prog_if);
+                printf("    Location:  PCI %02x:%02x.%x\n", p->bus, p->slot, p->func);
+                printf("    Hardware:  Vendor 0x%04X, Device 0x%04X, ProgIF 0x%02X\n",
+                       p->vendor_id, p->device_id, p->prog_if);
+                printf("    Resources: IRQ %u, BAR0: 0x%08x\n", p->irq, p->bar0);
+                printf("    Status:    INITIALIZED (Bus enumeration ready)\n");
+            }
+        }
+        if (usb_found == 0) {
+            printf("  No USB host controllers detected on PCI bus.\n");
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "refresh") == 0) {
+        printf("[hardware] Rescanning hardware buses (PCI, ATA, SMP, E820)...\n");
+        int total = device_rescan();
+        printf("[hardware] Rescan complete. Registry updated: %d active devices.\n", total);
+        return;
+    }
+
+    if (strcmp(argv[1], "info") == 0) {
+        if (argc < 3) {
+            printf("Usage: hardware info <device_id>\n");
+            return;
+        }
+        uint32_t id = (uint32_t)atoi(argv[2]);
+        const device_node_t *dev = device_find_by_id(id);
+        if (!dev) {
+            printf("hardware: device ID %u not found. Run 'hardware list' for available IDs.\n", id);
+            return;
+        }
+        printf("=== Hardware Device Detail: ID %u ===\n", dev->id);
+        printf("  Canonical Name:     %s\n", dev->name ? dev->name : "");
+        printf("  Category / Type:    %s\n", device_type_to_string(dev->type));
+        printf("  Operational State:  %s\n", device_state_to_string(dev->state));
+        printf("  Vendor:             %s\n", dev->vendor ? dev->vendor : "");
+        printf("  Model:              %s\n", dev->model ? dev->model : "");
+        printf("  Description:        %s\n", dev->description ? dev->description : "");
+        printf("  Bus Interface:      %s\n", bus_type_to_string(dev->res.bus_type));
+        printf("  Associated Driver:  %s\n", (dev->driver_name && dev->driver_name[0]) ? dev->driver_name : "none");
+        if (dev->res.bus_type == BUS_TYPE_PCI) {
+            printf("  PCI Coordinates:    Bus %u, Slot %u, Func %u\n",
+                   dev->res.pci_bus, dev->res.pci_slot, dev->res.pci_func);
+            printf("  PCI IDs:            Vendor 0x%04x, Device 0x%04x\n",
+                   dev->res.vendor_id, dev->res.device_id);
+            printf("  PCI Class:          0x%02x, Subclass 0x%02x, ProgIF 0x%02x\n",
+                   dev->res.pci_class, dev->res.pci_subclass, dev->res.pci_progif);
+            for (size_t b = 0; b < dev->res.bar_count; b++) {
+                if (dev->res.bar[b] != 0) {
+                    printf("  BAR[%u]:             0x%08x\n", (uint32_t)b, dev->res.bar[b]);
+                }
+            }
+        }
+        if (dev->res.io_base != 0) {
+            printf("  I/O Base Port:      0x%x\n", dev->res.io_base);
+        }
+        if (dev->res.mmio_base != 0) {
+            printf("  MMIO Base Address:  0x%08x (Size: %u bytes)\n",
+                   dev->res.mmio_base, dev->res.mmio_size);
+        }
+        if (dev->res.irq != 0) {
+            printf("  IRQ Line:           %u\n", dev->res.irq);
+        }
+        if (dev->res.size_bytes != 0) {
+            char sz[32];
+            format_size(dev->res.size_bytes, sz, sizeof(sz));
+            printf("  Capacity / Size:    %s (%llu bytes)\n", sz, dev->res.size_bytes);
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "status") == 0) {
+        printf("=== Hardware Health & Subsystem Status ===\n");
+        uint32_t err_count = device_get_count_by_state(DEVICE_STATE_ERROR);
+        uint32_t dis_count = device_get_count_by_state(DEVICE_STATE_DISABLED);
+        uint32_t cpus_online = smp_get_active_cpu_count();
+        uint32_t cpus_total = smp_get_cpu_count();
+
+        const char *health_str = "HEALTHY";
+        if (err_count > 0) {
+            health_str = "ERROR (Hardware errors present)";
+        } else if (cpus_online < cpus_total) {
+            health_str = "DEGRADED (Secondary CPU core(s) offline)";
+        } else if (dis_count > 0) {
+            health_str = "DEGRADED (Disabled devices present)";
+        }
+        printf("  System Hardware Status: %s\n", health_str);
+        printf("  Total Registered:       %u devices\n", device_get_count());
+        printf("    - ACTIVE:             %u\n", device_get_count_by_state(DEVICE_STATE_ACTIVE));
+        printf("    - INITIALIZED:        %u\n", device_get_count_by_state(DEVICE_STATE_INITIALIZED));
+        printf("    - DISCOVERED:         %u\n", device_get_count_by_state(DEVICE_STATE_DISCOVERED));
+        printf("    - DISABLED:           %u\n", device_get_count_by_state(DEVICE_STATE_DISABLED));
+        printf("    - ERROR:              %u\n", device_get_count_by_state(DEVICE_STATE_ERROR));
+        printf("  Subsystem Device Counts:\n");
+        printf("    - CPU Cores:          %u\n", device_get_count_by_type(DEVICE_TYPE_CPU));
+        printf("    - Memory Pools:       %u\n", device_get_count_by_type(DEVICE_TYPE_MEMORY));
+        printf("    - PCI Devices:        %u\n", device_get_count_by_type(DEVICE_TYPE_PCI));
+        printf("    - Storage Drives:     %u\n", device_get_count_by_type(DEVICE_TYPE_STORAGE));
+        printf("    - Network Adapters:   %u\n", device_get_count_by_type(DEVICE_TYPE_NETWORK));
+        printf("    - Input Devices:      %u\n", device_get_count_by_type(DEVICE_TYPE_INPUT));
+        printf("    - Audio Devices:      %u\n", device_get_count_by_type(DEVICE_TYPE_AUDIO));
+        printf("    - Video Adapters:     %u\n", device_get_count_by_type(DEVICE_TYPE_VIDEO));
+        printf("    - System Controllers: %u\n", device_get_count_by_type(DEVICE_TYPE_SYSTEM));
+        printf("    - USB Controllers:    %u\n", device_get_count_by_type(DEVICE_TYPE_USB));
+        return;
+    }
+
+    printf("hardware: unknown subcommand '%s'.\n", argv[1]);
+    printf("Usage: hardware [overview | list | cpu | memory | pci | storage | network | usb | refresh | info <id> | status]\n");
+}
+
+static void builtin_storage(int argc, char **argv) {
+    if (argc < 2 || strcmp(argv[1], "list") == 0) {
+        storage_pool_print_status();
+        printf("\n=== Physical Block Devices & Partitions ===\n");
+        block_device_t *bdev = block_dev_get_list();
+        if (!bdev) {
+            printf("  No block devices registered in system.\n");
+        } else {
+            while (bdev) {
+                partition_table_t ptable;
+                partition_scan(bdev, &ptable);
+                partition_print_table(&ptable);
+                partition_free_table(&ptable);
+                bdev = bdev->next;
+            }
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "status") == 0) {
+        storage_pool_print_status();
+        return;
+    }
+
+    if (strcmp(argv[1], "usage") == 0) {
+        storage_pool_print_usage();
+        return;
+    }
+
+    if (strcmp(argv[1], "check") == 0) {
+        storage_pool_check();
+        return;
+    }
+
+    if (strcmp(argv[1], "create") == 0) {
+        const char *uuid = (argc > 2) ? argv[2] : "IPO_STORAGE_POOL";
+        const char *dev = (argc > 3) ? argv[3] : NULL;
+        if (dev) {
+            printf("Creating persistent storage pool '%s' on device '%s'...\n", uuid, dev);
+        } else {
+            printf("Creating persistent storage pool '%s'...\n", uuid);
+        }
+        int res = storage_pool_create_ex(uuid, dev);
+        if (res == 0) {
+            printf("Storage pool successfully created and persisted to disk.\n");
+        } else if (res == -2) {
+            printf("Failed to create storage pool: target block device not found or empty.\n");
+        } else {
+            printf("Failed to create storage pool (error %d).\n", res);
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "add") == 0) {
+        if (argc < 3) {
+            printf("Usage: storage add <block_device>\n");
+            return;
+        }
+        block_device_t *bdev = block_dev_get(argv[2]);
+        if (!bdev) {
+            printf("storage: block device '%s' not found.\n", argv[2]);
+            return;
+        }
+        int res = storage_pool_add_device(bdev);
+        if (res == 0) {
+            printf("Successfully attached '%s' to storage pool.\n", argv[2]);
+        } else {
+            printf("Failed to add '%s' to storage pool (error %d).\n", argv[2], res);
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "recover") == 0) {
+        printf("Executing manual storage pool crash recovery...\n");
+        int count = storage_pool_recover();
+        if (count >= 0) {
+            printf("Recovery finished: %d interrupted transaction(s) resolved.\n", count);
+        } else {
+            printf("Recovery failed (primary member unavailable).\n");
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "save") == 0) {
+        int res = storage_pool_save_metadata();
+        if (res == 0) {
+            printf("Storage pool metadata successfully synchronized to disk.\n");
+        } else {
+            printf("Failed to save storage pool metadata.\n");
+        }
+        return;
+    }
+
+    printf("storage: unknown subcommand '%s'.\n", argv[1]);
+    printf("Usage: storage [list | status | usage | check | create [uuid] [dev] | add <dev> | recover | save]\n");
+}
+
+static void builtin_symbols(int argc, char **argv) {
+    const char *filter = (argc >= 2) ? argv[1] : NULL;
+    size_t count = 0;
+    const kernel_sym_entry_t *syms = kmod_get_symbols(&count);
+    if (!syms || count == 0) {
+        printf("symbols: No exported kernel symbols found.\n");
+        return;
+    }
+    printf("=== Exported Kernel Symbols (%u total) ===\n", (uint32_t)count);
+    size_t shown = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (!filter || strstr(syms[i].name, filter)) {
+            printf("  %p  %s\n", syms[i].addr, syms[i].name);
+            shown++;
+        }
+    }
+    if (filter) {
+        printf("Found %u symbol(s) matching '%s'.\n", (uint32_t)shown, filter);
+    }
+}
+
+static void builtin_drivers(int argc, char **argv) {
+    if (argc < 2 || strcmp(argv[1], "list") == 0) {
+        printf("=== Loaded Drivers & Dynamic Modules ===\n");
+        printf("  Loaded Dynamic Drivers:  %u active\n", driver_count_kernel() + driver_count_user());
+        printf("  Dynamic Modules (KMOD):  %u loaded (ABI 0x%04x)\n\n", kmod_count(), KMOD_ABI_VERSION);
+        driver_print_list();
+        printf("\n");
+        kmod_print_list();
+        return;
+    }
+
+    if (strcmp(argv[1], "status") == 0) {
+        size_t ksym_cnt = 0;
+        kmod_get_symbols(&ksym_cnt);
+        printf("=== Driver Subsystem Status ===\n");
+        printf("  Loaded Dynamic Drivers:  %u active\n", driver_count_kernel() + driver_count_user());
+        printf("  Dynamic Modules (KMOD):  %u loaded\n", kmod_count());
+        printf("  KMOD ABI Version:        0x%04x (v1.0)\n", KMOD_ABI_VERSION);
+        printf("  Exported Kernel Symbols: %u functions\n", (uint32_t)ksym_cnt);
+        printf("  KMOD Executable Format:  IKMD Header, Relocatable 32-bit ELF payload\n");
+        return;
+    }
+
+    if (strcmp(argv[1], "info") == 0) {
+        if (argc < 3) {
+            printf("Usage: drivers info <id|name>\n");
+            return;
+        }
+        uint32_t id = 0;
+        for (int i = 0; argv[2][i] >= '0' && argv[2][i] <= '9'; i++) {
+            id = id * 10 + (argv[2][i] - '0');
+        }
+        kmod_t *mod = (id > 0) ? kmod_find_by_id(id) : kmod_find_by_name(argv[2]);
+        if (mod) {
+            printf("=== Dynamic Driver Module: %s ===\n", mod->name);
+            printf("  Module ID:   %u\n", mod->id);
+            printf("  Author:      %s\n", (mod->author && mod->author[0]) ? mod->author : "Unknown");
+            printf("  Version:     %s\n", (mod->version && mod->version[0]) ? mod->version : "1.0");
+            printf("  Description: %s\n", (mod->description && mod->description[0]) ? mod->description : "N/A");
+            printf("  ABI Version: 0x%04x\n", mod->abi_version);
+            printf("  Memory Base: %p (%u bytes)\n", mod->image_base, (uint32_t)mod->image_size);
+            printf("  References:  %u\n", mod->ref_count);
+            printf("  Status:      %s\n", (mod->flags & KMOD_FLAG_ACTIVE) ? "ACTIVE" : "LOADED");
+            return;
+        }
+
+        driver_t *d = driver_find(argv[2]);
+        if (d) {
+            printf("=== %s Driver: %s ===\n",
+                   (d->flags & DRIVER_FLAG_KERNEL) ? "Built-in Kernel" : "Userland Resident",
+                   d->name);
+            printf("  Description: %s\n", d->description ? d->description : "N/A");
+            printf("  Type:        %s\n", (d->flags & DRIVER_FLAG_KERNEL) ? "Kernel Core" : "Userland Process");
+            if (d->owner && process_is_valid((process_t *)d->owner)) {
+                process_t *p = (process_t *)d->owner;
+                printf("  Owner PID:   %u (%s)\n", p->pid, p->name ? p->name : "unnamed");
+            }
+            printf("  Flags:       0x%08x (%s)\n",
+                   d->flags, (d->flags & DRIVER_FLAG_ACTIVE) ? "ACTIVE" : "REGISTERED");
+            printf("  Hooks:       ");
+            if (d->on_tick) printf("Timer ");
+            if (d->on_key) printf("Keyboard ");
+            if (d->on_command) printf("Command ");
+            if (d->on_char_output) printf("CharOut ");
+            if (d->read || d->write) printf("I/O ");
+            putchar('\n');
+            return;
+        }
+
+        printf("drivers: Module or driver '%s' not found.\n", argv[2]);
+        return;
+    }
+
+    if (strcmp(argv[1], "load") == 0) {
+        if (argc < 3) {
+            printf("Usage: drivers load <path/to/driver.kmd>\n");
+            return;
+        }
+        kmod_t *mod = NULL;
+        int res = kmod_load_file(argv[2], &mod);
+        if (res == 0 && mod) {
+            printf("drivers: Successfully loaded module '%s' (ID %u, %u bytes @ %p).\n",
+                   mod->name, mod->id, (uint32_t)mod->image_size, mod->image_base);
+        } else {
+            printf("drivers: Failed to load module from '%s' (error code %d).\n", argv[2], res);
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "unload") == 0) {
+        if (argc < 3) {
+            printf("Usage: drivers unload <id|name>\n");
+            return;
+        }
+        uint32_t id = 0;
+        for (int i = 0; argv[2][i] >= '0' && argv[2][i] <= '9'; i++) {
+            id = id * 10 + (argv[2][i] - '0');
+        }
+        int res = (id > 0) ? kmod_unload(id) : kmod_unload_by_name(argv[2]);
+        if (res == 0) {
+            printf("drivers: Successfully unloaded module '%s'.\n", argv[2]);
+        } else {
+            printf("drivers: Failed to unload module '%s' (error code %d).\n", argv[2], res);
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "symbols") == 0 || strcmp(argv[1], "syms") == 0) {
+        builtin_symbols(argc - 1, argv + 1);
+        return;
+    }
+
+    printf("drivers: unknown subcommand '%s'.\n", argv[1]);
+    printf("Usage: drivers [list | info <id/name> | load <path> | unload <id/name> | status]\n");
+}
+
 int try_execute_command(const char *cmdline) {
     if (!cmdline) return -1;
 
-    // Extract command name (first token)
-    const char *p = cmdline;
-    while (*p == ' ' || *p == '\t') p++;
-    if (*p == '\0') return 0;
-
-
-    size_t name_cap = 64u;
-    char *name = kmalloc(name_cap);
-    if (name == NULL) {
-        return -1;
-    }
-    size_t i = 0u;
-    while (*p && *p != ' ' && *p != '\t') {
-        if (i + 1u >= name_cap) {
-            size_t new_cap = name_cap * 2u;
-            char *new_name = kmalloc(new_cap);
-            if (new_name == NULL) {
-                kfree(name);
-                return -1;
-            }
-            memcpy(new_name, name, i);
-            kfree(name);
-            name = new_name;
-            name_cap = new_cap;
-        }
-        name[i++] = *p++;
-    }
-    name[i] = '\0';
-
-    // Parse arguments from cmdline
-    char **argv = NULL;
     int argc = 0;
-    int argv_cap = 8;
-    argv = kmalloc((size_t)argv_cap * sizeof(char *));
-    if (argv == NULL) {
-        kfree(name);
-        return -1;
+    char **argv = NULL;
+    if (cmdline_split(cmdline, &argc, &argv) <= 0 || argc == 0 || !argv || !argv[0]) {
+        if (argv) cmdline_free_args(argc, argv);
+        return 0;
     }
-    argv[argc++] = name;
-
-    while (*p && (*p == ' ' || *p == '\t')) p++;
-
-    size_t arg_cap = 256u;
-    char *arg_buf = kmalloc(arg_cap);
-    size_t arg_pos = 0u;
-    int in_arg = 0;
-    char in_quote = 0;
-
-    while (*p) {
-        char c = *p;
-
-        if (in_quote) {
-            if (c == in_quote) {
-                in_quote = 0;
-                p++;
-                continue;
-            }
-            if (in_quote == '"' && c == '\\' && (*(p + 1) == '"' || *(p + 1) == '\\')) {
-                p++;
-                c = *p;
-            }
-            if (arg_pos + 1u >= arg_cap) {
-                size_t new_cap = arg_cap + 256u;
-                char *extended = kmalloc(new_cap);
-                if (extended == NULL) {
-                    kfree(arg_buf);
-                    for (int j = 0; j < argc; j++) kfree(argv[j]);
-                    kfree(argv);
-                    return -1;
-                }
-                memcpy(extended, arg_buf, arg_pos);
-                kfree(arg_buf);
-                arg_buf = extended;
-                arg_cap = new_cap;
-            }
-            arg_buf[arg_pos++] = c;
-            p++;
-            in_arg = 1;
-            continue;
-        }
-
-        if (c == '\'' || c == '"') {
-            in_quote = c;
-            in_arg = 1;
-            p++;
-            continue;
-        }
-
-        if (c == '\\' && *(p + 1) != '\0') {
-            char next = *(p + 1);
-            if (next == ' ' || next == '\t' || next == '"' || next == '\'' || next == '\\') {
-                p++;
-                c = *p;
-            }
-            if (arg_pos + 1u >= arg_cap) {
-                size_t new_cap = arg_cap + 256u;
-                char *extended = kmalloc(new_cap);
-                if (extended == NULL) {
-                    kfree(arg_buf);
-                    for (int j = 0; j < argc; j++) kfree(argv[j]);
-                    kfree(argv);
-                    return -1;
-                }
-                memcpy(extended, arg_buf, arg_pos);
-                kfree(arg_buf);
-                arg_buf = extended;
-                arg_cap = new_cap;
-            }
-            arg_buf[arg_pos++] = c;
-            p++;
-            in_arg = 1;
-            continue;
-        }
-
-        if (c == ' ' || c == '\t') {
-            if (in_arg) {
-                arg_buf[arg_pos] = '\0';
-                char *arg_copy = kmalloc(arg_pos + 1u);
-                if (arg_copy) {
-                    strcpy(arg_copy, arg_buf);
-                    if (argc + 1 >= argv_cap) {
-                        int new_cap = argv_cap * 2;
-                        char **new_argv = kmalloc((size_t)new_cap * sizeof(char *));
-                        if (new_argv == NULL) {
-                            kfree(arg_copy);
-                            kfree(arg_buf);
-                            for (int j = 0; j < argc; j++) kfree(argv[j]);
-                            kfree(argv);
-                            return -1;
-                        }
-                        memcpy(new_argv, argv, (size_t)argc * sizeof(char *));
-                        kfree(argv);
-                        argv = new_argv;
-                        argv_cap = new_cap;
-                    }
-                    argv[argc++] = arg_copy;
-                }
-                arg_pos = 0u;
-                in_arg = 0;
-            }
-            p++;
-            continue;
-        }
-
-        if (arg_pos + 1u >= arg_cap) {
-            size_t new_cap = arg_cap + 256u;
-            char *extended = kmalloc(new_cap);
-            if (extended == NULL) {
-                kfree(arg_buf);
-                for (int j = 0; j < argc; j++) kfree(argv[j]);
-                kfree(argv);
-                return -1;
-            }
-            memcpy(extended, arg_buf, arg_pos);
-            kfree(arg_buf);
-            arg_buf = extended;
-            arg_cap = new_cap;
-        }
-        arg_buf[arg_pos++] = c;
-        p++;
-        in_arg = 1;
-    }
-
-    if (in_arg) {
-        arg_buf[arg_pos] = '\0';
-        char *arg_copy = kmalloc(arg_pos + 1u);
-        if (arg_copy) {
-            strcpy(arg_copy, arg_buf);
-            if (argc + 1 >= argv_cap) {
-                int new_cap = argv_cap * 2;
-                char **new_argv = kmalloc((size_t)new_cap * sizeof(char *));
-                if (new_argv == NULL) {
-                    kfree(arg_copy);
-                    kfree(arg_buf);
-                    for (int j = 0; j < argc; j++) kfree(argv[j]);
-                    kfree(argv);
-                    return -1;
-                }
-                memcpy(new_argv, argv, (size_t)argc * sizeof(char *));
-                kfree(argv);
-                argv = new_argv;
-                argv_cap = new_cap;
-            }
-            argv[argc++] = arg_copy;
-        }
-    }
-
-    kfree(arg_buf);
-    argv[argc] = NULL;
+    const char *name = argv[0];
 
     // Check Builtins
     int builtin_handled = 0;
-    if (strcmp(name, "help") == 0 || strcmp(name, "?") == 0) {
+    if (strcmp(name, "help") == 0) {
         builtin_help();
         builtin_handled = 1;
-    } else if (strcmp(name, "clear") == 0 || strcmp(name, "cls") == 0) {
+    } else if (strcmp(name, "clear") == 0) {
         builtin_clear();
         builtin_handled = 1;
     } else if (strcmp(name, "pwd") == 0) {
@@ -2306,10 +2777,10 @@ int try_execute_command(const char *cmdline) {
     } else if (strcmp(name, "cd") == 0) {
         builtin_cd(argc, argv);
         builtin_handled = 1;
-    } else if (strcmp(name, "ls") == 0 || strcmp(name, "dir") == 0) {
+    } else if (strcmp(name, "ls") == 0) {
         builtin_ls(argc, argv);
         builtin_handled = 1;
-    } else if (strcmp(name, "cat") == 0 || strcmp(name, "type") == 0) {
+    } else if (strcmp(name, "cat") == 0) {
         builtin_cat(argc, argv);
         builtin_handled = 1;
     } else if (strcmp(name, "touch") == 0) {
@@ -2318,13 +2789,13 @@ int try_execute_command(const char *cmdline) {
     } else if (strcmp(name, "mkdir") == 0) {
         builtin_mkdir(argc, argv);
         builtin_handled = 1;
-    } else if (strcmp(name, "rm") == 0 || strcmp(name, "del") == 0 || strcmp(name, "rmdir") == 0) {
+    } else if (strcmp(name, "rm") == 0) {
         builtin_rm(argc, argv);
         builtin_handled = 1;
-    } else if (strcmp(name, "cp") == 0 || strcmp(name, "copy") == 0) {
+    } else if (strcmp(name, "cp") == 0) {
         builtin_cp(argc, argv);
         builtin_handled = 1;
-    } else if (strcmp(name, "mv") == 0 || strcmp(name, "move") == 0 || strcmp(name, "rename") == 0) {
+    } else if (strcmp(name, "mv") == 0) {
         builtin_mv(argc, argv);
         builtin_handled = 1;
     } else if (strcmp(name, "stat") == 0) {
@@ -2333,17 +2804,16 @@ int try_execute_command(const char *cmdline) {
     } else if (strcmp(name, "echo") == 0) {
         builtin_echo(argc, argv, cmdline);
         builtin_handled = 1;
-    } else if (strcmp(name, "reboot") == 0 || strcmp(name, "restart") == 0) {
+    } else if (strcmp(name, "reboot") == 0) {
         builtin_reboot();
         builtin_handled = 1;
-    } else if (strcmp(name, "shutdown") == 0 || strcmp(name, "poweroff") == 0 ||
-               strcmp(name, "exit") == 0 || strcmp(name, "halt") == 0) {
+    } else if (strcmp(name, "shutdown") == 0) {
         builtin_shutdown();
         builtin_handled = 1;
     } else if (strcmp(name, "reinstall_fs") == 0) {
         builtin_reinstall_fs();
         builtin_handled = 1;
-    } else if (strcmp(name, "ps") == 0 || strcmp(name, "tasks") == 0 || strcmp(name, "procs") == 0) {
+    } else if (strcmp(name, "ps") == 0) {
         builtin_ps();
         builtin_handled = 1;
     } else if (strcmp(name, "kill") == 0) {
@@ -2352,26 +2822,32 @@ int try_execute_command(const char *cmdline) {
     } else if (strcmp(name, "killall") == 0) {
         builtin_killall();
         builtin_handled = 1;
-    } else if (strcmp(name, "df") == 0 || strcmp(name, "diskinfo") == 0) {
+    } else if (strcmp(name, "df") == 0) {
         builtin_df();
         builtin_handled = 1;
-    } else if (strcmp(name, "meminfo") == 0 || strcmp(name, "free") == 0) {
+    } else if (strcmp(name, "free") == 0) {
         builtin_meminfo();
         builtin_handled = 1;
-    } else if (strcmp(name, "driver") == 0 || strcmp(name, "drivers") == 0 || strcmp(name, "lsmod") == 0) {
-        driver_print_list();
+    } else if (strcmp(name, "drivers") == 0) {
+        builtin_drivers(argc, argv);
         builtin_handled = 1;
-    } else if (strcmp(name, "keymap") == 0 || strcmp(name, "layout") == 0 ||
-               strcmp(name, "keymaps") == 0) {
+    } else if (strcmp(name, "symbols") == 0 || strcmp(name, "ksyms") == 0) {
+        builtin_symbols(argc, argv);
+        builtin_handled = 1;
+    } else if (strcmp(name, "storage") == 0) {
+        builtin_storage(argc, argv);
+        builtin_handled = 1;
+    } else if (strcmp(name, "keymap") == 0) {
         builtin_keymap(argc, argv);
         builtin_handled = 1;
-    } else if (strcmp(name, "return") == 0 || strcmp(name, "retval") == 0 ||
-               strcmp(name, "show_return") == 0 || strcmp(name, "return_val") == 0 ||
-               strcmp(name, "ret") == 0) {
+    } else if (strcmp(name, "return") == 0) {
         builtin_show_return(argc, argv);
         builtin_handled = 1;
-    } else if (strcmp(name, "ifconfig") == 0 || strcmp(name, "ip") == 0 || strcmp(name, "ipconfig") == 0) {
+    } else if (strcmp(name, "ifconfig") == 0) {
         builtin_ifconfig(argc, argv);
+        builtin_handled = 1;
+    } else if (strcmp(name, "hardware") == 0) {
+        builtin_hardware(argc, argv);
         builtin_handled = 1;
     } else if (strcmp(name, "run") == 0) {
         /* Find the part of cmdline after "run " */
@@ -2380,10 +2856,7 @@ int try_execute_command(const char *cmdline) {
         if (strncmp(run_args, "run", 3) == 0) run_args += 3;
         while (*run_args == ' ' || *run_args == '\t') run_args++;
         int res = run_cmd_execute(run_args);
-        for (int j = 0; j < argc; j++) {
-            kfree(argv[j]);
-        }
-        kfree(argv);
+        cmdline_free_args(argc, argv);
         if (res < 0) return res;
         process_set_last_exit_code(res);
         return 1000;
@@ -2412,38 +2885,22 @@ int try_execute_command(const char *cmdline) {
 
     if (builtin_handled) {
         process_set_last_exit_code(0);
-        for (int j = 0; j < argc; j++) {
-            kfree(argv[j]);
-        }
-        kfree(argv);
+        cmdline_free_args(argc, argv);
         return 1000; // Special code for builtin success
     }
 
     // Resolve to filesystem path for external executables
     char *path = resolve_command_path(name);
     if (!path) {
-        for (int j = 0; j < argc; j++) {
-            kfree(argv[j]);
-        }
-        kfree(argv);
+        cmdline_free_args(argc, argv);
         return 0; // not found
     }
 
-    // If the file is a script, terminal executes the interpreter
-    int script_res = terminal_try_execute_script(path, argc, argv);
-    int result;
-    if (script_res >= 0) {
-        result = script_res;
-    } else {
-        // Execute program with arguments
-        result = process_exec(path, argc, argv);
-    }
+    // Execute program with arguments (supports ELF, scripts, and flat binaries natively)
+    int result = universal_process_execute(path, argc, argv);
 
     // Free allocated argument copies
-    for (int j = 0; j < argc; j++) {
-        kfree(argv[j]);
-    }
-    kfree(argv);
+    cmdline_free_args(argc, argv);
     kfree(path);
     return result;
 }
@@ -2453,13 +2910,10 @@ void terminal_poll_serial_commands(void) {
     if (serial_polling) return;
     serial_polling = true;
 
-    static char *serial_cmd_buf = NULL;
-    static size_t serial_cmd_cap = 0;
-    static size_t serial_cmd_len = 0;
     static bool serial_wm_prompt_shown = false;
 
     /* When WM session is active, show '> ' prompt via serial once per input cycle */
-    if (wm_session_active() && !serial_wm_prompt_shown && serial_cmd_len == 0) {
+    if (wm_session_active() && !serial_wm_prompt_shown && s_serial_cmd_len == 0) {
         serial_printf("> ");
         serial_wm_prompt_shown = true;
     }
@@ -2472,22 +2926,24 @@ void terminal_poll_serial_commands(void) {
     while ((ch = serial_getc()) >= 0) {
         if (ch == '\n' || ch == '\r') {
             serial_putc('\n');
-            if (serial_cmd_len > 0 && serial_cmd_buf != NULL) {
-                serial_cmd_buf[serial_cmd_len] = '\0';
-                serial_printf("[serial] exec: %s\n", serial_cmd_buf);
+            if (s_serial_cmd_len > 0 && s_serial_cmd_buf != NULL) {
+                s_serial_cmd_buf[s_serial_cmd_len] = '\0';
+                serial_printf("[serial] exec: %s\n", s_serial_cmd_buf);
 
-                push_command_history(serial_cmd_buf);
+                push_command_history(s_serial_cmd_buf);
 
-                int exec = try_execute_command(serial_cmd_buf);
+                int exec = try_execute_command(s_serial_cmd_buf);
                 if (exec == 0) {
-                    serial_printf("Command not found: %s\n", serial_cmd_buf);
+                    serial_printf("Command not found: %s\n", s_serial_cmd_buf);
                     if (!wm_session_active()) {
-                        printf("Command not found: %s\n", serial_cmd_buf);
+                        printf("Command not found: %s\n", s_serial_cmd_buf);
                     }
                 } else if (exec < 0) {
-                    serial_printf("Execution failed (error %d): %s\n", exec, serial_cmd_buf);
-                    if (!wm_session_active()) {
-                        printf("Execution failed (error %d): %s\n", exec, serial_cmd_buf);
+                    if (process_get_exit_code() != 126) {
+                        serial_printf("Execution failed (error %d): %s\n", exec, s_serial_cmd_buf);
+                        if (!wm_session_active()) {
+                            printf("Execution failed (error %d): %s\n", exec, s_serial_cmd_buf);
+                        }
                     }
                 } else if (exec != 1000) {
                     int ret = process_get_exit_code();
@@ -2499,8 +2955,10 @@ void terminal_poll_serial_commands(void) {
                     }
                 }
 
-                serial_cmd_len = 0;
-                serial_cmd_buf[0] = '\0';
+                s_serial_cmd_len = 0;
+                if (s_serial_cmd_buf != NULL) {
+                    s_serial_cmd_buf[0] = '\0';
+                }
                 serial_wm_prompt_shown = false;
 
                 if (!wm_session_active()) {
@@ -2514,10 +2972,10 @@ void terminal_poll_serial_commands(void) {
             }
         } else if (ch == 0x08 || ch == 0x7F) {
             /* Backspace / DEL */
-            if (serial_cmd_len > 0) {
-                serial_cmd_len--;
-                if (serial_cmd_buf != NULL) {
-                    serial_cmd_buf[serial_cmd_len] = '\0';
+            if (s_serial_cmd_len > 0) {
+                s_serial_cmd_len--;
+                if (s_serial_cmd_buf != NULL) {
+                    s_serial_cmd_buf[s_serial_cmd_len] = '\0';
                 }
                 serial_putc('\b');
                 serial_putc(' ');
@@ -2532,25 +2990,25 @@ void terminal_poll_serial_commands(void) {
                 wm_session_stop();
                 print_prompt();
             }
-            serial_cmd_len = 0;
-            if (serial_cmd_buf) serial_cmd_buf[0] = '\0';
+            s_serial_cmd_len = 0;
+            if (s_serial_cmd_buf) s_serial_cmd_buf[0] = '\0';
             serial_wm_prompt_shown = false;
         } else if (ch >= 0x20 || ch == '\t') {
-            if (serial_cmd_buf == NULL || serial_cmd_len + 2u > serial_cmd_cap) {
-                size_t new_cap = (serial_cmd_cap == 0) ? 256u : serial_cmd_cap * 2u;
+            if (s_serial_cmd_buf == NULL || s_serial_cmd_len + 2u > s_serial_cmd_cap) {
+                size_t new_cap = (s_serial_cmd_cap == 0) ? 256u : s_serial_cmd_cap * 2u;
                 char *new_buf = (char *)kmalloc(new_cap);
                 if (new_buf != NULL) {
-                    if (serial_cmd_buf != NULL && serial_cmd_len > 0) {
-                        memcpy(new_buf, serial_cmd_buf, serial_cmd_len);
-                        kfree(serial_cmd_buf);
+                    if (s_serial_cmd_buf != NULL && s_serial_cmd_len > 0) {
+                        memcpy(new_buf, s_serial_cmd_buf, s_serial_cmd_len);
+                        kfree(s_serial_cmd_buf);
                     }
-                    serial_cmd_buf = new_buf;
-                    serial_cmd_cap = new_cap;
+                    s_serial_cmd_buf = new_buf;
+                    s_serial_cmd_cap = new_cap;
                 }
             }
-            if (serial_cmd_buf != NULL && serial_cmd_len + 1u < serial_cmd_cap) {
-                serial_cmd_buf[serial_cmd_len++] = (char)ch;
-                serial_cmd_buf[serial_cmd_len] = '\0';
+            if (s_serial_cmd_buf != NULL && s_serial_cmd_len + 1u < s_serial_cmd_cap) {
+                s_serial_cmd_buf[s_serial_cmd_len++] = (char)ch;
+                s_serial_cmd_buf[s_serial_cmd_len] = '\0';
                 serial_putc((char)ch); /* echo */
             }
         }
@@ -2600,10 +3058,6 @@ void terminal_console(void){
             return;
         }
 
-        /* Dispatch application hotkeys (highest priority) and system hotkeys */
-        if (keyboard_dispatch_hotkey(scancode)) {
-            return;
-        }
 
         uint32_t now = timer_millis();
         if (!is_break_code && scancode == last_terminal_scancode) {
@@ -2640,13 +3094,13 @@ void terminal_console(void){
          */
         if (!is_break_code) {
             if (scancode == SC_PAGE_UP) {
-                if (top_buffer_count > 0) {
+                if (*active_top_count() > 0) {
                     terminal_scroll_up();
                 }
                 return;
             }
             if (scancode == SC_PAGE_DOWN) {
-                if (bottom_buffer_count > 0) {
+                if (*active_bottom_count() > 0) {
                     terminal_scroll_down();
                 }
                 return;
@@ -2666,7 +3120,7 @@ void terminal_console(void){
                     last_history_action_ms = now;
 
                     if (command_history_index < 0) {
-                        size_t snapshot_len = strlen(input_buf);
+                        size_t snapshot_len = input_buf ? strlen(input_buf) : 0u;
                         if (current_input_snapshot == NULL || strlen(current_input_snapshot) < snapshot_len + 1u) {
                             size_t new_cap = snapshot_len + 1u;
                             if (new_cap < 256u) {
@@ -2682,7 +3136,11 @@ void terminal_console(void){
                             }
                             current_input_snapshot = new_snapshot;
                         }
-                        strcpy(current_input_snapshot, input_buf);
+                        if (input_buf != NULL) {
+                            strcpy(current_input_snapshot, input_buf);
+                        } else {
+                            current_input_snapshot[0] = '\0';
+                        }
                         command_history_index = command_history_count - 1;
                     } else if (command_history_index > 0) {
                         command_history_index--;
@@ -2793,9 +3251,11 @@ void terminal_console(void){
                     vga_hide_cursor();
                     putchar('\n');
 
-                    input_buf[input_len] = '\0';
+                    if (input_buf != NULL) {
+                        input_buf[input_len] = '\0';
+                    }
 
-                    if (input_len > 0) {
+                    if (input_len > 0 && input_buf != NULL) {
                         push_command_history(input_buf);
                         keyboard_flush_hardware();
                         keyboard_flush_queue();
@@ -2805,7 +3265,9 @@ void terminal_console(void){
                         if (exec == 0) {
                             printf("Command not found: %s\n", input_buf);
                         } else if (exec < 0) {
-                            printf("Execution failed (error %d): %s\n", exec, input_buf);
+                            if (process_get_exit_code() != 126) {
+                                printf("Execution failed (error %d): %s\n", exec, input_buf);
+                            }
                         } else if (exec != 1000) {
                             int ret = process_get_exit_code();
                             if (terminal_show_return_value) {
@@ -2817,7 +3279,9 @@ void terminal_console(void){
                     /* Reset buffer */
                     input_len = 0;
                     cursor_pos = 0;
-                    input_buf[0] = '\0';
+                    if (input_buf != NULL) {
+                        input_buf[0] = '\0';
+                    }
                     if (current_input_snapshot != NULL) {
                         current_input_snapshot[0] = '\0';
                     }
@@ -2831,7 +3295,7 @@ void terminal_console(void){
                 }
                 /* Handle backspace (UTF-8 aware) */
                 else if (out_str[0] == '\b' || out_str[0] == 127) {
-                    if (cursor_pos > 0) {
+                    if (cursor_pos > 0 && input_buf != NULL) {
                         size_t del_bytes = 1;
                         while (cursor_pos >= del_bytes + 1u &&
                                ((unsigned char)input_buf[cursor_pos - del_bytes] & 0xC0) == 0x80) {
@@ -2848,25 +3312,29 @@ void terminal_console(void){
                 /* Handle tab */
                 else if (out_str[0] == '\t') {
                     ensure_input_buffer(input_len + 1u);
-                    size_t old_len = input_len;
-                    memmove(&input_buf[cursor_pos + 1], &input_buf[cursor_pos], input_len - cursor_pos + 1);
-                    input_buf[cursor_pos] = '\t';
-                    cursor_pos++;
-                    input_len++;
-                    input_buf[input_len] = '\0';
-                    render_input_line(old_len);
+                    if (input_buf != NULL) {
+                        size_t old_len = input_len;
+                        memmove(&input_buf[cursor_pos + 1], &input_buf[cursor_pos], input_len - cursor_pos + 1);
+                        input_buf[cursor_pos] = '\t';
+                        cursor_pos++;
+                        input_len++;
+                        input_buf[input_len] = '\0';
+                        render_input_line(old_len);
+                    }
                 }
                 /* Printable string (arbitrary length: UTF-8 character, word, symbol, emoji) */
                 else {
                     size_t slen = strlen(out_str);
                     ensure_input_buffer(input_len + slen + 1u);
-                    size_t old_len = input_len;
-                    memmove(&input_buf[cursor_pos + slen], &input_buf[cursor_pos], input_len - cursor_pos + 1);
-                    memcpy(&input_buf[cursor_pos], out_str, slen);
-                    cursor_pos += slen;
-                    input_len += slen;
-                    input_buf[input_len] = '\0';
-                    render_input_line(old_len);
+                    if (input_buf != NULL) {
+                        size_t old_len = input_len;
+                        memmove(&input_buf[cursor_pos + slen], &input_buf[cursor_pos], input_len - cursor_pos + 1);
+                        memcpy(&input_buf[cursor_pos], out_str, slen);
+                        cursor_pos += slen;
+                        input_len += slen;
+                        input_buf[input_len] = '\0';
+                        render_input_line(old_len);
+                    }
                 }
             }
         }
@@ -2907,7 +3375,7 @@ void terminal_auto_scroll(void) {
         }
     }
 
-    uint16_t blank = vga_entry(0x00, VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+    uint16_t blank = vga_entry(' ', VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
     uint16_t bottom_offset = (top + rows - 1) * VGA_WIDTH;
 
     for (uint16_t c = 0; c < VGA_WIDTH; c++) {

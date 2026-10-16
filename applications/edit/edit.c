@@ -30,8 +30,6 @@
 #include <system/state.h>
 #include <kernel/process.h>
 
-#define MAX_LINES 2048
-#define MAX_LINE_LEN 256
 #define VIEW_ROWS 24
 #define GUTTER_WIDTH 5
 #define TEXT_COLS (VGA_WIDTH - GUTTER_WIDTH)
@@ -58,9 +56,11 @@ typedef enum {
 #define SC_END        0x4F
 #define SC_DELETE     0x53
 
-/* Editor state */
-static char lines[MAX_LINES][MAX_LINE_LEN];
+/* Editor state - Dynamic Self-Expanding Buffer (Unlimited lines, Unlimited line lengths) */
+static char **lines = NULL;
+static size_t *line_caps = NULL;
 static int line_count = 0;
+static int line_capacity = 0;
 static char current_file[128];
 static bool is_modified = false;
 static bool show_line_numbers = true;
@@ -79,9 +79,11 @@ static int cmd_len = 0;
 static char status_msg[128];
 static uint32_t status_timer = 0;
 
-/* Undo single step */
-static char undo_lines[MAX_LINES][MAX_LINE_LEN];
+/* Undo single step - Dynamic Self-Expanding Buffer */
+static char **undo_lines = NULL;
+static size_t *undo_line_caps = NULL;
 static int undo_count = 0;
+static int undo_capacity = 0;
 static int undo_cur_line = 0;
 static int undo_cur_col = 0;
 static bool can_undo = false;
@@ -94,20 +96,103 @@ static uint16_t back_buffer[VGA_WIDTH * VGA_HEIGHT];
 /* Pending normal command state (e.g. 'd' for 'dd', 'g' for 'gg') */
 static char pending_op = '\0';
 
-
-static void my_strcat(char *dst, const char *src, size_t max_len) {
-    size_t dlen = strlen(dst);
-    while (*src && dlen + 1 < max_len) {
-        dst[dlen++] = *src++;
+static void ensure_line_capacity(int line_idx, size_t needed_len) {
+    if (line_idx < 0) return;
+    if (line_idx >= line_capacity) {
+        int new_cap = (line_capacity == 0) ? 16 : line_capacity * 2;
+        if (new_cap <= line_idx) new_cap = line_idx + 16;
+        lines = krealloc(lines, (size_t)new_cap * sizeof(char *));
+        line_caps = krealloc(line_caps, (size_t)new_cap * sizeof(size_t));
+        for (int i = line_capacity; i < new_cap; i++) {
+            lines[i] = NULL;
+            line_caps[i] = 0;
+        }
+        line_capacity = new_cap;
     }
-    dst[dlen] = '\0';
+
+    if (needed_len + 1 > line_caps[line_idx] || lines[line_idx] == NULL) {
+        size_t new_cap = (line_caps[line_idx] == 0) ? 32 : line_caps[line_idx] * 2;
+        if (new_cap <= needed_len + 1) new_cap = needed_len + 32;
+        lines[line_idx] = krealloc(lines[line_idx], new_cap);
+        if (line_caps[line_idx] == 0 && lines[line_idx] != NULL) {
+            lines[line_idx][0] = '\0';
+        }
+        line_caps[line_idx] = new_cap;
+    }
+}
+
+static void ensure_undo_line_capacity(int line_idx, size_t needed_len) {
+    if (line_idx < 0) return;
+    if (line_idx >= undo_capacity) {
+        int new_cap = (undo_capacity == 0) ? 16 : undo_capacity * 2;
+        if (new_cap <= line_idx) new_cap = line_idx + 16;
+        undo_lines = krealloc(undo_lines, (size_t)new_cap * sizeof(char *));
+        undo_line_caps = krealloc(undo_line_caps, (size_t)new_cap * sizeof(size_t));
+        for (int i = undo_capacity; i < new_cap; i++) {
+            undo_lines[i] = NULL;
+            undo_line_caps[i] = 0;
+        }
+        undo_capacity = new_cap;
+    }
+
+    if (needed_len + 1 > undo_line_caps[line_idx] || undo_lines[line_idx] == NULL) {
+        size_t new_cap = (undo_line_caps[line_idx] == 0) ? 32 : undo_line_caps[line_idx] * 2;
+        if (new_cap <= needed_len + 1) new_cap = needed_len + 32;
+        undo_lines[line_idx] = krealloc(undo_lines[line_idx], new_cap);
+        if (undo_line_caps[line_idx] == 0 && undo_lines[line_idx] != NULL) {
+            undo_lines[line_idx][0] = '\0';
+        }
+        undo_line_caps[line_idx] = new_cap;
+    }
+}
+
+static void buffer_clear(void) {
+    if (lines) {
+        for (int i = 0; i < line_capacity; i++) {
+            if (lines[i]) {
+                kfree(lines[i]);
+                lines[i] = NULL;
+            }
+            line_caps[i] = 0;
+        }
+    }
+    line_count = 0;
+}
+
+static void undo_clear(void) {
+    if (undo_lines) {
+        for (int i = 0; i < undo_capacity; i++) {
+            if (undo_lines[i]) {
+                kfree(undo_lines[i]);
+                undo_lines[i] = NULL;
+            }
+            undo_line_caps[i] = 0;
+        }
+    }
+    undo_count = 0;
+    can_undo = false;
+}
+
+static void buffer_init(void) {
+    buffer_clear();
+    ensure_line_capacity(0, 0);
+    if (lines && lines[0]) lines[0][0] = '\0';
+    line_count = 1;
+    cur_line = 0;
+    cur_col = 0;
+    row_offset = 0;
+    col_offset = 0;
 }
 
 static void save_undo_state(void) {
-    if (line_count > MAX_LINES) line_count = MAX_LINES;
     for (int i = 0; i < line_count; i++) {
-        strncpy(undo_lines[i], lines[i], MAX_LINE_LEN - 1);
-        undo_lines[i][MAX_LINE_LEN - 1] = '\0';
+        size_t len = (lines && lines[i]) ? strlen(lines[i]) : 0;
+        ensure_undo_line_capacity(i, len);
+        if (lines && lines[i]) {
+            memcpy(undo_lines[i], lines[i], len + 1);
+        } else if (undo_lines && undo_lines[i]) {
+            undo_lines[i][0] = '\0';
+        }
     }
     undo_count = line_count;
     undo_cur_line = cur_line;
@@ -120,30 +205,35 @@ static void restore_undo_state(void) {
         snprintf(status_msg, sizeof(status_msg), "Already at oldest change");
         return;
     }
-    char temp_lines[MAX_LINES][MAX_LINE_LEN];
-    int temp_count = line_count;
-    int temp_cur_line = cur_line;
-    int temp_cur_col = cur_col;
-    for (int i = 0; i < line_count; i++) {
-        strncpy(temp_lines[i], lines[i], MAX_LINE_LEN - 1);
-        temp_lines[i][MAX_LINE_LEN - 1] = '\0';
-    }
 
+    char **tmp_lines = lines;
+    size_t *tmp_caps = line_caps;
+    int tmp_count = line_count;
+    int tmp_cap = line_capacity;
+    int tmp_cur_line = cur_line;
+    int tmp_cur_col = cur_col;
+
+    lines = undo_lines;
+    line_caps = undo_line_caps;
     line_count = undo_count;
-    for (int i = 0; i < line_count; i++) {
-        strncpy(lines[i], undo_lines[i], MAX_LINE_LEN - 1);
-        lines[i][MAX_LINE_LEN - 1] = '\0';
-    }
+    line_capacity = undo_capacity;
     cur_line = undo_cur_line;
     cur_col = undo_cur_col;
 
-    for (int i = 0; i < temp_count; i++) {
-        strncpy(undo_lines[i], temp_lines[i], MAX_LINE_LEN - 1);
-        undo_lines[i][MAX_LINE_LEN - 1] = '\0';
+    undo_lines = tmp_lines;
+    undo_line_caps = tmp_caps;
+    undo_count = tmp_count;
+    undo_capacity = tmp_cap;
+    undo_cur_line = tmp_cur_line;
+    undo_cur_col = tmp_cur_col;
+
+    if (cur_line >= line_count) cur_line = (line_count > 0) ? line_count - 1 : 0;
+    if (lines && lines[cur_line]) {
+        int clen = (int)strlen(lines[cur_line]);
+        if (cur_col > clen) cur_col = clen;
+    } else {
+        cur_col = 0;
     }
-    undo_count = temp_count;
-    undo_cur_line = temp_cur_line;
-    undo_cur_col = temp_cur_col;
 
     is_modified = true;
     snprintf(status_msg, sizeof(status_msg), "1 change undone");
@@ -151,29 +241,27 @@ static void restore_undo_state(void) {
 
 /* File operations */
 static bool load_file(const char *path) {
-    line_count = 0;
+    buffer_clear();
+    undo_clear();
     is_modified = false;
     can_undo = false;
 
     struct ipo_inode st;
     if (ipo_stat(path, &st) != 0) {
         /* New file */
-        line_count = 1;
-        lines[0][0] = '\0';
+        buffer_init();
         snprintf(status_msg, sizeof(status_msg), "\"%s\" [New File]", path);
         return true;
     }
 
     if ((st.mode & IPO_INODE_TYPE_DIR) != 0) {
         snprintf(status_msg, sizeof(status_msg), "Error: \"%s\" is a directory", path);
-        line_count = 1;
-        lines[0][0] = '\0';
+        buffer_init();
         return false;
     }
 
     if (st.size == 0) {
-        line_count = 1;
-        lines[0][0] = '\0';
+        buffer_init();
         snprintf(status_msg, sizeof(status_msg), "\"%s\" [Empty File]", path);
         return true;
     }
@@ -181,8 +269,7 @@ static bool load_file(const char *path) {
     int fd = ipo_open(path);
     if (fd < 0) {
         snprintf(status_msg, sizeof(status_msg), "Error: Cannot open \"%s\"", path);
-        line_count = 1;
-        lines[0][0] = '\0';
+        buffer_init();
         return false;
     }
 
@@ -190,8 +277,7 @@ static bool load_file(const char *path) {
     if (!buf) {
         ipo_close(fd);
         snprintf(status_msg, sizeof(status_msg), "Error: Out of memory");
-        line_count = 1;
-        lines[0][0] = '\0';
+        buffer_init();
         return false;
     }
 
@@ -201,35 +287,44 @@ static bool load_file(const char *path) {
     if (rd < 0) {
         kfree(buf);
         snprintf(status_msg, sizeof(status_msg), "Error reading \"%s\"", path);
-        line_count = 1;
-        lines[0][0] = '\0';
+        buffer_init();
         return false;
     }
 
     buf[rd] = '\0';
 
-    /* Parse lines */
+    /* Parse lines dynamically with NO limits on line_count or line_length */
     int l_idx = 0;
-    int c_idx = 0;
-    for (int i = 0; i < rd && l_idx < MAX_LINES; i++) {
+    size_t c_idx = 0;
+    ensure_line_capacity(0, 0);
+
+    for (int i = 0; i < rd; i++) {
         char ch = buf[i];
         if (ch == '\r') continue;
         if (ch == '\n') {
+            ensure_line_capacity(l_idx, c_idx);
             lines[l_idx][c_idx] = '\0';
             l_idx++;
             c_idx = 0;
+            ensure_line_capacity(l_idx, 0);
+            lines[l_idx][0] = '\0';
         } else {
-            if (c_idx < MAX_LINE_LEN - 1) {
-                lines[l_idx][c_idx++] = ch;
-            }
+            ensure_line_capacity(l_idx, c_idx + 1);
+            lines[l_idx][c_idx++] = ch;
         }
     }
     if (c_idx > 0 || l_idx == 0) {
+        ensure_line_capacity(l_idx, c_idx);
         lines[l_idx][c_idx] = '\0';
         l_idx++;
     }
     line_count = l_idx;
     kfree(buf);
+
+    cur_line = 0;
+    cur_col = 0;
+    row_offset = 0;
+    col_offset = 0;
 
     snprintf(status_msg, sizeof(status_msg), "\"%s\" %d lines, %d bytes", path, line_count, rd);
     return true;
@@ -239,7 +334,11 @@ static bool save_file(const char *path) {
     /* Calculate total size */
     size_t total = 0;
     for (int i = 0; i < line_count; i++) {
-        total += strlen(lines[i]) + 1; /* include \n */
+        if (lines && lines[i]) {
+            total += strlen(lines[i]) + 1; /* include \n */
+        } else {
+            total += 1;
+        }
     }
 
     char *buf = kmalloc(total + 1);
@@ -250,9 +349,11 @@ static bool save_file(const char *path) {
 
     size_t pos = 0;
     for (int i = 0; i < line_count; i++) {
-        size_t len = strlen(lines[i]);
-        memcpy(buf + pos, lines[i], len);
-        pos += len;
+        if (lines && lines[i]) {
+            size_t len = strlen(lines[i]);
+            memcpy(buf + pos, lines[i], len);
+            pos += len;
+        }
         buf[pos++] = '\n';
     }
 
@@ -360,6 +461,103 @@ static void update_viewport(void) {
     }
 }
 
+/* Dynamic Keymap & Layout Helpers - Query directly from OS runtime */
+static bool keymap_name_matches(const char *name, const char *pattern) {
+    if (!name || !pattern || pattern[0] == '\0') return false;
+    size_t nlen = strlen(pattern);
+    size_t hlen = strlen(name);
+    if (nlen > hlen) return false;
+
+    for (size_t h = 0; h <= hlen - nlen; h++) {
+        size_t k = 0;
+        while (k < nlen) {
+            char c1 = name[h + k];
+            char c2 = pattern[k];
+            if (c1 >= 'A' && c1 <= 'Z') c1 = (char)(c1 + ('a' - 'A'));
+            if (c2 >= 'A' && c2 <= 'Z') c2 = (char)(c2 + ('a' - 'A'));
+            if (c1 != c2) break;
+            k++;
+        }
+        if (k == nlen) return true;
+    }
+    return false;
+}
+
+static bool switch_to_dynamic_layout(const char *target) {
+    if (!target || target[0] == '\0') return false;
+
+    const char *start_name = dynamic_keymap_get_name();
+    char origin[64];
+    origin[0] = '\0';
+    if (start_name) {
+        strncpy(origin, start_name, sizeof(origin) - 1);
+        origin[sizeof(origin) - 1] = '\0';
+    }
+
+    if (keymap_name_matches(origin, target)) {
+        return true; /* Already active */
+    }
+
+    while (true) {
+        dynamic_keymap_cycle_next();
+        const char *cur = dynamic_keymap_get_name();
+        if (!cur) break;
+        if (keymap_name_matches(cur, target)) {
+            return true;
+        }
+        if (origin[0] != '\0' && strcmp(cur, origin) == 0) {
+            /* Cycled through all registered OS layouts and returned to start */
+            break;
+        }
+    }
+    return false;
+}
+
+static void get_dynamic_lang_tag(char *tag, size_t max_len) {
+    if (!tag || max_len == 0) return;
+    tag[0] = '\0';
+    const char *name = dynamic_keymap_get_name();
+    if (!name || name[0] == '\0') {
+        strncpy(tag, "KEY", max_len - 1);
+        tag[max_len - 1] = '\0';
+        return;
+    }
+
+    /* Check if name contains tag in parentheses e.g. "English (US)" -> "US" */
+    const char *open_paren = strchr(name, '(');
+    if (open_paren != NULL) {
+        const char *p = open_paren + 1;
+        while (*p == ' ') p++;
+        const char *close_paren = strchr(p, ')');
+        if (close_paren != NULL && close_paren > p && (size_t)(close_paren - p) <= 4) {
+            size_t len = (size_t)(close_paren - p);
+            if (len >= max_len) len = max_len - 1;
+            for (size_t i = 0; i < len; i++) {
+                char c = p[i];
+                if (c >= 'a' && c <= 'z') c = (char)(c - ('a' - 'A'));
+                tag[i] = c;
+            }
+            tag[len] = '\0';
+            return;
+        }
+    }
+
+    /* Otherwise, take first 2-3 characters and uppercase them */
+    size_t ti = 0;
+    for (size_t i = 0; name[i] != '\0' && ti < 3 && ti < max_len - 1; i++) {
+        char c = name[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+            if (c >= 'a' && c <= 'z') c = (char)(c - ('a' - 'A'));
+            tag[ti++] = c;
+        }
+    }
+    tag[ti] = '\0';
+    if (ti == 0) {
+        strncpy(tag, "KEY", max_len - 1);
+        tag[max_len - 1] = '\0';
+    }
+}
+
 /* Full-screen Vim Help Reference Overlay */
 static void render_help_screen(void) {
     static const char *help_lines[25] = {
@@ -385,7 +583,7 @@ static void render_help_screen(void) {
         " COMMANDS (Type ':' in Normal mode):",
         "   :w [file]   Save file to disk    | :q    Quit (fails if modified)",
         "   :wq, :x     Save file and quit   | :q!   Force quit without saving",
-        "   :ru, :en, :ua Switch layout      | <F2> / Ctrl+Shift: Cycle layout",
+        "   :lang [name] Switch layout       | <F2> / Ctrl+Space: Cycle layout",
         "==================== Press <ESC>, <F1>, or <Enter> to close ===================="
     };
 
@@ -562,13 +760,8 @@ static void render(void) {
                  current_file[0] ? current_file : "[No Name]",
                  is_modified ? " [+]" : "");
 
-        const char *lang_name = dynamic_keymap_get_name();
-        const char *lang_tag = "EN";
-        if (lang_name) {
-            if (strstr(lang_name, "Russian") != NULL) lang_tag = "RU";
-            else if (strstr(lang_name, "Ukrainian") != NULL) lang_tag = "UA";
-            else if (strstr(lang_name, "Chinese") != NULL) lang_tag = "ZH";
-        }
+        char lang_tag[16];
+        get_dynamic_lang_tag(lang_tag, sizeof(lang_tag));
 
         int cur_screen_col = get_screen_col(lines[cur_line], cur_col);
         char right_part[48];
@@ -641,11 +834,11 @@ static void render(void) {
 /* Insert mode operations */
 static void insert_char(char c) {
     save_undo_state();
-    char *line = lines[cur_line];
-    int len = (int)strlen(line);
-    if (len >= MAX_LINE_LEN - 2) return;
-
+    int len = (lines && lines[cur_line]) ? (int)strlen(lines[cur_line]) : 0;
     if (cur_col > len) cur_col = len;
+
+    ensure_line_capacity(cur_line, (size_t)len + 1);
+    char *line = lines[cur_line];
     memmove(&line[cur_col + 1], &line[cur_col], len - cur_col + 1);
     line[cur_col] = c;
     cur_col++;
@@ -659,23 +852,28 @@ static void insert_string(const char *s) {
 }
 
 static void split_line(void) {
-    if (line_count >= MAX_LINES - 1) return;
     save_undo_state();
+    ensure_line_capacity(line_count, 0);
 
-    char *cur = lines[cur_line];
+    char *cur = (lines && lines[cur_line]) ? lines[cur_line] : "";
     int len = (int)strlen(cur);
     if (cur_col > len) cur_col = len;
 
-    /* Shift lines down */
+    size_t right_len = (size_t)(len - cur_col);
+    char *right_str = kmalloc(right_len + 32);
+    if (right_str) {
+        memcpy(right_str, &cur[cur_col], right_len + 1);
+    }
+    cur[cur_col] = '\0';
+
     for (int i = line_count; i > cur_line + 1; i--) {
-        strncpy(lines[i], lines[i - 1], MAX_LINE_LEN - 1);
-        lines[i][MAX_LINE_LEN - 1] = '\0';
+        lines[i] = lines[i - 1];
+        line_caps[i] = line_caps[i - 1];
     }
 
-    /* Copy split half to new line */
-    strncpy(lines[cur_line + 1], &cur[cur_col], MAX_LINE_LEN - 1);
-    lines[cur_line + 1][MAX_LINE_LEN - 1] = '\0';
-    cur[cur_col] = '\0';
+    lines[cur_line + 1] = right_str ? right_str : kmalloc(32);
+    if (lines[cur_line + 1] && !right_str) lines[cur_line + 1][0] = '\0';
+    line_caps[cur_line + 1] = right_len + 32;
 
     line_count++;
     cur_line++;
@@ -687,7 +885,7 @@ static void delete_char_backwards(void) {
     if (cur_col > 0) {
         save_undo_state();
         char *line = lines[cur_line];
-        int len = (int)strlen(line);
+        int len = line ? (int)strlen(line) : 0;
         int prev = utf8_prev_char_offset(line, cur_col);
         memmove(&line[prev], &line[cur_col], len - cur_col + 1);
         cur_col = prev;
@@ -696,27 +894,33 @@ static void delete_char_backwards(void) {
         /* Join with previous line */
         save_undo_state();
         char *prev = lines[cur_line - 1];
-        int prev_len = (int)strlen(prev);
+        int prev_len = prev ? (int)strlen(prev) : 0;
         char *cur = lines[cur_line];
-        int cur_len = (int)strlen(cur);
+        int cur_len = cur ? (int)strlen(cur) : 0;
 
-        if (prev_len + cur_len < MAX_LINE_LEN - 1) {
-            my_strcat(prev, cur, MAX_LINE_LEN);
-            for (int i = cur_line; i < line_count - 1; i++) {
-                strncpy(lines[i], lines[i + 1], MAX_LINE_LEN - 1);
-                lines[i][MAX_LINE_LEN - 1] = '\0';
-            }
-            line_count--;
-            cur_line--;
-            cur_col = prev_len;
-            is_modified = true;
+        ensure_line_capacity(cur_line - 1, (size_t)(prev_len + cur_len));
+        prev = lines[cur_line - 1];
+        memcpy(&prev[prev_len], cur, cur_len + 1);
+
+        char *to_free = lines[cur_line];
+        for (int i = cur_line; i < line_count - 1; i++) {
+            lines[i] = lines[i + 1];
+            line_caps[i] = line_caps[i + 1];
         }
+        lines[line_count - 1] = NULL;
+        line_caps[line_count - 1] = 0;
+        if (to_free) kfree(to_free);
+
+        line_count--;
+        cur_line--;
+        cur_col = prev_len;
+        is_modified = true;
     }
 }
 
 static void delete_char_under_cursor(void) {
     char *line = lines[cur_line];
-    int len = (int)strlen(line);
+    int len = line ? (int)strlen(line) : 0;
     if (cur_col < len) {
         save_undo_state();
         int next = utf8_next_char_offset(line, cur_col);
@@ -726,32 +930,44 @@ static void delete_char_under_cursor(void) {
         /* Join with next line */
         save_undo_state();
         char *next = lines[cur_line + 1];
-        int next_len = (int)strlen(next);
-        if (len + next_len < MAX_LINE_LEN - 1) {
-            my_strcat(line, next, MAX_LINE_LEN);
-            for (int i = cur_line + 1; i < line_count - 1; i++) {
-                strncpy(lines[i], lines[i + 1], MAX_LINE_LEN - 1);
-                lines[i][MAX_LINE_LEN - 1] = '\0';
-            }
-            line_count--;
-            is_modified = true;
+        int next_len = next ? (int)strlen(next) : 0;
+
+        ensure_line_capacity(cur_line, (size_t)(len + next_len));
+        line = lines[cur_line];
+        memcpy(&line[len], next, next_len + 1);
+
+        char *to_free = lines[cur_line + 1];
+        for (int i = cur_line + 1; i < line_count - 1; i++) {
+            lines[i] = lines[i + 1];
+            line_caps[i] = line_caps[i + 1];
         }
+        lines[line_count - 1] = NULL;
+        line_caps[line_count - 1] = 0;
+        if (to_free) kfree(to_free);
+
+        line_count--;
+        is_modified = true;
     }
 }
 
 static void delete_current_line(void) {
     if (line_count <= 1) {
         save_undo_state();
-        lines[0][0] = '\0';
+        if (lines && lines[0]) lines[0][0] = '\0';
         cur_col = 0;
         is_modified = true;
         return;
     }
     save_undo_state();
+    char *to_free = lines[cur_line];
     for (int i = cur_line; i < line_count - 1; i++) {
-        strncpy(lines[i], lines[i + 1], MAX_LINE_LEN - 1);
-        lines[i][MAX_LINE_LEN - 1] = '\0';
+        lines[i] = lines[i + 1];
+        line_caps[i] = line_caps[i + 1];
     }
+    lines[line_count - 1] = NULL;
+    line_caps[line_count - 1] = 0;
+    if (to_free) kfree(to_free);
+
     line_count--;
     if (cur_line >= line_count) cur_line = line_count - 1;
     cur_col = 0;
@@ -760,7 +976,9 @@ static void delete_current_line(void) {
 
 static void delete_to_line_end(void) {
     save_undo_state();
-    lines[cur_line][cur_col] = '\0';
+    if (lines && lines[cur_line]) {
+        lines[cur_line][cur_col] = '\0';
+    }
     if (cur_col > 0) cur_col--;
     is_modified = true;
 }
@@ -769,22 +987,27 @@ static void join_lines(void) {
     if (cur_line >= line_count - 1) return;
     save_undo_state();
     char *cur = lines[cur_line];
-    int cur_len = (int)strlen(cur);
+    int cur_len = cur ? (int)strlen(cur) : 0;
     char *next = lines[cur_line + 1];
-    int next_len = (int)strlen(next);
+    int next_len = next ? (int)strlen(next) : 0;
 
-    if (cur_len + 1 + next_len < MAX_LINE_LEN - 1) {
-        cur[cur_len] = ' ';
-        cur[cur_len + 1] = '\0';
-        my_strcat(cur, next, MAX_LINE_LEN);
-        for (int i = cur_line + 1; i < line_count - 1; i++) {
-            strncpy(lines[i], lines[i + 1], MAX_LINE_LEN - 1);
-            lines[i][MAX_LINE_LEN - 1] = '\0';
-        }
-        line_count--;
-        cur_col = cur_len;
-        is_modified = true;
+    ensure_line_capacity(cur_line, (size_t)(cur_len + 1 + next_len));
+    cur = lines[cur_line];
+    cur[cur_len] = ' ';
+    memcpy(&cur[cur_len + 1], next, next_len + 1);
+
+    char *to_free = lines[cur_line + 1];
+    for (int i = cur_line + 1; i < line_count - 1; i++) {
+        lines[i] = lines[i + 1];
+        line_caps[i] = line_caps[i + 1];
     }
+    lines[line_count - 1] = NULL;
+    line_caps[line_count - 1] = 0;
+    if (to_free) kfree(to_free);
+
+    line_count--;
+    cur_col = cur_len;
+    is_modified = true;
 }
 
 /* Word navigation */
@@ -820,30 +1043,30 @@ static bool execute_command(void) {
     char *cmd = cmd_buf;
     while (*cmd == ' ') cmd++;
 
-    if (strcmp(cmd, "q") == 0 || strcmp(cmd, "Q") == 0 || strcmp(cmd, "й") == 0 || strcmp(cmd, "Й") == 0) {
+    if (strcmp(cmd, "q") == 0 || strcmp(cmd, "Q") == 0) {
         if (is_modified) {
             snprintf(status_msg, sizeof(status_msg), "No write since last change (add ! to override)");
             return false;
         }
         return true; /* Exit editor */
-    } else if (strcmp(cmd, "q!") == 0 || strcmp(cmd, "Q!") == 0 || strcmp(cmd, "й!") == 0 || strcmp(cmd, "Й!") == 0) {
+    } else if (strcmp(cmd, "q!") == 0 || strcmp(cmd, "Q!") == 0) {
         return true; /* Force exit */
-    } else if (strcmp(cmd, "w") == 0 || strcmp(cmd, "W") == 0 || strcmp(cmd, "ц") == 0 || strcmp(cmd, "Ц") == 0) {
+    } else if (strcmp(cmd, "w") == 0 || strcmp(cmd, "W") == 0) {
         if (current_file[0] == '\0') {
             snprintf(status_msg, sizeof(status_msg), "Error: No file name");
         } else {
             save_file(current_file);
         }
-    } else if (strncmp(cmd, "w ", 2) == 0 || strncmp(cmd, "ц ", 3) == 0) {
+    } else if (strncmp(cmd, "w ", 2) == 0) {
         const char *new_path = (cmd[0] == 'w') ? cmd + 2 : cmd + 3;
         while (*new_path == ' ') new_path++;
         if (*new_path) {
             strncpy(current_file, new_path, sizeof(current_file) - 1);
             save_file(current_file);
         }
-    } else if (strcmp(cmd, "wq") == 0 || strcmp(cmd, "WQ") == 0 || strcmp(cmd, "цй") == 0 ||
-               strcmp(cmd, "wq!") == 0 || strcmp(cmd, "WQ!") == 0 || strcmp(cmd, "цй!") == 0 ||
-               strcmp(cmd, "x") == 0 || strcmp(cmd, "X") == 0 || strcmp(cmd, "ч") == 0) {
+    } else if (strcmp(cmd, "wq") == 0 || strcmp(cmd, "WQ") == 0 ||
+               strcmp(cmd, "wq!") == 0 || strcmp(cmd, "WQ!") == 0 ||
+               strcmp(cmd, "x") == 0 || strcmp(cmd, "X") == 0) {
         if (current_file[0] == '\0') {
             snprintf(status_msg, sizeof(status_msg), "Error: No file name");
         } else {
@@ -858,64 +1081,50 @@ static bool execute_command(void) {
     } else if (strcmp(cmd, "set nonu") == 0) {
         show_line_numbers = false;
         snprintf(status_msg, sizeof(status_msg), "Line numbers disabled");
-    } else if (strncmp(cmd, "lang ", 5) == 0 || strcmp(cmd, "ru") == 0 || strcmp(cmd, "ua") == 0 ||
-               strcmp(cmd, "en") == 0 || strcmp(cmd, "zh") == 0 || strcmp(cmd, "lang") == 0) {
-        const char *target = NULL;
-        if (strncmp(cmd, "lang ", 5) == 0) target = cmd + 5;
-        else if (strcmp(cmd, "ru") == 0) target = "ru";
-        else if (strcmp(cmd, "ua") == 0) target = "ua";
-        else if (strcmp(cmd, "en") == 0) target = "en";
-        else if (strcmp(cmd, "zh") == 0) target = "zh";
+    } else if (strncmp(cmd, "lang", 4) == 0 || strncmp(cmd, "keymap", 6) == 0 || strncmp(cmd, "layout", 6) == 0) {
+        const char *arg = (strncmp(cmd, "keymap", 6) == 0 || strncmp(cmd, "layout", 6) == 0) ? cmd + 6 : cmd + 4;
+        while (*arg == ' ') arg++;
 
-        if (target == NULL) {
+        if (*arg == '\0') {
             dynamic_keymap_cycle_next();
             snprintf(status_msg, sizeof(status_msg), "Layout: %s", dynamic_keymap_get_name());
         } else {
-            bool found = false;
-            for (int i = 0; i < 8; i++) {
-                const char *cur = dynamic_keymap_get_name();
-                if ((target[0] == 'r' && strstr(cur, "Russian") != NULL) ||
-                    (target[0] == 'u' && strstr(cur, "Ukrainian") != NULL) ||
-                    (target[0] == 'e' && strstr(cur, "English") != NULL) ||
-                    (target[0] == 'z' && strstr(cur, "Chinese") != NULL) ||
-                    strstr(cur, target) != NULL) {
-                    found = true;
-                    break;
-                }
-                dynamic_keymap_cycle_next();
-            }
-            if (found) {
+            if (switch_to_dynamic_layout(arg)) {
                 snprintf(status_msg, sizeof(status_msg), "Layout: %s", dynamic_keymap_get_name());
             } else {
-                snprintf(status_msg, sizeof(status_msg), "Layout '%s' not loaded. Run /applications/lang_%s first", target, target);
+                snprintf(status_msg, sizeof(status_msg), "Layout '%s' not found in OS keymap", arg);
             }
         }
     } else if (strncmp(cmd, "font", 4) == 0) {
         const char *arg = cmd + 4;
         while (*arg == ' ') arg++;
         if (*arg == '\0') {
-            snprintf(status_msg, sizeof(status_msg), "Font: %s (%u glyphs)",
-                     vga_font_get_current_name(), vga_font_get_glyph_count());
-        } else {
-            char fpath[128];
-            if (arg[0] == '/') {
-                snprintf(fpath, sizeof(fpath), "%s", arg);
-            } else {
-                snprintf(fpath, sizeof(fpath), "/fonts/%s.fnt", arg);
+            const char *fname = vga_font_get_current_name();
+            uint32_t count = vga_font_get_glyph_count();
+            if (fname == NULL || fname[0] == '\0') {
+                fname = "System VGA Hardware Font";
+                if (count == 0) count = 256;
             }
-            int res = vga_load_cyrillic_font(fpath);
+            snprintf(status_msg, sizeof(status_msg), "Font: %s (%u glyphs)", fname, count);
+        } else {
+            int res = vga_font_load_database(arg);
             if (res == 0) {
                 snprintf(status_msg, sizeof(status_msg), "Font: %s (%u glyphs)",
                          vga_font_get_current_name(), vga_font_get_glyph_count());
             } else {
-                snprintf(status_msg, sizeof(status_msg), "Cannot load font '%s'", arg);
+                snprintf(status_msg, sizeof(status_msg), "Cannot load font from '%s'", arg);
             }
         }
     } else if (strcmp(cmd, "help") == 0 || strcmp(cmd, "h") == 0) {
         show_help_screen = true;
         return false;
     } else {
-        snprintf(status_msg, sizeof(status_msg), "Unknown command: :%s (type :help or press F1)", cmd);
+        /* Check if entered command directly matches an active OS keymap */
+        if (cmd[0] != '\0' && switch_to_dynamic_layout(cmd)) {
+            snprintf(status_msg, sizeof(status_msg), "Layout: %s", dynamic_keymap_get_name());
+        } else {
+            snprintf(status_msg, sizeof(status_msg), "Unknown command: :%s (type :help or press F1)", cmd);
+        }
     }
     return false;
 }
@@ -954,37 +1163,36 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Ensure text mode is set (in case previous app was in Mode 13h) */
-    vga_set_mode_text();
-
-    /* Save previous screen to restore cleanly upon exit */
-    vga_hide_cursor();
+    /* Save previous screen & cursor position to restore cleanly upon exit */
+    saved_cursor = vga_get_cursor_position();
     if (vga_is_graphics_mode()) {
         for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
             saved_screen[i] = 0x0720;
         }
-        saved_cursor = 0;
+        saved_cursor = VGA_START_CURSOR_POSITION;
     } else {
         memcpy(saved_screen, (const void *)VGA_MEMORY, sizeof(saved_screen));
-        saved_cursor = vga_get_cursor_position();
         for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
             uint16_t ent = saved_screen[i];
             uint8_t ch = (uint8_t)(ent & 0xFF);
             uint8_t attr = (uint8_t)(ent >> 8);
             if (ch == VGA_CURSOR_GLYPH_SLOT) {
                 saved_screen[i] = (ent & 0xFF00) | ' ';
-            } else if (ent == 0xFFFF || attr == 0xFF || attr == 0x20) {
+            } else if (ent == 0xFFFF || attr == 0xFF) {
                 saved_screen[i] = 0x0720;
             }
         }
     }
 
+    /* Ensure text mode is set (in case previous app was in Mode 13h) */
+    vga_set_mode_text();
+    vga_hide_cursor();
+
     /* Load target file */
     if (current_file[0] != '\0') {
         load_file(current_file);
     } else {
-        line_count = 1;
-        lines[0][0] = '\0';
+        buffer_init();
         status_msg[0] = '\0';
     }
 
@@ -1143,32 +1351,34 @@ int main(int argc, char **argv) {
                 pending_op = '\0';
             } else if (sc == 0x18 && !keyboard_is_shift_pressed()) { /* 'o' -> Open line below */
                 save_undo_state();
-                if (line_count < MAX_LINES - 1) {
-                    for (int i = line_count; i > cur_line + 1; i--) {
-                        strncpy(lines[i], lines[i - 1], MAX_LINE_LEN - 1);
-                        lines[i][MAX_LINE_LEN - 1] = '\0';
-                    }
-                    lines[cur_line + 1][0] = '\0';
-                    line_count++;
-                    cur_line++;
-                    cur_col = 0;
-                    is_modified = true;
-                    mode = MODE_INSERT;
+                ensure_line_capacity(line_count, 0);
+                for (int i = line_count; i > cur_line + 1; i--) {
+                    lines[i] = lines[i - 1];
+                    line_caps[i] = line_caps[i - 1];
                 }
+                lines[cur_line + 1] = kmalloc(32);
+                if (lines[cur_line + 1]) lines[cur_line + 1][0] = '\0';
+                line_caps[cur_line + 1] = 32;
+                line_count++;
+                cur_line++;
+                cur_col = 0;
+                is_modified = true;
+                mode = MODE_INSERT;
                 pending_op = '\0';
             } else if (sc == 0x18 && keyboard_is_shift_pressed()) { /* 'O' -> Open line above */
                 save_undo_state();
-                if (line_count < MAX_LINES - 1) {
-                    for (int i = line_count; i > cur_line; i--) {
-                        strncpy(lines[i], lines[i - 1], MAX_LINE_LEN - 1);
-                        lines[i][MAX_LINE_LEN - 1] = '\0';
-                    }
-                    lines[cur_line][0] = '\0';
-                    line_count++;
-                    cur_col = 0;
-                    is_modified = true;
-                    mode = MODE_INSERT;
+                ensure_line_capacity(line_count, 0);
+                for (int i = line_count; i > cur_line; i--) {
+                    lines[i] = lines[i - 1];
+                    line_caps[i] = line_caps[i - 1];
                 }
+                lines[cur_line] = kmalloc(32);
+                if (lines[cur_line]) lines[cur_line][0] = '\0';
+                line_caps[cur_line] = 32;
+                line_count++;
+                cur_col = 0;
+                is_modified = true;
+                mode = MODE_INSERT;
                 pending_op = '\0';
             } else if (sc == 0x2D) { /* 'x' -> Delete char */
                 delete_char_under_cursor();
@@ -1289,7 +1499,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
         uint16_t ent = saved_screen[i];
         uint8_t attr = (uint8_t)(ent >> 8);
-        if (ent == 0xFFFF || attr == 0xFF || attr == 0x20) {
+        if (ent == 0xFFFF || attr == 0xFF) {
             saved_screen[i] = 0x0720;
         }
     }
@@ -1298,6 +1508,13 @@ int main(int argc, char **argv) {
     vga_font_set_app_mode(false);
     dynamic_keymap_set_app_mode(false);
     keyboard_set_app_input_mode(false);
+
+    buffer_clear();
+    undo_clear();
+    if (lines) { kfree(lines); lines = NULL; }
+    if (line_caps) { kfree(line_caps); line_caps = NULL; }
+    if (undo_lines) { kfree(undo_lines); undo_lines = NULL; }
+    if (undo_line_caps) { kfree(undo_line_caps); undo_line_caps = NULL; }
 
     return 0;
 }

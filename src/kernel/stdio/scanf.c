@@ -43,7 +43,7 @@ int scanf(const char *format, ...) {
         syscall_args
     );
 
-    if (bytes_read == (uint32_t)(-2u)) {
+    if (bytes_read == -2) {
         /* Ctrl+C — read was interrupted, propagate without printing anything */
         if (input != NULL) {
             kfree(input);
@@ -235,6 +235,9 @@ int scanf(const char *format, ...) {
                 while (*pattern != ']' && *pattern != '\0') {
                     set_chars[(unsigned char)*pattern] = 1;
                     pattern++;
+                }
+                if (*pattern != ']') {
+                    break;
                 }
                 char *output = va_arg(args, char *);
                 size_t copied = 0u;

@@ -48,6 +48,7 @@ typedef struct process {
 
     uint16_t *text_vram_backup; // Backup of 80x25 text VRAM when swapped to background
     uint8_t *gfx_vram_backup;   // Backup of 320x200 graphics VRAM when swapped to background
+    uint8_t *gfx_palette_backup; // Backup of 256-color DAC palette (768 bytes) when swapped to background
     uint16_t text_cursor_pos;   // Saved cursor position in text mode
     bool text_cursor_visible;   // Saved cursor visibility in text mode
     bool completed_and_acknowledged; // Process completed execution and was acknowledged / closed
@@ -95,6 +96,7 @@ typedef int (*process_entry_t)(int argc, char **argv);
 
 // Function prototypes
 void process_init(void);
+int universal_process_execute(const char *path, int argc, char **argv);
 int process_exec(const char *path, int argc, char **argv);
 int process_get_exit_code(void);
 void process_set_last_exit_code(int code);

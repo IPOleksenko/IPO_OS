@@ -1,6 +1,7 @@
 #include <driver/sound.h>
 #include <system/pit.h>
 #include <ioport.h>
+#include <stdio.h>
 
 /* Sound control port */
 #define SOUND_CTRL_PORT 0x61
@@ -9,6 +10,7 @@
 
 void sound_init(void) {
     pit_init(0);  /* Just initialize PIT structure */
+    serial_printf("[sound] PC speaker audio driver initialized.\n");
 }
 
 void sound_play(uint32_t frequency) {

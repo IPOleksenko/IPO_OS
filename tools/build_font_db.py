@@ -110,13 +110,22 @@ def main():
     # 1. Fixed font: FullCyrSlav-Fixed16 (including ASCII)
     fixed_records = dict(cyr_fixed)
     fixed_records.update(hanzi)
+    dash_bmp = fixed_records.get(0x2013, bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0x7E, 0, 0, 0, 0, 0, 0]))
+    for cp in (0x2010, 0x2011, 0x2012):
+        if cp not in fixed_records:
+            fixed_records[cp] = dash_bmp
     write_ifnt(fonts_dir / "fixed.fnt", fixed_records)
+    write_ifnt(fonts_dir / "default.fnt", fixed_records)
 
     # 2. Terminus font: FullCyrSlav-Terminus16 (including ASCII)
     print("Extracting Terminus console font...")
     term_psf = "/usr/share/consolefonts/FullCyrSlav-Terminus16.psf.gz"
     if Path(term_psf).exists():
         cyr_term = extract_psf1(term_psf)
+        dash_term = cyr_term.get(0x2013, bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0x7E, 0, 0, 0, 0, 0, 0]))
+        for cp in (0x2010, 0x2011, 0x2012):
+            if cp not in cyr_term:
+                cyr_term[cp] = dash_term
         write_ifnt(fonts_dir / "terminus.fnt", cyr_term)
 
     # 3. Bold font: FullCyrSlav-TerminusBoldVGA16 (including ASCII)
@@ -124,6 +133,10 @@ def main():
     bold_psf = "/usr/share/consolefonts/FullCyrSlav-TerminusBoldVGA16.psf.gz"
     if Path(bold_psf).exists():
         cyr_bold = extract_psf1(bold_psf)
+        dash_bold = cyr_bold.get(0x2013, bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0x7E, 0, 0, 0, 0, 0, 0]))
+        for cp in (0x2010, 0x2011, 0x2012):
+            if cp not in cyr_bold:
+                cyr_bold[cp] = dash_bold
         write_ifnt(fonts_dir / "bold.fnt", cyr_bold)
 
 if __name__ == "__main__":

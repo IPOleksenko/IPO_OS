@@ -80,9 +80,17 @@ static void process_file(const char *path, int multi) {
     }
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
+    if (size <= 0) {
+        fclose(f);
+        return;
+    }
     fseek(f, 0, SEEK_SET);
 
     uint8_t *raw = (uint8_t *)malloc(size);
+    if (!raw) {
+        fclose(f);
+        return;
+    }
     if (fread(raw, 1, size, f) != (size_t)size) {
         free(raw);
         fclose(f);

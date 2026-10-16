@@ -14,4 +14,9 @@ int ipo_syscall(uint32_t num, uint32_t argc, uint32_t *argv) {
 }
 
 void syscall_reset_user_heap(void) {
+    void *cur = ipo_sbrk(0);
+    if (cur != (void *)-1 && (uintptr_t)cur > 0x08000000u) {
+        int32_t dec = (int32_t)(0x08000000u - (uintptr_t)cur);
+        ipo_sbrk(dec);
+    }
 }

@@ -296,7 +296,10 @@ void glClear(GLbitfield mask) {
         uint32_t g = (uint32_t)(ctx->clear_color[1] * 255.0f);
         uint32_t b = (uint32_t)(ctx->clear_color[2] * 255.0f);
         uint32_t a = (uint32_t)(ctx->clear_color[3] * 255.0f);
-        if (r > 255) r = 255; if (g > 255) g = 255; if (b > 255) b = 255; if (a > 255) a = 255;
+        if (r > 255) r = 255;
+        if (g > 255) g = 255;
+        if (b > 255) b = 255;
+        if (a > 255) a = 255;
         uint32_t pixel = (a << 24) | (r << 16) | (g << 8) | b;
 
         for (size_t i = 0; i < total; i++) {

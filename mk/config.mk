@@ -124,11 +124,13 @@ endif
 
 AUDIODEV ?= pa
 
+QEMU_SERIAL_FLAGS := -serial stdio
+
 QEMU_FLAGS := 	-m 2048 \
-				-drive format=raw,file=$(OS_IMAGE),if=ide,index=0 \
-              	-drive format=raw,file=build/disk.img,if=ide,index=1 \
+				-drive format=raw,file=$(OS_IMAGE),if=ide,index=0,file.locking=off \
+              	-drive format=raw,file=build/disk.img,if=ide,index=1,file.locking=off \
                	-cdrom build/disk.iso \
                	-device sb16,audiodev=snd \
                	-audiodev $(AUDIODEV),id=snd -machine pcspk-audiodev=snd \
                	$(QEMU_NET_FLAGS) \
-				-serial stdio
+				$(QEMU_SERIAL_FLAGS)

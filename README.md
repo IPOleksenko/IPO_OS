@@ -105,83 +105,131 @@ Updates the boot configuration with kernel size information:
 make patch-config
 ```
 
-## **load_applications.py**
+## 🛠️ Build & Development Tools (`tools/`)
 
+The `tools/` directory contains host-side build automation scripts, image formatters, symbol generators, and native developer toolchain wrappers:
+
+---
+
+### **1. format_disk_via_os.py — In-Kernel Virtual Disk Formatter**
+- **File:** [tools/format_disk_via_os.py](tools/format_disk_via_os.py)
+- **Purpose:** Automatically formats `build/disk.img` natively through the IPO_OS kernel running inside headless QEMU. This guarantees that the IPO_FS superblock, root directory inode, inode table, and block bitmap are initialized with 100% compliance to the kernel's filesystem driver.
+- **Invoked by:** `make image`
+- **Manual Usage:**
+```bash
+python3 tools/format_disk_via_os.py --boot build/boot/boot.bin --kernel build/kernel/kernel.bin --disk build/disk.img
+```
+- **Options:**
+  - `--disk <path>` — target disk image (default: `build/disk.img`).
+  - `--boot <path>` — bootloader binary (default: `build/boot/boot.bin`).
+  - `--kernel <path>` — compiled kernel binary (default: `build/kernel/kernel.bin`).
+  - `--size-mb <int>` — disk image size in MB (default: `128`).
+  - `--force` — re-format the disk even if a valid IPO_FS superblock already exists.
+
+---
+
+### **2. load_applications.py — Application & Toolchain Image Loader**
 - **File:** [tools/load_applications.py](tools/load_applications.py)
-- **Purpose:** loads compiled applications into the OS disk image so they are available from `/applications` at runtime.
-
-### Usage
-
+- **Purpose:** Scans compiled binaries, libraries, and headers in `build/applications`, converts executable ELF formats for the kernel's universal binary loader, and writes them into `/applications` and system directories inside the IPO_FS disk image.
+- **Invoked by:** `make image`
+- **Manual Usage:**
 ```bash
 python3 tools/load_applications.py
 ```
+- **Options:**
+  - `--image <path>` — destination disk image (default: `build/disk.img`).
+  - `--start-lba <int>` — partition LBA start offset (default: `2048`).
+  - `--apps-dir <path>` — path to compiled applications (default: `build/applications`).
+  - `--dry-run` — simulate files to be copied without writing to disk.
 
-It scans the built app binaries in `build/applications`, copies them into the filesystem image, and makes them executable from the shell.
+---
 
-## **Disk Editor**
+### **3. create_live_image.py — Unified Live USB OS Image Generator**
+- **File:** [tools/create_live_image.py](tools/create_live_image.py)
+- **Purpose:** Combines the bootloader, kernel, and IPO_FS filesystem partition into a single, bootable 128 MB Live USB disk image (`build/IPO_OS.img`) with a valid Master Boot Record (MBR) partition table at sector 0.
+- **Invoked by:** `make image`, `make run`
+- **Manual Usage:**
+```bash
+python3 tools/create_live_image.py
+```
+- **Features:**
+  - Generates a bootable MBR with partition 1 starting at LBA 2048.
+  - Updates superblocks and syncs partition boundaries.
+  - Allows burning directly to a physical flash drive: `sudo dd if=build/IPO_OS.img of=/dev/sdX bs=4M status=progress`.
 
+---
+
+### **4. disk_editor.py — Offline IPO_FS Inspector & File Manager**
 - **File:** [tools/disk_editor.py](tools/disk_editor.py)
-- **Purpose:** A utility for viewing and editing the contents of the IPO_FS filesystem inside a disk image. Allows listing directories, reading files, creating directories, writing text files, copying files from the host into the image, and deleting entries.
-
-### Usage and options
-
-General syntax:
-
+- **Purpose:** CLI utility and Python library for inspecting, reading, and modifying IPO_FS disk images on the host machine without running QEMU or the OS kernel.
+- **Usage Syntax:**
 ```bash
 python3 tools/disk_editor.py [-i IMAGE] [-s START_LBA] <command> [arguments]
 ```
-
-- `-i, --image` — path to the disk image (default: `build/disk.img`).
-- `-s, --start-lba` — LBA offset of the start of the IPO_FS partition inside the image (default: `2048`).
-
-Supported commands:
-
-- `format` — clear the filesystem by deleting all files and directories
-- `ls [path]` — list directory contents (default: `/`).
-- `cat <path>` — print a file's contents to stdout (use `--` or shell redirection if needed).
-- `mkdir <path>` — create a directory at the specified path.
-- `touch <path> [text|local_file]` — create a file or overwrite it with the given text; if the second argument is a path to an existing local file, that file will be imported into the image (either provide text or a local file).
-- `put <src> <dest>` — copy a local file `src` into the image at path `dest` (default destination: `/`).
-- `rm <path>` — remove a file or an empty directory.
-
-### Examples
-
-- Clear the filesystem
-
+- **Commands:**
+  - `ls [path]` — list files and directories (default: `/`).
+  - `cat <path>` — output file contents to terminal.
+  - `mkdir <path>` — create a new directory.
+  - `put <src_file> <dest_path>` — import host file into the disk image.
+  - `touch <path> [text|file]` — create a file with text or import content.
+  - `rm <path>` — delete a file or directory.
+  - `format` — wipe and initialize a clean IPO_FS partition.
+- **Examples:**
 ```bash
-python3 tools/disk_editor.py format
-```
-
-- List the image root:
-
-```bash
-python3 tools/disk_editor.py ls /
-```
-
-- Show a text file:
-
-```bash
+python3 tools/disk_editor.py ls /applications
 python3 tools/disk_editor.py cat /etc/example.txt
+python3 tools/disk_editor.py put ./my_prog /applications/my_prog
 ```
 
-- Create a directory and copy a local file into it:
+---
 
+### **5. generate_ksyms.py — Kernel Symbol Table Generator**
+- **File:** [tools/generate_ksyms.py](tools/generate_ksyms.py)
+- **Purpose:** Extracts public symbols (functions, global variables, syscall dispatchers) from `build/kernel/kernel.elf` using `nm`, formats them into sorted lookup arrays, and outputs `build/kernel/kernel_syms_autogen.c`.
+- **Invoked by:** `make kernel`
+- **Manual Usage:**
 ```bash
-python3 tools/disk_editor.py mkdir /mydir
-python3 tools/disk_editor.py put ./local.bin /mydir/remote.bin
+python3 tools/generate_ksyms.py -e build/kernel/kernel.elf -o build/kernel/kernel_syms_autogen.c
 ```
+- **Features:**
+  - Provides the symbol database for the dynamic driver subsystem (`kmod`).
+  - Powers the OS shell's runtime `symbols` command to view all active kernel routines and memory addresses.
 
-- Create a file with text:
+---
 
+### **6. build_font_db.py — VGA & Graphical Font Compiler**
+- **File:** [tools/build_font_db.py](tools/build_font_db.py)
+- **Purpose:** Compiles Cyrillic and Latin 8x16 bitmap font definitions into the binary font database `build/fonts/default.fnt`.
+- **Invoked by:** `make image`
+- **Manual Usage:**
 ```bash
-python3 tools/disk_editor.py touch /hello.txt "Hello IPO"
+python3 tools/build_font_db.py
 ```
+- **Features:**
+  - Supports CP866 / UTF-8 Cyrillic glyph rendering for the VGA text console and VBE graphical window manager (`wm`).
 
-- Remove a file:
+---
 
+### **7. setup-tap.sh — Host TAP Network Interface Setup**
+- **File:** [tools/setup-tap.sh](tools/setup-tap.sh)
+- **Purpose:** Configures Linux TAP device (`tap0`) and host IP routing for full bare-metal TCP/IP communication with IPO_OS in QEMU.
+- **Invoked by:** `make setup-tap`
+- **Manual Usage:**
 ```bash
-python3 tools/disk_editor.py rm /oldfile
+sudo ./tools/setup-tap.sh [tap_dev] [host_ip] [netmask] [guest_ip]
 ```
+- **Defaults:** `tap_dev=tap0`, `host_ip=192.168.7.1`, `netmask=24`, `guest_ip=192.168.7.2`.
+
+---
+
+### **8. binutils/ — In-OS Developer Toolchain Drivers**
+- **Directory:** [tools/binutils/](tools/binutils/)
+- **Files:** `gcc.c`, `ld.c`, `as.c`, `ar.c`, `nm.c`, `objdump.c`, `objcopy.c`, `readelf.c`
+- **Purpose:** C source code for the native developer toolchain utilities running inside IPO_OS.
+- **Invoked by:** `make toolchain`
+- **Resulting Binaries:** Built and installed into `/applications/` (`gcc`, `g++`, `ld`, `as`, `ar`, `ranlib`, `objcopy`, `strip`, `objdump`, `readelf`, `nm`) to enable native compilation, assembly, and inspection directly inside IPO_OS.
+
+---
 
 ## 🌐 Networking (TAP Mode & Direct Ports Access)
 

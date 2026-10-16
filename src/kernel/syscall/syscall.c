@@ -541,6 +541,31 @@ static uint32_t syscall_builtin_fs_stat(uint32_t num,
     return (uint32_t)(res ? 0u : 1u);
 }
 
+static uint32_t syscall_builtin_fs_statvfs(uint32_t num,
+                                           uint32_t argc,
+                                           uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || argv == NULL) return IPO_SYSCALL_ENOSYS;
+    uint32_t *out = (uint32_t *)(uintptr_t)argv[0];
+    if (out == NULL || !fs_mounted) return 1u;
+
+    uint32_t data_start = (uint32_t)sb.data_blocks_start;
+    uint32_t total = (sb.fs_size_blocks > data_start)
+                     ? (uint32_t)(sb.fs_size_blocks - data_start) : 0;
+    uint32_t used = total ? bitmap_count_set(sb.block_bitmap_start, total) : 0;
+    uint32_t ino_total = (uint32_t)sb.inode_count;
+    uint32_t ino_used = ino_total ? bitmap_count_set(sb.inode_bitmap_start, ino_total) : 0;
+
+    out[0] = sb.block_size;                 /* f_bsize */
+    out[1] = sb.block_size;                 /* f_frsize */
+    out[2] = total;                         /* f_blocks */
+    out[3] = total > used ? total - used : 0; /* f_bfree */
+    out[4] = out[3];                        /* f_bavail */
+    out[5] = ino_total;                     /* f_files */
+    out[6] = ino_total > ino_used ? ino_total - ino_used : 0; /* f_ffree */
+    return 0u;
+}
+
 static uint32_t syscall_builtin_fs_list(uint32_t num,
                                         uint32_t argc,
                                         uint32_t *argv) {
@@ -996,11 +1021,6 @@ static uint32_t syscall_builtin_read(uint32_t num,
         }
 
         update_hot_key_state(scancode);
-
-        /* 1. Dispatch application hotkeys (highest priority) and system hotkeys */
-        if (keyboard_dispatch_hotkey(scancode)) {
-            continue;
-        }
 
         if (scancode & 0x80u) {
             continue;
@@ -1461,8 +1481,8 @@ static uint32_t syscall_builtin_sbrk(uint32_t num, uint32_t argc, uint32_t *argv
         inc = (int32_t)argv[0];
     }
     process_t *proc = process_get_current();
-    uint32_t proc_base = USER_HEAP_START + (proc && proc->pid > 0 ? (proc->pid - 1) : 0) * 0x04000000u;
-    uint32_t proc_limit = proc_base + 0x04000000u;
+    uint32_t proc_base = USER_HEAP_START + (proc && proc->pid > 0 ? (proc->pid - 1) : 0) * 0x20000000u;
+    uint32_t proc_limit = proc_base + 0x20000000u;
     uint32_t *pbreak = (proc && proc->user_heap_break >= proc_base) ? &proc->user_heap_break : &user_heap_break;
     uint32_t prev = *pbreak;
     if (inc == 0) {
@@ -1629,17 +1649,16 @@ static uint32_t syscall_builtin_net_connect_endpoint(uint32_t num, uint32_t argc
     if (argc < 3u || !argv || !argv[1] || argv[2] > UINT16_MAX) {
         return (uint32_t)-1;
     }
-    char host[256];
     const char *user_host = (const char *)(uintptr_t)argv[1];
-    size_t i = 0;
-    for (; i < sizeof(host) - 1u && user_host[i] != '\0'; i++) {
-        host[i] = user_host[i];
-    }
-    if (i == sizeof(host) - 1u && user_host[i] != '\0') {
+    size_t host_len = strlen(user_host);
+    char *host = (char *)kmalloc(host_len + 1u);
+    if (!host) {
         return (uint32_t)-1;
     }
-    host[i] = '\0';
-    return (uint32_t)connect_endpoint((int)argv[0], host, (uint16_t)argv[2]);
+    memcpy(host, user_host, host_len + 1u);
+    uint32_t ret = (uint32_t)connect_endpoint((int)argv[0], host, (uint16_t)argv[2]);
+    kfree(host);
+    return ret;
 }
 
 static uint32_t syscall_builtin_net_send(uint32_t num, uint32_t argc, uint32_t *argv) {
@@ -2007,7 +2026,9 @@ static uint32_t syscall_builtin_vga_set_mode(uint32_t num, uint32_t argc, uint32
     } else {
         if (cur) cur->wants_graphics = false;
         if (!fg || cur == fg) {
-            vga_set_mode_text_hardware();
+            if (vga_is_graphics_mode()) {
+                vga_set_mode_text_hardware();
+            }
         }
     }
     return 0;
@@ -2035,8 +2056,22 @@ static uint32_t syscall_builtin_system_interrupt(uint32_t num, uint32_t argc, ui
     return kernel_system_interrupted ? 1 : 0;
 }
 
+void syscall_load_idt(void) {
+
+    ipo_idt_ptr_t idt_ptr = {
+        .limit = (uint16_t)(sizeof(ipo_idt_table) - 1),
+        .base = (uint32_t)ipo_idt_table
+    };
+
+    __asm__ volatile(
+        "lidt %0"
+        :
+        : "m"(idt_ptr));
+}
+
 void syscall_init(void) {
     memset(ipo_idt_table, 0, sizeof(ipo_idt_table));
+
 
     ipo_register_syscall(
         IPO_SYSCALL_REGISTER,
@@ -2392,18 +2427,19 @@ void syscall_init(void) {
         IPO_KERNEL_CODE_SEG,
         IPO_IDT_ENTRY_FLAGS);
 
-    ipo_idt_ptr_t idt_ptr = {
-        .limit = (uint16_t)(sizeof(ipo_idt_table) - 1),
-        .base = (uint32_t)ipo_idt_table
-    };
+    extern void smp_ipi_isr(void);
+    ipo_idt_set_gate(
+        0xE0,
+        (uint32_t)smp_ipi_isr,
+        IPO_KERNEL_CODE_SEG,
+        0x8Eu);
 
-    __asm__ volatile(
-        "lidt %0"
-        :
-        : "m"(idt_ptr));
+    syscall_load_idt();
+    serial_printf("[syscall] System call dispatch table initialized (IDT vector 0x80 registered).\n");
 }
 
 uint32_t syscall_dispatch(uint32_t num,
+
                           uint32_t argc,
                           uint32_t *argv)
 {

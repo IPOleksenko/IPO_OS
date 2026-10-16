@@ -13,28 +13,52 @@
 #include <kernel/driver.h>
 #include <driver/input/mouse.h>
 #include <net/net.h>
+#include <memory/memory_map.h>
+#include <kernel/smp.h>
+#include <kernel/device.h>
+#include <driver/storage/block_dev.h>
+#include <storage/storage_pool.h>
+#include <kernel/kmod.h>
 #include <stdio.h>
 
 #define FS_START_LBA (uint32_t)2048
 #define STARTUP_SOUND {NOTE_C6, 150}, {NOTE_E6, 150}, {NOTE_G6, 150}, {NOTE_C7, 200}
 
 static void ensure_fs_mounted(void) {
-    if (ipo_fs_mount(FS_START_LBA) || ipo_fs_mount(0)) {
-        printf("Mounted IPO_FS\n");
+    storage_pool_state_t pool_state = storage_pool_get_state();
+    if (pool_state == STORAGE_POOL_STATE_CORRUPT) {
+        printf("[ipo_fs] Storage pool metadata is CORRUPTED. Automatic formatting ABORTED to prevent data loss.\n");
         return;
     }
 
-    printf("No IPO_FS found, attempting dynamic format...\n");
+    if (ipo_fs_mount(FS_START_LBA) || ipo_fs_mount(0)) {
+        if (pool_state == STORAGE_POOL_STATE_DEGRADED) {
+            printf("[ipo_fs] Mounted IPO_FS in DEGRADED storage pool mode.\n");
+        } else {
+            printf("[ipo_fs] Mounted IPO_FS\n");
+        }
+        return;
+    }
 
-    uint64_t pool_capacity = ata_get_pool_capacity();
+    if (pool_state == STORAGE_POOL_STATE_DEGRADED) {
+        printf("[ipo_fs] Storage pool is DEGRADED. Automatic formatting ABORTED to protect surviving data.\n");
+        return;
+    }
+
+    printf("[ipo_fs] No IPO_FS found, attempting dynamic format...\n");
+
+    uint64_t pool_capacity = storage_pool_get_capacity();
     if (pool_capacity == 0) {
-        printf("Disk not detected: running in diskless mode\n");
+        pool_capacity = ata_get_pool_capacity();
+    }
+    if (pool_capacity == 0) {
+        printf("[ipo_fs] Disk not detected: running in diskless mode\n");
         return;
     }
 
     /* Disk too small (< 10 sectors / ~5 KB) */
     if (pool_capacity < 10) {
-        printf("Disk too small for filesystem (< 5 KB)\n");
+        printf("[ipo_fs] Disk too small for filesystem (< 5 KB)\n");
         return;
     }
 
@@ -60,7 +84,7 @@ static void ensure_fs_mounted(void) {
     } else if (!ipo_fs_mount(start_lba)) {
         printf("ipo_fs_mount failed after format\n");
     } else {
-        printf("Mounted IPO_FS at LBA %u\n", (uint32_t)start_lba);
+        printf("[ipo_fs] Mounted IPO_FS at LBA %u\n", (uint32_t)start_lba);
     }
 }
 
@@ -94,35 +118,62 @@ void play_startup_sound(void) {
     }
 }
 
-
 void kmain(void) {
     system_set_state(SYSTEM_STATE_BOOT);
 
     terminal_initialize();
 
+    printf("[kernel] Initializing memory map (BIOS E820)...\n");
+    memory_map_init();
+    printf("[kernel] Memory map initialized.\n");
+
+    printf("[kernel] Initializing process manager...\n");
     process_init();
+    printf("[kernel] Process manager initialized.\n");
 
+    printf("[kernel] Initializing system calls...\n");
     syscall_init();
+    printf("[kernel] System calls initialized.\n");
 
+    printf("[kernel] Initializing timer & PIT...\n");
     timer_init();
+    printf("[kernel] Timer initialized.\n");
 
+    printf("[kernel] Initializing Symmetric Multiprocessing (SMP)...\n");
+    smp_init();
+    printf("[kernel] SMP initialization complete.\n");
+
+    printf("[kernel] Initializing async scheduler...\n");
     async_scheduler_init();
+    printf("[kernel] Async scheduler initialized.\n");
 
+    printf("[kernel] Initializing sound...\n");
     sound_init();
+    printf("[kernel] Sound initialized.\n");
     
+    printf("[kernel] Initializing block devices...\n");
+    block_dev_init();
+    printf("[kernel] Block devices initialized.\n");
+
+    printf("[kernel] Initializing ATA storage...\n");
     ata_init();
+    printf("[kernel] ATA storage initialized.\n");
 
-    ipo_fs_init();
+    printf("[kernel] Initializing unified storage pool...\n");
+    storage_pool_init();
+    printf("[kernel] Unified storage pool initialized.\n");
 
-    ensure_fs_mounted();
-
-    play_startup_sound();
-
-    terminal_initialize();
+    printf("[kernel] Initializing dynamic driver subsystem (kmod)...\n");
+    kmod_init();
+    printf("[kernel] Dynamic driver subsystem initialized.\n");
     
+    printf("[kernel] Saving text mode hardware state...\n");
     vga_save_text_state();
+    printf("[kernel] Text mode hardware state saved.\n");
 
+    printf("[kernel] Initializing PS/2 mouse...\n");
     mouse_init();
+    printf("[kernel] PS/2 mouse initialized.\n");
 
     const net_config_t net_config = {
         .icmp_queue_capacity = 8,
@@ -135,9 +186,25 @@ void kmain(void) {
         printf("[net] Failed to initialize network buffers\n");
     }
 
+    printf("[kernel] Initializing system drivers...\n");
     driver_init_system_drivers();
+    printf("[kernel] System drivers initialized.\n");
 
-    printf("Type \"help\" or \"?\" on the keyboard to view commands, shortcuts, and OS features.\n\n");
+    printf("[kernel] Initializing unified device registry...\n");
+    device_init();
+    printf("[kernel] Unified device registry initialized.\n");
+
+    printf("[kernel] Initializing IPO_FS internal state...\n");
+    ipo_fs_init();
+    printf("[kernel] IPO_FS internal state initialized.\n");
+
+    printf("[kernel] Mounting filesystem...\n");
+    ensure_fs_mounted();
+    printf("[kernel] Filesystem mount check complete.\n");
+
+    play_startup_sound();
+    terminal_initialize();
+    printf("Type \"help\" on the keyboard to view commands, shortcuts, and OS features.\n\n");
 
     system_set_state(SYSTEM_STATE_TERMINAL_IDLE);
 

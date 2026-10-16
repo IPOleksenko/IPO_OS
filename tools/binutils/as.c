@@ -97,6 +97,5 @@ int main(int argc, char **argv) {
 
     dyn_str_free(&cmd);
     dyn_str_free(&extra_args);
-    return ret;
-    return ret;
+    return (ret < 0) ? 1 : ret;
 }

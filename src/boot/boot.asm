@@ -15,27 +15,8 @@ start:
 
     mov [BOOT_DRIVE], dl
 
-    mov si, msg
+    mov si, banner
     call print
-    
-    mov si, tab
-    call print
-    
-    mov si, tab
-    call print
-
-    mov si, by_author
-    call print
-
-    mov si, new_line
-    call print
-    
-    mov si, new_line
-    call print
-
-    ; progress: A
-    mov ax, 0x0E41
-    int 0x10
 
     ; check INT13h extensions
     mov ah, 0x41
@@ -78,11 +59,6 @@ start:
     jmp .read_loop
 
 .read_done:
-
-    ; progress: R
-    mov ax, 0x0E52
-    int 0x10
-
     ; enable A20
     in al, 0x92
     or al, 00000010b
@@ -99,18 +75,14 @@ start:
 ; Writes total RAM size in bytes to memory location 0x8FF0.
 ; ---------------------------------------------------------------
 detect_memory:
-    push di
-    push bx
-    push cx
-    push dx
-    push eax
-    push es
-
     xor ebx, ebx
+    mov dword [0x8FE0], 0x45383230  ; 'E820' magic
+    mov dword [0x8FE4], 0           ; E820 entry count
+    mov dword [0x8FE8], 0x6000      ; E820 table pointer (phys 0x6000)
     mov dword [0x8FF0], 0
-    mov di, 0x8000
+    mov di, 0x0600
     mov es, di
-    mov di, 0
+    xor di, di
 
 .detect_loop:
     mov eax, 0xE820
@@ -120,6 +92,8 @@ detect_memory:
     jc .done
     cmp eax, 0x534D4150
     jne .done
+
+    inc dword [0x8FE4]              ; entry_count++
 
     cmp dword [es:di+16], 1
     jne .next_entry
@@ -143,11 +117,6 @@ detect_memory:
     int 0x15
     jc .exit
 
-    mov bx, 0x0000
-    mov ax, ax
-    ; ax = memory between 1MB and 16MB in KB
-    ; bx = memory between 16MB and 64MB in 64KB blocks
-    ; convert to bytes: (ax + bx * 64) * 1024
     xor edx, edx
     mov dx, bx
     shl edx, 6
@@ -156,12 +125,6 @@ detect_memory:
     mov dword [0x8FF0], edx
 
 .exit:
-    pop es
-    pop eax
-    pop dx
-    pop cx
-    pop bx
-    pop di
     ret
 
 align 8
@@ -176,23 +139,16 @@ gdt_desc:
     dd gdt_start
 
 pm_setup:
-    ; progress: G
-    mov ax, 0x0E47
-    int 0x10
-
-    ; --- hide BIOS text cursor while still in real mode ---
+    ; hide BIOS text cursor
     mov ah, 0x01
-    mov ch, 0x20     ; bit 5 set to hide
+    mov ch, 0x20
     mov cl, 0x00
     int 0x10
 
-    ; NOTE: BIOS ints no longer work fully after the code below.
     lgdt [gdt_desc]
     mov eax, cr0
     or  eax, 1
     mov cr0, eax
-
-    ; NOTE: after this far jump, BIOS ints no longer work at all.
     jmp 0x08:pmode_entry
 
 [BITS 32]
@@ -208,22 +164,22 @@ pmode_entry:
 
 [BITS 16]
 disk_error:
-    push ax
-    mov al, 'E'
+    mov ax, 0x0E45
+    int 0x10
+.hang:
+    hlt
+    jmp .hang
+
+print:
+.print_loop:
+    lodsb
+    test al, al
+    jz .print_done
     mov ah, 0x0E
     int 0x10
-    pop ax
-    mov al, ah
-    shr al, 4
-    add al, '0'
-    cmp al, '9'
-    jbe .p1
-    add al, 7
-.p1:
-    mov ah, 0x0E
-    int 0x10
-.hang:  hlt
-        jmp .hang
+    jmp .print_loop
+.print_done:
+    ret
 
 BOOT_DRIVE: db 0
 
@@ -240,26 +196,22 @@ dap_lba:
     dd 1                    ; LBA start
     dd 0
 
-; ============================================================
-; Print
-; ============================================================
-print:
-    pusha
-.print_loop:
-    lodsb
-    test al, al
-    jz .done
-    mov ah, 0x0E
-    int 0x10
-    jmp .print_loop
-.done:
-    popa
-    ret
+banner: db "IPO_OS by IPOleksenko", 13, 10, 0
 
-msg         db "IPO_OS", 0
-by_author   db "by IPOleksenko", 0
-tab         db "  ", 0
-new_line    db 13, 10, 0
+times 446-($-$$) db 0
 
-times 510-($-$$) db 0
+; ============================================================
+; Standard MBR Partition Table (64 bytes: 4 x 16-byte entries)
+; ============================================================
+; Partition 1: Active, Type 0x83 (Linux / IPO_FS), Start LBA 2048
+db 0x80                 ; Bootable / Active flag
+db 0x00, 0x20, 0x21     ; CHS start
+db 0x83                 ; Partition Type (0x83 = Linux / IPO_FS)
+db 0xFE, 0xFF, 0xFF     ; CHS end
+dd 2048                 ; LBA start (1 MB offset)
+dd 260096               ; Sector count (127 MB default)
+
+; Partitions 2, 3, 4 (empty)
+times 48 db 0
+
 dw 0xAA55

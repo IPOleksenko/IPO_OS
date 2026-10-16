@@ -1,27 +1,55 @@
 #include <driver/input/keymap/keymap.h>
+#include <memory/kmalloc.h>
 #include <string.h>
 
-bool key_state[NUM_KEYS] = {false};
+static bool s_default_key_state[256] = {false};
+bool *key_state = s_default_key_state;
+uint32_t key_state_cap = 256;
 bool shift_mode = false;
 
+static void key_state_ensure_capacity(uint32_t needed) {
+    if (needed < key_state_cap) return;
+    uint32_t new_cap = (key_state_cap == 0) ? 256 : (key_state_cap * 2);
+    while (new_cap <= needed) {
+        new_cap *= 2;
+    }
+    bool *new_arr = (bool *)kmalloc(new_cap * sizeof(bool));
+    if (!new_arr) return;
+    memset(new_arr, 0, new_cap * sizeof(bool));
+    if (key_state && key_state_cap > 0) {
+        memcpy(new_arr, key_state, key_state_cap * sizeof(bool));
+        if (key_state != s_default_key_state) {
+            kfree(key_state);
+        }
+    }
+    key_state = new_arr;
+    key_state_cap = new_cap;
+}
+
+bool keyboard_is_key_pressed(uint32_t key) {
+    if (!key_state || key >= key_state_cap) return false;
+    return key_state[key];
+}
+
+static bool right_ctrl_pressed = false;
 bool keyboard_is_ctrl_pressed(void) {
-    return key_state[SC_PRESS_CTRL];
+    return keyboard_is_key_pressed(SC_PRESS_CTRL) || right_ctrl_pressed;
 }
 
 bool keyboard_is_left_shift_pressed(void) {
-    return key_state[SC_PRESS_LEFT_SHIFT];
+    return keyboard_is_key_pressed(SC_PRESS_LEFT_SHIFT);
 }
 
 bool keyboard_is_right_shift_pressed(void) {
-    return key_state[SC_PRESS_RIGHT_SHIFT];
+    return keyboard_is_key_pressed(SC_PRESS_RIGHT_SHIFT);
 }
 
 bool keyboard_is_shift_pressed(void) {
-    return (key_state[SC_PRESS_LEFT_SHIFT] || key_state[SC_PRESS_RIGHT_SHIFT]);
+    return (keyboard_is_left_shift_pressed() || keyboard_is_right_shift_pressed());
 }
 
 bool keyboard_is_alt_pressed(void) {
-    return key_state[SC_PRESS_ALT];
+    return keyboard_is_key_pressed(SC_PRESS_ALT);
 }
 
 uint8_t keyboard_get_modifiers(void) {
@@ -43,7 +71,7 @@ char* get_keymap(void) {
 static char static_char_buf[2] = {0, 0};
 
 const char* keyboard_get_key_string(uint8_t scancode) {
-    if (scancode == 0x00u || scancode >= 0x80u) {
+    if (scancode == 0x00u) {
         return NULL;
     }
 
@@ -66,7 +94,7 @@ const char* keyboard_get_key_string(uint8_t scancode) {
         return NULL;
     }
 
-    /* Check dynamic keymap translation */
+    /* Check dynamic keymap translation (supports full scancode range) */
     const char *dyn = dynamic_keymap_translate(scancode, shift_mode);
     if (dyn != NULL) {
         if (dyn[0] == '\0') {
@@ -75,28 +103,38 @@ const char* keyboard_get_key_string(uint8_t scancode) {
         return dyn;
     }
 
-    /* When a custom layout is active: unmapped typing keys output default symbol */
+    /* Break codes (hardware key releases) do not emit text characters */
+    if (scancode >= 0x80u) {
+        return NULL;
+    }
+
+    /* When a custom layout is active: check control keys or custom fallback symbol */
     if (dynamic_keymap_is_active()) {
         if (scancode == KEY_ENTER)     return "\n";
         if (scancode == KEY_BACKSPACE) return "\b";
         if (scancode == KEY_TAB)       return "\t";
         if (scancode == KEY_ESC)       return "\x1B";
         if (scancode == KEY_SPACE)     return " ";
-        return dynamic_keymap_get_default_symbol();
+        const char *def = dynamic_keymap_get_default_symbol();
+        if (def != NULL && def[0] != '\0') {
+            return def;
+        }
     }
 
     char* keymap = get_keymap();
-    char c = keymap[scancode];
-    if (c != 0x00) {
-        static_char_buf[0] = c;
-        static_char_buf[1] = '\0';
-        return static_char_buf;
+    if (scancode < 128) {
+        char c = keymap[scancode];
+        if (c != 0x00) {
+            static_char_buf[0] = c;
+            static_char_buf[1] = '\0';
+            return static_char_buf;
+        }
     }
 
     return NULL;
 }
 
-char get_char(uint8_t scancode) {
+char __attribute__((weak)) get_char(uint8_t scancode) {
     if (scancode == 0x00)
         return 0x00;
 
@@ -113,17 +151,12 @@ void hot_key_handler(uint8_t scancode) {
     shift_mode = keyboard_is_shift_pressed();
 }
 
-bool keyboard_dispatch_hotkey(uint8_t scancode) {
-    (void)scancode;
-    return false;
-}
 
 static bool e0_prefix = false;
-static bool right_ctrl_pressed = false;
 
 void keyboard_clear_key_state(void) {
-    for (size_t i = 0; i < NUM_KEYS; i++) {
-        key_state[i] = false;
+    if (key_state && key_state_cap > 0) {
+        memset(key_state, 0, key_state_cap * sizeof(bool));
     }
     shift_mode = false;
     e0_prefix = false;
@@ -144,10 +177,20 @@ void update_hot_key_state(uint8_t scancode) {
         if (e0_prefix) right_ctrl_pressed = false;
     }
 
-    if (scancode < (uint8_t)NUM_KEYS) {
-        key_state[scancode] = true;
-    } else if (scancode >= 0x80u && (scancode & 0x7Fu) < (uint8_t)NUM_KEYS) {
-        key_state[scancode & 0x7Fu] = false;
+    key_state_ensure_capacity(scancode);
+
+    if (scancode < 0x80u) {
+        if (scancode < key_state_cap) {
+            key_state[scancode] = true;
+        }
+    } else {
+        uint8_t base = scancode & 0x7Fu;
+        if (base < key_state_cap) {
+            key_state[base] = false;
+        }
+        if (scancode < key_state_cap) {
+            key_state[scancode] = false;
+        }
     }
 
     e0_prefix = false;

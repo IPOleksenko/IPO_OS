@@ -140,6 +140,11 @@ static int strip_elf(const uint8_t *raw, long sz, const char *outfile) {
     cur_offset = (cur_offset + 15) & ~15;
 
     Elf32_Shdr *new_shdrs = (Elf32_Shdr *)malloc(eh->e_shnum * sizeof(Elf32_Shdr));
+    if (!new_shdrs) {
+        free(out);
+        fprintf(stderr, "objcopy: out of memory\n");
+        return 1;
+    }
     uint16_t new_shnum = 0;
 
     for (uint16_t i = 0; i < eh->e_shnum; i++) {
@@ -148,7 +153,7 @@ static int strip_elf(const uint8_t *raw, long sz, const char *outfile) {
 
         int discard = 0;
         if (flag_strip_all) {
-            if (s->sh_type == SHT_SYMTAB || s->sh_type == SHT_STRTAB && i != eh->e_shstrndx) discard = 1;
+            if (s->sh_type == SHT_SYMTAB || (s->sh_type == SHT_STRTAB && i != eh->e_shstrndx)) discard = 1;
             if (s->sh_type == SHT_REL || s->sh_type == SHT_RELA) discard = 1;
             if (strncmp(sname, ".debug", 6) == 0 || strncmp(sname, ".comment", 8) == 0) discard = 1;
         } else if (flag_strip_debug) {
@@ -245,6 +250,10 @@ int main(int argc, char **argv) {
     }
     fseek(fin, 0, SEEK_END);
     long sz = ftell(fin);
+    if (sz <= 0) {
+        fclose(fin);
+        return 1;
+    }
     fseek(fin, 0, SEEK_SET);
 
     uint8_t *raw = (uint8_t *)malloc(sz);

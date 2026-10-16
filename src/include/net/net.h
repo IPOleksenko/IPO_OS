@@ -36,6 +36,8 @@ typedef struct {
 } net_config_t;
 
 /* Byte order helpers */
+#ifndef _BYTEORDER_HELPERS_DEFINED
+#define _BYTEORDER_HELPERS_DEFINED
 static inline uint16_t htons(uint16_t v) {
     return (uint16_t)((v << 8) | (v >> 8));
 }
@@ -51,6 +53,7 @@ static inline uint32_t htonl(uint32_t v) {
 static inline uint32_t ntohl(uint32_t v) {
     return htonl(v);
 }
+#endif
 
 /* Checksum utility (RFC 1071) */
 uint16_t net_checksum(const void *data, size_t len);

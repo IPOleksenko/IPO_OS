@@ -43,4 +43,9 @@ void pit_set_frequency(uint8_t counter, uint32_t hz);
  */
 uint16_t pit_get_divisor(uint32_t hz);
 
+/**
+ * Get the frequency currently programmed on a PIT counter (0 if never programmed)
+ */
+uint32_t pit_get_frequency(uint8_t counter);
+
 #endif

@@ -17,8 +17,9 @@
 #define SC_PRESS_ALT            0x38
 #define SC_UNPRESS_ALT          0xB8
 
-#define NUM_KEYS 128
-extern bool key_state[NUM_KEYS];
+extern bool *key_state;
+extern uint32_t key_state_cap;
+bool keyboard_is_key_pressed(uint32_t key);
 
 #define KBD_MOD_NONE   0x00
 #define KBD_MOD_CTRL   0x01
@@ -32,7 +33,6 @@ bool keyboard_is_left_shift_pressed(void);
 bool keyboard_is_right_shift_pressed(void);
 bool keyboard_is_alt_pressed(void);
 void keyboard_clear_key_state(void);
-bool keyboard_dispatch_hotkey(uint8_t scancode);
 
 extern bool shift_mode;
 

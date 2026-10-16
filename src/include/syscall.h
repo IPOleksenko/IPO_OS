@@ -133,6 +133,8 @@
 
 #define IPO_SYSCALL_DRIVER_SET_DESC   0x1063u
 
+#define IPO_SYSCALL_FS_STATVFS        0x1064u
+
 #define IPO_SYSCALL_WM_CREATE_WINDOW   0x1070u
 
 #define IPO_SYSCALL_WM_DESTROY_WINDOW  0x1071u
@@ -337,6 +339,13 @@ static inline int ipo_delete(const char *path) {
     return ipo_syscall(IPO_SYSCALL_FS_DELETE, 1u, args);
 }
 
+static inline int ipo_rename(const char *oldpath, const char *newpath) {
+    uint32_t args[2];
+    args[0] = (uint32_t)(uintptr_t)oldpath;
+    args[1] = (uint32_t)(uintptr_t)newpath;
+    return ipo_syscall(IPO_SYSCALL_FS_RENAME, 2u, args);
+}
+
 static inline int ipo_seek(int fd, int32_t offset, int whence) {
     uint32_t args[3];
     args[0] = (uint32_t)fd;
@@ -498,4 +507,4 @@ static inline int ipo_driver_list(void) {
 
 void syscall_reset_user_heap(void);
 
-#endif
+#endif

@@ -4,6 +4,7 @@
 #include <system/timer.h>
 #include <string.h>
 #include <stdio.h>
+#include <memory/kmalloc.h>
 #include <ioport.h>
 #include <syscall.h>
 
@@ -77,7 +78,31 @@ void dns_process_response_packet(const void *data, uint16_t len) {
             if (ctx->dns_queue_capacity == 0) {
                 return;
             }
-            size_t slot = ctx->dns_q_idx % ctx->dns_queue_capacity;
+            size_t slot = ctx->dns_queue_capacity;
+            for (size_t i = 0; i < ctx->dns_queue_capacity; i++) {
+                if (!ctx->dns_queue[i].valid) {
+                    slot = i;
+                    break;
+                }
+            }
+            if (slot == ctx->dns_queue_capacity) {
+                /* Queue full of unconsumed answers -> dynamically double capacity */
+                size_t old_cap = ctx->dns_queue_capacity;
+                size_t new_cap = (old_cap == 0) ? 8 : (old_cap * 2);
+                if (new_cap > old_cap && new_cap <= (SIZE_MAX / sizeof(dns_reply_entry_t))) {
+                    dns_reply_entry_t *new_q = (dns_reply_entry_t *)krealloc(ctx->dns_queue, new_cap * sizeof(dns_reply_entry_t));
+                    if (new_q) {
+                        memset(new_q + old_cap, 0, (new_cap - old_cap) * sizeof(dns_reply_entry_t));
+                        slot = old_cap;
+                        ctx->dns_queue = new_q;
+                        ctx->dns_queue_capacity = new_cap;
+                    }
+                }
+            }
+            if (slot == ctx->dns_queue_capacity) {
+                /* Fallback if allocation failed: circular overwrite */
+                slot = ctx->dns_q_idx % ctx->dns_queue_capacity;
+            }
             ctx->dns_queue[slot].id = ntohs(hdr->id);
             ctx->dns_queue[slot].ip = resolved_ip;
             ctx->dns_queue[slot].valid = true;
@@ -146,16 +171,9 @@ bool dns_resolve(const char *hostname, ip4_addr_t *out_ip, uint32_t timeout_ms) 
 
     uint16_t query_len = (uint16_t)(qname - query_buf);
     udp_send(netif->dns, client_port, 53, query_buf, query_len);
-    if (netif->dns != IP4_ADDR(192, 168, 7, 3)) {
-        udp_send(IP4_ADDR(192, 168, 7, 3), client_port, 53, query_buf, query_len);
-    }
-    if (netif->dns != IP4_ADDR(192, 168, 7, 1)) {
-        udp_send(IP4_ADDR(192, 168, 7, 1), client_port, 53, query_buf, query_len);
-    }
 
     uint32_t start = timer_millis();
     uint32_t last_send = start;
-    int retry_count = 0;
     while (timer_millis() - start < timeout_ms) {
         net_poll();
 
@@ -169,14 +187,9 @@ bool dns_resolve(const char *hostname, ip4_addr_t *out_ip, uint32_t timeout_ms) 
         }
 
         if (timer_millis() - last_send >= 400) {
-            retry_count++;
             ip4_addr_t target_dns = netif->dns;
-            if (retry_count == 1) {
+            if (target_dns == 0) {
                 target_dns = IP4_ADDR(8, 8, 8, 8);
-            } else if (retry_count == 2) {
-                target_dns = IP4_ADDR(1, 1, 1, 1);
-            } else {
-                target_dns = IP4_ADDR(192, 168, 7, 3);
             }
             udp_send(target_dns, client_port, 53, query_buf, query_len);
             last_send = timer_millis();

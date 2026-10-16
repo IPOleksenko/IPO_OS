@@ -80,6 +80,7 @@ typedef struct {
 
 void vga_load_font(uint8_t start_code, uint32_t count, const uint8_t *glyphs);
 int vga_load_cyrillic_font(const char *path);
+int vga_font_load_database(const char *path);
 void vga_font_clear_registry(void);
 int vga_font_register_glyph(uint32_t codepoint, const uint8_t *bitmap);
 void vga_font_apply_glyphs(const dynamic_glyph_def_t *glyphs, uint32_t count);

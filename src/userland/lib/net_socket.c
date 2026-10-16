@@ -81,6 +81,6 @@ int socket_close(int sockfd) {
     return net_socket_call(IPO_SYSCALL_NET_CLOSE, 1u, args);
 }
 
-int close(int sockfd) {
+int __attribute__((weak)) close(int sockfd) {
     return socket_close(sockfd);
 }

@@ -14,6 +14,16 @@ driver_t* driver_find(const char *name) {
         if (strcmp(curr->name, name) == 0) {
             return curr;
         }
+        if (curr->owner != NULL && process_is_valid((process_t *)curr->owner)) {
+            process_t *p = (process_t *)curr->owner;
+            if (p->name != NULL) {
+                const char *base = strrchr(p->name, '/');
+                base = base ? base + 1 : p->name;
+                if (strcmp(base, name) == 0) {
+                    return curr;
+                }
+            }
+        }
         curr = curr->next;
     }
     return NULL;
@@ -85,7 +95,19 @@ int driver_unregister(const char *name) {
     driver_t *prev = NULL;
 
     while (curr != NULL) {
-        if (strcmp(curr->name, name) == 0) {
+        bool matches = (strcmp(curr->name, name) == 0);
+        if (!matches && curr->owner != NULL && process_is_valid((process_t *)curr->owner)) {
+            process_t *p = (process_t *)curr->owner;
+            if (p->name != NULL) {
+                const char *base = strrchr(p->name, '/');
+                base = base ? base + 1 : p->name;
+                if (strcmp(base, name) == 0) {
+                    matches = true;
+                }
+            }
+        }
+
+        if (matches) {
             if (curr->flags & DRIVER_FLAG_KERNEL) {
                 return -3; /* Cannot unregister built-in kernel driver */
             }
@@ -146,28 +168,34 @@ uint32_t driver_count(void) {
     return count;
 }
 
-static void print_padded(const char *s, int width) {
-    int len = 0;
-    if (s) {
-        while (s[len]) {
-            putchar(s[len]);
-            len++;
-        }
+uint32_t driver_count_kernel(void) {
+    uint32_t count = 0;
+    driver_t *curr = driver_head;
+    while (curr != NULL) {
+        if (curr->flags & DRIVER_FLAG_KERNEL) count++;
+        curr = curr->next;
     }
-    while (len < width) {
-        putchar(' ');
-        len++;
+    return count;
+}
+
+uint32_t driver_count_user(void) {
+    uint32_t count = 0;
+    driver_t *curr = driver_head;
+    while (curr != NULL) {
+        if (curr->flags & DRIVER_FLAG_USER) count++;
+        curr = curr->next;
     }
+    return count;
 }
 
 void driver_print_list(void) {
     if (driver_head == NULL) {
-        printf("No drivers loaded.\n");
+        printf("  No dynamic drivers currently loaded.\n");
         return;
     }
 
-    printf("  NAME           TYPE     HOOKS   DESCRIPTION\n");
-    printf("  ---------------------------------------------------------------------------\n");
+    printf("  NAME           TYPE     ORIGIN / STATUS       HOOKS   DESCRIPTION\n");
+    printf("  -----------------------------------------------------------------------------------\n");
 
     driver_t *curr = driver_head;
     while (curr != NULL) {
@@ -182,11 +210,24 @@ void driver_print_list(void) {
         hooks[hpos] = '\0';
 
         const char *type_str = (curr->flags & DRIVER_FLAG_KERNEL) ? "KERNEL" : "USER";
+        char origin_buf[32];
+        if (curr->flags & DRIVER_FLAG_KERNEL) {
+            snprintf(origin_buf, sizeof(origin_buf), "Built-in Core");
+        } else if (curr->owner != NULL && process_is_valid((process_t *)curr->owner)) {
+            process_t *p = (process_t *)curr->owner;
+            const char *base = p->name ? strrchr(p->name, '/') : NULL;
+            base = base ? base + 1 : (p->name ? p->name : "app");
+            snprintf(origin_buf, sizeof(origin_buf), "PID %u (%s)", p->pid, base);
+        } else {
+            snprintf(origin_buf, sizeof(origin_buf), "Resident Process");
+        }
+
         printf("  ");
         print_padded(curr->name, 15);
         print_padded(type_str, 9);
+        print_padded(origin_buf, 22);
         print_padded(hooks, 8);
-        printf("%s\n", curr->description);
+        printf("%s\n", curr->description ? curr->description : "");
         curr = curr->next;
     }
     printf("\n  Hooks: T=Timer, K=Key, C=Command, O=CharOut, I=IO\n");
@@ -357,28 +398,11 @@ char driver_dispatch_char_output(char c) {
 }
 
 void driver_init_system_drivers(void) {
-    static const struct {
-        const char *name;
-        const char *desc;
-    } sys_drvs[] = {
-        {"pit",      "8254 Programmable Interval Timer"},
-        {"keyboard", "PS/2 Keyboard Controller"},
-        {"mouse",    "PS/2 Mouse Device Driver"},
-        {"vga",      "VGA Text/Graphics & VBE Display Driver"},
-        {"ata",      "IDE/ATA Hard Disk PIO Driver"},
-        {"sound",    "PC Speaker & Audio Core Subsystem"},
-        {"pci",      "PCI Bus Controller & Device Enumerator"},
-        {"rtl8139",  "Realtek RTL8139 Fast Ethernet NIC"},
-    };
-
-    for (size_t i = 0; i < sizeof(sys_drvs) / sizeof(sys_drvs[0]); i++) {
-        driver_t drv;
-        memset(&drv, 0, sizeof(drv));
-        drv.name = (char *)sys_drvs[i].name;
-        drv.description = (char *)sys_drvs[i].desc;
-        drv.flags = DRIVER_FLAG_KERNEL | DRIVER_FLAG_ACTIVE;
-        driver_register(&drv);
-    }
+    /* Built-in system hardware (PIT, Keyboard, Mouse, VGA, ATA, Sound, PCI)
+     * are monolithic core components initialized directly by the kernel.
+     * We do not register dummy placeholders here so that 'drivers' only
+     * reports genuinely loaded dynamic modules and userland drivers. */
+    serial_printf("[driver] Built-in system drivers ready.\n");
 }
 
 int driver_set_description(const char *name, const char *new_desc) {

@@ -12,7 +12,26 @@
 #include <stdio.h>
 #include <string.h>
 
-static uint8_t rx_packet_buf[1536];
+static uint8_t *rx_packet_buf = NULL;
+static size_t rx_packet_buf_cap = 0;
+
+static bool ensure_rx_packet_buf(size_t needed) {
+    if (rx_packet_buf && rx_packet_buf_cap >= needed) {
+        return true;
+    }
+    size_t new_cap = (rx_packet_buf_cap == 0) ? 2048 : (rx_packet_buf_cap * 2);
+    while (new_cap < needed) {
+        new_cap *= 2;
+    }
+    uint8_t *new_buf = (uint8_t *)krealloc(rx_packet_buf, new_cap);
+    if (!new_buf) {
+        return false;
+    }
+    rx_packet_buf = new_buf;
+    rx_packet_buf_cap = new_cap;
+    return true;
+}
+
 net_shared_ctx_t g_net_shared_ctx __attribute__((aligned(4)));
 
 uint16_t net_checksum(const void *data, size_t len) {
@@ -108,11 +127,11 @@ bool net_init(const net_config_t *config) {
         if (ctx->rtl_dev.initialized) {
             ctx->default_if.link_up = true;
         }
-        return ctx->icmp_queue_capacity == config->icmp_queue_capacity &&
-               ctx->arp_table_capacity == config->arp_table_capacity &&
-               ctx->udp_table_capacity == config->udp_sockets_capacity &&
-               ctx->dns_queue_capacity == config->dns_queue_capacity &&
-               ctx->loopback_queue_capacity == config->loopback_queue_capacity;
+        return ctx->icmp_queue_capacity >= config->icmp_queue_capacity &&
+               ctx->arp_table_capacity >= config->arp_table_capacity &&
+               ctx->udp_table_capacity >= config->udp_sockets_capacity &&
+               ctx->dns_queue_capacity >= config->dns_queue_capacity &&
+               ctx->loopback_queue_capacity >= config->loopback_queue_capacity;
     }
 
     if (ctx->magic != NET_SHARED_MAGIC) {
@@ -139,7 +158,7 @@ bool net_init(const net_config_t *config) {
             memset(ctx->dns_queue, 0, ctx->dns_queue_capacity * sizeof(*ctx->dns_queue));
         }
         ctx->magic = NET_SHARED_MAGIC;
-        ctx->default_if.mac = (mac_addr_t){{0x52, 0x54, 0x00, 0x12, 0x34, 0x56}};
+        memset(&ctx->default_if.mac, 0, sizeof(ctx->default_if.mac));
         ctx->default_if.ip = IP4_ADDR(192, 168, 7, 2);
         ctx->default_if.netmask = IP4_ADDR(255, 255, 255, 0);
         ctx->default_if.gateway = IP4_ADDR(192, 168, 7, 1);
@@ -183,9 +202,21 @@ void net_poll(void) {
 
     if (!ctx->default_if.link_up) return;
 
-    int len;
-    while ((len = rtl8139_receive_packet(rx_packet_buf, sizeof(rx_packet_buf))) > 0) {
+    int peek_len;
+    while ((peek_len = rtl8139_peek_packet_size()) > 0) {
+        if (!ensure_rx_packet_buf((size_t)peek_len + 64u)) {
+            break;
+        }
+        int len = rtl8139_receive_packet(rx_packet_buf, (uint32_t)rx_packet_buf_cap);
+        if (len <= 0) break;
         eth_receive(rx_packet_buf, (uint16_t)len);
+    }
+
+    if (ensure_rx_packet_buf(2048)) {
+        int len;
+        while ((len = rtl8139_receive_packet(rx_packet_buf, (uint32_t)rx_packet_buf_cap)) > 0) {
+            eth_receive(rx_packet_buf, (uint16_t)len);
+        }
     }
 }
 
