@@ -391,13 +391,15 @@ static int storage_pool_load_metadata_unlocked(void) {
 
         /* Look up physical block device */
         block_device_t *target_bdev = block_dev_get(mem->bdev_name);
-        /* Portable fallback: if single-member pool moved to different device slot (e.g. ata1 -> ata0) */
+        /* Portable fallback: if single-member pool moved to different device slot */
         if (!target_bdev && i == 0 && loaded == 1 && sb_host_dev) {
             target_bdev = sb_host_dev;
-            pool_member_set_name(mem, sb_host_dev->name);
         }
 
         if (target_bdev && target_bdev->total_sectors > 0) {
+            if (target_bdev->name) {
+                pool_member_set_name(mem, target_bdev->name);
+            }
             mem->bdev = target_bdev;
             mem->online = true;
             target_bdev->flags |= BLOCK_DEV_POOL_MEMBER;
@@ -433,12 +435,14 @@ int storage_pool_load_metadata(void) {
 
 /* Crash recovery: scan on-disk WAL journal, identify uncommitted writes, replay or rollback - Unlocked */
 static int storage_pool_recover_unlocked(void) {
-    if (!s_storage_pool.members[0].online || !s_storage_pool.members[0].bdev) {
+    if (s_storage_pool.member_count == 0 || !s_storage_pool.members ||
+        !s_storage_pool.members[0].online || !s_storage_pool.members[0].bdev) {
         return -1;
     }
 
     block_device_t *bdev0 = s_storage_pool.members[0].bdev;
     uint32_t recovered_count = 0;
+    uint32_t disk_tx_count = 0;
     uint8_t sector_buf[512];
 
     uint64_t journal_start = s_storage_pool.journal_lba ? s_storage_pool.journal_lba : STORAGE_POOL_JOURNAL_LBA;
@@ -471,7 +475,7 @@ static int storage_pool_recover_unlocked(void) {
                 s_next_tx_id = tx->tx_id + 1;
             }
 
-            s_storage_pool.journal.total_tx_count++;
+            disk_tx_count++;
 
             /* Interrupted write detected! */
             if (tx->state == TX_STATE_PENDING) {
@@ -510,6 +514,10 @@ static int storage_pool_recover_unlocked(void) {
         }
     }
 
+    if (s_storage_pool.journal.total_tx_count < disk_tx_count) {
+        s_storage_pool.journal.total_tx_count = disk_tx_count;
+    }
+
     if (recovered_count > 0) {
         s_storage_pool.recovery_count += recovered_count;
         serial_printf("[storage_pool] Crash recovery completed: %u interrupted transaction(s) resolved.\n",
@@ -521,6 +529,7 @@ static int storage_pool_recover_unlocked(void) {
 }
 
 int storage_pool_recover(void) {
+    if (!s_storage_pool.initialized) storage_pool_init();
     spin_lock(&s_pool_lock);
     int res = storage_pool_recover_unlocked();
     spin_unlock(&s_pool_lock);
@@ -529,6 +538,46 @@ int storage_pool_recover(void) {
 
 int storage_pool_create_ex(const char *pool_uuid, const char *bdev_name) {
     spin_lock(&s_pool_lock);
+
+    /* Validate target block device BEFORE cleaning up existing pool */
+    block_device_t *target_bdev = NULL;
+    if (bdev_name && *bdev_name) {
+        target_bdev = block_dev_get(bdev_name);
+        if (!target_bdev || target_bdev->total_sectors == 0) {
+            serial_printf("[storage_pool] Cannot create storage pool: specified device '%s' not found or empty.\n", bdev_name);
+            spin_unlock(&s_pool_lock);
+            return -2;
+        }
+    }
+    if (!target_bdev) {
+        block_device_t *bdev = block_dev_get_list();
+        while (bdev) {
+            if ((bdev->flags & BLOCK_DEV_BOOTABLE) && bdev->total_sectors >= 2048 + 10) {
+                target_bdev = bdev;
+                break;
+            }
+            bdev = bdev->next;
+        }
+    }
+    if (!target_bdev) {
+        block_device_t *bdev = block_dev_get_list();
+        while (bdev) {
+            if (bdev->total_sectors >= 2048 + 10) {
+                target_bdev = bdev;
+                break;
+            }
+            bdev = bdev->next;
+        }
+    }
+    if (!target_bdev) {
+        target_bdev = block_dev_get_list();
+    }
+
+    if (!target_bdev || target_bdev->total_sectors == 0) {
+        serial_printf("[storage_pool] Cannot create storage pool: no suitable block device found.\n");
+        spin_unlock(&s_pool_lock);
+        return -2;
+    }
 
     /* Free any previous allocations to avoid memory leaks */
     storage_pool_cleanup_unlocked();
@@ -553,51 +602,10 @@ int storage_pool_create_ex(const char *pool_uuid, const char *bdev_name) {
     s_storage_pool.backup_sb_lba = STORAGE_POOL_BACKUP_SB_LBA;
 
     if (pool_uuid && *pool_uuid) {
-        uint8_t ub[16];
-        memset(ub, 0, sizeof(ub));
-        strncpy((char *)ub, pool_uuid, 16);
-        storage_pool_set_pool_uuid(ub, 16);
-    } else {
-        storage_pool_set_pool_uuid((const uint8_t *)"IPO_STORAGE_POOL", 16);
-    }
-
-    /* Live USB / Portable Architecture:
-     * If specific device name given, look it up; otherwise bind to the system boot drive
-     * (prefer ata0 if >= 2048 + 10 sectors, or first suitable drive).
-     * Never automatically annex host PC internal drives without user consent. */
-    block_device_t *target_bdev = NULL;
-    if (bdev_name && *bdev_name) {
-        target_bdev = block_dev_get(bdev_name);
-    }
-    if (!target_bdev) {
-        block_device_t *bdev = block_dev_get_list();
-        while (bdev) {
-            if (strcmp(bdev->name, "ata0") == 0 && bdev->total_sectors >= 2048 + 10) {
-                target_bdev = bdev;
-                break;
-            }
-            bdev = bdev->next;
-        }
-    }
-    if (!target_bdev) {
-        block_device_t *bdev = block_dev_get_list();
-        while (bdev) {
-            if (bdev->total_sectors >= 2048 + 10) {
-                target_bdev = bdev;
-                break;
-            }
-            bdev = bdev->next;
-        }
-    }
-    if (!target_bdev) {
-        target_bdev = block_dev_get_list();
-    }
-
-    if (!target_bdev || target_bdev->total_sectors == 0) {
-        serial_printf("[storage_pool] Cannot create storage pool: no suitable block device found.\n");
-        storage_pool_cleanup_unlocked();
-        spin_unlock(&s_pool_lock);
-        return -2;
+        size_t ulen = strlen(pool_uuid);
+        storage_pool_set_pool_uuid((const uint8_t *)pool_uuid, ulen);
+    } else if (target_bdev->name) {
+        storage_pool_set_pool_uuid((const uint8_t *)target_bdev->name, strlen(target_bdev->name));
     }
 
     pool_member_t *m = &s_storage_pool.members[0];
@@ -607,11 +615,8 @@ int storage_pool_create_ex(const char *pool_uuid, const char *bdev_name) {
     m->start_pool_lba = 0;
     m->capacity_sectors = target_bdev->total_sectors;
     m->online = true;
-    {
-        char ubuf[16];
-        memset(ubuf, 0, sizeof(ubuf));
-        snprintf(ubuf, sizeof(ubuf), "MEMBER-%02u", 0);
-        pool_member_set_uuid(m, (const uint8_t *)ubuf, 16);
+    if (target_bdev->name) {
+        pool_member_set_uuid(m, (const uint8_t *)target_bdev->name, strlen(target_bdev->name));
     }
 
     target_bdev->flags |= BLOCK_DEV_POOL_MEMBER;
@@ -635,7 +640,7 @@ int storage_pool_create_ex(const char *pool_uuid, const char *bdev_name) {
     spin_unlock(&s_pool_lock);
 
     serial_printf("[storage_pool] Created persistent pool '%.16s' on '%s': %u members, %llu sectors (%llu MB)\n",
-                  s_storage_pool.pool_uuid,
+                  s_storage_pool.pool_uuid ? (const char *)s_storage_pool.pool_uuid : "Unknown",
                   target_bdev->name,
                   s_storage_pool.member_count,
                   s_storage_pool.total_capacity_sectors,
@@ -666,7 +671,7 @@ int storage_pool_init(void) {
 
         spin_unlock(&s_pool_lock);
 
-        serial_printf("[storage_pool] Restored from persistent disk metadata: state=%s, %u member(s), %llu sectors (%llu MB)\n",
+        printf("[storage_pool] Restored from persistent disk metadata: state=%s, %u member(s), %llu sectors (%llu MB)\n",
                       storage_pool_get_state_str(),
                       s_storage_pool.member_count,
                       s_storage_pool.total_capacity_sectors,
@@ -677,8 +682,8 @@ int storage_pool_init(void) {
     spin_unlock(&s_pool_lock);
 
     /* First-time pool creation (no existing persistent superblocks) */
-    serial_printf("[storage_pool] No persistent superblock found on disk. Initializing default pool...\n");
-    return storage_pool_create("IPO_STORAGE_POOL");
+    printf("[storage_pool] No persistent superblock found on disk. Initializing default pool...\n");
+    return storage_pool_create(NULL);
 }
 
 bool storage_pool_is_initialized(void) {
@@ -744,7 +749,8 @@ int storage_pool_add_device(block_device_t *bdev) {
 
     /* Check if already added */
     for (uint32_t i = 0; i < s_storage_pool.member_count; i++) {
-        if (strcmp(s_storage_pool.members[i].bdev_name, bdev->name) == 0) {
+        if (strcmp(s_storage_pool.members[i].bdev_name, bdev->name) == 0 ||
+            s_storage_pool.members[i].bdev == bdev) {
             if (!s_storage_pool.members[i].online) {
                 s_storage_pool.members[i].bdev = bdev;
                 s_storage_pool.members[i].online = true;
@@ -787,11 +793,8 @@ int storage_pool_add_device(block_device_t *bdev) {
     m->start_pool_lba = s_storage_pool.total_capacity_sectors;
     m->capacity_sectors = bdev->total_sectors;
     m->online = true;
-    {
-        char ubuf[16];
-        memset(ubuf, 0, sizeof(ubuf));
-        snprintf(ubuf, sizeof(ubuf), "MEMBER-%02u", idx);
-        pool_member_set_uuid(m, (const uint8_t *)ubuf, 16);
+    if (bdev->name) {
+        pool_member_set_uuid(m, (const uint8_t *)bdev->name, strlen(bdev->name));
     }
 
     bdev->flags |= BLOCK_DEV_POOL_MEMBER;
@@ -1142,8 +1145,8 @@ void storage_pool_print_status(void) {
     uint32_t cap_mb = (uint32_t)((cap * 512ull) / (1024ull * 1024ull));
 
     printf("=== Unified Storage Pool Status ===\n");
-    printf("  Pool Name:        pool0\n");
-    printf("  Pool UUID:        %.16s\n", s_storage_pool.pool_uuid);
+    printf("  Pool UUID:        %.16s\n",
+           (s_storage_pool.pool_uuid && s_storage_pool.pool_uuid[0]) ? (const char *)s_storage_pool.pool_uuid : "Unknown");
     printf("  Status:           %s\n", storage_pool_get_state_str());
     printf("  Generation:       %u\n", s_storage_pool.generation);
     uint64_t sb_lba = s_storage_pool.sb_lba ? s_storage_pool.sb_lba : STORAGE_POOL_PRIMARY_SB_LBA;
@@ -1152,10 +1155,10 @@ void storage_pool_print_status(void) {
 
     printf("  Primary SB:       Sector %llu (Backup: Sector %llu)\n",
            sb_lba, backup_sb_lba);
-    printf("  WAL Journal:      Sectors %llu..%llu (%u sectors, %u entries)\n",
+    printf("  WAL Journal:      Sectors %llu..%llu (%u sectors, %u slots)\n",
            journal_start,
            journal_start + STORAGE_POOL_JOURNAL_SECTORS - 1,
-           STORAGE_POOL_JOURNAL_SECTORS, (uint32_t)s_storage_pool.journal.entries_cap);
+           STORAGE_POOL_JOURNAL_SECTORS, (uint32_t)STORAGE_DISK_WAL_SLOTS);
     printf("  Total Capacity:   %llu sectors (%u MB)\n", cap, cap_mb);
     printf("  Chunk/Extent:     %u sectors (%u KB)\n",
            s_storage_pool.chunk_size_sectors, (s_storage_pool.chunk_size_sectors * 512u) / 1024u);
@@ -1165,14 +1168,16 @@ void storage_pool_print_status(void) {
         pool_member_t *mem = &s_storage_pool.members[m];
         uint32_t mem_mb = (uint32_t)((mem->capacity_sectors * 512ull) / (1024ull * 1024ull));
         printf("    [%u] %-10s Offset: %-10llu Sectors: %-10llu Size: %-6u MB Status: %s\n",
-               m, mem->bdev_name, mem->start_pool_lba, mem->capacity_sectors,
+               m, (mem->bdev_name && mem->bdev_name[0]) ? mem->bdev_name : "Unknown",
+               mem->start_pool_lba, mem->capacity_sectors,
                mem_mb, mem->online ? "ONLINE" : "OFFLINE / MISSING");
     }
 
     printf("  Transaction Journal Stats:\n");
     printf("    Total Transactions:  %u\n", s_storage_pool.journal.total_tx_count);
     printf("    Active Transactions: %u\n", s_storage_pool.journal.active_tx_count);
-    printf("    Ring Buffer Size:    %u entries\n", (uint32_t)s_storage_pool.journal.entries_cap);
+    printf("    Journal Capacity:    %u on-disk slots (%u in-memory entries)\n",
+           (uint32_t)STORAGE_DISK_WAL_SLOTS, (uint32_t)s_storage_pool.journal.entries_cap);
 }
 
 void storage_pool_print_usage(void) {
@@ -1200,8 +1205,8 @@ void storage_pool_print_usage(void) {
     printf("  Pool Status:       %s\n", storage_pool_get_state_str());
 
     if (fs_mounted) {
-        printf("  Active Filesystem: IPO_FS (Block size: %u bytes, Total inodes: %u, Used inodes: %u)\n",
-               sb.block_size, ino_total, ino_used);
+        printf("  Active Filesystem: %.6s (Block size: %u bytes, Total inodes: %u, Used inodes: %u)\n",
+               (const char *)&sb.magic, sb.block_size, ino_total, ino_used);
     } else {
         printf("  Active Filesystem: None / Unformatted\n");
     }

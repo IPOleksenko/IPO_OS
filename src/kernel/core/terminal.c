@@ -22,6 +22,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <net/net.h>
+#include <net/loopback.h>
 #include <kernel/device.h>
 #include <kernel/smp.h>
 #include <memory/memory_map.h>
@@ -246,27 +247,14 @@ static char *path_combine_and_canonicalize(const char *dir, const char *file) {
     return out;
 }
 
-static void make_abs_path(const char *rel_or_abs, char *out, size_t out_size) {
-    if (!out || out_size == 0) return;
-    char *dyn = make_abs_path_dyn(rel_or_abs);
-    if (!dyn) {
-        out[0] = '\0';
-        return;
-    }
-    strncpy(out, dyn, out_size - 1u);
-    out[out_size - 1u] = '\0';
-    kfree(dyn);
-}
-
-
 void print_header(void) {
     volatile uint16_t* vga = VGA_MEMORY;
 
-    char os_name[] = "IPO_OS";
-    char created_by[] = "Created by IPOleksenko";
+    const char *os_name = "IPO_OS";
+    const char *created_by = "Created by IPOleksenko";
 
-    uint8_t os_name_length = sizeof(os_name) - 1;
-    uint8_t created_by_length = sizeof(created_by) - 1;
+    uint8_t os_name_length = (uint8_t)strlen(os_name);
+    uint8_t created_by_length = (uint8_t)strlen(created_by);
 
     for (uint8_t i = 0; i < os_name_length; i++) {
         vga[i] = vga_entry(os_name[i], VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
@@ -317,35 +305,42 @@ void terminal_render_language_bar(void) {
     }
 
     const char *lang_name = dynamic_keymap_get_name();
-    if (lang_name == NULL) {
-        lang_name = "English (US)";
+    if (lang_name == NULL || lang_name[0] == '\0') {
+        lang_name = "Unknown";
     }
     size_t len = strlen(lang_name);
 
     if (len + 12 <= (size_t)VGA_WIDTH) {
         /* Fits in 80 columns: display formatted cleanly */
-        char bar_text[128];
-        int prefix_len = snprintf(bar_text, sizeof(bar_text), "Keyboard Layout: %s", lang_name);
-        if (prefix_len < 0) prefix_len = 0;
-        render_bar_string_to_vga(row1_start, bar_text, (size_t)prefix_len);
+        size_t bar_cap = len + 32u;
+        char *bar_text = (char *)kmalloc(bar_cap);
+        if (bar_text) {
+            int prefix_len = snprintf(bar_text, bar_cap, "Keyboard Layout: %s", lang_name);
+            if (prefix_len < 0) prefix_len = 0;
+            render_bar_string_to_vga(row1_start, bar_text, (size_t)prefix_len);
+            kfree(bar_text);
+        }
     } else {
         /* Longer than 80 characters: infinite circular marquee! */
-        const char sep[] = "   ***   ";
+        const char *sep = "   ***   ";
         size_t sep_len = strlen(sep);
         size_t loop_len = len + sep_len;
 
-        char marquee_buf[128];
-        size_t col = 0;
-        for (col = 0; col < (size_t)VGA_WIDTH; col++) {
-            size_t idx = (lang_bar_offset + col) % loop_len;
-            if (idx < len) {
-                marquee_buf[col] = lang_name[idx];
-            } else {
-                marquee_buf[col] = sep[idx - len];
+        char *marquee_buf = (char *)kmalloc(VGA_WIDTH + 1);
+        if (marquee_buf) {
+            size_t col = 0;
+            for (col = 0; col < (size_t)VGA_WIDTH; col++) {
+                size_t idx = (lang_bar_offset + col) % loop_len;
+                if (idx < len) {
+                    marquee_buf[col] = lang_name[idx];
+                } else {
+                    marquee_buf[col] = sep[idx - len];
+                }
             }
+            marquee_buf[col] = '\0';
+            render_bar_string_to_vga(row1_start, marquee_buf, col);
+            kfree(marquee_buf);
         }
-        marquee_buf[col] = '\0';
-        render_bar_string_to_vga(row1_start, marquee_buf, col);
     }
 }
 
@@ -368,7 +363,7 @@ void terminal_language_bar_tick(void) {
     }
     lang_bar_last_tick_ms = now;
 
-    const char sep[] = "   ***   ";
+    const char *sep = "   ***   ";
     size_t loop_len = len + strlen(sep);
     lang_bar_offset = (lang_bar_offset + 1u) % (uint32_t)loop_len;
 
@@ -914,7 +909,14 @@ char* resolve_command_path(const char *cmd) {
     } 
     // Relative path with ./ or ../ or subdirectories
     else if (cmd[0] == '.' || strchr(cmd, '/')) {
-        make_abs_path(cmd, to_check, buf_size);
+        char *abs = make_abs_path_dyn(cmd);
+        if (abs) {
+            strncpy(to_check, abs, buf_size - 1);
+            to_check[buf_size - 1] = '\0';
+            kfree(abs);
+        } else {
+            to_check[0] = '\0';
+        }
         fs_canonicalize(to_check, canonical, buf_size);
         if (path_resolve(canonical, &inode) == 0 && 
             ipo_fs_stat(canonical, &stat) && 
@@ -937,7 +939,14 @@ char* resolve_command_path(const char *cmd) {
 
         for (int i = 0; search_paths[i] != NULL || i == 0; i++) {
             if (search_paths[i] == NULL && i == 0) {
-                make_abs_path(cmd, to_check, buf_size);
+                char *abs = make_abs_path_dyn(cmd);
+                if (abs) {
+                    strncpy(to_check, abs, buf_size - 1);
+                    to_check[buf_size - 1] = '\0';
+                    kfree(abs);
+                } else {
+                    to_check[0] = '\0';
+                }
             } else if (search_paths[i] != NULL) {
                 snprintf(to_check, buf_size, "%s/%s", search_paths[i], cmd);
             } else {
@@ -1066,16 +1075,35 @@ static void builtin_help(void) {
     printf("      - Query or configure device IP address, netmask, gateway and MAC.\n");
     printf("\n");
     printf("  [Drivers & Kernel Modules]\n");
-    printf("    drivers [list | info <id/name> | load <path> | unload <id/name> | status]\n");
+    printf("    drivers [list | info <id/name> | load <path> | unload <id/name> | status | symbols [filter]]\n");
     printf("      - Manage kernel drivers and dynamic runtime modules (KMOD ABI 0x0100).\n");
-    printf("    symbols [filter]\n");
+    printf("    symbols [filter] | ksyms [filter]\n");
     printf("      - Inspect all exported kernel function symbols, memory addresses, and OS entry points.\n");
     printf("\n");
     printf("  [Hardware Resources & Infrastructure]\n");
     printf("    hardware [overview | list | cpu | memory | pci | storage | network | usb | refresh | info <id> | status]\n");
-    printf("      - Inspect detected hardware resources: CPU/SMP cores, BIOS E820 RAM, PCI bus, ATA storage pool, network, USB.\n");
+    printf("      - Inspect hardware resources scanned directly from hardware buses & tables:\n");
+    printf("          overview (default) : Summary of CPU, RAM, PCI, ATA storage, network, and device registry.\n");
+    printf("          list               : Table of all discovered hardware & ACPI devices with IDs and resources.\n");
+    printf("          cpu                : CPU vendor/brand/features, logical cores table, and SMP status.\n");
+    printf("          memory             : BIOS E820 physical memory map and managed memory pools.\n");
+    printf("          pci                : Enumerated PCI bus devices (B:S.F, Vendor:Device, Class:Subclass, IRQ).\n");
+    printf("          storage            : Detected ATA/IDE drives (model, serial, firmware, capacity) and pool size.\n");
+    printf("          network            : Physical PCI network controllers (MAC, link, speed) and resources.\n");
+    printf("          usb                : Discovered PCI USB host controllers and resources.\n");
+    printf("          refresh            : Re-enumerate hardware buses (SMP, E820, PCI, ATA, ACPI) and rebuild registry.\n");
+    printf("          info <id>          : Detailed hardware resource report for device <id> from 'hardware list'.\n");
+    printf("          status             : System hardware health and device count breakdown by state and type.\n");
     printf("    storage [list | status | usage | check | create [uuid] [dev] | add <dev> | recover | save]\n");
-    printf("      - Manage multi-disk storage pool, persistent superblocks, WAL journal consistency, and crash recovery.\n");
+    printf("      - Manage multi-disk storage pool, block devices, partitions, superblocks, and WAL journal:\n");
+    printf("          list (default)     : Show storage pool status and scan all physical block devices & partitions.\n");
+    printf("          status             : Show unified storage pool state, superblock LBAs, WAL journal, and members.\n");
+    printf("          usage              : Show volume space usage, active filesystem stats, and member drive breakdown.\n");
+    printf("          check              : Verify sector 0, primary/backup superblock CRCs, partitions, and WAL journal.\n");
+    printf("          create [uuid] [dev]: Create a persistent storage pool with optional UUID on target block device.\n");
+    printf("          add <dev>          : Attach a physical block device (by hardware serial/name or index) to the pool.\n");
+    printf("          recover            : Scan on-disk WAL journal and resolve uncommitted/interrupted transactions.\n");
+    printf("          save               : Synchronize primary and backup superblock metadata to all online member disks.\n");
     printf("\n");
     printf("  [Disk & Memory Info]\n");
     printf("    df\n");
@@ -1097,7 +1125,7 @@ static void builtin_help(void) {
     printf("    reinstall_fs\n");
     printf("      - Completely reinstall filesystem on disk (wipes FS and resets to defaults).\n");
     printf("    help\n");
-    printf("      - Display this system documentation and syntax reference.\n");
+    printf("      - Display this full system documentation and command reference.\n");
     printf("\n");
     printf("2. FILE & DIRECTORY PATH SYNTAX\n");
     printf("  IPO_OS uses unified path resolution across all shell commands and applications:\n");
@@ -1156,7 +1184,7 @@ static void builtin_help(void) {
     printf("    - Updates dynamically in real time upon switching or enabling/disabling layouts.\n");
 }
 
-static void builtin_clear(void) {
+void builtin_clear(void) {
     vga_clear(
         VGA_COLOR_WHITE,
         VGA_COLOR_BLACK,
@@ -1164,6 +1192,23 @@ static void builtin_clear(void) {
         VGA_START_CURSOR_POSITION
     );
     print_header();
+
+    if (terminal_top_buffer) {
+        init_scroll_buffer(terminal_top_buffer);
+    }
+    if (terminal_bottom_buffer) {
+        init_scroll_buffer(terminal_bottom_buffer);
+    }
+
+    uint16_t (*top_buf)[VGA_WIDTH] = active_top_buffer();
+    uint16_t (*bot_buf)[VGA_WIDTH] = active_bottom_buffer();
+    if (top_buf && top_buf != terminal_top_buffer) {
+        init_scroll_buffer(top_buf);
+    }
+    if (bot_buf && bot_buf != terminal_bottom_buffer) {
+        init_scroll_buffer(bot_buf);
+    }
+
     *active_top_count() = 0;
     *active_bottom_count() = 0;
     top_buffer_count = 0;
@@ -1172,6 +1217,16 @@ static void builtin_clear(void) {
     prompt_start_cursor = VGA_START_CURSOR_POSITION;
     cursor_pos = 0;
     previous_rendered_vis_len = 0;
+}
+
+void terminal_clear_buffer(void) {
+    builtin_clear();
+    prompt_shown = false;
+    input_len = 0;
+    cursor_pos = 0;
+    if (input_buf != NULL) {
+        input_buf[0] = '\0';
+    }
 }
 
 static void builtin_pwd(void) {
@@ -1286,29 +1341,39 @@ static void builtin_cat(int argc, char **argv) {
         return;
     }
     for (int a = 1; a < argc; a++) {
-        char target[1024];
-        make_abs_path(argv[a], target, sizeof(target));
+        char *target = make_abs_path_dyn(argv[a]);
+        if (!target) continue;
 
         struct ipo_inode stat;
         if (!ipo_fs_stat(target, &stat)) {
             printf("cat: %s: No such file or directory\n", argv[a]);
+            kfree(target);
             continue;
         }
         if ((stat.mode & IPO_INODE_TYPE_DIR) != 0) {
             printf("cat: %s: Is a directory\n", argv[a]);
+            kfree(target);
             continue;
         }
 
         int fd = ipo_fs_open(target);
         if (fd < 0) {
             printf("cat: %s: Failed to open\n", argv[a]);
+            kfree(target);
             continue;
         }
 
-        char chunk[256];
+        size_t chunk_cap = 4096;
+        char *chunk = (char *)kmalloc(chunk_cap + 1);
+        if (!chunk) {
+            ipo_fs_close(fd);
+            kfree(target);
+            continue;
+        }
+
         uint32_t offset = 0;
         while (offset < stat.size) {
-            uint32_t to_read = sizeof(chunk) - 1;
+            uint32_t to_read = (uint32_t)chunk_cap;
             if (offset + to_read > stat.size) {
                 to_read = stat.size - offset;
             }
@@ -1318,9 +1383,11 @@ static void builtin_cat(int argc, char **argv) {
             for (int i = 0; i < read_bytes; i++) {
                 putchar(chunk[i]);
             }
-            offset += read_bytes;
+            offset += (uint32_t)read_bytes;
         }
+        kfree(chunk);
         ipo_fs_close(fd);
+        kfree(target);
     }
 }
 
@@ -1330,11 +1397,12 @@ static void builtin_touch(int argc, char **argv) {
         return;
     }
     for (int a = 1; a < argc; a++) {
-        char target[1024];
-        make_abs_path(argv[a], target, sizeof(target));
+        char *target = make_abs_path_dyn(argv[a]);
+        if (!target) continue;
 
         struct ipo_inode stat;
         if (ipo_fs_stat(target, &stat)) {
+            kfree(target);
             continue;
         }
 
@@ -1342,6 +1410,7 @@ static void builtin_touch(int argc, char **argv) {
         if (ino < 0) {
             printf("touch: cannot create '%s'\n", argv[a]);
         }
+        kfree(target);
     }
 }
 
@@ -1351,13 +1420,14 @@ static void builtin_mkdir(int argc, char **argv) {
         return;
     }
     for (int a = 1; a < argc; a++) {
-        char target[1024];
-        make_abs_path(argv[a], target, sizeof(target));
+        char *target = make_abs_path_dyn(argv[a]);
+        if (!target) continue;
 
         int ino = ipo_fs_create(target, IPO_INODE_TYPE_DIR);
         if (ino < 0) {
             printf("mkdir: cannot create directory '%s'\n", argv[a]);
         }
+        kfree(target);
     }
 }
 
@@ -1367,18 +1437,20 @@ static void builtin_rm(int argc, char **argv) {
         return;
     }
     for (int a = 1; a < argc; a++) {
-        char target[1024];
-        make_abs_path(argv[a], target, sizeof(target));
+        char *target = make_abs_path_dyn(argv[a]);
+        if (!target) continue;
 
         struct ipo_inode stat;
         if (!ipo_fs_stat(target, &stat)) {
             printf("rm: cannot remove '%s': No such file or directory\n", argv[a]);
+            kfree(target);
             continue;
         }
 
         if (!ipo_fs_delete(target)) {
             printf("rm: cannot remove '%s': Protected or non-empty directory\n", argv[a]);
         }
+        kfree(target);
     }
 }
 
@@ -1456,10 +1528,19 @@ static void builtin_cp(int argc, char **argv) {
         return;
     }
 
-    uint8_t chunk[512];
+    size_t chunk_cap = 4096;
+    uint8_t *chunk = (uint8_t *)kmalloc(chunk_cap);
+    if (!chunk) {
+        ipo_fs_close(src_fd);
+        ipo_fs_close(dst_fd);
+        kfree(src);
+        kfree(dst);
+        return;
+    }
+
     uint32_t offset = 0;
     while (offset < src_stat.size) {
-        uint32_t to_copy = sizeof(chunk);
+        uint32_t to_copy = (uint32_t)chunk_cap;
         if (offset + to_copy > src_stat.size) to_copy = src_stat.size - offset;
         int rb = ipo_fs_read(src_fd, chunk, to_copy, offset);
         if (rb <= 0) break;
@@ -1468,9 +1549,10 @@ static void builtin_cp(int argc, char **argv) {
             printf("cp: error writing destination '%s'\n", argv[2]);
             break;
         }
-        offset += rb;
+        offset += (uint32_t)rb;
     }
 
+    kfree(chunk);
     ipo_fs_close(src_fd);
     ipo_fs_close(dst_fd);
     kfree(src);
@@ -1515,18 +1597,20 @@ static void builtin_stat(int argc, char **argv) {
         return;
     }
     for (int a = 1; a < argc; a++) {
-        char target[1024];
-        make_abs_path(argv[a], target, sizeof(target));
+        char *target = make_abs_path_dyn(argv[a]);
+        if (!target) continue;
 
         uint32_t inode_num = 0;
         if (path_resolve(target, &inode_num) < 0) {
             printf("stat: cannot resolve '%s'\n", argv[a]);
+            kfree(target);
             continue;
         }
 
         struct ipo_inode st;
         if (!read_inode(inode_num, &st)) {
             printf("stat: cannot read inode %u\n", inode_num);
+            kfree(target);
             continue;
         }
 
@@ -1534,6 +1618,7 @@ static void builtin_stat(int argc, char **argv) {
         printf("  Protected: %s\n", (st.mode & IPO_INODE_FLAG_PROTECTED) ? "Yes" : "No");
         printf("  Size:      %u bytes\n", st.size);
         printf("  Links:     %u\n", st.links_count);
+        kfree(target);
     }
 }
 
@@ -1887,14 +1972,7 @@ void terminal_initialize(void) {
 
     vga_init_font_cache();
 
-    vga_clear(
-        VGA_COLOR_WHITE,
-        VGA_COLOR_BLACK,
-        true,
-        VGA_START_CURSOR_POSITION
-    );
-
-    print_header();
+    builtin_clear();
 
     /* Flush any scancodes that accumulated during boot */
     keyboard_flush_hardware();
@@ -1960,7 +2038,7 @@ void terminal_initialize(void) {
     }
 
     load_command_history_from_file();
-    serial_printf("[terminal] Terminal interface initialized (call #%u, VGA 80x25 text mode, font cache ready).\n", s_terminal_init_count);
+    printf("[terminal] Terminal interface initialized (call #%u, VGA 80x25 text mode, font cache ready).\n", s_terminal_init_count);
 }
 
 /* Print the command prompt */
@@ -2132,35 +2210,42 @@ static void builtin_ifconfig(int argc, char **argv) {
         printf("[ifconfig] Network settings updated.\n");
     }
 
-    char ip_str[32], mask_str[32], gw_str[32], dns_str[32];
-    ip_to_str(netif->ip, ip_str, sizeof(ip_str));
-    ip_to_str(netif->netmask, mask_str, sizeof(mask_str));
-    ip_to_str(netif->gateway, gw_str, sizeof(gw_str));
-    ip_to_str(netif->dns, dns_str, sizeof(dns_str));
+    char *ip_str = ip_to_str_dyn(netif->ip);
+    char *mask_str = ip_to_str_dyn(netif->netmask);
+    char *gw_str = ip_to_str_dyn(netif->gateway);
+    char *dns_str = ip_to_str_dyn(netif->dns);
 
     printf("eth0: flags=<%s> mtu 1500\n", netif->link_up ? "UP,RUNNING" : "DOWN");
-    printf("      inet %s  netmask %s\n", ip_str, mask_str);
-    printf("      gateway %s  dns %s\n", gw_str, dns_str);
+    printf("      inet %s  netmask %s\n", ip_str ? ip_str : "Unknown", mask_str ? mask_str : "Unknown");
+    printf("      gateway %s  dns %s\n", gw_str ? gw_str : "Unknown", dns_str ? dns_str : "Unknown");
     printf("      ether %02x:%02x:%02x:%02x:%02x:%02x\n",
            netif->mac.mac[0], netif->mac.mac[1], netif->mac.mac[2],
            netif->mac.mac[3], netif->mac.mac[4], netif->mac.mac[5]);
+
+    if (ip_str) kfree(ip_str);
+    if (mask_str) kfree(mask_str);
+    if (gw_str) kfree(gw_str);
+    if (dns_str) kfree(dns_str);
 }
 
 static void builtin_hardware(int argc, char **argv) {
     if (argc < 2 || strcmp(argv[1], "overview") == 0) {
         printf("================ IPO_OS Hardware Resources Overview ================\n");
-        char vendor[32], brand[64];
-        smp_get_cpu_vendor(vendor, sizeof(vendor));
-        smp_get_cpu_brand(brand, sizeof(brand));
+        char *vendor = smp_get_cpu_vendor_dyn();
+        char *brand = smp_get_cpu_brand_dyn();
         printf("  CPU:       %u core(s) detected (%u active online)\n",
                smp_get_cpu_count(), smp_get_active_cpu_count());
-        printf("             Vendor: %s, Model: %s\n", vendor, brand);
+        printf("             Vendor: %s, Model: %s\n",
+               (vendor && vendor[0]) ? vendor : "Unknown",
+               (brand && brand[0]) ? brand : "Unknown");
+        if (vendor) kfree(vendor);
+        if (brand) kfree(brand);
 
         uint64_t total_ram = memory_map_get_total_ram();
-        char size_buf[32];
-        format_size(total_ram, size_buf, sizeof(size_buf));
+        char *size_buf = format_size_dynamic(total_ram);
         printf("  Memory:    Total RAM: %s (%u usable regions)\n",
-               size_buf, memory_map_get_region_count());
+               size_buf ? size_buf : "Unknown", memory_map_get_region_count());
+        if (size_buf) kfree(size_buf);
 
         printf("  PCI:       %u PCI device(s) detected on bus\n", pci_get_count());
         printf("  Storage:   %u ATA/IDE drive(s) present, pool capacity: %u MB\n",
@@ -2173,10 +2258,6 @@ static void builtin_hardware(int argc, char **argv) {
                device_get_count(),
                device_get_count_by_state(DEVICE_STATE_ACTIVE),
                device_get_count_by_state(DEVICE_STATE_INITIALIZED));
-        printf("--------------------------------------------------------------------\n");
-        printf("Commands: hardware list | cpu | memory | pci | storage | network | usb | smp\n");
-        printf("          hardware refresh | info <id> | status\n");
-        printf("====================================================================\n");
         return;
     }
 
@@ -2188,26 +2269,34 @@ static void builtin_hardware(int argc, char **argv) {
             printf(" %2u  ", curr->id);
             print_padded(device_type_to_string(curr->type), 9);
             print_padded(device_state_to_string(curr->state), 13);
-            print_padded(curr->name ? curr->name : "", 13);
+            print_padded((curr->name && curr->name[0]) ? curr->name : "Unknown", 13);
 
-            char res_str[24];
-            if (curr->res.bus_type == BUS_TYPE_PCI) {
-                snprintf(res_str, sizeof(res_str), "PCI %02x:%02x.%x",
-                         curr->res.pci_bus, curr->res.pci_slot, curr->res.pci_func);
-            } else if (curr->res.io_base != 0) {
-                if (curr->res.irq != 0) {
-                    snprintf(res_str, sizeof(res_str), "IO 0x%x, IRQ %u", curr->res.io_base, curr->res.irq);
+            size_t res_size = 64;
+            char *res_str = (char *)kmalloc(res_size);
+            if (res_str) {
+                if (curr->res.bus_type == BUS_TYPE_PCI) {
+                    snprintf(res_str, res_size, "PCI %02x:%02x.%x",
+                             curr->res.pci_bus, curr->res.pci_slot, curr->res.pci_func);
+                } else if (curr->res.io_base != 0) {
+                    if (curr->res.irq > 0 && curr->res.irq < 255) {
+                        snprintf(res_str, res_size, "IO 0x%x, IRQ %u", curr->res.io_base, curr->res.irq);
+                    } else {
+                        snprintf(res_str, res_size, "IO 0x%x", curr->res.io_base);
+                    }
+                } else if (curr->res.mmio_base != 0) {
+                    snprintf(res_str, res_size, "MMIO 0x%x", curr->res.mmio_base);
+                } else if (curr->res.irq > 0 && curr->res.irq < 255) {
+                    snprintf(res_str, res_size, "IRQ %u", curr->res.irq);
                 } else {
-                    snprintf(res_str, sizeof(res_str), "IO 0x%x", curr->res.io_base);
+                    snprintf(res_str, res_size, "-");
                 }
-            } else if (curr->res.mmio_base != 0) {
-                snprintf(res_str, sizeof(res_str), "MMIO 0x%x", curr->res.mmio_base);
+                print_padded(res_str, 21);
+                kfree(res_str);
             } else {
-                snprintf(res_str, sizeof(res_str), "-");
+                print_padded("-", 21);
             }
-            print_padded(res_str, 21);
 
-            printf("%.20s\n", curr->description ? curr->description : "");
+            printf("%s\n", (curr->description && curr->description[0]) ? curr->description : "Unknown");
             curr = curr->next;
         }
         return;
@@ -2215,19 +2304,21 @@ static void builtin_hardware(int argc, char **argv) {
 
     if (strcmp(argv[1], "cpu") == 0) {
         printf("=== Central Processing Unit (CPU & SMP) ===\n");
-        char vendor[32], brand[64], features[256];
-        smp_get_cpu_vendor(vendor, sizeof(vendor));
-        smp_get_cpu_brand(brand, sizeof(brand));
-        smp_get_cpu_features_str(features, sizeof(features));
+        char *vendor = smp_get_cpu_vendor_dyn();
+        char *brand = smp_get_cpu_brand_dyn();
+        char *features = smp_get_cpu_features_str_dyn();
         uint32_t fam = 0, mod = 0, step = 0;
         smp_get_cpu_model_info(&fam, &mod, &step);
 
-        printf("  Vendor:           %s\n", vendor);
-        printf("  Model / Brand:    %s\n", brand);
+        printf("  Vendor:           %s\n", (vendor && vendor[0]) ? vendor : "Unknown");
+        printf("  Model / Brand:    %s\n", (brand && brand[0]) ? brand : "Unknown");
         printf("  Family/Model/Stp: Family %u, Model %u, Stepping %u\n", fam, mod, step);
         printf("  Detected Cores:   %u logical core(s)\n", smp_get_cpu_count());
         printf("  Active Cores:     %u online core(s)\n", smp_get_active_cpu_count());
-        printf("  CPUID Features:   %s\n", features);
+        printf("  CPUID Features:   %s\n", (features && features[0]) ? features : "Unknown");
+        if (vendor) kfree(vendor);
+        if (brand) kfree(brand);
+        if (features) kfree(features);
 
         printf("\n  Logical Cores Table:\n");
         printf("  CORE  LAPIC  ROLE     STATUS   TICKS       STACK TOP   STACK BASE\n");
@@ -2262,23 +2353,33 @@ static void builtin_hardware(int argc, char **argv) {
     if (strcmp(argv[1], "memory") == 0) {
         printf("=== Physical Memory & Address Map (BIOS E820) ===\n");
         uint64_t total = memory_map_get_total_ram();
-        char size_buf[32];
-        format_size(total, size_buf, sizeof(size_buf));
-        printf("  Total Detected RAM: %s (%llu bytes)\n", size_buf, total);
+        char *size_buf = format_size_dynamic(total);
+        printf("  Total Detected RAM: %s (%llu bytes)\n", size_buf ? size_buf : "Unknown", total);
+        if (size_buf) kfree(size_buf);
 
         uint32_t raw_e820_count = memory_map_get_raw_e820_count();
         if (raw_e820_count > 0) {
             printf("\n  Raw BIOS E820 Memory Map (%u entries):\n", raw_e820_count);
-            printf("  #   BASE ADDRESS        LENGTH              TYPE\n");
+            printf("  #   BASE ADDRESS              LENGTH          TYPE\n");
             printf("  --------------------------------------------------------------\n");
             for (uint32_t i = 0; i < raw_e820_count; i++) {
                 const e820_entry_t *e = memory_map_get_raw_e820_entry(i);
                 if (!e) continue;
-                char esize[32];
-                format_size(e->length, esize, sizeof(esize));
-                printf("  %-2u  0x%08llx - 0x%08llx  %-14s  %s\n",
-                       i, e->base, e->base + e->length, esize,
+                char *esize = format_size_dynamic(e->length);
+                size_t range_cap = 48;
+                char *range_str = (char *)kmalloc(range_cap);
+                printf("  %-2u  ", i);
+                if (range_str) {
+                    snprintf(range_str, range_cap, "0x%08llx - 0x%08llx", e->base, e->base + e->length);
+                    print_padded(range_str, 26);
+                    kfree(range_str);
+                } else {
+                    printf("0x%08llx - 0x%08llx  ", e->base, e->base + e->length);
+                }
+                printf("%-14s  %s\n",
+                       esize ? esize : "Unknown",
                        memory_map_e820_type_name(e->type));
+                if (esize) kfree(esize);
             }
         }
 
@@ -2288,13 +2389,14 @@ static void builtin_hardware(int argc, char **argv) {
         for (uint32_t i = 0; i < memory_map_get_region_count(); i++) {
             const memory_region_t *r = memory_map_get_region(i);
             if (!r) continue;
-            char rsize[32], used_str[32];
-            format_size((uint64_t)r->size, rsize, sizeof(rsize));
-            format_size((uint64_t)r->used, used_str, sizeof(used_str));
+            char *rsize = format_size_dynamic((uint64_t)r->size);
+            char *used_str = format_size_dynamic((uint64_t)r->used);
             printf("  %-2u  0x%08x    %-12s  %-12s  %s\n",
-                   i, r->base, rsize,
-                   r->used ? used_str : "None",
+                   i, r->base, rsize ? rsize : "Unknown",
+                   used_str ? used_str : "Unknown",
                    r->is_usable ? "ACTIVE" : "INITIALIZED");
+            if (rsize) kfree(rsize);
+            if (used_str) kfree(used_str);
         }
         return;
     }
@@ -2303,14 +2405,16 @@ static void builtin_hardware(int argc, char **argv) {
         printf("=== Peripheral Component Interconnect (PCI Bus) ===\n");
         uint32_t count = pci_get_count();
         printf("  Discovered %u PCI device(s):\n\n", count);
-        printf("  B:S.F   VENDOR:DEV   VENDOR                  CLASS [CODE:SUBCLASS]\n");
+        printf("  B:S.F   VENDOR:DEV   VENDOR                  DEVICE / MODEL [CLASS:SUB]\n");
         printf("  -------------------------------------------------------------------------\n");
         for (uint32_t i = 0; i < count; i++) {
             const pci_device_t *p = pci_get_device(i);
             if (!p) continue;
             printf("  %02x:%02x.%x  %04x:%04x     ", p->bus, p->slot, p->func, p->vendor_id, p->device_id);
-            print_padded(pci_vendor_name(p->vendor_id), 24);
-            printf("%s", pci_class_name(p->class_code, p->subclass));
+            print_padded((p->vendor_name && p->vendor_name[0]) ? p->vendor_name : "Unknown", 24);
+            printf("%s [%02x:%02x]",
+                   (p->device_name && p->device_name[0]) ? p->device_name : "Unknown",
+                   p->class_code, p->subclass);
             if (p->irq > 0 && p->irq < 255) {
                 printf(" (IRQ %u)", p->irq);
             }
@@ -2324,21 +2428,27 @@ static void builtin_hardware(int argc, char **argv) {
         uint32_t count = ata_get_device_count();
         printf("  Detected ATA Drive(s): %u\n", count);
         uint64_t pool_sec = ata_get_pool_capacity();
-        char pool_sz[32];
-        format_size(pool_sec * 512ull, pool_sz, sizeof(pool_sz));
-        printf("  Multi-Drive Storage Pool Capacity: %s (%llu sectors)\n\n", pool_sz, pool_sec);
+        uint32_t def_sec_sz = 512u;
+        if (count > 0 && ata_get_device(0) && ata_get_device(0)->sector_size > 0) {
+            def_sec_sz = ata_get_device(0)->sector_size;
+        }
+        char *pool_sz = format_size_dynamic(pool_sec * (uint64_t)def_sec_sz);
+        printf("  Multi-Drive Storage Pool Capacity: %s (%llu sectors)\n\n", pool_sz ? pool_sz : "Unknown", pool_sec);
+        if (pool_sz) kfree(pool_sz);
 
-        printf("  DRIVE  CHANNEL  ROLE    MODEL                     SERIAL           CAPACITY\n");
-        printf("  -----------------------------------------------------------------------------\n");
+        printf("  DRIVE  CHANNEL  ROLE    MODEL                     SERIAL           FIRMWARE   CAPACITY\n");
+        printf("  ---------------------------------------------------------------------------------------\n");
         for (uint32_t i = 0; i < count; i++) {
             ata_device_t *d = ata_get_device(i);
             if (!d || !d->present) continue;
-            char cap_buf[32];
-            format_size(d->capacity_sectors * 512ull, cap_buf, sizeof(cap_buf));
-            printf("  %-5u  Pri/%-4u  %-6s  ", i, d->channel, d->drive ? "Slave" : "Master");
-            print_padded((d->model && d->model[0]) ? d->model : "N/A", 26);
-            print_padded((d->serial && d->serial[0]) ? d->serial : "N/A", 17);
-            printf("%s\n", cap_buf);
+            uint32_t sec_sz = d->sector_size ? d->sector_size : def_sec_sz;
+            char *cap_buf = format_size_dynamic(d->capacity_sectors * (uint64_t)sec_sz);
+            printf("  %-5u  %-7u  %-6s  ", i, d->channel, d->drive ? "Slave" : "Master");
+            print_padded((d->model && d->model[0]) ? d->model : "Unknown", 26);
+            print_padded((d->serial && d->serial[0]) ? d->serial : "Unknown", 17);
+            print_padded((d->firmware && d->firmware[0]) ? d->firmware : "Unknown", 11);
+            printf("%s\n", cap_buf ? cap_buf : "Unknown");
+            if (cap_buf) kfree(cap_buf);
         }
         return;
     }
@@ -2351,14 +2461,20 @@ static void builtin_hardware(int argc, char **argv) {
             const pci_device_t *p = pci_get_device(i);
             if (!p || p->class_code != 0x02) continue;
             net_pci_count++;
-            printf("  Controller #%u: PCI Network Device [0x%04X:0x%04X]\n",
-                   net_pci_count, p->vendor_id, p->device_id);
+            printf("  Controller #%u: %s [0x%04X:0x%04X], Class 0x%02X:0x%02X\n",
+                   net_pci_count,
+                   (p->device_name && p->device_name[0]) ? p->device_name : "Unknown",
+                   p->vendor_id, p->device_id, p->class_code, p->subclass);
+            printf("     Vendor:    %s\n", (p->vendor_name && p->vendor_name[0]) ? p->vendor_name : "Unknown");
             printf("     Location:  PCI %02x:%02x.%x, IRQ: %u\n",
                    p->bus, p->slot, p->func, p->irq);
-            if (p->bar0 & 1) {
-                printf("     I/O Port:  0x%x\n", (unsigned int)(p->bar0 & ~3u));
-            } else if (p->bar0 != 0) {
-                printf("     MMIO:      0x%08x\n", (unsigned int)(p->bar0 & ~0xFu));
+            for (size_t b = 0; b < p->bar_count; b++) {
+                if (p->bar[b] == 0) continue;
+                if (p->bar[b] & 1) {
+                    printf("     BAR[%u]:    I/O Port 0x%x\n", (unsigned)b, (unsigned int)(p->bar[b] & ~3u));
+                } else {
+                    printf("     BAR[%u]:    MMIO 0x%08x\n", (unsigned)b, (unsigned int)(p->bar[b] & ~0xFu));
+                }
             }
 
             if (p->vendor_id == RTL8139_VENDOR_ID && p->device_id == RTL8139_DEVICE_ID && rtl8139_is_present()) {
@@ -2366,18 +2482,21 @@ static void builtin_hardware(int argc, char **argv) {
                 if (m) {
                     printf("     MAC:       %02x:%02x:%02x:%02x:%02x:%02x\n",
                            m[0], m[1], m[2], m[3], m[4], m[5]);
+                } else {
+                    printf("     MAC:       Unknown\n");
                 }
-                uint16_t io = (uint16_t)(p->bar0 & ~3u);
-                uint8_t msr = inb(io + 0x58);
-                bool link_up = (msr & 0x04) == 0;
-                int speed = (msr & 0x08) ? 10 : 100;
-                printf("     Hardware:  Link %s (%d Mbps)\n", link_up ? "UP" : "DOWN", speed);
+                uint16_t io = (p->bar_count > 0) ? (uint16_t)(p->bar[0] & ~3u) : 0;
+                if (io != 0) {
+                    uint8_t msr = inb(io + 0x58);
+                    bool link_up = (msr & 0x04) == 0;
+                    int speed = (msr & 0x08) ? 10 : 100;
+                    printf("     Hardware:  Link %s (%d Mbps)\n", link_up ? "UP" : "DOWN", speed);
+                }
             }
         }
         if (net_pci_count == 0) {
             printf("  No physical PCI network controllers detected.\n");
         }
-        printf("  Virtual:   lo0 (127.0.0.1/8, MTU 65536, Interface UP)\n");
         return;
     }
 
@@ -2390,12 +2509,23 @@ static void builtin_hardware(int argc, char **argv) {
             if (!p) continue;
             if (p->class_code == 0x0C && p->subclass == 0x03) {
                 usb_found++;
-                printf("  Controller #%d: USB Host Controller (ProgIF 0x%02X)\n", usb_found, p->prog_if);
+                printf("  Controller #%d: %s [0x%04X:0x%04X], Class 0x%02X:0x%02X, ProgIF 0x%02X\n",
+                       usb_found,
+                       (p->device_name && p->device_name[0]) ? p->device_name : "Unknown",
+                       p->vendor_id, p->device_id, p->class_code, p->subclass, p->prog_if);
                 printf("    Location:  PCI %02x:%02x.%x\n", p->bus, p->slot, p->func);
-                printf("    Hardware:  Vendor 0x%04X, Device 0x%04X, ProgIF 0x%02X\n",
-                       p->vendor_id, p->device_id, p->prog_if);
-                printf("    Resources: IRQ %u, BAR0: 0x%08x\n", p->irq, p->bar0);
-                printf("    Status:    INITIALIZED (Bus enumeration ready)\n");
+                printf("    Vendor:    %s\n", (p->vendor_name && p->vendor_name[0]) ? p->vendor_name : "Unknown");
+                printf("    IRQ:       %u\n", p->irq);
+                for (size_t b = 0; b < p->bar_count; b++) {
+                    if (p->bar[b] == 0) continue;
+                    if (p->bar[b] & 1) {
+                        printf("    BAR[%u]:    0x%08x (I/O Port 0x%x)\n", (unsigned)b, p->bar[b], (unsigned)(p->bar[b] & ~3u));
+                    } else {
+                        printf("    BAR[%u]:    0x%08x (MMIO 0x%08x)\n", (unsigned)b, p->bar[b], (unsigned)(p->bar[b] & ~0xFu));
+                    }
+                }
+                uint16_t pci_cmd = pci_read_word(p->bus, p->slot, p->func, 0x04);
+                printf("    Status:    %s\n", (pci_cmd & 0x07u) ? "ACTIVE" : "INITIALIZED");
             }
         }
         if (usb_found == 0) {
@@ -2405,9 +2535,12 @@ static void builtin_hardware(int argc, char **argv) {
     }
 
     if (strcmp(argv[1], "refresh") == 0) {
-        printf("[hardware] Rescanning hardware buses (PCI, ATA, SMP, E820)...\n");
+        printf("[hardware] Rescanning hardware buses...\n");
         int total = device_rescan();
-        printf("[hardware] Rescan complete. Registry updated: %d active devices.\n", total);
+        printf("[hardware] Rescan complete. Registry updated: %d registered devices (ACTIVE: %u, INITIALIZED: %u).\n",
+               total,
+               device_get_count_by_state(DEVICE_STATE_ACTIVE),
+               device_get_count_by_state(DEVICE_STATE_INITIALIZED));
         return;
     }
 
@@ -2423,14 +2556,14 @@ static void builtin_hardware(int argc, char **argv) {
             return;
         }
         printf("=== Hardware Device Detail: ID %u ===\n", dev->id);
-        printf("  Canonical Name:     %s\n", dev->name ? dev->name : "");
+        printf("  Canonical Name:     %s\n", (dev->name && dev->name[0]) ? dev->name : "Unknown");
         printf("  Category / Type:    %s\n", device_type_to_string(dev->type));
         printf("  Operational State:  %s\n", device_state_to_string(dev->state));
-        printf("  Vendor:             %s\n", dev->vendor ? dev->vendor : "");
-        printf("  Model:              %s\n", dev->model ? dev->model : "");
-        printf("  Description:        %s\n", dev->description ? dev->description : "");
+        printf("  Vendor:             %s\n", (dev->vendor && dev->vendor[0]) ? dev->vendor : "Unknown");
+        printf("  Model:              %s\n", (dev->model && dev->model[0]) ? dev->model : "Unknown");
+        printf("  Description:        %s\n", (dev->description && dev->description[0]) ? dev->description : "Unknown");
         printf("  Bus Interface:      %s\n", bus_type_to_string(dev->res.bus_type));
-        printf("  Associated Driver:  %s\n", (dev->driver_name && dev->driver_name[0]) ? dev->driver_name : "none");
+        printf("  Associated Driver:  %s\n", (dev->driver_name && dev->driver_name[0]) ? dev->driver_name : "Unknown");
         if (dev->res.bus_type == BUS_TYPE_PCI) {
             printf("  PCI Coordinates:    Bus %u, Slot %u, Func %u\n",
                    dev->res.pci_bus, dev->res.pci_slot, dev->res.pci_func);
@@ -2451,13 +2584,13 @@ static void builtin_hardware(int argc, char **argv) {
             printf("  MMIO Base Address:  0x%08x (Size: %u bytes)\n",
                    dev->res.mmio_base, dev->res.mmio_size);
         }
-        if (dev->res.irq != 0) {
+        if (dev->res.irq > 0 && dev->res.irq < 255) {
             printf("  IRQ Line:           %u\n", dev->res.irq);
         }
-        if (dev->res.size_bytes != 0) {
-            char sz[32];
-            format_size(dev->res.size_bytes, sz, sizeof(sz));
-            printf("  Capacity / Size:    %s (%llu bytes)\n", sz, dev->res.size_bytes);
+        if (dev->res.size_bytes != 0 && dev->type != DEVICE_TYPE_CPU) {
+            char *sz = format_size_dynamic(dev->res.size_bytes);
+            printf("  Capacity / Size:    %s (%llu bytes)\n", sz ? sz : "Unknown", dev->res.size_bytes);
+            if (sz) kfree(sz);
         }
         return;
     }
@@ -2495,6 +2628,7 @@ static void builtin_hardware(int argc, char **argv) {
         printf("    - Video Adapters:     %u\n", device_get_count_by_type(DEVICE_TYPE_VIDEO));
         printf("    - System Controllers: %u\n", device_get_count_by_type(DEVICE_TYPE_SYSTEM));
         printf("    - USB Controllers:    %u\n", device_get_count_by_type(DEVICE_TYPE_USB));
+        printf("    - Unknown / Other:    %u\n", device_get_count_by_type(DEVICE_TYPE_UNKNOWN));
         return;
     }
 
@@ -2537,12 +2671,14 @@ static void builtin_storage(int argc, char **argv) {
     }
 
     if (strcmp(argv[1], "create") == 0) {
-        const char *uuid = (argc > 2) ? argv[2] : "IPO_STORAGE_POOL";
+        const char *uuid = (argc > 2) ? argv[2] : NULL;
         const char *dev = (argc > 3) ? argv[3] : NULL;
         if (dev) {
-            printf("Creating persistent storage pool '%s' on device '%s'...\n", uuid, dev);
-        } else {
+            printf("Creating persistent storage pool '%s' on device '%s'...\n", uuid ? uuid : "default", dev);
+        } else if (uuid) {
             printf("Creating persistent storage pool '%s'...\n", uuid);
+        } else {
+            printf("Creating persistent storage pool...\n");
         }
         int res = storage_pool_create_ex(uuid, dev);
         if (res == 0) {
@@ -2567,7 +2703,7 @@ static void builtin_storage(int argc, char **argv) {
         }
         int res = storage_pool_add_device(bdev);
         if (res == 0) {
-            printf("Successfully attached '%s' to storage pool.\n", argv[2]);
+            printf("Successfully attached '%s' to storage pool.\n", bdev->name ? bdev->name : argv[2]);
         } else {
             printf("Failed to add '%s' to storage pool (error %d).\n", argv[2], res);
         }
@@ -2654,11 +2790,11 @@ static void builtin_drivers(int argc, char **argv) {
         }
         kmod_t *mod = (id > 0) ? kmod_find_by_id(id) : kmod_find_by_name(argv[2]);
         if (mod) {
-            printf("=== Dynamic Driver Module: %s ===\n", mod->name);
+            printf("=== Dynamic Driver Module: %s ===\n", (mod->name && mod->name[0]) ? mod->name : "Unknown");
             printf("  Module ID:   %u\n", mod->id);
             printf("  Author:      %s\n", (mod->author && mod->author[0]) ? mod->author : "Unknown");
-            printf("  Version:     %s\n", (mod->version && mod->version[0]) ? mod->version : "1.0");
-            printf("  Description: %s\n", (mod->description && mod->description[0]) ? mod->description : "N/A");
+            printf("  Version:     %s\n", (mod->version && mod->version[0]) ? mod->version : "Unknown");
+            printf("  Description: %s\n", (mod->description && mod->description[0]) ? mod->description : "Unknown");
             printf("  ABI Version: 0x%04x\n", mod->abi_version);
             printf("  Memory Base: %p (%u bytes)\n", mod->image_base, (uint32_t)mod->image_size);
             printf("  References:  %u\n", mod->ref_count);
@@ -2670,12 +2806,12 @@ static void builtin_drivers(int argc, char **argv) {
         if (d) {
             printf("=== %s Driver: %s ===\n",
                    (d->flags & DRIVER_FLAG_KERNEL) ? "Built-in Kernel" : "Userland Resident",
-                   d->name);
-            printf("  Description: %s\n", d->description ? d->description : "N/A");
+                   (d->name && d->name[0]) ? d->name : "Unknown");
+            printf("  Description: %s\n", (d->description && d->description[0]) ? d->description : "Unknown");
             printf("  Type:        %s\n", (d->flags & DRIVER_FLAG_KERNEL) ? "Kernel Core" : "Userland Process");
             if (d->owner && process_is_valid((process_t *)d->owner)) {
                 process_t *p = (process_t *)d->owner;
-                printf("  Owner PID:   %u (%s)\n", p->pid, p->name ? p->name : "unnamed");
+                printf("  Owner PID:   %u (%s)\n", p->pid, (p->name && p->name[0]) ? p->name : "Unknown");
             }
             printf("  Flags:       0x%08x (%s)\n",
                    d->flags, (d->flags & DRIVER_FLAG_ACTIVE) ? "ACTIVE" : "REGISTERED");
@@ -2857,13 +2993,13 @@ int try_execute_command(const char *cmdline) {
         size_t redir_len = 0;
         stdout_redirect_end(&redir_buf, &redir_len);
 
-        char target_path[1024];
-        make_abs_path(redir_file, target_path, sizeof(target_path));
+        char *target_path = make_abs_path_dyn(redir_file);
 
-        if (!ipo_fs_write_text(target_path, redir_buf ? redir_buf : "", append_mode)) {
+        if (!ipo_fs_write_text(target_path ? target_path : redir_file, redir_buf ? redir_buf : "", append_mode)) {
             printf("redirection: failed to write to '%s'\n", redir_file);
         }
 
+        if (target_path) kfree(target_path);
         if (redir_buf) kfree(redir_buf);
         kfree(clean_cmd);
         kfree(redir_file);

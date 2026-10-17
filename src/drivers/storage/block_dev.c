@@ -15,7 +15,7 @@ void block_dev_init(void) {
     s_block_dev_head = NULL;
     s_next_bdev_id = 1;
     s_bdev_initialized = true;
-    serial_printf("[block_dev] Subsystem initialized.\n");
+    printf("[block_dev] Subsystem initialized.\n");
 }
 
 int block_dev_register(block_device_t *bdev) {
@@ -129,6 +129,36 @@ block_device_t *block_dev_get(const char *name) {
         }
         curr = curr->next;
     }
+
+    /* Also allow lookup by numeric index ("0", "1") or "ata0", "ata1" */
+    const char *num_str = NULL;
+    if (name[0] >= '0' && name[0] <= '9') {
+        num_str = name;
+    } else if (name[0] == 'a' && name[1] == 't' && name[2] == 'a' && name[3] >= '0' && name[3] <= '9') {
+        num_str = name + 3;
+    }
+    if (num_str) {
+        uint32_t idx = 0;
+        bool valid_num = true;
+        for (size_t i = 0; num_str[i] != '\0'; i++) {
+            if (num_str[i] < '0' || num_str[i] > '9') {
+                valid_num = false;
+                break;
+            }
+            idx = idx * 10u + (uint32_t)(num_str[i] - '0');
+        }
+        if (valid_num) {
+            curr = s_block_dev_head;
+            while (curr) {
+                if ((uint32_t)(uintptr_t)curr->priv_data == idx) {
+                    spin_unlock(&s_block_dev_lock);
+                    return curr;
+                }
+                curr = curr->next;
+            }
+        }
+    }
+
     spin_unlock(&s_block_dev_lock);
     return NULL;
 }

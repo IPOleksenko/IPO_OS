@@ -9,6 +9,7 @@
 void print_header(void);
 
 void terminal_initialize(void);
+void terminal_clear_buffer(void);
 void terminal_clear_command_history(void);
 void terminal_lock_input(void);
 void terminal_unlock_input(void);

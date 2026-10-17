@@ -10,7 +10,7 @@
 
 void sound_init(void) {
     pit_init(0);  /* Just initialize PIT structure */
-    serial_printf("[sound] PC speaker audio driver initialized.\n");
+    printf("[sound] PC speaker audio driver initialized.\n");
 }
 
 void sound_play(uint32_t frequency) {

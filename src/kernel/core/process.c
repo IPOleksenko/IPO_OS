@@ -2299,7 +2299,7 @@ void process_init(void) {
     allocated_blocks = NULL;
     process_sync_shared_context();
     
-    serial_printf("[process] Process manager initialized (capacity: %llu MB).\n", get_process_heap_capacity() / (1024 * 1024));
+    printf("[process] Process manager initialized (capacity: %llu MB).\n", get_process_heap_capacity() / (1024 * 1024));
 }
 
 /**

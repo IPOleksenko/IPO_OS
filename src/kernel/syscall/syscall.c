@@ -2824,7 +2824,7 @@ void syscall_init(void) {
         0x8Eu);
 
     syscall_load_idt();
-    serial_printf("[syscall] System call dispatch table initialized (IDT vector 0x80 registered).\n");
+    printf("[syscall] System call dispatch table initialized (IDT vector 0x80 registered).\n");
 }
 
 uint32_t syscall_dispatch(uint32_t num,

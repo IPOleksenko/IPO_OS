@@ -497,17 +497,9 @@ static int parse_gpt(block_device_t *bdev, partition_table_t *table) {
                     tmp_name[c] = '\0';
                     if (tmp_name[0] != '\0') {
                         partition_info_set_name(&p, tmp_name);
-                    } else {
-                        char fallback[64];
-                        snprintf(fallback, sizeof(fallback), "GPT-Part-%u", p.part_number);
-                        partition_info_set_name(&p, fallback);
                     }
                     kfree(tmp_name);
                 }
-            } else {
-                char fallback[64];
-                snprintf(fallback, sizeof(fallback), "GPT-Part-%u", p.part_number);
-                partition_info_set_name(&p, fallback);
             }
 
             partition_table_add(table, &p);
@@ -617,21 +609,22 @@ int partition_scan(block_device_t *bdev, partition_table_t *out_table) {
         p.flags = (e->status & 0x80) ? 1 : 0;
         p.valid = true;
 
-        /* Dynamically probe partition first sector for filesystem signature */
+        /* Dynamically probe partition first sector for ASCII filesystem signature */
         uint8_t pbuf[512];
-        bool probed = false;
         if (block_dev_read(bdev, e->lba_start, 1, pbuf)) {
-            if (memcmp(pbuf, "IPO_FS", 6) == 0) {
-                char tmp[64];
-                snprintf(tmp, sizeof(tmp), "IPO_FS (0x%02X)", e->type);
-                partition_info_set_name(&p, tmp);
-                probed = true;
+            size_t sig_len = 0;
+            while (sig_len < 16 && pbuf[sig_len] >= 0x21 && pbuf[sig_len] <= 0x7E) {
+                sig_len++;
             }
-        }
-        if (!probed) {
-            char tmp[64];
-            snprintf(tmp, sizeof(tmp), "Partition %u (0x%02X)", p.part_number, e->type);
-            partition_info_set_name(&p, tmp);
+            if (sig_len >= 3) {
+                char *sig = (char *)kmalloc(sig_len + 1);
+                if (sig) {
+                    memcpy(sig, pbuf, sig_len);
+                    sig[sig_len] = '\0';
+                    partition_info_set_name(&p, sig);
+                    kfree(sig);
+                }
+            }
         }
 
         partition_table_add(out_table, &p);
@@ -778,14 +771,22 @@ void partition_print_table(const partition_table_t *table) {
         uint64_t end_lba = p->start_lba + p->sector_count - 1;
         uint32_t size_mb = (uint32_t)((p->sector_count * 512ull) / (1024ull * 1024ull));
 
-        printf("    %u   %s   %-15llu %-15llu %-11llu %-10u %s\n",
+        printf("    %u   %s   %-15llu %-15llu %-11llu %-10u ",
                p->part_number,
                (p->flags & 1) ? "*" : " ",
                p->start_lba,
                end_lba,
                p->sector_count,
-               size_mb,
-               p->name ? p->name : "");
+               size_mb);
+        if (table->type == PARTITION_TABLE_MBR) {
+            if (p->name && p->name[0]) {
+                printf("0x%02X (%s)\n", p->mbr_type, p->name);
+            } else {
+                printf("0x%02X (Unknown)\n", p->mbr_type);
+            }
+        } else {
+            printf("%s\n", (p->name && p->name[0]) ? p->name : "Unknown");
+        }
     }
 }
 

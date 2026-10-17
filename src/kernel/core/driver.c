@@ -397,14 +397,6 @@ char driver_dispatch_char_output(char c) {
     return res;
 }
 
-void driver_init_system_drivers(void) {
-    /* Built-in system hardware (PIT, Keyboard, Mouse, VGA, ATA, Sound, PCI)
-     * are monolithic core components initialized directly by the kernel.
-     * We do not register dummy placeholders here so that 'drivers' only
-     * reports genuinely loaded dynamic modules and userland drivers. */
-    serial_printf("[driver] Built-in system drivers ready.\n");
-}
-
 int driver_set_description(const char *name, const char *new_desc) {
     if (name == NULL || new_desc == NULL) return -1;
     driver_t *drv = driver_find(name);

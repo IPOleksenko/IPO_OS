@@ -60,6 +60,7 @@ uint16_t net_checksum(const void *data, size_t len);
 
 /* String conversion */
 void ip_to_str(ip4_addr_t ip, char *buf, size_t size);
+char *ip_to_str_dyn(ip4_addr_t ip);
 bool str_to_ip(const char *str, ip4_addr_t *out_ip);
 
 /* Net initialization and polling */

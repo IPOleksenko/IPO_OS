@@ -46,7 +46,6 @@ uint32_t driver_count(void);
 uint32_t driver_count_kernel(void);
 uint32_t driver_count_user(void);
 void driver_print_list(void);
-void driver_init_system_drivers(void);
 int driver_set_description(const char *name, const char *new_desc);
 
 /* Kernel dispatchers */

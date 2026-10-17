@@ -326,7 +326,7 @@ void vga_save_text_state(void) {
     __asm__ volatile("push %0; popf" : : "r"(font_flags));
 
     text_state_saved = true;
-    serial_printf("[vga] Text mode hardware state saved (cursor_pos=%u, visible=%d).\n", saved_cursor_pos, (int)saved_cursor_visible);
+    printf("[vga] Text mode hardware state saved (cursor_pos=%u, visible=%d).\n", saved_cursor_pos, (int)saved_cursor_visible);
 }
 
 void vga_set_mode_13h_hardware(void) {

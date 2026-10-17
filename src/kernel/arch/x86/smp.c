@@ -1,6 +1,7 @@
 #include <kernel/smp.h>
 #include <memory/kmalloc.h>
 #include <memory/memory_map.h>
+#include <system/timer.h>
 #include <stdio.h>
 #include <string.h>
 #include <ioport.h>
@@ -985,7 +986,7 @@ void smp_init(void) {
         arch_status.cross_core_scheduler = SMP_STATUS_BLOCKED;
     }
 
-    serial_printf("[smp] SMP Initialization Complete: %u core(s) detected, %u core(s) active\n",
+    printf("[smp] SMP Initialization Complete: %u core(s) detected, %u core(s) active\n",
                   cpu_count, active_cpu_count);
 
     smp_print_summary();
@@ -1001,6 +1002,9 @@ uint32_t smp_get_active_cpu_count(void) {
 
 const cpu_info_t *smp_get_cpu_info(uint32_t cpu_id) {
     if (cpu_id >= cpu_count) return NULL;
+    if (cpus[cpu_id].is_bsp) {
+        cpus[cpu_id].ticks = timer_millis();
+    }
     return &cpus[cpu_id];
 }
 
@@ -1115,7 +1119,7 @@ void smp_get_cpu_vendor(char *buf, size_t max_len) {
     if (!buf || max_len == 0) return;
     buf[0] = '\0';
     if (!check_cpuid_supported()) {
-        strncpy(buf, "Generic x86", max_len - 1);
+        strncpy(buf, "Unknown", max_len - 1);
         buf[max_len - 1] = '\0';
         return;
     }
@@ -1127,7 +1131,7 @@ void smp_get_cpu_vendor(char *buf, size_t max_len) {
     *(uint32_t *)(vendor + 4) = edx;
     *(uint32_t *)(vendor + 8) = ecx;
     vendor[12] = '\0';
-    strncpy(buf, vendor, max_len - 1);
+    strncpy(buf, vendor[0] ? vendor : "Unknown", max_len - 1);
     buf[max_len - 1] = '\0';
     kfree(vendor);
 }
@@ -1136,7 +1140,7 @@ void smp_get_cpu_brand(char *buf, size_t max_len) {
     if (!buf || max_len == 0) return;
     buf[0] = '\0';
     if (!check_cpuid_supported()) {
-        strncpy(buf, "Processor", max_len - 1);
+        strncpy(buf, "Unknown", max_len - 1);
         buf[max_len - 1] = '\0';
         return;
     }
@@ -1166,16 +1170,8 @@ void smp_get_cpu_brand(char *buf, size_t max_len) {
         }
     }
 
-    /* Fallback if extended brand string leaf is not present */
-    size_t vlen = 64;
-    char *vendor = (char *)kmalloc(vlen);
-    if (vendor) {
-        smp_get_cpu_vendor(vendor, vlen);
-        uint32_t family = 0, model = 0, stepping = 0;
-        smp_get_cpu_model_info(&family, &model, &stepping);
-        snprintf(buf, max_len, "%s Family %u Model %u Stepping %u", vendor, family, model, stepping);
-        kfree(vendor);
-    }
+    strncpy(buf, "Unknown", max_len - 1);
+    buf[max_len - 1] = '\0';
 }
 
 void smp_get_cpu_model_info(uint32_t *family, uint32_t *model, uint32_t *stepping) {
@@ -1211,7 +1207,7 @@ void smp_get_cpu_features_str(char *buf, size_t max_len) {
     if (!buf || max_len == 0) return;
     buf[0] = '\0';
     if (!check_cpuid_supported()) {
-        strncpy(buf, "None", max_len - 1);
+        strncpy(buf, "Unknown", max_len - 1);
         buf[max_len - 1] = '\0';
         return;
     }
@@ -1219,7 +1215,7 @@ void smp_get_cpu_features_str(char *buf, size_t max_len) {
     uint32_t eax, ebx, ecx, edx;
     cpuid(0, &eax, &ebx, &ecx, &edx);
     if (eax < 1) {
-        strncpy(buf, "CPUID v0", max_len - 1);
+        strncpy(buf, "Unknown", max_len - 1);
         buf[max_len - 1] = '\0';
         return;
     }
@@ -1262,4 +1258,28 @@ void smp_get_cpu_features_str(char *buf, size_t max_len) {
             buf[pos] = '\0';
         }
     }
+}
+
+char *smp_get_cpu_vendor_dyn(void) {
+    size_t sz = 64;
+    char *buf = (char *)kmalloc(sz);
+    if (!buf) return NULL;
+    smp_get_cpu_vendor(buf, sz);
+    return buf;
+}
+
+char *smp_get_cpu_brand_dyn(void) {
+    size_t sz = 128;
+    char *buf = (char *)kmalloc(sz);
+    if (!buf) return NULL;
+    smp_get_cpu_brand(buf, sz);
+    return buf;
+}
+
+char *smp_get_cpu_features_str_dyn(void) {
+    size_t sz = 512;
+    char *buf = (char *)kmalloc(sz);
+    if (!buf) return NULL;
+    smp_get_cpu_features_str(buf, sz);
+    return buf;
 }

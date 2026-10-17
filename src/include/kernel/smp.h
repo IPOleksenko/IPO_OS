@@ -83,8 +83,11 @@ void smp_broadcast_task(smp_task_fn_t fn, void *arg);
 
 /* Extended CPU capability queries */
 void smp_get_cpu_vendor(char *buf, size_t max_len);
+char *smp_get_cpu_vendor_dyn(void);
 void smp_get_cpu_brand(char *buf, size_t max_len);
+char *smp_get_cpu_brand_dyn(void);
 void smp_get_cpu_features_str(char *buf, size_t max_len);
+char *smp_get_cpu_features_str_dyn(void);
 void smp_get_cpu_model_info(uint32_t *family, uint32_t *model, uint32_t *stepping);
 
 #endif /* KERNEL_SMP_H */

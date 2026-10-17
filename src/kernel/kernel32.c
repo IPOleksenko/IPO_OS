@@ -10,7 +10,6 @@
 #include <kernel/process.h>
 #include <syscall.h>
 #include <system/timer.h>
-#include <kernel/driver.h>
 #include <driver/input/mouse.h>
 #include <net/net.h>
 #include <memory/memory_map.h>
@@ -123,57 +122,29 @@ void kmain(void) {
 
     terminal_initialize();
 
-    printf("[kernel] Initializing memory map (BIOS E820)...\n");
     memory_map_init();
-    printf("[kernel] Memory map initialized.\n");
 
-    printf("[kernel] Initializing process manager...\n");
     process_init();
-    printf("[kernel] Process manager initialized.\n");
 
-    printf("[kernel] Initializing system calls...\n");
     syscall_init();
-    printf("[kernel] System calls initialized.\n");
 
-    printf("[kernel] Initializing timer & PIT...\n");
     timer_init();
-    printf("[kernel] Timer initialized.\n");
 
-    printf("[kernel] Initializing Symmetric Multiprocessing (SMP)...\n");
     smp_init();
-    printf("[kernel] SMP initialization complete.\n");
 
-    printf("[kernel] Initializing async scheduler...\n");
     async_scheduler_init();
-    printf("[kernel] Async scheduler initialized.\n");
 
-    printf("[kernel] Initializing sound...\n");
     sound_init();
-    printf("[kernel] Sound initialized.\n");
     
-    printf("[kernel] Initializing block devices...\n");
     block_dev_init();
-    printf("[kernel] Block devices initialized.\n");
 
-    printf("[kernel] Initializing ATA storage...\n");
     ata_init();
-    printf("[kernel] ATA storage initialized.\n");
 
-    printf("[kernel] Initializing unified storage pool...\n");
     storage_pool_init();
-    printf("[kernel] Unified storage pool initialized.\n");
 
-    printf("[kernel] Initializing dynamic driver subsystem (kmod)...\n");
     kmod_init();
-    printf("[kernel] Dynamic driver subsystem initialized.\n");
     
-    printf("[kernel] Saving text mode hardware state...\n");
-    vga_save_text_state();
-    printf("[kernel] Text mode hardware state saved.\n");
-
-    printf("[kernel] Initializing PS/2 mouse...\n");
     mouse_init();
-    printf("[kernel] PS/2 mouse initialized.\n");
 
     const net_config_t net_config = {
         .icmp_queue_capacity = 8,
@@ -186,27 +157,15 @@ void kmain(void) {
         printf("[net] Failed to initialize network buffers\n");
     }
 
-    printf("[kernel] Initializing system drivers...\n");
-    driver_init_system_drivers();
-    printf("[kernel] System drivers initialized.\n");
-
-    printf("[kernel] Initializing unified device registry...\n");
     device_init();
-    printf("[kernel] Unified device registry initialized.\n");
 
-    printf("[kernel] Initializing IPO_FS internal state...\n");
     ipo_fs_init();
-    printf("[kernel] IPO_FS internal state initialized.\n");
 
-    printf("[kernel] Mounting filesystem...\n");
     ensure_fs_mounted();
-    printf("[kernel] Filesystem mount check complete.\n");
-
-    /* Automatically load system console font database if available */
-    vga_load_cyrillic_font("/fonts/default.fnt");
 
     play_startup_sound();
-    terminal_initialize();
+    terminal_clear_buffer();
+    terminal_clear_command_history();
     printf("Type \"help\" on the keyboard to view commands, shortcuts, and OS features.\n\n");
 
     system_set_state(SYSTEM_STATE_TERMINAL_IDLE);

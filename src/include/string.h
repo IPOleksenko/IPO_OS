@@ -32,6 +32,7 @@ int parse_int(const char *str, int *out_val);
 int parse_uint(const char *str, uint32_t *out_val);
 int parse_hex(const char *str, uint32_t *out_val);
 int format_size(uint64_t bytes, char *buf, size_t buf_size);
+char *format_size_dynamic(uint64_t bytes);
 
 /* Command argument tokenization */
 int cmdline_split(const char *cmdline, int *out_argc, char ***out_argv);

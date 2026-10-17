@@ -28,12 +28,19 @@ typedef struct {
     uint16_t heads;
     uint16_t sectors;
 
+    /* Hardware resources & sector size */
+    uint16_t io_base;
+    uint16_t ctrl_base;
+    uint8_t  irq;
+    uint32_t sector_size;
+
     /* Capacity */
     uint64_t capacity_sectors; /* Total sectors (LBA28 / LBA48) */
 
     /* Identification strings */
     char *model;       /* Dynamically allocated, NUL-terminated */
     char *serial;      /* Dynamically allocated, NUL-terminated */
+    char *firmware;    /* Dynamically allocated, NUL-terminated */
 
 } ata_device_t;
 

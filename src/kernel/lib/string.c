@@ -150,6 +150,10 @@ void print_padded(const char *s, int width) {
             len++;
         }
     }
+    if (len >= width) {
+        putchar(' ');
+        return;
+    }
     while (len < width) {
         putchar(' ');
         len++;
@@ -249,7 +253,7 @@ int format_size(uint64_t bytes, char *buf, size_t buf_size) {
     if (!buf || buf_size == 0) return 0;
     if (bytes >= (1024ull * 1024ull * 1024ull)) {
         uint32_t gb = (uint32_t)(bytes / (1024ull * 1024ull * 1024ull));
-        uint32_t rem_mb = (uint32_t)((bytes % (1024ull * 1024ull * 1024ull)) / (102ull * 1024ull * 1024ull));
+        uint32_t rem_mb = (uint32_t)(((bytes % (1024ull * 1024ull * 1024ull)) * 10ull) / (1024ull * 1024ull * 1024ull));
         return snprintf(buf, buf_size, "%u.%u GB", gb, rem_mb);
     } else if (bytes >= (1024ull * 1024ull)) {
         uint32_t mb = (uint32_t)(bytes / (1024ull * 1024ull));
@@ -260,6 +264,14 @@ int format_size(uint64_t bytes, char *buf, size_t buf_size) {
     } else {
         return snprintf(buf, buf_size, "%u B", (uint32_t)bytes);
     }
+}
+
+char *format_size_dynamic(uint64_t bytes) {
+    size_t sz = 64;
+    char *buf = (char *)kmalloc(sz);
+    if (!buf) return NULL;
+    format_size(bytes, buf, sz);
+    return buf;
 }
 
 int cmdline_split(const char *cmdline, int *out_argc, char ***out_argv) {

@@ -1,4 +1,5 @@
 #include <driver/ata/ata.h>
+#include <driver/net/pci.h>
 #include <driver/storage/block_dev.h>
 #include <storage/storage_pool.h>
 #include <memory/kmalloc.h>
@@ -41,6 +42,7 @@ static size_t identify_buf_size = 0;
 typedef struct {
     uint16_t base;
     uint16_t ctrl;
+    uint8_t  irq;
 } ata_channel_info_t;
 
 static ata_channel_info_t *ata_channels = NULL;
@@ -81,7 +83,12 @@ static inline uint16_t identify_buf_get(size_t idx) {
     return 0;
 }
 
-static bool ata_register_channel(uint16_t base, uint16_t ctrl) {
+static bool ata_register_channel(uint16_t base, uint16_t ctrl, uint8_t irq) {
+    for (uint32_t i = 0; i < ata_channel_count; i++) {
+        if (ata_channels[i].base == base && ata_channels[i].ctrl == ctrl) {
+            return true;
+        }
+    }
     if (ata_channel_count >= ata_channel_capacity) {
         uint32_t new_cap = (ata_channel_capacity == 0) ? 4 : (ata_channel_capacity * 2);
         ata_channel_info_t *new_arr = (ata_channel_info_t *)krealloc(ata_channels, new_cap * sizeof(ata_channel_info_t));
@@ -91,6 +98,7 @@ static bool ata_register_channel(uint16_t base, uint16_t ctrl) {
     }
     ata_channels[ata_channel_count].base = base;
     ata_channels[ata_channel_count].ctrl = ctrl;
+    ata_channels[ata_channel_count].irq  = irq;
     ata_channel_count++;
     return true;
 }
@@ -107,6 +115,13 @@ static inline uint16_t ata_channel_ctrl(uint8_t channel) {
         return ata_channels[channel].ctrl;
     }
     return (channel == 0) ? ATA_PRIMARY_CTRL : 0x376;
+}
+
+static inline uint8_t ata_channel_irq(uint8_t channel) {
+    if (channel < ata_channel_count && ata_channels) {
+        return ata_channels[channel].irq;
+    }
+    return (channel == 0) ? 14 : 15;
 }
 
 static ata_device_t *ata_device_allocate(void) {
@@ -218,9 +233,25 @@ static bool ata_identify(uint8_t channel, uint8_t drive) {
     dev->channel = channel;
     dev->drive = drive;
     dev->type = ATA_DEVICE_PATA;
+    dev->io_base = base;
+    dev->ctrl_base = ctrl;
+    dev->irq = ata_channel_irq(channel);
 
-    dev->serial = ata_read_string(10, 10);
-    dev->model = ata_read_string(27, 20);
+    dev->cylinders = identify_buf_get(1);
+    dev->heads     = identify_buf_get(3);
+    dev->sectors   = identify_buf_get(6);
+
+    dev->serial   = ata_read_string(10, 10);
+    dev->firmware = ata_read_string(23, 4);
+    dev->model    = ata_read_string(27, 20);
+
+    uint16_t w106 = identify_buf_get(106);
+    if ((w106 & 0xC000u) == 0x4000u && (w106 & (1u << 12))) {
+        uint32_t words_per_sec = (uint32_t)identify_buf_get(117) | ((uint32_t)identify_buf_get(118) << 16);
+        dev->sector_size = words_per_sec ? (words_per_sec * 2u) : (uint32_t)(identify_buf_size * sizeof(uint16_t));
+    } else {
+        dev->sector_size = (uint32_t)(identify_buf_size * sizeof(uint16_t));
+    }
 
     if (identify_buf_get(83) & (1 << 10)) {
         dev->capacity_sectors =
@@ -255,14 +286,15 @@ static void ata_register_block_devices(void) {
         ata_device_t *d = &ata_devices[i];
         if (!d->present) continue;
 
-        char dev_name[64];
-        snprintf(dev_name, sizeof(dev_name), "ata%u", (unsigned)i);
+        const char *hw_name = (d->serial && d->serial[0]) ? d->serial :
+                              ((d->model && d->model[0]) ? d->model : NULL);
+        if (!hw_name) continue;
 
         block_device_t bdev;
         memset(&bdev, 0, sizeof(bdev));
-        bdev.name = dev_name;
+        bdev.name = (char *)hw_name;
         bdev.total_sectors = d->capacity_sectors;
-        bdev.sector_size = 512;
+        bdev.sector_size = d->sector_size;
         bdev.flags = (i == 0) ? BLOCK_DEV_BOOTABLE : 0;
         bdev.ops = &s_ata_bdev_ops;
         bdev.priv_data = (void *)(uintptr_t)i;
@@ -274,19 +306,37 @@ void ata_init(void) {
     ata_device_count = 0;
 
     if (ata_channel_count == 0) {
-        ata_register_channel(ATA_PRIMARY_BASE, ATA_PRIMARY_CTRL);
-        ata_register_channel(0x170, 0x376);
+        if (pci_get_count() == 0) {
+            pci_scan_all(NULL, NULL);
+        }
+        uint32_t pcount = pci_get_count();
+        for (uint32_t i = 0; i < pcount; i++) {
+            const pci_device_t *p = pci_get_device(i);
+            if (!p || p->class_code != 0x01 || p->subclass != 0x01) continue;
+            uint16_t b0 = (p->bar_count > 0 && (p->bar[0] & ~3u) != 0) ? (uint16_t)(p->bar[0] & ~3u) : ATA_PRIMARY_BASE;
+            uint16_t c0 = (p->bar_count > 1 && (p->bar[1] & ~3u) != 0) ? (uint16_t)((p->bar[1] & ~3u) + 2) : ATA_PRIMARY_CTRL;
+            uint8_t irq0 = (p->prog_if & 0x01) ? p->irq : 14;
+            ata_register_channel(b0, c0, irq0);
+
+            uint16_t b1 = (p->bar_count > 2 && (p->bar[2] & ~3u) != 0) ? (uint16_t)(p->bar[2] & ~3u) : 0x170;
+            uint16_t c1 = (p->bar_count > 3 && (p->bar[3] & ~3u) != 0) ? (uint16_t)((p->bar[3] & ~3u) + 2) : 0x376;
+            uint8_t irq1 = (p->prog_if & 0x04) ? p->irq : 15;
+            ata_register_channel(b1, c1, irq1);
+        }
+        if (ata_channel_count == 0) {
+            ata_register_channel(ATA_PRIMARY_BASE, ATA_PRIMARY_CTRL, 14);
+            ata_register_channel(0x170, 0x376, 15);
+        }
     }
 
     for (uint32_t c = 0; c < ata_channel_count; c++) {
-        const char *ch_name = (c == 0) ? "primary" : (c == 1) ? "secondary" : "extended";
-        serial_printf("ATA: scanning %s channel (base=0x%x, ctrl=0x%x)...\n",
-                      ch_name, (unsigned)ata_channels[c].base, (unsigned)ata_channels[c].ctrl);
+        printf("ATA: scanning channel %u (base=0x%x, ctrl=0x%x, irq=%u)...\n",
+                      (unsigned)c, (unsigned)ata_channels[c].base, (unsigned)ata_channels[c].ctrl, (unsigned)ata_channels[c].irq);
         ata_identify((uint8_t)c, 0); /* master */
         ata_identify((uint8_t)c, 1); /* slave */
     }
 
-    serial_printf("ATA: found %u device(s)\n", (unsigned)ata_device_count);
+    printf("ATA: found %u device(s)\n", (unsigned)ata_device_count);
     ata_print_devices();
 
     ata_register_block_devices();

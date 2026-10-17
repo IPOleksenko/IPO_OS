@@ -85,7 +85,7 @@ void async_scheduler_init(void)
     async_task_list = NULL;
     async_ticks = 0;
     async_initialized = true;
-    serial_printf("[async] Asynchronous task scheduler initialized.\n");
+    printf("[async] Asynchronous task scheduler initialized.\n");
 }
 
 

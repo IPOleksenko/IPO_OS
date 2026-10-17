@@ -1,18 +1,11 @@
 #include <kernel/device.h>
+#include <kernel/driver.h>
 #include <kernel/smp.h>
 #include <memory/kmalloc.h>
 #include <memory/memory_map.h>
 #include <driver/net/pci.h>
-#include <driver/net/rtl8139.h>
 #include <driver/ata/ata.h>
-#include <driver/sound.h>
-#include <driver/audio_core.h>
-#include <system/timer.h>
 #include <ioport.h>
-#include <net/net.h>
-#include <net/loopback.h>
-#include <system/pit.h>
-#include <driver/vbe_bga.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -253,29 +246,6 @@ device_node_t *device_register(const device_node_t *dev) {
 
     spin_lock(&s_device_lock);
 
-    /* Check if already registered by name */
-    device_node_t *existing = s_device_head;
-    while (existing) {
-        if (existing->name && dev->name && strcmp(existing->name, dev->name) == 0) {
-            /* Update existing entry */
-            existing->state = dev->state;
-            existing->type = dev->type;
-            existing->parent_id = dev->parent_id;
-            existing->capabilities = dev->capabilities;
-            if (dev->vendor) device_node_set_vendor(existing, dev->vendor);
-            if (dev->model)  device_node_set_model(existing, dev->model);
-            if (dev->description) device_node_set_description(existing, dev->description);
-            if (dev->driver_name) device_node_set_driver_name(existing, dev->driver_name);
-            device_resources_copy(&existing->res, &dev->res);
-            existing->driver_ptr = dev->driver_ptr;
-            existing->ops = dev->ops;
-            existing->priv_data = dev->priv_data;
-            spin_unlock(&s_device_lock);
-            return existing;
-        }
-        existing = existing->next;
-    }
-
     /* Allocate dynamic node */
     device_node_t *node = (device_node_t *)kmalloc(sizeof(device_node_t));
     if (!node) {
@@ -415,70 +385,39 @@ const device_node_t *device_get_list(void) {
  * ------------------------------------------------------------- */
 
 static void scan_cpu_subsystem(void) {
-    char vendor[32];
-    char brand[64];
-    smp_get_cpu_vendor(vendor, sizeof(vendor));
-    smp_get_cpu_brand(brand, sizeof(brand));
+    char *vendor = smp_get_cpu_vendor_dyn();
+    char *brand = smp_get_cpu_brand_dyn();
+    char *features = smp_get_cpu_features_str_dyn();
 
     uint32_t cpu_count = smp_get_cpu_count();
-    if (cpu_count == 0) cpu_count = 1;
-
     for (uint32_t i = 0; i < cpu_count; i++) {
         const cpu_info_t *info = smp_get_cpu_info(i);
+        if (!info) continue;
+
         device_node_t dev;
         device_node_init(&dev);
 
         dev.type = DEVICE_TYPE_CPU;
-        dev.state = (info && info->is_online) ? DEVICE_STATE_ACTIVE : DEVICE_STATE_INITIALIZED;
-        char name[32];
-        snprintf(name, sizeof(name), "cpu%u", i);
-        device_node_set_name(&dev, name);
+        dev.state = info->is_online ? DEVICE_STATE_ACTIVE : DEVICE_STATE_INITIALIZED;
+        device_node_set_name(&dev, (brand && brand[0]) ? brand : vendor);
         device_node_set_vendor(&dev, vendor);
         device_node_set_model(&dev, brand);
-
-        uint32_t lapic_id = info ? info->lapic_id : i;
-        bool is_bsp = info ? info->is_bsp : (i == 0);
-        char desc[128];
-        snprintf(desc, sizeof(desc),
-                 "x86 Logical Core %u [%s, LAPIC ID %u]",
-                 i, is_bsp ? "BSP Primary" : "AP Secondary", lapic_id);
-        device_node_set_description(&dev, desc);
+        device_node_set_description(&dev, (features && features[0]) ? features : brand);
 
         dev.res.bus_type = BUS_TYPE_INTERNAL;
         dev.res.mmio_base = smp_get_lapic_base();
-        dev.res.mmio_size = 0x1000;
-        dev.res.size_bytes = (uint64_t)cpu_count;
 
-        device_node_set_driver_name(&dev, "smp_core");
         device_register(&dev);
         device_node_free(&dev);
     }
+
+    if (vendor) kfree(vendor);
+    if (brand) kfree(brand);
+    if (features) kfree(features);
 }
 
 static void scan_memory_subsystem(void) {
     uint32_t region_count = memory_map_get_region_count();
-    uint64_t total_ram = memory_map_get_total_ram();
-
-    if (region_count == 0) {
-        /* Single fallback pool */
-        device_node_t dev;
-        device_node_init(&dev);
-        dev.type = DEVICE_TYPE_MEMORY;
-        dev.state = DEVICE_STATE_ACTIVE;
-        device_node_set_name(&dev, "ram0");
-        device_node_set_vendor(&dev, "System BIOS");
-        device_node_set_model(&dev, "System RAM");
-        char desc[64];
-        snprintf(desc, sizeof(desc), "Total RAM: %u MB", (uint32_t)(total_ram / (1024 * 1024)));
-        device_node_set_description(&dev, desc);
-        dev.res.bus_type = BUS_TYPE_INTERNAL;
-        dev.res.mmio_base = 0x00100000;
-        dev.res.size_bytes = total_ram;
-        device_node_set_driver_name(&dev, "memory_map");
-        device_register(&dev);
-        device_node_free(&dev);
-        return;
-    }
 
     for (uint32_t i = 0; i < region_count; i++) {
         const memory_region_t *reg = memory_map_get_region(i);
@@ -488,24 +427,16 @@ static void scan_memory_subsystem(void) {
         device_node_init(&dev);
         dev.type = DEVICE_TYPE_MEMORY;
         dev.state = reg->is_usable ? DEVICE_STATE_ACTIVE : DEVICE_STATE_INITIALIZED;
-        char name[32];
-        snprintf(name, sizeof(name), "ram%u", i);
-        device_node_set_name(&dev, name);
-        device_node_set_vendor(&dev, "BIOS E820");
-        char model[64];
-        snprintf(model, sizeof(model), "%s RAM Pool", reg->is_usable ? "Usable" : "Reserved");
-        device_node_set_model(&dev, model);
-        char desc[128];
-        snprintf(desc, sizeof(desc),
-                 "Base: 0x%08x, Size: %u KB, Used: %u KB",
-                 reg->base, reg->size / 1024u, reg->used / 1024u);
-        device_node_set_description(&dev, desc);
+
+        char *size_str = format_size_dynamic((uint64_t)reg->size);
+        device_node_set_name(&dev, size_str);
+        device_node_set_description(&dev, size_str);
+        if (size_str) kfree(size_str);
 
         dev.res.bus_type = BUS_TYPE_INTERNAL;
         dev.res.mmio_base = reg->base;
-        dev.res.mmio_size = reg->used;
+        dev.res.mmio_size = reg->size;
         dev.res.size_bytes = (uint64_t)reg->size;
-        device_node_set_driver_name(&dev, "memory_map");
 
         device_register(&dev);
         device_node_free(&dev);
@@ -522,7 +453,6 @@ static void scan_pci_subsystem(void) {
         device_node_t dev;
         device_node_init(&dev);
 
-        /* Identify category */
         if (pdev->class_code == 0x0C && pdev->subclass == 0x03) {
             dev.type = DEVICE_TYPE_USB;
         } else if (pdev->class_code == 0x01) {
@@ -537,23 +467,13 @@ static void scan_pci_subsystem(void) {
             dev.type = DEVICE_TYPE_PCI;
         }
 
-        char name[32];
-        snprintf(name, sizeof(name), "pci%02x:%02x.%x", pdev->bus, pdev->slot, pdev->func);
-        device_node_set_name(&dev, name);
-        device_node_set_vendor(&dev, pci_vendor_name(pdev->vendor_id));
-        device_node_set_model(&dev, pci_class_name(pdev->class_code, pdev->subclass));
+        uint16_t pci_cmd = pci_read_word(pdev->bus, pdev->slot, pdev->func, 0x04);
+        dev.state = (pci_cmd & 0x07u) ? DEVICE_STATE_ACTIVE : DEVICE_STATE_INITIALIZED;
 
-        /* Set default description */
-        char desc[160];
-        if (dev.type == DEVICE_TYPE_USB) {
-            snprintf(desc, sizeof(desc),
-                     "USB Host Controller (ProgIF 0x%02X) [0x%04x:0x%04x]",
-                     pdev->prog_if, pdev->vendor_id, pdev->device_id);
-        } else {
-            snprintf(desc, sizeof(desc), "%s [DevID 0x%04x:0x%04x IRQ %u]",
-                     dev.model ? dev.model : "PCI Device", pdev->vendor_id, pdev->device_id, pdev->irq);
-        }
-        device_node_set_description(&dev, desc);
+        device_node_set_name(&dev, pdev->device_name ? pdev->device_name : pdev->vendor_name);
+        device_node_set_vendor(&dev, pdev->vendor_name);
+        device_node_set_model(&dev, pdev->device_name);
+        device_node_set_description(&dev, pdev->device_name ? pdev->device_name : pdev->vendor_name);
 
         dev.res.bus_type = BUS_TYPE_PCI;
         dev.res.pci_bus = pdev->bus;
@@ -564,32 +484,15 @@ static void scan_pci_subsystem(void) {
         dev.res.pci_class = pdev->class_code;
         dev.res.pci_subclass = pdev->subclass;
         dev.res.pci_progif = pdev->prog_if;
-        for (int b = 0; b < 6; b++) device_resources_add_bar(&dev.res, pdev->bar[b]);
-        dev.res.irq = pdev->irq;
-
-        /* Extract primary I/O base or MMIO from BARs */
-        for (int b = 0; b < 6; b++) {
+        for (size_t b = 0; b < pdev->bar_count; b++) {
+            device_resources_add_bar(&dev.res, pdev->bar[b]);
             if (pdev->bar[b] & 1) {
                 if (dev.res.io_base == 0) dev.res.io_base = (uint16_t)(pdev->bar[b] & ~3u);
             } else if (pdev->bar[b] != 0) {
                 if (dev.res.mmio_base == 0) dev.res.mmio_base = pdev->bar[b] & ~0xFu;
             }
         }
-
-        /* Associate driver matching */
-        if (pdev->vendor_id == 0x10EC && pdev->device_id == 0x8139) {
-            device_node_set_driver_name(&dev, "rtl8139");
-            dev.state = rtl8139_is_present() ? DEVICE_STATE_ACTIVE : DEVICE_STATE_INITIALIZED;
-        } else if (pdev->class_code == 0x01 && pdev->subclass == 0x01) {
-            device_node_set_driver_name(&dev, "ata");
-            dev.state = DEVICE_STATE_ACTIVE;
-        } else if (pdev->class_code == 0x03) {
-            device_node_set_driver_name(&dev, "vga");
-            dev.state = DEVICE_STATE_ACTIVE;
-        } else {
-            device_node_set_driver_name(&dev, "pci_generic");
-            dev.state = DEVICE_STATE_INITIALIZED;
-        }
+        dev.res.irq = pdev->irq;
 
         device_register(&dev);
         device_node_free(&dev);
@@ -608,388 +511,459 @@ static void scan_storage_subsystem(void) {
 
         dev.type = DEVICE_TYPE_STORAGE;
         dev.state = DEVICE_STATE_ACTIVE;
-        char name[32];
-        snprintf(name, sizeof(name), "ata%u-%s",
-                 adev->channel, adev->drive ? "slave" : "master");
-        device_node_set_name(&dev, name);
-        device_node_set_vendor(&dev, "ATA/IDE Disk");
-        device_node_set_model(&dev, (adev->model && adev->model[0]) ? adev->model : "Generic Hard Disk");
-
-        uint64_t cap_bytes = adev->capacity_sectors * 512ull;
-        uint32_t cap_mb = (uint32_t)(cap_bytes / (1024ull * 1024ull));
-
-        char desc[160];
-        snprintf(desc, sizeof(desc),
-                 "Channel %u %s: %u MB (%u sectors), S/N: %s",
-                 adev->channel, adev->drive ? "Slave" : "Master",
-                 cap_mb, (uint32_t)adev->capacity_sectors,
-                 (adev->serial && adev->serial[0]) ? adev->serial : "N/A");
-        device_node_set_description(&dev, desc);
+        device_node_set_name(&dev, (adev->serial && adev->serial[0]) ? adev->serial : adev->model);
+        device_node_set_model(&dev, adev->model);
+        device_node_set_description(&dev, (adev->model && adev->model[0]) ? adev->model : adev->firmware);
 
         dev.res.bus_type = BUS_TYPE_IDE;
-        dev.res.io_base = (adev->channel == 0) ? 0x1F0 : 0x170;
-        dev.res.irq = (adev->channel == 0) ? 14 : 15;
-        dev.res.size_bytes = cap_bytes;
-        device_node_set_driver_name(&dev, "ata");
+        dev.res.io_base = adev->io_base;
+        dev.res.irq = adev->irq;
+        dev.res.size_bytes = adev->capacity_sectors * (uint64_t)adev->sector_size;
 
         device_register(&dev);
         device_node_free(&dev);
     }
 }
 
-/* ---------------------------------------------------------------------
- * Live hardware probes: every description below is read from the device
- * itself (registers, BIOS tables, driver state) rather than hardcoded.
- * --------------------------------------------------------------------- */
-static bool ps2_read_config(uint8_t *out) {
-    uint32_t flags;
-    __asm__ volatile("pushf; pop %0; cli" : "=r"(flags) : : "memory");
-    bool ok = false;
-    for (int i = 0; i < 100000 && (inb(0x64) & 0x02); i++) io_wait();
-    outb(0x64, 0x20);
-    for (int i = 0; i < 100000; i++) {
-        if (inb(0x64) & 0x01) { *out = inb(0x60); ok = true; break; }
-        io_wait();
-    }
-    if (flags & 0x200) __asm__ volatile("sti" : : : "memory");
-    return ok;
-}
-
-static uint8_t pit_read_status(uint8_t counter) {
-    outb(0x43, (uint8_t)(0xE0 | (2u << counter)));
-    return inb(0x40 + counter);
-}
-
-static bool acpi_find_rsdp(uint32_t *out_addr, uint8_t *out_rev, char oem[7], uint32_t *out_rsdt) {
-    uint32_t ebda = ((uint32_t)*(volatile uint16_t *)0x40E) << 4;
-    uint32_t ranges[2][2] = { { ebda, ebda + 1024 }, { 0xE0000, 0x100000 } };
-    for (int r = 0; r < 2; r++) {
-        if (r == 0 && (ebda < 0x80000 || ebda >= 0xA0000)) continue;
-        for (uint32_t a = ranges[r][0]; a + 20 <= ranges[r][1]; a += 16) {
-            const uint8_t *p = (const uint8_t *)(uintptr_t)a;
-            if (memcmp(p, "RSD PTR ", 8) != 0) continue;
-            uint8_t sum = 0;
-            for (int i = 0; i < 20; i++) sum = (uint8_t)(sum + p[i]);
-            if (sum != 0) continue;
-            *out_addr = a;
-            *out_rev = p[15];
-            memcpy(oem, p + 9, 6);
-            oem[6] = 0;
-            *out_rsdt = *(const uint32_t *)(p + 16);
-            return true;
+static bool acpi_check_range_for_rsdp(uint32_t start, uint32_t end, uint32_t *out_addr, uint8_t *out_rev, char **out_oem, uint32_t *out_rsdt) {
+    for (uint32_t a = start; a + 20 <= end; a += 16) {
+        const uint8_t *p = (const uint8_t *)(uintptr_t)a;
+        if (memcmp(p, "RSD PTR ", 8) != 0) continue;
+        uint8_t sum = 0;
+        for (int i = 0; i < 20; i++) sum = (uint8_t)(sum + p[i]);
+        if (sum != 0) continue;
+        *out_addr = a;
+        *out_rev = p[15];
+        *out_rsdt = *(const uint32_t *)(p + 16);
+        if (out_oem) {
+            char *oem = (char *)kmalloc(7);
+            if (oem) {
+                memcpy(oem, p + 9, 6);
+                oem[6] = '\0';
+                for (int k = 5; k >= 0 && oem[k] == ' '; k--) oem[k] = '\0';
+            }
+            *out_oem = oem;
         }
+        return true;
     }
     return false;
 }
 
-static void ip_fmt(ip4_addr_t ip, char *buf, size_t n) {
-    snprintf(buf, n, "%u.%u.%u.%u", (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
+static bool acpi_find_rsdp_dyn(uint32_t *out_addr, uint8_t *out_rev, char **out_oem, uint32_t *out_rsdt) {
+    uint32_t ebda = ((uint32_t)*(volatile uint16_t *)0x40E) << 4;
+    if (ebda >= 0x80000 && ebda < 0xA0000) {
+        if (acpi_check_range_for_rsdp(ebda, ebda + 1024, out_addr, out_rev, out_oem, out_rsdt)) {
+            return true;
+        }
+    }
+    return acpi_check_range_for_rsdp(0xE0000, 0x100000, out_addr, out_rev, out_oem, out_rsdt);
 }
 
-static int mask_prefix(ip4_addr_t m) {
-    int n = 0;
-    while (m & 0x80000000u) { n++; m <<= 1; }
-    return n;
+static char *acpi_copy_trimmed_field(const uint8_t *src, size_t len) {
+    while (len > 0 && (src[len - 1] == ' ' || src[len - 1] == '\0')) len--;
+    char *out = (char *)kmalloc(len + 1);
+    if (!out) return NULL;
+    memcpy(out, src, len);
+    out[len] = '\0';
+    return out;
 }
 
-__attribute__((weak)) bool loopback_get_info(uint16_t *mtu, size_t *queue_capacity) {
-    if (mtu) *mtu = 65536;
-    if (queue_capacity) *queue_capacity = 256;
-    return true;
+static char *acpi_decode_eisa_id_dyn(uint32_t val) {
+    static const char hex[] = "0123456789ABCDEF";
+    char *out = (char *)kmalloc(8);
+    if (!out) return NULL;
+    uint8_t b0 = (uint8_t)(val & 0xFFu);
+    uint8_t b1 = (uint8_t)((val >> 8) & 0xFFu);
+    uint8_t b2 = (uint8_t)((val >> 16) & 0xFFu);
+    uint8_t b3 = (uint8_t)((val >> 24) & 0xFFu);
+    out[0] = (char)(((b0 >> 2) & 0x1Fu) + 0x40u);
+    out[1] = (char)((((b0 & 0x03u) << 3) | ((b1 >> 5) & 0x07u)) + 0x40u);
+    out[2] = (char)((b1 & 0x1Fu) + 0x40u);
+    out[3] = hex[(b2 >> 4) & 0x0Fu];
+    out[4] = hex[b2 & 0x0Fu];
+    out[5] = hex[(b3 >> 4) & 0x0Fu];
+    out[6] = hex[b3 & 0x0Fu];
+    out[7] = '\0';
+    return out;
 }
 
-static void scan_network_subsystem(void) {
-    /* 1. Realtek RTL8139 NIC */
-    if (rtl8139_is_present()) {
-        const uint8_t *mac = rtl8139_get_mac();
-        device_node_t dev;
-        device_node_init(&dev);
-
-        dev.type = DEVICE_TYPE_NETWORK;
-        dev.state = DEVICE_STATE_ACTIVE;
-        device_node_set_name(&dev, "rtl8139-eth0");
-        device_node_set_vendor(&dev, pci_vendor_name(RTL8139_VENDOR_ID));
-        device_node_set_model(&dev, pci_class_name(0x02, 0x00));
-
-        pci_device_t pdev;
-        if (pci_find_device(RTL8139_VENDOR_ID, RTL8139_DEVICE_ID, &pdev)) {
-            dev.res.bus_type = BUS_TYPE_PCI;
-            dev.res.pci_bus = pdev.bus;
-            dev.res.pci_slot = pdev.slot;
-            dev.res.pci_func = pdev.func;
-            dev.res.io_base = (uint16_t)(pdev.bar0 & ~3u);
-            dev.res.irq = pdev.irq;
-        }
-
-        char desc[128];
-        if (mac) {
-            snprintf(desc, sizeof(desc),
-                     "MAC: %02x:%02x:%02x:%02x:%02x:%02x, Port: 0x%x, IRQ: %u",
-                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-                     dev.res.io_base, dev.res.irq);
-        } else {
-            snprintf(desc, sizeof(desc), "Port: 0x%x, IRQ: %u", dev.res.io_base, dev.res.irq);
-        }
-        device_node_set_description(&dev, desc);
-
-        device_node_set_driver_name(&dev, "rtl8139");
-        device_register(&dev);
-        device_node_free(&dev);
+static size_t aml_parse_pkg_length(const uint8_t *buf, size_t max_len, size_t *out_len_bytes) {
+    if (max_len == 0) {
+        if (out_len_bytes) *out_len_bytes = 0;
+        return 0;
     }
-
-    /* 2. Virtual Loopback Interface */
-    device_node_t lo;
-    device_node_init(&lo);
-    lo.type = DEVICE_TYPE_NETWORK;
-    lo.state = DEVICE_STATE_ACTIVE;
-    device_node_set_name(&lo, "net-lo0");
-    device_node_set_vendor(&lo, "IPO_OS Kernel");
-    device_node_set_model(&lo, "Local Loopback Network Adapter");
-    {
-        char ipb[16], desc[96];
-        uint16_t mtu = 0;
-        size_t qcap = 0;
-        bool up = loopback_get_info(&mtu, &qcap);
-        ip_fmt(IP4_ADDR_LOOPBACK, ipb, sizeof(ipb));
-        snprintf(desc, sizeof(desc), "IPv4: %s/8, MTU: %u, Interface: %s, Queue: %u slots",
-                 ipb, (unsigned)mtu, up ? "UP" : "DOWN", (unsigned)qcap);
-        device_node_set_description(&lo, desc);
-        if (!up) lo.state = DEVICE_STATE_DISABLED;
+    uint8_t lead = buf[0];
+    uint8_t byte_cnt = (lead >> 6) & 0x03u;
+    if (byte_cnt == 0) {
+        if (out_len_bytes) *out_len_bytes = 1;
+        return (size_t)(lead & 0x3Fu);
     }
-    lo.res.bus_type = BUS_TYPE_INTERNAL;
-    device_node_set_driver_name(&lo, "loopback");
-    device_register(&lo);
-    device_node_free(&lo);
+    if ((size_t)(1 + byte_cnt) > max_len) {
+        if (out_len_bytes) *out_len_bytes = 1;
+        return 0;
+    }
+    size_t pkg_len = (size_t)(lead & 0x0Fu);
+    for (uint8_t i = 0; i < byte_cnt; i++) {
+        pkg_len |= ((size_t)buf[1 + i]) << (4 + 8 * i);
+    }
+    if (out_len_bytes) *out_len_bytes = 1 + byte_cnt;
+    return pkg_len;
 }
 
-static void scan_system_and_input_subsystem(void) {
-    /* PIT 8254 */
-    device_node_t pit;
-    device_node_init(&pit);
-    pit.type = DEVICE_TYPE_SYSTEM;
-    pit.state = DEVICE_STATE_ACTIVE;
-    device_node_set_name(&pit, "pit0");
-    device_node_set_vendor(&pit, "System");
-    device_node_set_model(&pit, "PIT 8254");
-    {
-        char desc[96];
-        uint8_t st = pit_read_status(0);
-        snprintf(desc, sizeof(desc), "Channel 0 Timer (%u Hz programmed, mode %u, status 0x%02X), Ports 0x40-0x43",
-                 (unsigned)pit_get_frequency(0), (unsigned)((st >> 1) & 7), (unsigned)st);
-        device_node_set_description(&pit, desc);
+static char *aml_parse_device_name_dyn(const uint8_t *buf, size_t max_len, size_t *out_consumed) {
+    size_t pos = 0;
+    while (pos < max_len && (buf[pos] == 0x5Cu || buf[pos] == 0x5Eu)) pos++;
+    if (pos >= max_len) {
+        if (out_consumed) *out_consumed = pos;
+        return NULL;
     }
-    pit.res.bus_type = BUS_TYPE_ISA;
-    pit.res.io_base = 0x40;
-    pit.res.io_size = 4;
-    pit.res.irq = 0;
-    device_node_set_driver_name(&pit, "pit");
-    device_register(&pit);
-    device_node_free(&pit);
-
-    /* Dual PIC 8259 */
-    device_node_t pic;
-    device_node_init(&pic);
-    pic.type = DEVICE_TYPE_SYSTEM;
-    pic.state = DEVICE_STATE_ACTIVE;
-    device_node_set_name(&pic, "pic0");
-    device_node_set_vendor(&pic, "System");
-    device_node_set_model(&pic, "Dual PIC 8259A");
-    {
-        char desc[96];
-        snprintf(desc, sizeof(desc), "Master PIC 0x20-0x21 (IMR 0x%02X), Slave PIC 0xA0-0xA1 (IMR 0x%02X)",
-                 (unsigned)inb(0x21), (unsigned)inb(0xA1));
-        device_node_set_description(&pic, desc);
-    }
-    pic.res.bus_type = BUS_TYPE_ISA;
-    pic.res.io_base = 0x20;
-    pic.res.io_size = 2;
-    device_node_set_driver_name(&pic, "pic");
-    device_register(&pic);
-    device_node_free(&pic);
-
-    /* PS/2 Keyboard */
-    device_node_t kbd;
-    device_node_init(&kbd);
-    kbd.type = DEVICE_TYPE_INPUT;
-    kbd.state = DEVICE_STATE_ACTIVE;
-    device_node_set_name(&kbd, "ps2-kbd");
-    device_node_set_vendor(&kbd, "PS/2 Controller");
-    device_node_set_model(&kbd, "Keyboard");
-    {
-        char desc[96];
-        uint8_t cfg = 0;
-        if (ps2_read_config(&cfg)) {
-            snprintf(desc, sizeof(desc), "8042 config 0x%02X: IRQ1 %s, clock %s, translation %s",
-                     (unsigned)cfg, (cfg & 0x01) ? "enabled" : "disabled",
-                     (cfg & 0x10) ? "disabled" : "enabled", (cfg & 0x40) ? "on" : "off");
-            if (cfg & 0x10) kbd.state = DEVICE_STATE_DISABLED;
-        } else {
-            snprintf(desc, sizeof(desc), "8042 controller did not respond");
-            kbd.state = DEVICE_STATE_DISABLED;
+    const uint8_t *seg = NULL;
+    if (buf[pos] == 0x00u) {
+        pos += 1;
+    } else if (buf[pos] == 0x2Eu && pos + 9 <= max_len) {
+        seg = buf + pos + 5;
+        pos += 9;
+    } else if (buf[pos] == 0x2Fu && pos + 2 <= max_len) {
+        uint8_t cnt = buf[pos + 1];
+        if (cnt > 0 && pos + 2 + (size_t)cnt * 4 <= max_len) {
+            seg = buf + pos + 2 + (size_t)(cnt - 1) * 4;
+            pos += 2 + (size_t)cnt * 4;
         }
-        device_node_set_description(&kbd, desc);
+    } else if (pos + 4 <= max_len) {
+        seg = buf + pos;
+        pos += 4;
     }
-    kbd.res.bus_type = BUS_TYPE_ISA;
-    kbd.res.io_base = 0x60;
-    kbd.res.irq = 1;
-    device_node_set_driver_name(&kbd, "keyboard");
-    device_register(&kbd);
-    device_node_free(&kbd);
+    if (out_consumed) *out_consumed = pos;
+    if (!seg) return NULL;
 
-    /* PS/2 Mouse */
-    device_node_t mouse;
-    device_node_init(&mouse);
-    mouse.type = DEVICE_TYPE_INPUT;
-    mouse.state = DEVICE_STATE_ACTIVE;
-    device_node_set_name(&mouse, "ps2-mouse");
-    device_node_set_vendor(&mouse, "PS/2 Controller");
-    device_node_set_model(&mouse, "Mouse (Aux Port)");
-    {
-        char desc[96];
-        uint8_t cfg = 0;
-        if (ps2_read_config(&cfg)) {
-            snprintf(desc, sizeof(desc), "8042 aux port: IRQ12 %s, clock %s (config 0x%02X)",
-                     (cfg & 0x02) ? "enabled" : "disabled",
-                     (cfg & 0x20) ? "disabled" : "enabled", (unsigned)cfg);
-            if (cfg & 0x20) mouse.state = DEVICE_STATE_DISABLED;
-        } else {
-            snprintf(desc, sizeof(desc), "8042 controller did not respond");
-            mouse.state = DEVICE_STATE_DISABLED;
+    char *name = (char *)kmalloc(5);
+    if (!name) return NULL;
+    size_t nlen = 0;
+    for (size_t i = 0; i < 4; i++) {
+        char c = (char)seg[i];
+        if (c == '_' && (i == 0 || i == 3)) continue;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+            name[nlen++] = c;
         }
-        device_node_set_description(&mouse, desc);
     }
-    mouse.res.bus_type = BUS_TYPE_ISA;
-    mouse.res.io_base = 0x60;
-    mouse.res.irq = 12;
-    device_node_set_driver_name(&mouse, "mouse");
-    device_register(&mouse);
-    device_node_free(&mouse);
-
-    /* PC Speaker */
-    device_node_t spk;
-    device_node_init(&spk);
-    spk.type = DEVICE_TYPE_AUDIO;
-    spk.state = DEVICE_STATE_ACTIVE;
-    device_node_set_name(&spk, "pcspk0");
-    device_node_set_vendor(&spk, "System Audio");
-    device_node_set_model(&spk, "Internal PC Speaker");
-    {
-        char desc[96];
-        uint8_t p61 = inb(0x61);
-        snprintf(desc, sizeof(desc), "PIT Counter 2 gate %s, speaker output %s (port 0x61=0x%02X), counter 2 %u Hz",
-                 (p61 & 1) ? "open" : "closed", (p61 & 2) ? "on" : "off", (unsigned)p61,
-                 (unsigned)pit_get_frequency(2));
-        device_node_set_description(&spk, desc);
+    name[nlen] = '\0';
+    if (nlen == 0) {
+        kfree(name);
+        return NULL;
     }
-    spk.res.bus_type = BUS_TYPE_ISA;
-    spk.res.io_base = 0x61;
-    device_node_set_driver_name(&spk, "sound");
-    device_register(&spk);
-    device_node_free(&spk);
+    return name;
+}
 
-    /* Sound Blaster 16 */
-    if (audio_get_active_backend() == AUDIO_BACKEND_SB16) {
-        device_node_t sb;
-        device_node_init(&sb);
-        sb.type = DEVICE_TYPE_AUDIO;
-        sb.state = DEVICE_STATE_ACTIVE;
-        device_node_set_name(&sb, "sb16");
-        device_node_set_vendor(&sb, "Audio DSP");
-        {
-            char model[48], desc[96];
-            uint8_t maj = 0, min = 0;
-            sb16_get_dsp_version(&maj, &min);
-            snprintf(model, sizeof(model), "Sound Blaster DSP v%u.%02u", (unsigned)maj, (unsigned)min);
-            device_node_set_model(&sb, model);
+static device_type_t acpi_hid_to_device_type(const char *hid) {
+    if (!hid) return DEVICE_TYPE_SYSTEM;
+    if (strncmp(hid, "PNP03", 5) == 0 || strncmp(hid, "PNP0F", 5) == 0) {
+        return DEVICE_TYPE_INPUT;
+    }
+    if (strncmp(hid, "PNP07", 5) == 0) {
+        return DEVICE_TYPE_STORAGE;
+    }
+    if (strncmp(hid, "PNP09", 5) == 0) {
+        return DEVICE_TYPE_VIDEO;
+    }
+    if (strncmp(hid, "PNP0A03", 7) == 0 || strncmp(hid, "PNP0A08", 7) == 0) {
+        return DEVICE_TYPE_PCI;
+    }
+    return DEVICE_TYPE_SYSTEM;
+}
 
-            /* Read configured IRQ / DMA from the card's mixer registers */
-            outb(0x224, 0x80); uint8_t irq_reg = inb(0x225);
-            outb(0x224, 0x81); uint8_t dma_reg = inb(0x225);
-            unsigned irq = (irq_reg & 1) ? 2 : (irq_reg & 2) ? 5 : (irq_reg & 4) ? 7 : (irq_reg & 8) ? 10 : 0;
-            unsigned dma8 = (dma_reg & 1) ? 0 : (dma_reg & 2) ? 1 : (dma_reg & 8) ? 3 : 0xFF;
-            unsigned dma16 = (dma_reg & 0x20) ? 5 : (dma_reg & 0x40) ? 6 : (dma_reg & 0x80) ? 7 : 0xFF;
-            snprintf(desc, sizeof(desc), "Audio DSP & Mixer, Port 0x220, IRQ %u, DMA %u/%u",
-                     irq, dma8, dma16);
-            device_node_set_description(&sb, desc);
-            sb.res.irq = (uint8_t)irq;
+/* Scan an ACPI DSDT or SSDT AML bytecode table for hardware Device() definitions */
+static void scan_acpi_aml_table(const uint8_t *sdt) {
+    if (!sdt) return;
+    uint32_t sdt_len = *(const uint32_t *)(sdt + 4);
+    if (sdt_len < 36 || sdt_len > 0x100000u) return;
+
+    char *table_oem = acpi_copy_trimmed_field(sdt + 10, 6);
+    uint16_t last_kbd_io = 0;
+
+    size_t i = 36;
+    while (i + 6 < sdt_len) {
+        if (sdt[i] == 0x5Bu && sdt[i + 1] == 0x82u) {
+            size_t len_bytes = 0;
+            size_t pkg_len = aml_parse_pkg_length(sdt + i + 2, sdt_len - (i + 2), &len_bytes);
+            if (pkg_len > 0 && len_bytes > 0 && i + 2 + pkg_len <= sdt_len) {
+                size_t name_off = i + 2 + len_bytes;
+                size_t name_consumed = 0;
+                char *dev_name = aml_parse_device_name_dyn(sdt + name_off, sdt_len - name_off, &name_consumed);
+                size_t body_start = name_off + name_consumed;
+                size_t dev_end = i + 2 + pkg_len;
+
+                size_t own_end = dev_end;
+                for (size_t k = body_start; k + 2 < dev_end; k++) {
+                    if (sdt[k] == 0x5Bu && sdt[k + 1] == 0x82u) {
+                        own_end = k;
+                        break;
+                    }
+                }
+
+                if (dev_name && body_start < own_end) {
+                    const uint8_t *body = sdt + body_start;
+                    size_t body_len = own_end - body_start;
+
+                    char *hid = NULL;
+                    char *uid_str = NULL;
+                    bool sta_disabled = false;
+
+                    for (size_t m = 0; m + 5 < body_len; m++) {
+                        if (memcmp(body + m, "_HID", 4) == 0 && !hid) {
+                            size_t p = m + 4;
+                            if (p + 5 <= body_len && body[p] == 0x0Cu) {
+                                uint32_t eval = *(const uint32_t *)(body + p + 1);
+                                hid = acpi_decode_eisa_id_dyn(eval);
+                            } else if (p + 2 <= body_len && body[p] == 0x0Du) {
+                                size_t slen = 0;
+                                while (p + 1 + slen < body_len && body[p + 1 + slen] != 0) slen++;
+                                hid = acpi_copy_trimmed_field(body + p + 1, slen);
+                            }
+                        } else if (memcmp(body + m, "_UID", 4) == 0 && !uid_str) {
+                            size_t p = m + 4;
+                            if (p + 2 <= body_len && body[p] == 0x0Du) {
+                                size_t slen = 0;
+                                while (p + 1 + slen < body_len && body[p + 1 + slen] != 0) slen++;
+                                uid_str = acpi_copy_trimmed_field(body + p + 1, slen);
+                            }
+                        } else if (memcmp(body + m, "_STA", 4) == 0) {
+                            if (m >= 1 && body[m - 1] == 0x08u) {
+                                size_t p = m + 4;
+                                if (p < body_len && body[p] == 0x00u) sta_disabled = true;
+                                else if (p + 1 < body_len && body[p] == 0x0Au && (body[p + 1] & 0x03u) == 0) sta_disabled = true;
+                            }
+                        }
+                    }
+
+                    uint16_t io_base = 0;
+                    uint16_t io_size = 0;
+                    uint32_t mmio_base = 0;
+                    uint32_t mmio_size = 0;
+                    uint8_t irq = 0xFF;
+
+                    /* Extract hardware resources from _CRS buffer descriptors */
+                    for (size_t m = 0; m + 4 < body_len; m++) {
+                        if (memcmp(body + m, "_CRS", 4) == 0) {
+                            for (size_t r = m + 4; r + 2 < body_len; r++) {
+                                if (body[r] == 0x79u && body[r + 1] == 0x00u) break; /* EndTag */
+                                if (body[r] == 0x47u && (body[r + 1] == 0x00u || body[r + 1] == 0x01u) && r + 8 <= body_len) {
+                                    uint16_t mn = *(const uint16_t *)(body + r + 2);
+                                    uint16_t mx = *(const uint16_t *)(body + r + 4);
+                                    uint8_t ln = body[r + 7];
+                                    if (mn == mx && mn > 0 && ln > 0 && io_base == 0) {
+                                        io_base = mn;
+                                        io_size = ln;
+                                    }
+                                    r += 7;
+                                } else if (body[r] == 0x4Bu && r + 4 <= body_len) {
+                                    uint16_t mn = *(const uint16_t *)(body + r + 1);
+                                    uint8_t ln = body[r + 3];
+                                    if (mn > 0 && ln > 0 && io_base == 0) {
+                                        io_base = mn;
+                                        io_size = ln;
+                                    }
+                                    r += 3;
+                                } else if ((body[r] == 0x22u || body[r] == 0x23u) && r + 3 <= body_len) {
+                                    uint16_t mask = *(const uint16_t *)(body + r + 1);
+                                    for (uint8_t bit = 0; bit < 16; bit++) {
+                                        if (mask == (uint16_t)(1u << bit)) {
+                                            irq = bit;
+                                            break;
+                                        }
+                                    }
+                                    r += (body[r] == 0x23u) ? 3 : 2;
+                                } else if (body[r] == 0x2Au && r + 3 <= body_len) {
+                                    r += 2;
+                                } else if (body[r] == 0x86u && body[r + 1] == 0x09u && r + 12 <= body_len) {
+                                    mmio_base = *(const uint32_t *)(body + r + 4);
+                                    mmio_size = *(const uint32_t *)(body + r + 8);
+                                    r += 11;
+                                }
+                            }
+                            break;
+                        }
+                    }
+
+                    /* Also check OperationRegion SystemMemory (0x5B 0x80 <NameSeg> 0x00 0x0C <base> 0x0B <len>) */
+                    if (mmio_base == 0) {
+                        for (size_t m = 0; m + 15 <= body_len; m++) {
+                            if (body[m] == 0x5Bu && body[m + 1] == 0x80u &&
+                                body[m + 6] == 0x00u && body[m + 7] == 0x0Cu) {
+                                mmio_base = *(const uint32_t *)(body + m + 8);
+                                if (body[m + 12] == 0x0Bu) {
+                                    mmio_size = *(const uint16_t *)(body + m + 13);
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    if (hid && strncmp(hid, "PNP03", 5) == 0 && io_base != 0) {
+                        last_kbd_io = io_base;
+                    }
+                    if (hid && strncmp(hid, "PNP0F", 5) == 0 && io_base == 0 && last_kbd_io != 0) {
+                        io_base = last_kbd_io;
+                        io_size = 1;
+                    }
+
+                    if (!sta_disabled && hid && (io_base != 0 || mmio_base != 0 || irq != 0xFF)) {
+                        device_node_t dev;
+                        device_node_init(&dev);
+                        dev.type = acpi_hid_to_device_type(hid);
+                        dev.state = DEVICE_STATE_ACTIVE;
+                        device_node_set_name(&dev, dev_name);
+                        device_node_set_vendor(&dev, table_oem);
+                        device_node_set_model(&dev, hid);
+                        device_node_set_description(&dev, (uid_str && uid_str[0]) ? uid_str : hid);
+
+                        dev.res.bus_type = (mmio_base != 0 && io_base == 0) ? BUS_TYPE_INTERNAL : BUS_TYPE_ISA;
+                        dev.res.io_base = io_base;
+                        dev.res.io_size = io_size;
+                        dev.res.mmio_base = mmio_base;
+                        dev.res.mmio_size = mmio_size;
+                        dev.res.irq = (irq != 0xFF) ? irq : 0;
+
+                        device_register(&dev);
+                        device_node_free(&dev);
+                    }
+
+                    if (hid) kfree(hid);
+                    if (uid_str) kfree(uid_str);
+                }
+                if (dev_name) kfree(dev_name);
+            }
         }
-        sb.res.bus_type = BUS_TYPE_ISA;
-        sb.res.io_base = 0x220;
-        device_node_set_driver_name(&sb, "audio_core");
-        device_register(&sb);
-        device_node_free(&sb);
+        i++;
     }
 
-    /* VGA Graphics / Display */
-    device_node_t vga;
-    device_node_init(&vga);
-    vga.type = DEVICE_TYPE_VIDEO;
-    vga.state = DEVICE_STATE_ACTIVE;
-    device_node_set_name(&vga, "vga0");
-    device_node_set_vendor(&vga, "Standard VGA / VBE");
-    device_node_set_model(&vga, "VGA Display Adapter & VBE Extensions");
-    {
-        char desc[160];
-        uint8_t bda_mode = *(volatile uint8_t *)0x449;
-        uint16_t cols = *(volatile uint16_t *)0x44A;
-        uint8_t rows = (uint8_t)(*(volatile uint8_t *)0x484 + 1);
-        outb(0x3CE, 0x06);
-        uint8_t gc_misc = inb(0x3CF);
-        static const uint32_t win_base[4] = { 0xA0000, 0xA0000, 0xB0000, 0xB8000 };
-        static const uint32_t win_size[4] = { 0x20000, 0x10000, 0x8000, 0x8000 };
-        uint32_t base = win_base[(gc_misc >> 2) & 3];
-        vga.res.mmio_base = base;
-        vga.res.mmio_size = win_size[(gc_misc >> 2) & 3];
+    if (table_oem) kfree(table_oem);
+}
 
-        vbe_bga_info_t vi;
-        int n = snprintf(desc, sizeof(desc), "BIOS mode 0x%02X %ux%u @ 0x%X",
-                         (unsigned)bda_mode, (unsigned)cols, (unsigned)rows, (unsigned)base);
-        if (vbe_bga_probe(&vi) && vi.available) {
-            snprintf(desc + n, sizeof(desc) - (size_t)n, ", VBE/BGA v0x%04X %dx%dx%d LFB 0x%X",
-                     (unsigned)vi.version, vi.width, vi.height, vi.bpp, (unsigned)vi.lfb_addr);
+static void scan_acpi_and_platform_subsystem(void) {
+    uint32_t rsdp = 0, rsdt = 0;
+    uint8_t rev = 0;
+    char *rsdp_oem = NULL;
+
+    if (acpi_find_rsdp_dyn(&rsdp, &rev, &rsdp_oem, &rsdt) && rsdt != 0) {
+        const uint8_t *rsdt_hdr = (const uint8_t *)(uintptr_t)rsdt;
+        if (memcmp(rsdt_hdr, "RSDT", 4) == 0) {
+            uint32_t rsdt_len = *(const uint32_t *)(rsdt_hdr + 4);
+            uint32_t entry_count = (rsdt_len >= 36) ? ((rsdt_len - 36) / 4) : 0;
+            const uint32_t *entries = (const uint32_t *)(rsdt_hdr + 36);
+
+            for (uint32_t e = 0; e < entry_count; e++) {
+                uint32_t tbl_addr = entries[e];
+                if (tbl_addr == 0) continue;
+                const uint8_t *tbl = (const uint8_t *)(uintptr_t)tbl_addr;
+                uint32_t tbl_len = *(const uint32_t *)(tbl + 4);
+                if (tbl_len < 36) continue;
+
+                char *tbl_sig = acpi_copy_trimmed_field(tbl + 0, 4);
+                char *tbl_oem = acpi_copy_trimmed_field(tbl + 10, 6);
+                char *tbl_tid = acpi_copy_trimmed_field(tbl + 16, 8);
+
+                if (memcmp(tbl, "APIC", 4) == 0 && tbl_len >= 44) {
+                    uint32_t pos = 44;
+                    while (pos + 2 <= tbl_len) {
+                        uint8_t rec_type = tbl[pos];
+                        uint8_t rec_len = tbl[pos + 1];
+                        if (rec_len < 2 || pos + rec_len > tbl_len) break;
+
+                        if (rec_type == 1 && rec_len >= 12) {
+                            uint32_t ioapic_addr = *(const uint32_t *)(tbl + pos + 4);
+
+                            device_node_t dev;
+                            device_node_init(&dev);
+                            dev.type = DEVICE_TYPE_SYSTEM;
+                            dev.state = DEVICE_STATE_ACTIVE;
+                            device_node_set_name(&dev, tbl_sig);
+                            device_node_set_vendor(&dev, tbl_oem);
+                            device_node_set_model(&dev, tbl_tid);
+                            device_node_set_description(&dev, tbl_tid);
+
+                            dev.res.bus_type = BUS_TYPE_INTERNAL;
+                            dev.res.mmio_base = ioapic_addr;
+                            device_register(&dev);
+                            device_node_free(&dev);
+                        }
+                        pos += rec_len;
+                    }
+                } else if (memcmp(tbl, "FACP", 4) == 0 && tbl_len >= 84) {
+                    uint32_t dsdt_addr = *(const uint32_t *)(tbl + 40);
+                    uint16_t sci_int   = *(const uint16_t *)(tbl + 46);
+                    uint32_t pm1a_evt  = *(const uint32_t *)(tbl + 56);
+
+                    device_node_t dev;
+                    device_node_init(&dev);
+                    dev.type = DEVICE_TYPE_SYSTEM;
+                    dev.state = DEVICE_STATE_ACTIVE;
+                    device_node_set_name(&dev, tbl_sig);
+                    device_node_set_vendor(&dev, tbl_oem);
+                    device_node_set_model(&dev, tbl_tid);
+                    device_node_set_description(&dev, tbl_tid);
+
+                    dev.res.bus_type = BUS_TYPE_ISA;
+                    dev.res.io_base = (uint16_t)pm1a_evt;
+                    dev.res.irq = (uint8_t)sci_int;
+                    device_register(&dev);
+                    device_node_free(&dev);
+
+                    if (dsdt_addr != 0) {
+                        scan_acpi_aml_table((const uint8_t *)(uintptr_t)dsdt_addr);
+                    }
+                } else if (memcmp(tbl, "SSDT", 4) == 0) {
+                    scan_acpi_aml_table(tbl);
+                }
+
+                if (tbl_sig) kfree(tbl_sig);
+                if (tbl_oem) kfree(tbl_oem);
+                if (tbl_tid) kfree(tbl_tid);
+            }
         }
-        device_node_set_description(&vga, desc);
     }
-    vga.res.bus_type = BUS_TYPE_ISA;
-    vga.res.io_base = 0x3C0;
-    device_node_set_driver_name(&vga, "vga");
-    device_register(&vga);
-    device_node_free(&vga);
+    if (rsdp_oem) kfree(rsdp_oem);
 
-    /* ACPI Subsystem */
-    device_node_t acpi;
-    device_node_init(&acpi);
-    acpi.type = DEVICE_TYPE_SYSTEM;
-    acpi.state = DEVICE_STATE_ACTIVE;
-    device_node_set_name(&acpi, "acpi0");
-    device_node_set_vendor(&acpi, "ACPI Specification");
-    {
-        uint32_t rsdp = 0, rsdt = 0;
-        uint8_t rev = 0;
-        char oem[7] = {0};
-        char desc[112];
-        if (acpi_find_rsdp(&rsdp, &rev, oem, &rsdt)) {
-            snprintf(desc, sizeof(desc), "RSDP at 0x%X, revision %u, OEM '%s', RSDT at 0x%X",
-                     (unsigned)rsdp, (unsigned)rev, oem, (unsigned)rsdt);
-            device_node_set_model(&acpi, oem);
-            device_node_set_description(&acpi, desc);
-            acpi.res.bus_type = BUS_TYPE_INTERNAL;
-            acpi.res.mmio_base = rsdp;
-            device_node_set_driver_name(&acpi, "acpi");
-            device_register(&acpi);
+    driver_t *drv = driver_get_list();
+    while (drv) {
+        if (drv->name && drv->name[0] && !device_find_by_name(drv->name)) {
+            device_node_t dev;
+            device_node_init(&dev);
+            dev.type = DEVICE_TYPE_SYSTEM;
+            dev.state = (drv->flags & DRIVER_FLAG_ACTIVE) ? DEVICE_STATE_ACTIVE : DEVICE_STATE_INITIALIZED;
+            device_node_set_name(&dev, drv->name);
+            device_node_set_description(&dev, drv->description);
+            dev.res.bus_type = BUS_TYPE_INTERNAL;
+            device_node_set_driver_name(&dev, drv->name);
+            device_register(&dev);
+            device_node_free(&dev);
         }
-        device_node_free(&acpi);
+        drv = drv->next;
     }
+}
+
+static void device_registry_clear(void) {
+    spin_lock(&s_device_lock);
+    device_node_t *curr = s_device_head;
+    while (curr) {
+        device_node_t *next = curr->next;
+        device_node_free(curr);
+        kfree(curr);
+        curr = next;
+    }
+    s_device_head = NULL;
+    s_next_id = 1;
+    spin_unlock(&s_device_lock);
 }
 
 int device_rescan(void) {
+    device_registry_clear();
+
     /* Rescan all hardware buses and register components */
     scan_cpu_subsystem();
     scan_memory_subsystem();
     scan_pci_subsystem();
     scan_storage_subsystem();
-    scan_network_subsystem();
-    scan_system_and_input_subsystem();
+    scan_acpi_and_platform_subsystem();
 
     serial_printf("[device] Rescan completed: %u devices currently in registry\n", device_get_count());
     return (int)device_get_count();
@@ -1005,3 +979,4 @@ void device_init(void) {
     printf("[device] Initializing Unified Device Registry\n");
     device_rescan();
 }
+

@@ -78,7 +78,7 @@ void memory_map_init(void) {
     if (magic == E820_MAGIC_VAL && raw_count > 0 && ptr_val != 0) {
         const e820_entry_t *entries = (const e820_entry_t *)(uintptr_t)ptr_val;
 
-        serial_printf("[mem] BIOS E820 Memory Map: %u entries at 0x%x\n", raw_count, ptr_val);
+        printf("[mem] BIOS E820 Memory Map: %u entries at 0x%x\n", raw_count, ptr_val);
 
         for (uint32_t i = 0; i < raw_count; i++) {
             memory_map_add_raw_e820(&entries[i]);
@@ -88,7 +88,7 @@ void memory_map_init(void) {
 
             if (len == 0) continue;
 
-            serial_printf("[mem]   Entry %u: 0x%llx - 0x%llx (%llu KB) [%s]\n",
+            printf("[mem]   Entry %u: 0x%llx - 0x%llx (%llu KB) [%s]\n",
                           i, base, base + len, len / 1024ull, memory_map_e820_type_name(type));
 
             if (type == E820_TYPE_USABLE) {
@@ -121,8 +121,8 @@ void memory_map_init(void) {
         }
     } else {
         /* Fallback if BIOS E820 not returned */
-        serial_printf("[mem] Fallback memory detection: %u bytes\n", fallback_ram);
-        total_usable_ram = fallback_ram ? fallback_ram : 0x08000000ull; /* Default 128 MB */
+        printf("[mem] Fallback memory detection: %u bytes\n", fallback_ram);
+        total_usable_ram = fallback_ram;
 
         if (total_usable_ram > 0x1000000ull) {
             uint32_t sz = (uint32_t)(total_usable_ram - 0x1000000ull);
@@ -131,7 +131,7 @@ void memory_map_init(void) {
         }
     }
 
-    serial_printf("[mem] Total Usable RAM: %llu MB (%llu bytes) across %u usable allocatable regions\n",
+    printf("[mem] Total Usable RAM: %llu MB (%llu bytes) across %u usable allocatable regions\n",
                   total_usable_ram / (1024ull * 1024ull), total_usable_ram, region_count);
     for (uint32_t r = 0; r < region_count; r++) {
         serial_printf("[mem]   Pool %u: 0x%x - 0x%x (%u MB, used/reserved: %u MB)\n",

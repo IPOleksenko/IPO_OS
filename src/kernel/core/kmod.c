@@ -49,7 +49,7 @@ int kmod_init(void) {
     s_kmod_head = NULL;
     s_next_kmod_id = 1;
     s_kmod_initialized = true;
-    serial_printf("[kmod] Dynamic Driver Subsystem initialized (ABI %04x, %u kernel symbols exported).\n",
+    printf("[kmod] Dynamic Driver Subsystem initialized (ABI %04x, %u kernel symbols exported).\n",
                   KMOD_ABI_VERSION, &s_kernel_syms_count ? (uint32_t)s_kernel_syms_count : 0);
     return 0;
 }

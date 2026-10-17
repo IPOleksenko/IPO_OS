@@ -64,6 +64,14 @@ void ip_to_str(ip4_addr_t ip, char *buf, size_t size) {
              (unsigned int)(ip & 0xFF));
 }
 
+char *ip_to_str_dyn(ip4_addr_t ip) {
+    size_t sz = 32;
+    char *buf = (char *)kmalloc(sz);
+    if (!buf) return NULL;
+    ip_to_str(ip, buf, sz);
+    return buf;
+}
+
 bool str_to_ip(const char *str, ip4_addr_t *out_ip) {
     if (!str || !out_ip) return false;
 
