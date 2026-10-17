@@ -28,6 +28,9 @@
 
 #define MICROPY_CONFIG_ROM_LEVEL (MICROPY_CONFIG_ROM_LEVEL_EXTRA_FEATURES)
 #define MICROPY_DEBUG_PRINTERS (1)
+#define MICROPY_FLOAT_IMPL (MICROPY_FLOAT_IMPL_DOUBLE)
+#define MICROPY_FLOAT_USE_NATIVE_FLT16 (0)
+#define MICROPY_LONGINT_IMPL (MICROPY_LONGINT_IMPL_MPZ)
 
 #define MICROPY_PY_BUILTINS_INPUT (1)
 #define MICROPY_PY_BUILTINS_HELP (1)
@@ -87,3 +90,12 @@
 
 #undef MICROPY_PY_SYS_PATH_DEFAULT
 #define MICROPY_PY_SYS_PATH_DEFAULT ":/lib:/app:/lib/python"
+
+struct _mp_obj_base_t;
+extern const struct _mp_obj_base_t mp_builtin_ipo_clear_obj;
+extern const struct _mp_obj_base_t mp_builtin_ipo_exit_obj;
+
+#define MICROPY_PORT_BUILTINS \
+    { MP_ROM_QSTR(MP_QSTR_clear), MP_ROM_PTR(&mp_builtin_ipo_clear_obj) }, \
+    { MP_ROM_QSTR(MP_QSTR_exit), MP_ROM_PTR(&mp_builtin_ipo_exit_obj) }, \
+    { MP_ROM_QSTR(MP_QSTR_quit), MP_ROM_PTR(&mp_builtin_ipo_exit_obj) },

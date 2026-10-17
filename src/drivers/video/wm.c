@@ -261,186 +261,7 @@ void wm_buf_draw_string(uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, co
         i += bytes;
     }
 }
-#ifdef IPO_APP
-/* =========================================================================
- * Application-side Window Manager API (syscall wrappers)
- * =========================================================================
- * Applications invoke the OS API to create and manage windows.
- * The kernel hosts the actual window structures, compositor, and VRAM.
- */
-#include <syscall.h>
 
-static int wm_call_window(uint32_t syscall_num, wm_window_t *win) {
-    if (!win) return 0;
-    uint32_t args[1] = { (uint32_t)(uintptr_t)win };
-    return ipo_syscall(syscall_num, 1u, args);
-}
-
-wm_window_t *wm_create_window(const wm_window_options_t *opts) {
-    uint32_t args[1];
-    args[0] = (uint32_t)(uintptr_t)opts;
-    return (wm_window_t *)(uintptr_t)ipo_syscall(IPO_SYSCALL_WM_CREATE_WINDOW, 1u, args);
-}
-
-void wm_destroy_window(wm_window_t *win) {
-    uint32_t args[1];
-    args[0] = (uint32_t)(uintptr_t)win;
-    ipo_syscall(IPO_SYSCALL_WM_DESTROY_WINDOW, 1u, args);
-}
-
-bool wm_is_window_valid(wm_window_t *win) {
-    if (!win) return false;
-    uint32_t args[1];
-    args[0] = (uint32_t)(uintptr_t)win;
-    return (bool)ipo_syscall(IPO_SYSCALL_WM_IS_VALID, 1u, args);
-}
-
-void wm_session_start(void) {
-    ipo_syscall(IPO_SYSCALL_WM_SESSION_START, 0u, NULL);
-}
-
-void wm_session_stop(void) {
-    ipo_syscall(IPO_SYSCALL_WM_SESSION_STOP, 0u, NULL);
-}
-
-bool wm_session_active(void) {
-    return (bool)ipo_syscall(IPO_SYSCALL_WM_SESSION_ACTIVE, 0u, NULL);
-}
-
-int wm_get_window_count(void) {
-    return (int)ipo_syscall(IPO_SYSCALL_WM_GET_COUNT, 0u, NULL);
-}
-
-int wm_get_window_count_for_pid(uint32_t pid) {
-    uint32_t args[1] = { pid };
-    return ipo_syscall(IPO_SYSCALL_WM_GET_COUNT_PID, 1u, args);
-}
-
-bool wm_has_windows_for_pid(uint32_t pid) {
-    uint32_t args[1] = { pid };
-    return ipo_syscall(IPO_SYSCALL_WM_HAS_WINDOWS_PID, 1u, args) != 0;
-}
-
-wm_window_t *wm_get_focused(void) {
-    return (wm_window_t *)(uintptr_t)ipo_syscall(IPO_SYSCALL_WM_GET_FOCUSED, 0u, NULL);
-}
-
-wm_window_t *wm_get_window_list(void) {
-    return (wm_window_t *)(uintptr_t)ipo_syscall(IPO_SYSCALL_WM_GET_LIST, 0u, NULL);
-}
-
-void wm_set_focus(wm_window_t *win) {
-    uint32_t args[1];
-    args[0] = (uint32_t)(uintptr_t)win;
-    ipo_syscall(IPO_SYSCALL_WM_SET_FOCUS, 1u, args);
-}
-
-void wm_focus_window_for_pid(uint32_t pid) {
-    uint32_t args[1] = { pid };
-    ipo_syscall(IPO_SYSCALL_WM_FOCUS_PID, 1u, args);
-}
-
-void wm_focus_next(void) {
-    ipo_syscall(IPO_SYSCALL_WM_FOCUS_NEXT, 0u, NULL);
-}
-
-void wm_focus_prev(void) {
-    ipo_syscall(IPO_SYSCALL_WM_FOCUS_PREV, 0u, NULL);
-}
-
-void wm_get_screen_bounds(int *out_w, int *out_h) {
-    vga_gfx_get_screen_bounds(out_w, out_h);
-}
-
-void wm_invalidate(wm_window_t *win) {
-    uint32_t args[1];
-    args[0] = (uint32_t)(uintptr_t)win;
-    ipo_syscall(IPO_SYSCALL_WM_INVALIDATE, 1u, args);
-}
-
-void wm_invalidate_all(void) {
-    ipo_syscall(IPO_SYSCALL_WM_INVALIDATE_ALL, 0u, NULL);
-}
-
-void wm_init(void) {
-    ipo_syscall(IPO_SYSCALL_WM_INIT, 0u, NULL);
-}
-
-void wm_set_fullscreen(wm_window_t *win, bool enable) {
-    if (!win) return;
-    uint32_t args[2] = { (uint32_t)(uintptr_t)win, (uint32_t)enable };
-    ipo_syscall(IPO_SYSCALL_WM_SET_FULLSCREEN, 2u, args);
-}
-
-void wm_minimize(wm_window_t *win) {
-    wm_call_window(IPO_SYSCALL_WM_MINIMIZE, win);
-}
-
-void wm_restore(wm_window_t *win) {
-    wm_call_window(IPO_SYSCALL_WM_RESTORE, win);
-}
-void wm_toggle_maximize(wm_window_t *win) {
-    if (!win) return;
-    uint32_t args[1];
-    args[0] = (uint32_t)(uintptr_t)win;
-    ipo_syscall(IPO_SYSCALL_WM_TOGGLE_MAXIMIZE, 1u, args);
-}
-void wm_move(wm_window_t *win, int16_t nx, int16_t ny) {
-    if (!win) return;
-    uint32_t args[3] = { (uint32_t)(uintptr_t)win, (uint32_t)(int32_t)nx,
-                         (uint32_t)(int32_t)ny };
-    ipo_syscall(IPO_SYSCALL_WM_MOVE, 3u, args);
-}
-bool wm_resize(wm_window_t *win, uint16_t nw, uint16_t nh) {
-    if (!win) return false;
-    uint32_t args[3];
-    args[0] = (uint32_t)(uintptr_t)win;
-    args[1] = (uint32_t)nw;
-    args[2] = (uint32_t)nh;
-    return (bool)ipo_syscall(IPO_SYSCALL_WM_RESIZE, 3u, args);
-}
-void wm_set_title(wm_window_t *win, const char *title) {
-    if (!win) return;
-    uint32_t args[2] = { (uint32_t)(uintptr_t)win, (uint32_t)(uintptr_t)title };
-    ipo_syscall(IPO_SYSCALL_WM_SET_TITLE, 2u, args);
-}
-
-void wm_set_shape(wm_window_t *win, const uint8_t *mask, uint16_t mw, uint16_t mh) {
-    if (!win) return;
-    uint32_t args[4] = { (uint32_t)(uintptr_t)win, (uint32_t)(uintptr_t)mask,
-                         (uint32_t)mw, (uint32_t)mh };
-    ipo_syscall(IPO_SYSCALL_WM_SET_SHAPE, 4u, args);
-}
-
-bool wm_dispatch_key(uint8_t scancode) {
-    uint32_t args[1] = { (uint32_t)scancode };
-    return ipo_syscall(IPO_SYSCALL_WM_DISPATCH_KEY, 1u, args) != 0;
-}
-
-void wm_compose(uint8_t *backbuf) {
-    if (!backbuf) return;
-    uint32_t args[1] = { (uint32_t)(uintptr_t)backbuf };
-    ipo_syscall(IPO_SYSCALL_WM_COMPOSE, 1u, args);
-}
-
-void wm_compositor_tick(void) {
-    ipo_syscall(IPO_SYSCALL_WM_COMPOSITOR_TICK, 0u, NULL);
-}
-
-void wm_session_run(void) {
-    ipo_syscall(IPO_SYSCALL_WM_SESSION_RUN, 0u, NULL);
-}
-
-wm_window_t *wm_register_window(const char *title, int16_t x, int16_t y, uint16_t w, uint16_t h,
-                                  wm_draw_cb_t draw_cb, wm_event_cb_t event_cb, void *user_data) {
-    wm_window_options_t opts = WM_WINDOW_OPTIONS_DEFAULT;
-    opts.title=title; opts.x=x; opts.y=y; opts.w=w; opts.h=h;
-    opts.draw_cb=draw_cb; opts.event_cb=event_cb; opts.user_data=user_data;
-    return wm_create_window(&opts);
-}
-void wm_remove_window(wm_window_t *win) { wm_destroy_window(win); }
-
-#else
 /* =========================================================================
  * Kernel-side Window Manager Implementation
  * ========================================================================= */
@@ -476,8 +297,15 @@ static bool wm_sess_active = false;
 static bool wm_prev_left   = false;
 static bool wm_prev_right  = false;
 
-/* Static 64 KB backbuffer in BSS (never freed, always available) */
-static uint8_t wm_backbuf[VGA_GFX_SIZE];
+/* Dynamically allocated 64 KB backbuffer (allocated on first use from kernel heap) */
+static uint8_t *wm_backbuf = NULL;
+
+static uint8_t *wm_get_backbuf(void) {
+    if (!wm_backbuf) {
+        wm_backbuf = (uint8_t *)kmalloc(VGA_GFX_SIZE);
+    }
+    return wm_backbuf;
+}
 
 static bool wm_window_is_visible_for_fg(const wm_window_t *w) {
     if (!w) return false;
@@ -1781,9 +1609,12 @@ void wm_compositor_tick(void) {
     }
 
     /* Compose & flip */
-    wm_compose(wm_backbuf);
-    draw_cursor(wm_backbuf, (int)ms.x, (int)ms.y);
-    vga_gfx_flip(wm_backbuf);
+    uint8_t *bb = wm_get_backbuf();
+    if (bb) {
+        wm_compose(bb);
+        draw_cursor(bb, (int)ms.x, (int)ms.y);
+        vga_gfx_flip(bb);
+    }
 }
 
 /* =========================================================================
@@ -1821,10 +1652,13 @@ void wm_session_start(void) {
     taskbar_scroll_offset = 0;
 
     /* Draw initial frame */
-    wm_compose(wm_backbuf);
-    draw_cursor(wm_backbuf, screen_w / 2, screen_h / 2);
-    if (should_switch_hw) {
-        vga_gfx_flip(wm_backbuf);
+    uint8_t *init_bb = wm_get_backbuf();
+    if (init_bb) {
+        wm_compose(init_bb);
+        draw_cursor(init_bb, screen_w / 2, screen_h / 2);
+        if (should_switch_hw) {
+            vga_gfx_flip(init_bb);
+        }
     }
 }
 
@@ -1876,4 +1710,3 @@ wm_window_t *wm_register_window(const char *title, int16_t x, int16_t y, uint16_
     return wm_create_window(&opts);
 }
 void wm_remove_window(wm_window_t *win) { wm_destroy_window(win); }
-#endif

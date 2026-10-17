@@ -83,8 +83,9 @@ int udp_send(ip4_addr_t dst_ip, uint16_t src_port, uint16_t dst_port, const void
     return ret;
 }
 
-/* Forward declaration for central DNS response processing */
+/* Forward declaration for central DNS & DHCP response processing */
 void dns_process_response_packet(const void *data, uint16_t len);
+void dhcp_process_packet(const void *data, uint16_t len);
 
 void udp_receive(ip4_addr_t src_ip, const void *data, uint16_t len) {
     if (!data || len < sizeof(udp_header_t)) {
@@ -106,6 +107,11 @@ void udp_receive(ip4_addr_t src_ip, const void *data, uint16_t len) {
     /* Central DNS response capture if from port 53 */
     if (src_port == 53) {
         dns_process_response_packet(payload, payload_len);
+    }
+
+    /* Central DHCP response capture if to client port 68 from server port 67 */
+    if (dst_port == 68 && src_port == 67) {
+        dhcp_process_packet(payload, payload_len);
     }
 
     net_shared_ctx_t *ctx = net_get_shared_context();

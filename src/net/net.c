@@ -8,6 +8,7 @@
 #include <net/tcp.h>
 #include <net/socket.h>
 #include <net/loopback.h>
+#include <net/dhcp.h>
 #include <memory/kmalloc.h>
 #include <stdio.h>
 #include <string.h>
@@ -154,15 +155,15 @@ bool net_init(const net_config_t *config) {
         ctx->udp_table_capacity = config->udp_sockets_capacity;
         ctx->dns_queue_capacity = config->dns_queue_capacity;
         ctx->loopback_queue_capacity = config->loopback_queue_capacity;
-        if (ctx->dns_queue_capacity > 0) {
+        if (ctx->dns_queue_capacity > 0 && ctx->dns_queue) {
             memset(ctx->dns_queue, 0, ctx->dns_queue_capacity * sizeof(*ctx->dns_queue));
         }
         ctx->magic = NET_SHARED_MAGIC;
         memset(&ctx->default_if.mac, 0, sizeof(ctx->default_if.mac));
-        ctx->default_if.ip = IP4_ADDR(192, 168, 7, 2);
-        ctx->default_if.netmask = IP4_ADDR(255, 255, 255, 0);
-        ctx->default_if.gateway = IP4_ADDR(192, 168, 7, 1);
-        ctx->default_if.dns = IP4_ADDR(192, 168, 7, 1);
+        ctx->default_if.ip = 0;
+        ctx->default_if.netmask = 0;
+        ctx->default_if.gateway = 0;
+        ctx->default_if.dns = 0;
         ctx->default_if.link_up = false;
 
         loopback_init();
@@ -171,17 +172,25 @@ bool net_init(const net_config_t *config) {
         udp_init();
         tcp_init();
         socket_subsystem_init();
-
         if (rtl8139_init()) {
             const uint8_t *mac = rtl8139_get_mac();
             memcpy(ctx->default_if.mac.mac, mac, 6);
             ctx->default_if.link_up = true;
-            char ip_str[32];
-            ip_to_str(ctx->default_if.ip, ip_str, sizeof(ip_str));
-            serial_printf("[net] RTL8139 init SUCCESS, MAC: %02x:%02x:%02x:%02x:%02x:%02x, IP: %s\n",
+            serial_printf("[net] RTL8139 init SUCCESS, MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
                           (unsigned int)mac[0], (unsigned int)mac[1], (unsigned int)mac[2],
-                          (unsigned int)mac[3], (unsigned int)mac[4], (unsigned int)mac[5],
-                          ip_str);
+                          (unsigned int)mac[3], (unsigned int)mac[4], (unsigned int)mac[5]);
+
+            /* Dynamic configuration via DHCP */
+            serial_printf("[net] Discovering network configuration via DHCP...\n");
+            if (dhcp_request_lease(3000)) {
+                serial_printf("[net] Dynamic network configuration established via DHCP.\n");
+            } else {
+                serial_printf("[net] DHCP not responding, falling back to static 192.168.7.2/24\n");
+                ctx->default_if.ip = IP4_ADDR(192, 168, 7, 2);
+                ctx->default_if.netmask = IP4_ADDR(255, 255, 255, 0);
+                ctx->default_if.gateway = IP4_ADDR(192, 168, 7, 1);
+                ctx->default_if.dns = IP4_ADDR(192, 168, 7, 3);
+            }
         } else {
             ctx->default_if.link_up = false;
             serial_printf("[net] RTL8139 init FAILED, link is down\n");

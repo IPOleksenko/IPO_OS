@@ -111,6 +111,8 @@ void autorun_init(void) {
             serial_printf("[autorun] Command not found\n");
         } else if (exec_result < 0) {
             serial_printf("[autorun] Command execution failed (error %d)\n", exec_result);
+        } else {
+            serial_printf("[autorun] Return value: %s\n", process_get_last_return_string());
         }
         kfree(full_line);
     }

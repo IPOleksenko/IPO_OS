@@ -1,26 +1,6 @@
 #include <stdio.h>
 #include <stdint.h>
 
-#ifdef IPO_APP
-#include <syscall.h>
-
-static void app_putchar(char c) {
-    char text[2] = { c, '\0' };
-
-    uint32_t syscall_args[] = {
-        (uint32_t)(uintptr_t)text
-    };
-
-    ipo_syscall(
-        IPO_SYSCALL_WRITE,
-        1u,
-        syscall_args
-    );
-}
-
-#define putchar app_putchar
-#endif
-
 /**
  * Formatted print function
  */

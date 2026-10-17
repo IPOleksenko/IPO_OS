@@ -322,8 +322,11 @@ int cmdline_split(const char *cmdline, int *out_argc, char ***out_argv) {
         }
 
         if (c == '\\' && *(p + 1) != '\0') {
-            p++;
-            c = *p;
+            char next = *(p + 1);
+            if (next == ' ' || next == '\t' || next == '"' || next == '\'' || next == '\\' || next == '&' || next == ';' || next == '|' || next == '>' || next == '<') {
+                p++;
+                c = *p;
+            }
             if (arg_pos + 1 >= arg_cap) {
                 size_t new_cap = arg_cap * 2;
                 char *ext = (char *)kmalloc(new_cap);
@@ -403,5 +406,13 @@ void cmdline_free_args(int argc, char **argv) {
         if (argv[i]) kfree(argv[i]);
     }
     kfree(argv);
+}
+
+char* strcat(char *dest, const char *src) {
+    if (!dest || !src) return dest;
+    char *rdest = dest;
+    while (*dest) dest++;
+    while ((*dest++ = *src++));
+    return rdest;
 }
 

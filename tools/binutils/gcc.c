@@ -114,6 +114,11 @@ static char *replace_extension(const char *path, const char *new_ext) {
     return res;
 }
 
+static void try_inject_return_format(str_list_t *in_files, str_list_t *obj_files) {
+    (void)in_files;
+    (void)obj_files;
+}
+
 int main(int argc, char **argv) {
     if (argc < 1 || !argv || !argv[0]) {
         fprintf(stderr, "gcc: no input files\n");
@@ -232,23 +237,25 @@ int main(int argc, char **argv) {
             // C or C++ source file
             dyn_str_append(&cmd, "tcc -c ");
             dyn_str_append(&cmd, inc_str.data);
-            dyn_str_append(&cmd, " ");
+            dyn_str_append(&cmd, " \"");
             dyn_str_append(&cmd, in);
-            dyn_str_append(&cmd, " -o ");
+            dyn_str_append(&cmd, "\" -o \"");
             dyn_str_append(&cmd, target_obj);
+            dyn_str_append(&cmd, "\"");
 
             if (flag_verbose) printf("%s\n", cmd.data);
             int ret = system(cmd.data);
-            if (ret != 0) {
-                // Try /usr/bin/tcc or /applications/tcc
+            if (ret == 127 || ret < 0) {
+                // Try /applications/tcc if tcc not in PATH
                 dyn_str_t fallback;
                 dyn_str_init(&fallback);
                 dyn_str_append(&fallback, "/applications/tcc -c ");
                 dyn_str_append(&fallback, inc_str.data);
-                dyn_str_append(&fallback, " ");
+                dyn_str_append(&fallback, " \"");
                 dyn_str_append(&fallback, in);
-                dyn_str_append(&fallback, " -o ");
+                dyn_str_append(&fallback, "\" -o \"");
                 dyn_str_append(&fallback, target_obj);
+                dyn_str_append(&fallback, "\"");
                 ret = system(fallback.data);
                 dyn_str_free(&fallback);
                 if (ret != 0) {
@@ -283,11 +290,27 @@ int main(int argc, char **argv) {
     }
 
     // Linking stage
+    try_inject_return_format(&in_files, &obj_files);
     const char *final_out = outfile ? outfile : "a.out";
     dyn_str_t link_cmd;
     dyn_str_init(&link_cmd);
-    dyn_str_append(&link_cmd, "ld -m elf_i386 -o ");
+    dyn_str_append(&link_cmd, "ld -m elf_i386");
+
+    FILE *fld = fopen("/lib/linker.ld", "rb");
+    if (fld) {
+        fclose(fld);
+        dyn_str_append(&link_cmd, " -T /lib/linker.ld");
+    } else {
+        fld = fopen("/usr/lib/linker.ld", "rb");
+        if (fld) {
+            fclose(fld);
+            dyn_str_append(&link_cmd, " -T /usr/lib/linker.ld");
+        }
+    }
+
+    dyn_str_append(&link_cmd, " -o \"");
     dyn_str_append(&link_cmd, final_out);
+    dyn_str_append(&link_cmd, "\"");
 
     if (!flag_nostdlib && !flag_nostartfiles) {
         FILE *f = fopen("/lib/crt0.o", "rb");
@@ -300,8 +323,9 @@ int main(int argc, char **argv) {
     }
 
     for (size_t i = 0; i < obj_files.count; i++) {
-        dyn_str_append(&link_cmd, " ");
+        dyn_str_append(&link_cmd, " \"");
         dyn_str_append(&link_cmd, obj_files.items[i]);
+        dyn_str_append(&link_cmd, "\"");
     }
 
     dyn_str_append(&link_cmd, " -L/lib -L/usr/lib");
@@ -335,11 +359,11 @@ int main(int argc, char **argv) {
 
     if (flag_verbose) printf("%s\n", link_cmd.data);
     int ret = system(link_cmd.data);
-    if (ret != 0) {
-        // Fallback to /usr/bin/ld
+    if (ret == 127 || ret < 0) {
+        // Fallback to /applications/ld if ld was not in path
         dyn_str_t fallback_link;
         dyn_str_init(&fallback_link);
-        dyn_str_append(&fallback_link, "/usr/bin/");
+        dyn_str_append(&fallback_link, "/applications/");
         dyn_str_append(&fallback_link, link_cmd.data);
         ret = system(fallback_link.data);
         dyn_str_free(&fallback_link);

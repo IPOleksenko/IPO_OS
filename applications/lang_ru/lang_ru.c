@@ -19,7 +19,7 @@ static const keymap_entry_t ru_keymap[] = {
     { KEY_Z, "я", "Я" }, { KEY_X, "ч", "Ч" }, { KEY_C, "с", "С" },
     { KEY_V, "м", "М" }, { KEY_B, "и", "И" }, { KEY_N, "т", "Т" },
     { KEY_M, "ь", "Ь" }, { KEY_COMMA, "б", "Б" }, { KEY_PERIOD, "ю", "Ю" },
-    { KEY_SLASH, ".", "," }, { KEY_SPACE, " ", " " }
+    { KEY_SLASH, ".", "," }, { KEY_BACKSLASH, "\\", "/" }, { KEY_SPACE, " ", " " }
 };
 
 int main(int argc, char **argv) {

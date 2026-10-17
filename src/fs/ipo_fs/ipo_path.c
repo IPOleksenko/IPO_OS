@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <memory/kmalloc.h>
+#include <kernel/terminal.h>
 
 int path_resolve(const char *path, uint32_t *out_inode) {
     if (!path || !out_inode) {
@@ -9,14 +10,40 @@ int path_resolve(const char *path, uint32_t *out_inode) {
         return -1;
     }
 
-    size_t plen = strlen(path);
+    const char *cwd = terminal_get_cwd();
+    if (!cwd || cwd[0] == '\0') cwd = "/";
+
+    char *combined = NULL;
+    const char *resolved_input = path;
+
+    if (path[0] != '/') {
+        size_t needed = strlen(cwd) + strlen(path) + 4;
+        combined = (char *)kmalloc(needed);
+        if (combined) {
+            if (strcmp(cwd, "/") == 0) {
+                snprintf(combined, needed, "/%s", path);
+            } else {
+                snprintf(combined, needed, "%s/%s", cwd, path);
+            }
+            resolved_input = combined;
+        }
+    }
+
+    size_t plen = strlen(resolved_input);
     size_t buf_size = plen + 32;
     if (buf_size < 512) buf_size = 512;
 
     char *tmp = (char *)kmalloc(buf_size);
-    if (!tmp) return -1;
+    if (!tmp) {
+        if (combined) kfree(combined);
+        return -1;
+    }
 
-    fs_canonicalize(path, tmp, buf_size);
+    fs_canonicalize(resolved_input, tmp, buf_size);
+    if (combined) {
+        kfree(combined);
+        combined = NULL;
+    }
     if (strcmp(tmp, "/") == 0) {
         kfree(tmp);
         *out_inode = 1;
@@ -139,14 +166,40 @@ int path_resolve_parent(const char *path, uint32_t *out_parent_inode, char *out_
         return -1;
     }
 
-    size_t plen = strlen(path);
+    const char *cwd = terminal_get_cwd();
+    if (!cwd || cwd[0] == '\0') cwd = "/";
+
+    char *combined = NULL;
+    const char *resolved_input = path;
+
+    if (path[0] != '/') {
+        size_t needed = strlen(cwd) + strlen(path) + 4;
+        combined = (char *)kmalloc(needed);
+        if (combined) {
+            if (strcmp(cwd, "/") == 0) {
+                snprintf(combined, needed, "/%s", path);
+            } else {
+                snprintf(combined, needed, "%s/%s", cwd, path);
+            }
+            resolved_input = combined;
+        }
+    }
+
+    size_t plen = strlen(resolved_input);
     size_t buf_size = plen + 32;
     if (buf_size < 512) buf_size = 512;
 
     char *tmp = (char *)kmalloc(buf_size);
-    if (!tmp) return -1;
+    if (!tmp) {
+        if (combined) kfree(combined);
+        return -1;
+    }
 
-    fs_canonicalize(path, tmp, buf_size);
+    fs_canonicalize(resolved_input, tmp, buf_size);
+    if (combined) {
+        kfree(combined);
+        combined = NULL;
+    }
     if (strcmp(tmp, "/") == 0) {
         kfree(tmp);
         return -1;

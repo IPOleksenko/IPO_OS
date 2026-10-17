@@ -67,8 +67,8 @@ static void init_storage_if_needed(void) {
 
     /* Slot 0 is always default English */
     keymap_storage[0].name = (char *)default_keymap_name;
-    keymap_storage[0].entries = NULL;
-    keymap_storage[0].count = 0;
+    keymap_storage[0].entries = (keymap_entry_t *)default_keymap_entries;
+    keymap_storage[0].count = default_keymap_entries_count;
     keymap_storage[0].is_custom = false;
     keymap_storage[0].enabled = true;
 
@@ -78,7 +78,7 @@ static void init_storage_if_needed(void) {
 }
 
 static void free_slot_entries(keymap_slot_t *slot) {
-    if (slot->entries != NULL) {
+    if (slot->entries != NULL && slot->is_custom) {
         kfree(slot->entries);
         slot->entries = NULL;
     }
@@ -197,7 +197,7 @@ const char* dynamic_keymap_translate_local(uint8_t scancode, bool shift) {
     init_storage_if_needed();
 
     keymap_slot_t *active = &keymap_storage[active_storage_index];
-    if (!active->enabled || !active->is_custom || active->entries == NULL || active->count == 0) {
+    if (!active->enabled || active->entries == NULL || active->count == 0) {
         return NULL;
     }
 
@@ -470,4 +470,25 @@ void dynamic_keymap_reset(void) {
     active_storage_index = 0; /* Return to English */
     apply_active_font();
     terminal_render_language_bar();
+}
+
+uint32_t dynamic_keymap_get_entries_count(uint32_t slot_idx) {
+    init_storage_if_needed();
+    if (slot_idx < keymap_storage_count && keymap_storage[slot_idx].entries != NULL) {
+        return keymap_storage[slot_idx].count;
+    }
+    return 0;
+}
+
+uint32_t dynamic_keymap_copy_entries(uint32_t slot_idx, keymap_entry_t *out_entries, uint32_t max_count) {
+    init_storage_if_needed();
+    if (slot_idx >= keymap_storage_count || !keymap_storage[slot_idx].entries || !out_entries || max_count == 0) {
+        return 0;
+    }
+    uint32_t count = keymap_storage[slot_idx].count;
+    if (count > max_count) {
+        count = max_count;
+    }
+    memcpy(out_entries, keymap_storage[slot_idx].entries, sizeof(keymap_entry_t) * count);
+    return count;
 }

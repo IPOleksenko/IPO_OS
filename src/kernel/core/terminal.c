@@ -1105,7 +1105,7 @@ static void builtin_help(void) {
     printf("  - Relative paths : Relative to current working directory (e.g. file.txt, dir/sub.txt).\n");
     printf("  - Current dir    : '.' refers to current directory (e.g. ./prog, ./data).\n");
     printf("  - Parent dir     : '..' ascends to parent directory (e.g. ../file, ../../dir).\n");
-    printf("  - Root / Home    : '~' represents the root directory '/' (e.g. cd ~).\n");
+    printf("  - Root           : '~' represents the root directory '/' (e.g. cd ~).\n");
     printf("  - Redundant '/'  : Multiple slashes '//', '///' are automatically collapsed to a single '/'.\n");
     printf("  - Paths w/spaces : Wrap path in quotes (\"my file.txt\", 'my file.txt') or escape with '\\' (my\\ file.txt).\n");
     printf("\n");
@@ -1183,20 +1183,44 @@ static void builtin_cd(int argc, char **argv) {
         terminal_cwd_set("/");
         return;
     }
-    char *target = make_abs_path_dyn(argv[1]);
-    if (!target) { printf("cd: out of memory\n"); return; }
+    char *combined_arg = NULL;
+    const char *path_arg = argv[1];
+    if (argc > 2) {
+        size_t total_len = 0;
+        for (int i = 1; i < argc; i++) {
+            total_len += strlen(argv[i]) + 1;
+        }
+        combined_arg = (char *)kmalloc(total_len + 1);
+        if (combined_arg) {
+            combined_arg[0] = '\0';
+            for (int i = 1; i < argc; i++) {
+                if (i > 1) strcat(combined_arg, " ");
+                strcat(combined_arg, argv[i]);
+            }
+            path_arg = combined_arg;
+        }
+    }
+    char *target = make_abs_path_dyn(path_arg);
+    if (!target) {
+        if (combined_arg) kfree(combined_arg);
+        printf("cd: out of memory\n");
+        return;
+    }
     struct ipo_inode stat;
     if (!ipo_fs_stat(target, &stat)) {
-        printf("cd: %s: No such directory\n", argv[1]);
+        printf("cd: %s: No such directory\n", path_arg);
+        if (combined_arg) kfree(combined_arg);
         kfree(target);
         return;
     }
     if ((stat.mode & IPO_INODE_TYPE_DIR) == 0) {
-        printf("cd: %s: Not a directory\n", argv[1]);
+        printf("cd: %s: Not a directory\n", path_arg);
+        if (combined_arg) kfree(combined_arg);
         kfree(target);
         return;
     }
     terminal_cwd_set(target);
+    if (combined_arg) kfree(combined_arg);
     kfree(target);
 }
 
@@ -1513,46 +1537,7 @@ static void builtin_stat(int argc, char **argv) {
     }
 }
 
-static void builtin_echo(int argc, char **argv, const char *cmdline) {
-    const char *append_pos = strstr(cmdline, ">>");
-    const char *write_pos = strchr(cmdline, '>');
-    if (write_pos) {
-        bool append = (append_pos != NULL && append_pos == write_pos);
-        const char *file_part = append ? (write_pos + 2) : (write_pos + 1);
-        while (*file_part == ' ' || *file_part == '\t') file_part++;
-        if (*file_part) {
-            char fn[256];
-            char target[1024];
-            int fnp = 0;
-            while (*file_part && *file_part != ' ' && *file_part != '\t' && *file_part != '\n' && fnp < 255) {
-                fn[fnp++] = *file_part++;
-            }
-            fn[fnp] = '\0';
-            make_abs_path(fn, target, sizeof(target));
-
-            const char *text_start = cmdline;
-            while (*text_start && (*text_start == ' ' || *text_start == '\t')) text_start++;
-            if (strncmp(text_start, "echo", 4) == 0) text_start += 4;
-            while (*text_start && (*text_start == ' ' || *text_start == '\t')) text_start++;
-
-            size_t text_len = (size_t)(write_pos - text_start);
-            while (text_len > 0 && (text_start[text_len - 1] == ' ' || text_start[text_len - 1] == '\t')) {
-                text_len--;
-            }
-            char *text_buf = kmalloc(text_len + 2);
-            if (text_buf) {
-                memcpy(text_buf, text_start, text_len);
-                text_buf[text_len] = '\n';
-                text_buf[text_len + 1] = '\0';
-                if (!ipo_fs_write_text(target, text_buf, append)) {
-                    printf("echo: failed to write to %s\n", fn);
-                }
-                kfree(text_buf);
-            }
-            return;
-        }
-    }
-
+static void builtin_echo(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         printf("%s%s", argv[i], (i + 1 < argc) ? " " : "");
     }
@@ -2080,9 +2065,8 @@ void terminal_apply_pending_input(void) {
                     printf("Execution failed (error %d): %s\n", exec, input_buf);
                 }
             } else if (exec != 1000) {
-                int ret = process_get_exit_code();
                 if (terminal_show_return_value) {
-                    printf("Return value: %d\n", ret);
+                    process_print_last_return_value();
                 }
             }
 
@@ -2752,8 +2736,139 @@ static void builtin_drivers(int argc, char **argv) {
     printf("Usage: drivers [list | info <id/name> | load <path> | unload <id/name> | status]\n");
 }
 
+static bool parse_command_redirection(const char *cmdline, char **out_cmd, char **out_file, bool *out_append) {
+    if (out_cmd) *out_cmd = NULL;
+    if (out_file) *out_file = NULL;
+    if (out_append) *out_append = false;
+    if (!cmdline) return false;
+
+    const char *p = cmdline;
+    char in_quote = '\0';
+    const char *redir_pos = NULL;
+    bool is_append = false;
+
+    while (*p) {
+        char c = *p;
+        if (in_quote) {
+            if (c == in_quote) {
+                in_quote = '\0';
+            } else if (c == '\\' && (*(p + 1) == in_quote || *(p + 1) == '\\')) {
+                p++;
+            }
+        } else {
+            if (c == '"' || c == '\'') {
+                in_quote = c;
+            } else if (c == '\\' && *(p + 1) != '\0') {
+                p++;
+            } else if (c == '>') {
+                redir_pos = p;
+                if (*(p + 1) == '>') {
+                    is_append = true;
+                } else {
+                    is_append = false;
+                }
+                break;
+            }
+        }
+        p++;
+    }
+
+    if (!redir_pos) return false;
+
+    /* Extract clean command portion before redirection */
+    size_t cmd_len = (size_t)(redir_pos - cmdline);
+    while (cmd_len > 0 && (cmdline[cmd_len - 1] == ' ' || cmdline[cmd_len - 1] == '\t')) {
+        cmd_len--;
+    }
+    char *clean_cmd = (char *)kmalloc(cmd_len + 1);
+    if (!clean_cmd) return false;
+    memcpy(clean_cmd, cmdline, cmd_len);
+    clean_cmd[cmd_len] = '\0';
+
+    /* Extract target filename after > or >> */
+    const char *fn_start = is_append ? (redir_pos + 2) : (redir_pos + 1);
+    while (*fn_start == ' ' || *fn_start == '\t') fn_start++;
+
+    if (*fn_start == '\0') {
+        kfree(clean_cmd);
+        return false;
+    }
+
+    size_t fn_cap = strlen(fn_start) + 1;
+    char *target_fn = (char *)kmalloc(fn_cap);
+    if (!target_fn) {
+        kfree(clean_cmd);
+        return false;
+    }
+
+    size_t fn_pos = 0;
+    const char *f = fn_start;
+
+    if (*f == '"' || *f == '\'') {
+        char q = *f++;
+        while (*f && *f != q) {
+            if (*f == '\\' && (*(f + 1) == q || *(f + 1) == '\\')) {
+                f++;
+            }
+            target_fn[fn_pos++] = *f++;
+        }
+        if (*f == q) f++;
+    } else {
+        /* Unquoted filename: take until newline/carriage return, unescaping backslashes */
+        while (*f && *f != '\n' && *f != '\r') {
+            if (*f == '\\' && *(f + 1) != '\0') {
+                f++;
+            }
+            target_fn[fn_pos++] = *f++;
+        }
+        while (fn_pos > 0 && (target_fn[fn_pos - 1] == ' ' || target_fn[fn_pos - 1] == '\t')) {
+            fn_pos--;
+        }
+    }
+    target_fn[fn_pos] = '\0';
+
+    if (fn_pos == 0) {
+        kfree(clean_cmd);
+        kfree(target_fn);
+        return false;
+    }
+
+    if (out_cmd) *out_cmd = clean_cmd;
+    else kfree(clean_cmd);
+
+    if (out_file) *out_file = target_fn;
+    else kfree(target_fn);
+
+    if (out_append) *out_append = is_append;
+    return true;
+}
+
 int try_execute_command(const char *cmdline) {
     if (!cmdline) return -1;
+
+    char *clean_cmd = NULL;
+    char *redir_file = NULL;
+    bool append_mode = false;
+
+    if (parse_command_redirection(cmdline, &clean_cmd, &redir_file, &append_mode)) {
+        stdout_redirect_start();
+        int res = try_execute_command(clean_cmd);
+        char *redir_buf = NULL;
+        size_t redir_len = 0;
+        stdout_redirect_end(&redir_buf, &redir_len);
+
+        char target_path[1024];
+        make_abs_path(redir_file, target_path, sizeof(target_path));
+
+        if (!ipo_fs_write_text(target_path, redir_buf ? redir_buf : "", append_mode)) {
+            printf("redirection: failed to write to '%s'\n", redir_file);
+        }
+
+        if (redir_buf) kfree(redir_buf);
+        kfree(clean_cmd);
+        kfree(redir_file);
+        return res;
+    }
 
     int argc = 0;
     char **argv = NULL;
@@ -2802,7 +2917,7 @@ int try_execute_command(const char *cmdline) {
         builtin_stat(argc, argv);
         builtin_handled = 1;
     } else if (strcmp(name, "echo") == 0) {
-        builtin_echo(argc, argv, cmdline);
+        builtin_echo(argc, argv);
         builtin_handled = 1;
     } else if (strcmp(name, "reboot") == 0) {
         builtin_reboot();
@@ -2946,11 +3061,9 @@ void terminal_poll_serial_commands(void) {
                         }
                     }
                 } else if (exec != 1000) {
-                    int ret = process_get_exit_code();
                     if (terminal_get_show_return_value()) {
-                        serial_printf("Return value: %d\n", ret);
                         if (!wm_session_active()) {
-                            printf("Return value: %d\n", ret);
+                            process_print_last_return_value();
                         }
                     }
                 }
@@ -3269,9 +3382,8 @@ void terminal_console(void){
                                 printf("Execution failed (error %d): %s\n", exec, input_buf);
                             }
                         } else if (exec != 1000) {
-                            int ret = process_get_exit_code();
                             if (terminal_show_return_value) {
-                                printf("Return value: %d\n", ret);
+                                process_print_last_return_value();
                             }
                         }
                     }

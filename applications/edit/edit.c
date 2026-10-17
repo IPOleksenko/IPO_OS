@@ -1057,12 +1057,26 @@ static bool execute_command(void) {
         } else {
             save_file(current_file);
         }
-    } else if (strncmp(cmd, "w ", 2) == 0) {
-        const char *new_path = (cmd[0] == 'w') ? cmd + 2 : cmd + 3;
+    } else if (strncmp(cmd, "w ", 2) == 0 || strncmp(cmd, "W ", 2) == 0 ||
+               strncmp(cmd, "wq ", 3) == 0 || strncmp(cmd, "WQ ", 3) == 0) {
+        bool and_quit = (cmd[1] == 'q' || cmd[1] == 'Q');
+        const char *new_path = and_quit ? cmd + 3 : cmd + 2;
         while (*new_path == ' ') new_path++;
         if (*new_path) {
-            strncpy(current_file, new_path, sizeof(current_file) - 1);
-            save_file(current_file);
+            size_t nplen = strlen(new_path);
+            if ((*new_path == '"' || *new_path == '\'') && nplen >= 2 && new_path[nplen - 1] == *new_path) {
+                size_t unquoted_len = nplen - 2;
+                if (unquoted_len < sizeof(current_file)) {
+                    memcpy(current_file, new_path + 1, unquoted_len);
+                    current_file[unquoted_len] = '\0';
+                }
+            } else {
+                strncpy(current_file, new_path, sizeof(current_file) - 1);
+                current_file[sizeof(current_file) - 1] = '\0';
+            }
+            if (save_file(current_file)) {
+                if (and_quit) return true;
+            }
         }
     } else if (strcmp(cmd, "wq") == 0 || strcmp(cmd, "WQ") == 0 ||
                strcmp(cmd, "wq!") == 0 || strcmp(cmd, "WQ!") == 0 ||
@@ -1151,8 +1165,16 @@ int main(int argc, char **argv) {
 
     current_file[0] = '\0';
     if (argc > 1) {
-        strncpy(current_file, argv[1], sizeof(current_file) - 1);
-        current_file[sizeof(current_file) - 1] = '\0';
+        for (int i = 1; i < argc; i++) {
+            if (i > 1) {
+                size_t clen = strlen(current_file);
+                if (clen + 1 < sizeof(current_file)) {
+                    current_file[clen] = ' ';
+                    current_file[clen + 1] = '\0';
+                }
+            }
+            strncat(current_file, argv[i], sizeof(current_file) - strlen(current_file) - 1);
+        }
     }
 
     /* If running in a batch behind another process, wait until we become foreground */
@@ -1199,6 +1221,7 @@ int main(int argc, char **argv) {
     /* Ensure font and keymap subsystems are in app mode */
     vga_font_set_app_mode(true);
     dynamic_keymap_set_app_mode(true);
+    keyboard_set_app_input_mode(true);
     keyboard_flush_hardware();
     keyboard_flush_app_queue();
     bool running = true;
@@ -1252,6 +1275,16 @@ int main(int argc, char **argv) {
             keyboard_clear_key_state();
             running = false;
             break;
+        }
+
+        /* Ctrl+S: Quick save file */
+        if (keyboard_is_ctrl_pressed() && (sc == 0x1F || sc == 0x9F)) {
+            if (current_file[0] == '\0') {
+                snprintf(status_msg, sizeof(status_msg), "Error: No file name (use :w <filename>)");
+            } else {
+                save_file(current_file);
+            }
+            continue;
         }
 
         /* If help screen is active, dismiss on any key */
@@ -1333,11 +1366,7 @@ int main(int argc, char **argv) {
             if (sc == SC_ESC) {
                 pending_op = '\0';
                 status_msg[0] = '\0';
-            } else if (sc == 0x17) { /* 'i' key -> Insert mode */
-                mode = MODE_INSERT;
-                pending_op = '\0';
-            } else if (sc == 0x1E) { /* 'a' key -> Append */
-                cur_col = utf8_next_char_offset(lines[cur_line], cur_col);
+            } else if (sc == 0x52) { /* 'Insert' key -> Insert mode */
                 mode = MODE_INSERT;
                 pending_op = '\0';
             } else if (sc == 0x17 && keyboard_is_shift_pressed()) { /* 'I' -> Insert at line start */
@@ -1345,8 +1374,15 @@ int main(int argc, char **argv) {
                 while (lines[cur_line][cur_col] == ' ') cur_col++;
                 mode = MODE_INSERT;
                 pending_op = '\0';
+            } else if (sc == 0x17) { /* 'i' key -> Insert mode */
+                mode = MODE_INSERT;
+                pending_op = '\0';
             } else if (sc == 0x1E && keyboard_is_shift_pressed()) { /* 'A' -> Append at line end */
                 cur_col = (int)strlen(lines[cur_line]);
+                mode = MODE_INSERT;
+                pending_op = '\0';
+            } else if (sc == 0x1E) { /* 'a' key -> Append */
+                cur_col = utf8_next_char_offset(lines[cur_line], cur_col);
                 mode = MODE_INSERT;
                 pending_op = '\0';
             } else if (sc == 0x18 && !keyboard_is_shift_pressed()) { /* 'o' -> Open line below */
@@ -1444,10 +1480,20 @@ int main(int argc, char **argv) {
                 cmd_len = 0;
                 cmd_buf[0] = '\0';
                 pending_op = '\0';
+            } else {
+                const char *ks = keyboard_get_key_string(sc);
+                if (ks && strcmp(ks, ":") == 0) {
+                    mode = MODE_COMMAND;
+                    cmd_len = 0;
+                    cmd_buf[0] = '\0';
+                    pending_op = '\0';
+                } else if (ks && (unsigned char)ks[0] >= 32) {
+                    snprintf(status_msg, sizeof(status_msg), "Press 'i' to enter Insert mode");
+                }
             }
         } else if (mode == MODE_INSERT) {
             /* Insert Mode */
-            if (sc == SC_ESC) {
+            if (sc == SC_ESC || sc == 0x52) {
                 mode = MODE_NORMAL;
                 if (cur_col > 0) cur_col--;
             } else if (sc == SC_BACKSPACE) {

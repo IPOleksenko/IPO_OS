@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Format disk image via IPO_OS kernel in headless QEMU.
-This replaces userspace/Python filesystem formatting with the native in-kernel IPO_OS implementation.
 """
 
 import argparse

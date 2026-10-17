@@ -83,11 +83,25 @@ int vprintf(const char *format, va_list ap);
 int vfprintf(FILE *stream, const char *format, va_list ap);
 int vsprintf(char *str, const char *format, va_list ap);
 int vsnprintf(char *str, size_t size, const char *format, va_list ap);
+int serial_printf(const char *format, ...);
 
 int scanf(const char *format, ...);
 int sscanf(const char *str, const char *format, ...);
 int fscanf(FILE *stream, const char *format, ...);
 int vsscanf(const char *str, const char *format, va_list ap);
+
+#ifndef _IPO_RETURN_FORMAT_DESC_T_DEFINED
+#define _IPO_RETURN_FORMAT_DESC_T_DEFINED
+typedef struct ipo_return_format_desc {
+    uint32_t magic;
+    const char *fmt;
+} ipo_return_format_desc_t;
+#endif
+
+#ifndef IPO_RETURN_FORMAT
+#define IPO_RETURN_FORMAT(fmt_str) \
+    __attribute__((used)) static const ipo_return_format_desc_t __ipo_ret_desc = { 0x524F5049, (fmt_str) }
+#endif
 
 #ifdef __cplusplus
 }

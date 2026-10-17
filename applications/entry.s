@@ -4,3 +4,4 @@
 .section .entry, "ax"
 _start:
     jmp main
+

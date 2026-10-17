@@ -24,5 +24,5 @@ void ipo_fs_init(void) {
             fds[i].flags = 0;
         }
     }
-    serial_printf("[ipo_fs] Filesystem state initialized (%u dynamic fds, ptr=%p).\n", fds_capacity, fds);
+    printf("[ipo_fs] Filesystem state initialized (%u dynamic fds, ptr=%p).\n", fds_capacity, fds);
 }

@@ -82,7 +82,7 @@ static void mouse_flush(void) {
 void mouse_init(void) {
     if (mouse_initialized) return;
 
-    serial_printf("[mouse] Initializing PS/2 mouse...\n");
+    printf("[mouse] Initializing PS/2 mouse...\n");
 
     // Flush any pending data from 8042 controller
     mouse_flush();
@@ -129,7 +129,7 @@ void mouse_init(void) {
     mouse_write(0xF2);
     (void)mouse_read(); // ACK
     uint8_t dev_id = mouse_read();
-    serial_printf("[mouse] PS/2 Device ID: 0x%x\n", dev_id);
+    printf("[mouse] PS/2 Device ID: 0x%x\n", dev_id);
     mouse_device_id = dev_id;
 
     if (dev_id == 0x03 || dev_id == 0x04) {
@@ -138,14 +138,14 @@ void mouse_init(void) {
         current_mouse_state.has_wheel = true;
         current_mouse_state.dev_id = dev_id;
         current_mouse_state.packet_size = 4;
-        serial_printf("[mouse] IntelliMouse with wheel enabled (4-byte packets, ID=0x%x)\n", dev_id);
+        printf("[mouse] IntelliMouse with wheel enabled (4-byte packets, ID=0x%x)\n", dev_id);
     } else {
         mouse_packet_size = 3;
         mouse_has_wheel = false;
         current_mouse_state.has_wheel = false;
         current_mouse_state.dev_id = dev_id;
         current_mouse_state.packet_size = 3;
-        serial_printf("[mouse] Standard PS/2 mouse (3-byte packets, ID=0x%x)\n", dev_id);
+        printf("[mouse] Standard PS/2 mouse (3-byte packets, ID=0x%x)\n", dev_id);
     }
 
     // Set resolution: 4 counts/mm
@@ -157,7 +157,7 @@ void mouse_init(void) {
     // Enable data reporting (0xF4)
     mouse_write(0xF4);
     uint8_t ack_enable = mouse_read(); // ACK (0xFA)
-    serial_printf("[mouse] Data reporting enabled (ACK=0x%x)\n", ack_enable);
+    printf("[mouse] Data reporting enabled (ACK=0x%x)\n", ack_enable);
 
     // Flush any leftover controller bytes so packet stream starts cleanly
     mouse_flush();
@@ -165,7 +165,7 @@ void mouse_init(void) {
     mouse_cycle = 0;
     mouse_initialized = true;
     mouse_set_bounds_from_display();
-    serial_printf("[mouse] PS/2 mouse initialization complete.\n");
+    printf("[mouse] PS/2 mouse initialization complete.\n");
 }
 
 static void mouse_process_packet(void) {

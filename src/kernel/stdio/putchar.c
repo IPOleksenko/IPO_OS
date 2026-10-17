@@ -27,6 +27,44 @@ static void release_output_lock(void) {
     __sync_lock_release(&output_lock);
 }
 
+static char *s_stdout_redir_buf = NULL;
+static size_t s_stdout_redir_len = 0;
+static size_t s_stdout_redir_cap = 0;
+static bool s_stdout_redir_active = false;
+
+void stdout_redirect_start(void) {
+    if (s_stdout_redir_buf) {
+        kfree(s_stdout_redir_buf);
+        s_stdout_redir_buf = NULL;
+    }
+    s_stdout_redir_len = 0;
+    s_stdout_redir_cap = 256;
+    s_stdout_redir_buf = (char *)kmalloc(s_stdout_redir_cap);
+    if (s_stdout_redir_buf) {
+        s_stdout_redir_buf[0] = '\0';
+    }
+    s_stdout_redir_active = true;
+}
+
+void stdout_redirect_end(char **out_buf, size_t *out_len) {
+    s_stdout_redir_active = false;
+    if (s_stdout_redir_buf) {
+        s_stdout_redir_buf[s_stdout_redir_len] = '\0';
+    }
+    if (out_buf) *out_buf = s_stdout_redir_buf;
+    else if (s_stdout_redir_buf) kfree(s_stdout_redir_buf);
+
+    if (out_len) *out_len = s_stdout_redir_len;
+
+    s_stdout_redir_buf = NULL;
+    s_stdout_redir_len = 0;
+    s_stdout_redir_cap = 0;
+}
+
+bool stdout_is_redirected(void) {
+    return s_stdout_redir_active;
+}
+
 /**
  * Output a single character to VGA memory at cursor position
  */
@@ -35,6 +73,26 @@ void putchar(char c) {
 }
 
 void putchar_color(char c, uint8_t fg, uint8_t bg) {
+    if (s_stdout_redir_active) {
+        if (s_stdout_redir_len + 2 > s_stdout_redir_cap) {
+            size_t ncap = s_stdout_redir_cap ? s_stdout_redir_cap * 2 : 256;
+            char *nb = (char *)kmalloc(ncap);
+            if (nb) {
+                if (s_stdout_redir_buf) {
+                    memcpy(nb, s_stdout_redir_buf, s_stdout_redir_len);
+                    kfree(s_stdout_redir_buf);
+                }
+                s_stdout_redir_buf = nb;
+                s_stdout_redir_cap = ncap;
+            }
+        }
+        if (s_stdout_redir_buf && s_stdout_redir_len + 1 < s_stdout_redir_cap) {
+            s_stdout_redir_buf[s_stdout_redir_len++] = c;
+            s_stdout_redir_buf[s_stdout_redir_len] = '\0';
+        }
+        return;
+    }
+
     serial_putc(c);
 
     process_t *curr = process_get_current();

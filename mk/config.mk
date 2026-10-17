@@ -109,6 +109,8 @@ LIB_CFLAGS := -m32 \
 	-fno-pic -fno-pie \
 	-fno-builtin \
 	-nostdlib -nostartfiles \
+	-fno-asynchronous-unwind-tables \
+	-fno-unwind-tables \
 	-I$(SRC)/include
 
 LD_FLAGS := -T $(SRC)/kernel/linker.ld -nostdlib

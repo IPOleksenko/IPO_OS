@@ -23,8 +23,24 @@ typedef int sig_atomic_t;
 typedef unsigned long sigset_t;
 typedef void (*sighandler_t)(int);
 
+typedef struct {
+    int si_signo;
+    int si_errno;
+    int si_code;
+    void *si_addr;
+} siginfo_t;
+
+typedef struct {
+    void *ss_sp;
+    int ss_flags;
+    size_t ss_size;
+} stack_t;
+
 struct sigaction {
-    void (*sa_handler)(int);
+    union {
+        void (*sa_handler)(int);
+        void (*sa_sigaction)(int, siginfo_t *, void *);
+    };
     sigset_t sa_mask;
     int sa_flags;
     void (*sa_restorer)(void);
@@ -52,6 +68,16 @@ struct sigaction {
 #define SIG_BLOCK   0
 #define SIG_UNBLOCK 1
 #define SIG_SETMASK 2
+
+#define FPE_INTDIV 1
+#define FPE_INTOVF 2
+#define FPE_FLTDIV 3
+#define FPE_FLTOVF 4
+#define FPE_FLTUND 5
+#define FPE_FLTRES 6
+#define FPE_FLTINV 7
+#define FPE_FLTSUB 8
+
 
 sighandler_t signal(int signum, sighandler_t handler);
 int raise(int sig);

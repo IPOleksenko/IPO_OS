@@ -15,6 +15,7 @@
 #include <net/icmp.h>
 #include <net/dns.h>
 #include <net/ipv4.h>
+#include <net/dyn_buf.h>
 #include <system/timer.h>
 #include <driver/input/keyboard.h>
 #include <driver/input/keymap/keymap.h>
@@ -61,12 +62,28 @@ static void wait_with_interrupt(uint32_t wait_ms) {
 }
 
 static bool ping_resolve(const char *hostname, ip4_addr_t *out_ip, uint32_t timeout_ms) {
+    if (!hostname || !out_ip) return false;
+
+    /* Self-expanding dynamic buffer without size limits or truncation */
+    dyn_buf_t clean_buf;
+    dyn_buf_init(&clean_buf, 64);
+
+    const char *p = hostname;
+    while (*p) {
+        dyn_buf_append_byte(&clean_buf, (uint8_t)*p);
+        p++;
+    }
+    dyn_buf_append_byte(&clean_buf, '\0');
+
+    const char *target = (const char *)clean_buf.data;
     uint32_t args[3] = {
-        (uint32_t)(uintptr_t)hostname,
+        (uint32_t)(uintptr_t)target,
         (uint32_t)(uintptr_t)out_ip,
         timeout_ms
     };
-    return ipo_syscall(IPO_SYSCALL_NET_DNS_RESOLVE, 3u, args) != 0;
+    bool res = (ipo_syscall(IPO_SYSCALL_NET_DNS_RESOLVE, 3u, args) != 0);
+    dyn_buf_free(&clean_buf);
+    return res;
 }
 
 static int ping_send_echo(ip4_addr_t dst_ip, uint16_t id, uint16_t seq,

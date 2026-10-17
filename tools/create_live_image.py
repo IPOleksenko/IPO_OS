@@ -10,7 +10,7 @@ Layout of the unified Live USB medium (128 MB raw disk):
   Sectors 2039:           Storage Pool Backup Superblock
   Sectors 2048+:          IPO_FS Filesystem Partition (/applications, /autorun, fonts, tools)
 
-This allows writing the image directly to any USB flash drive (e.g. via dd or Rufus)
+This allows writing the image directly to any USB flash drive
 and booting on any PC without installation, preserving all changes on the USB flash drive.
 """
 

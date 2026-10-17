@@ -201,12 +201,3 @@ void pci_enable_bus_mastering(const pci_device_t *dev) {
     pci_write_word(dev->bus, dev->slot, dev->func, 0x04, cmd);
 }
 
-/* Weak stubs to allow freestanding libapp.a linking when rtl8139.o is filtered out */
-__attribute__((weak)) bool rtl8139_is_present(void) {
-    return false;
-}
-
-__attribute__((weak)) const uint8_t *rtl8139_get_mac(void) {
-    return NULL;
-}
-

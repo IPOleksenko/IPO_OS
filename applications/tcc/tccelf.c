@@ -1920,7 +1920,9 @@ static void tcc_add_linker_symbols(TCCState *s1)
 
     set_linker_sym(s1, "_etext", text_section, 0);
     set_linker_sym(s1, "_edata", data_section, 0);
+    set_linker_sym(s1, "__bss_start", bss_section, 0);
     set_linker_sym(s1, "_end", bss_section, 0);
+    set_linker_sym(s1, "__bss_end", bss_section, 0);
 #if TARGETOS_OpenBSD
     set_global_sym(s1, "__executable_start", NULL, ELF_START_ADDR);
 #endif
@@ -2138,6 +2140,7 @@ static void bind_exe_dynsyms(TCCState *s1, int is_PIE)
     }
     /* update _end symbol with new bss length */
     set_linker_sym(s1, "_end", bss_section, 2);
+    set_linker_sym(s1, "__bss_end", bss_section, 2);
 }
 
 /* Bind symbols of libraries: export all non local symbols of executable that

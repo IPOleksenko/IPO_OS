@@ -1002,6 +1002,6 @@ void device_init(void) {
     s_next_id = 1;
     s_registry_initialized = true;
 
-    serial_printf("[device] Initializing Unified Device Registry\n");
+    printf("[device] Initializing Unified Device Registry\n");
     device_rescan();
 }

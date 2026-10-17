@@ -61,14 +61,16 @@ uint8_t keyboard_get_modifiers(void) {
 }
 
 char* get_keymap(void) {
-    if (shift_mode) {
-        return (char*)keymap_english_shift;
-    } else {
-        return (char*)keymap_english;
+    static char s_kernel_keymap[256];
+    memset(s_kernel_keymap, 0, sizeof(s_kernel_keymap));
+    for (uint32_t sc = 0; sc < 256; sc++) {
+        const char *s = dynamic_keymap_translate((uint8_t)sc, shift_mode);
+        if (s != NULL && s[0] != '\0') {
+            s_kernel_keymap[sc] = s[0];
+        }
     }
+    return s_kernel_keymap;
 }
-
-static char static_char_buf[2] = {0, 0};
 
 const char* keyboard_get_key_string(uint8_t scancode) {
     if (scancode == 0x00u) {
@@ -118,16 +120,6 @@ const char* keyboard_get_key_string(uint8_t scancode) {
         const char *def = dynamic_keymap_get_default_symbol();
         if (def != NULL && def[0] != '\0') {
             return def;
-        }
-    }
-
-    char* keymap = get_keymap();
-    if (scancode < 128) {
-        char c = keymap[scancode];
-        if (c != 0x00) {
-            static_char_buf[0] = c;
-            static_char_buf[1] = '\0';
-            return static_char_buf;
         }
     }
 

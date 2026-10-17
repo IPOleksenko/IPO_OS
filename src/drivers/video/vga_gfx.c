@@ -222,9 +222,6 @@ static inline void ac_write(uint8_t index, uint8_t val) {
 }
 
 void vga_save_text_state(void) {
-#ifdef IPO_APP
-    return;
-#else
     /* If graphics mode is active or text VRAM was already saved, NEVER read 0xB8000!
      * In Mode 13h, 0xB8000 is unmapped by hardware and reading it yields 0x2020 bus float. */
     if (vga_is_graphics_mode() || has_saved_text_vram) {
@@ -330,7 +327,6 @@ void vga_save_text_state(void) {
 
     text_state_saved = true;
     serial_printf("[vga] Text mode hardware state saved (cursor_pos=%u, visible=%d).\n", saved_cursor_pos, (int)saved_cursor_visible);
-#endif
 }
 
 void vga_set_mode_13h_hardware(void) {

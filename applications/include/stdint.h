@@ -33,4 +33,17 @@ typedef uint64_t           uintmax_t;
 #define INT64_MAX  9223372036854775807LL
 #define UINT64_MAX 18446744073709551615ULL
 
+#ifndef SIZE_MAX
+#define SIZE_MAX   4294967295U
+#endif
+#ifndef UINTPTR_MAX
+#define UINTPTR_MAX 4294967295U
+#endif
+#ifndef INTPTR_MAX
+#define INTPTR_MAX  2147483647
+#endif
+#ifndef INTPTR_MIN
+#define INTPTR_MIN  (-2147483647 - 1)
+#endif
+
 #endif

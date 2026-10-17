@@ -24,22 +24,6 @@ def safe_put(disk, src_path, dest_path):
 
 
 def safe_put_executable(disk, src_path, dest_path):
-    src = Path(src_path)
-    if not src.exists():
-        return
-    try:
-        with open(src, "rb") as f:
-            magic = f.read(4)
-        if magic == b"\x7fELF":
-            tmp_bin = src.parent / f".{src.name}.raw_bin"
-            cmd = ["objcopy", "--set-section-flags", ".bss=alloc,load,contents", "-O", "binary", str(src), str(tmp_bin)]
-            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if res.returncode == 0 and tmp_bin.exists():
-                safe_put(disk, tmp_bin, dest_path)
-                tmp_bin.unlink(missing_ok=True)
-                return
-    except Exception as e:
-        print(f"Warning converting {src_path} -> {dest_path}: {e}")
     safe_put(disk, src_path, dest_path)
 
 
@@ -120,6 +104,7 @@ def main():
         "strip": toolchain_dir / "strip.elf",
         "nasm": toolchain_dir / "nasm.elf",
         "micropython": toolchain_dir / "python.elf",
+        "python": toolchain_dir / "python.elf",
         "lua": toolchain_dir / "lua" / "lua.elf",
         "luac": toolchain_dir / "lua" / "luac.elf",
     }
@@ -191,7 +176,9 @@ def main():
             if p.exists():
                 safe_put(disk, p, f"/lib/{lf}")
 
-        linker_script = project_root / "src" / "userland" / "linker.ld"
+        linker_script = project_root / "applications" / "lib" / "linker.ld"
+        if not linker_script.exists():
+            linker_script = project_root / "src" / "userland" / "linker.ld"
         if not linker_script.exists():
             linker_script = project_root / "lib" / "linker.ld"
         if linker_script.exists():

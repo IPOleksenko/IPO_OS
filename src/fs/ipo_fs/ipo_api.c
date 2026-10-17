@@ -33,7 +33,7 @@ static void write_dir_dots(uint32_t inode_no, uint32_t parent, uint64_t block) {
 }
 
 static bool zero_blocks(uint64_t start_block, uint64_t num_blocks) {
-    #define ZERO_CHUNK_BLOCKS 64
+    #define ZERO_CHUNK_BLOCKS 8
     static uint8_t zero_chunk[ZERO_CHUNK_BLOCKS * IPO_FS_BLOCK_SIZE];
     uint64_t remaining = num_blocks;
     uint64_t curr = start_block;

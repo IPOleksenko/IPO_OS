@@ -202,6 +202,9 @@ void kmain(void) {
     ensure_fs_mounted();
     printf("[kernel] Filesystem mount check complete.\n");
 
+    /* Automatically load system console font database if available */
+    vga_load_cyrillic_font("/fonts/default.fnt");
+
     play_startup_sound();
     terminal_initialize();
     printf("Type \"help\" on the keyboard to view commands, shortcuts, and OS features.\n\n");

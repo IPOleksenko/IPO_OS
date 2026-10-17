@@ -6,12 +6,14 @@
 #include <memory/kmalloc.h>
 #include <kernel/terminal.h>
 #include <driver/input/keyboard.h>
+#include <driver/input/mouse.h>
 #include <driver/input/keymap/keymap.h>
 #include <driver/input/keymap/dynamic_keymap.h>
 #include <kernel/driver.h>
 #include <system/state.h>
 #include <system/timer.h>
 #include <driver/sound.h>
+#include <driver/audio_core.h>
 #include <vga.h>
 #include <vga_gfx.h>
 #include <wm.h>
@@ -636,6 +638,60 @@ static uint32_t syscall_builtin_get_exit_code(uint32_t num, uint32_t argc, uint3
     return (uint32_t)process_get_exit_code();
 }
 
+static uint32_t syscall_builtin_set_return_value(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 2u || argv == NULL) return (uint32_t)-1;
+    process_return_type_t type = (process_return_type_t)argv[0];
+    const char *type_name = "";
+    const char *str_val = NULL;
+    int32_t int_val = 0;
+    const void *data = NULL;
+    uint32_t size = 0;
+
+    if (type == PROC_RET_INT) {
+        int_val = (int32_t)argv[1];
+        type_name = "int";
+    } else if (type == PROC_RET_CHAR) {
+        int_val = (int32_t)(char)argv[1];
+        type_name = "char";
+    } else if (type == PROC_RET_STRING) {
+        str_val = (const char *)(uintptr_t)argv[1];
+        if (argc > 2u && argv[2] != 0) {
+            type_name = (const char *)(uintptr_t)argv[2];
+        } else {
+            type_name = "char*";
+        }
+    } else if (type == PROC_RET_STRUCT) {
+        data = (const void *)(uintptr_t)argv[1];
+        size = argc > 2u ? argv[2] : 0;
+        if (argc > 3u && argv[3] != 0) {
+            type_name = (const char *)(uintptr_t)argv[3];
+        } else {
+            type_name = "struct";
+        }
+    } else if (type == PROC_RET_POINTER) {
+        data = (const void *)(uintptr_t)argv[1];
+        type_name = "void*";
+    }
+
+    process_set_current_return_value(type, type_name, str_val, int_val, data, size);
+    return 0;
+}
+
+static uint32_t syscall_builtin_get_return_value(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 2u || argv == NULL) return (uint32_t)-1;
+    char *buf = (char *)(uintptr_t)argv[0];
+    uint32_t max_len = argv[1];
+    if (!buf || max_len == 0) return (uint32_t)-1;
+
+    const char *val_str = process_get_last_return_string();
+    if (!val_str) val_str = "";
+    strncpy(buf, val_str, max_len - 1);
+    buf[max_len - 1] = '\0';
+    return (uint32_t)strlen(buf);
+}
+
 static uint32_t syscall_builtin_terminal_input(uint32_t num,
                                                uint32_t argc,
                                                uint32_t *argv) {
@@ -672,7 +728,80 @@ static uint32_t syscall_builtin_keymap_set(uint32_t num,
 static uint32_t syscall_builtin_keymap_get(uint32_t num,
                                            uint32_t argc,
                                            uint32_t *argv) {
-    (void)num; (void)argc; (void)argv;
+    (void)num;
+    if (argc == 0 || argv == NULL) {
+        return (uint32_t)(uintptr_t)dynamic_keymap_get_name_local();
+    }
+
+    uint32_t cmd = argv[0];
+    switch (cmd) {
+        case 0: { /* Get active layout name */
+            const char *name = dynamic_keymap_get_name_local();
+            if (argc >= 3u && argv[1] != 0 && argv[2] > 0) {
+                char *buf = (char *)(uintptr_t)argv[1];
+                uint32_t max_len = argv[2];
+                strncpy(buf, name ? name : "Unknown", max_len - 1);
+                buf[max_len - 1] = '\0';
+                return 0;
+            }
+            return (uint32_t)(uintptr_t)name;
+        }
+        case 1: { /* Get character translation table for scancodes 0..max_len-1 */
+            if (argc >= 3u && argv[1] != 0 && argv[2] > 0) {
+                char *out_table = (char *)(uintptr_t)argv[1];
+                uint32_t max_len = argv[2];
+                bool shift = (argc >= 4u) ? (bool)argv[3] : false;
+                memset(out_table, 0, max_len);
+                for (uint32_t sc = 0; sc < max_len; sc++) {
+                    const char *s = dynamic_keymap_translate_local((uint8_t)sc, shift);
+                    if (s != NULL && s[0] != '\0') {
+                        out_table[sc] = s[0];
+                    }
+                }
+                return 0;
+            }
+            return IPO_SYSCALL_ENOSYS;
+        }
+        case 2: { /* Copy entries: argv[1]=slot, argv[2]=out_entries, argv[3]=max_count */
+            if (argc >= 4u && argv[2] != 0 && argv[3] > 0) {
+                uint32_t slot = argv[1];
+                keymap_entry_t *out = (keymap_entry_t *)(uintptr_t)argv[2];
+                uint32_t max_count = argv[3];
+                return dynamic_keymap_copy_entries(slot, out, max_count);
+            }
+            return 0;
+        }
+        case 3: { /* Get total layout count */
+            return dynamic_keymap_get_count();
+        }
+        case 4: { /* Get entries count for slot: argv[1]=slot */
+            if (argc >= 2u) {
+                return dynamic_keymap_get_entries_count(argv[1]);
+            }
+            return 0;
+        }
+        case 5: { /* Get slot name: argv[1]=slot, argv[2]=buf, argv[3]=max_len */
+            if (argc >= 4u && argv[2] != 0 && argv[3] > 0) {
+                uint32_t slot = argv[1];
+                char *buf = (char *)(uintptr_t)argv[2];
+                uint32_t max_len = argv[3];
+                const char *sname = dynamic_keymap_get_slot_name(slot);
+                strncpy(buf, sname ? sname : "Unknown", max_len - 1);
+                buf[max_len - 1] = '\0';
+                return 0;
+            }
+            return IPO_SYSCALL_ENOSYS;
+        }
+        case 6: { /* Is slot enabled: argv[1]=slot */
+            if (argc >= 2u) {
+                return dynamic_keymap_is_slot_enabled(argv[1]) ? 1u : 0u;
+            }
+            return 0;
+        }
+        default:
+            break;
+    }
+
     return (uint32_t)(uintptr_t)dynamic_keymap_get_name_local();
 }
 
@@ -700,6 +829,16 @@ static uint32_t syscall_builtin_vga_glyph(uint32_t num,
                                          uint32_t *argv) {
     (void)num;
     if (argc < 1u || argv == NULL) return (uint32_t)-1;
+    if (argc >= 2u && argv[0] != 0) {
+        const char *str = (const char *)(uintptr_t)argv[0];
+        size_t str_len = (size_t)argv[1];
+        size_t consumed = 0;
+        uint8_t glyph = utf8_to_vga_glyph(str, str_len, &consumed);
+        if (argc >= 3u && argv[2] != 0) {
+            *(uint32_t *)(uintptr_t)argv[2] = (uint32_t)consumed;
+        }
+        return (uint32_t)glyph;
+    }
     uint32_t codepoint = argv[0];
     int slot = vga_font_register_glyph(codepoint, NULL);
     return (uint32_t)slot;
@@ -769,8 +908,16 @@ static uint32_t syscall_builtin_keymap_cycle_prev(uint32_t num,
 static uint32_t syscall_builtin_keymap_get_name(uint32_t num,
                                                 uint32_t argc,
                                                 uint32_t *argv) {
-    (void)num; (void)argc; (void)argv;
-    return (uint32_t)(uintptr_t)dynamic_keymap_get_name_local();
+    (void)num;
+    const char *name = dynamic_keymap_get_name_local();
+    if (argc >= 2u && argv != NULL && argv[0] != 0 && argv[1] > 0) {
+        char *user_buf = (char *)(uintptr_t)argv[0];
+        uint32_t max_len = argv[1];
+        strncpy(user_buf, name ? name : "English", max_len - 1);
+        user_buf[max_len - 1] = '\0';
+        return 0;
+    }
+    return (uint32_t)(uintptr_t)name;
 }
 
 static uint32_t syscall_builtin_driver_register(uint32_t num,
@@ -1470,7 +1617,8 @@ static uint32_t syscall_builtin_stack_shrink(uint32_t num,
 }
 
 #define USER_HEAP_START 0x08000000u
-#define USER_HEAP_LIMIT 0x40000000u
+#define USER_HEAP_PER_PROC 0x01000000u /* 16 MB per process */
+#define USER_HEAP_MAX_SLOTS 7
 
 static uint32_t user_heap_break = USER_HEAP_START;
 
@@ -1481,9 +1629,11 @@ static uint32_t syscall_builtin_sbrk(uint32_t num, uint32_t argc, uint32_t *argv
         inc = (int32_t)argv[0];
     }
     process_t *proc = process_get_current();
-    uint32_t proc_base = USER_HEAP_START + (proc && proc->pid > 0 ? (proc->pid - 1) : 0) * 0x20000000u;
-    uint32_t proc_limit = proc_base + 0x20000000u;
-    uint32_t *pbreak = (proc && proc->user_heap_break >= proc_base) ? &proc->user_heap_break : &user_heap_break;
+    uint32_t slot = (proc && proc->pid > 0) ? ((proc->pid - 1) % USER_HEAP_MAX_SLOTS) : 0;
+    uint32_t proc_base = USER_HEAP_START + slot * USER_HEAP_PER_PROC;
+    uint32_t proc_limit = proc_base + USER_HEAP_PER_PROC;
+    uint32_t *pbreak = (proc && proc->user_heap_break >= proc_base && proc->user_heap_break <= proc_limit)
+                       ? &proc->user_heap_break : &user_heap_break;
     uint32_t prev = *pbreak;
     if (inc == 0) {
         return prev;
@@ -1760,6 +1910,10 @@ static uint32_t syscall_builtin_exit(uint32_t num, uint32_t argc, uint32_t *argv
     if (proc != NULL) {
         proc->is_running = 0;
         proc->exit_code = code;
+        proc->completed_and_acknowledged = true;
+        if (!proc->return_val_explicit) {
+            process_set_current_return_value(PROC_RET_INT, "int", NULL, code, NULL, 0);
+        }
     }
     process_set_last_exit_code(code);
     process_yield_kernel();
@@ -2056,6 +2210,203 @@ static uint32_t syscall_builtin_system_interrupt(uint32_t num, uint32_t argc, ui
     return kernel_system_interrupted ? 1 : 0;
 }
 
+static uint32_t syscall_builtin_kbd_get_scancode(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    return (uint32_t)keyboard_get_scancode();
+}
+
+static uint32_t syscall_builtin_kbd_wait_scancode(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    return (uint32_t)keyboard_wait_scancode();
+}
+
+static uint32_t syscall_builtin_kbd_set_app_mode(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc > 0 && argv) {
+        keyboard_set_app_input_mode(argv[0] != 0);
+    }
+    return 0;
+}
+
+static uint32_t syscall_builtin_kbd_flush(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    keyboard_flush_queue();
+    keyboard_flush_app_queue();
+    keyboard_flush_hardware();
+    keyboard_clear_key_state();
+    return 0;
+}
+
+static uint32_t syscall_builtin_kbd_get_modifiers(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    return (uint32_t)keyboard_get_modifiers();
+}
+
+static uint32_t syscall_builtin_kbd_poll(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    keyboard_poll();
+    return 0;
+}
+
+static uint32_t syscall_builtin_kbd_get_key_string(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || argv == NULL) return 0;
+    uint8_t scancode = (uint8_t)argv[0];
+    const char *s = keyboard_get_key_string(scancode);
+    if (!s) return 0;
+    if (argc >= 3u && argv[1] != 0 && argv[2] > 0) {
+        char *user_buf = (char *)(uintptr_t)argv[1];
+        uint32_t max_len = argv[2];
+        strncpy(user_buf, s, max_len - 1);
+        user_buf[max_len - 1] = '\0';
+        return 1;
+    }
+    return (uint32_t)(uintptr_t)s;
+}
+
+static uint32_t syscall_builtin_mouse_get_state(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc > 0 && argv && argv[0]) {
+        mouse_get_state((mouse_state_t *)(uintptr_t)argv[0]);
+    }
+    return 0;
+}
+
+static uint32_t syscall_builtin_vga_set_cursor(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc > 0 && argv) {
+        vga_set_cursor((uint16_t)argv[0]);
+    }
+    return 0;
+}
+
+static uint32_t syscall_builtin_vga_get_cursor(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    return (uint32_t)vga_get_cursor_position();
+}
+
+static uint32_t syscall_builtin_vga_show_cursor(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    vga_show_cursor();
+    return 0;
+}
+
+static uint32_t syscall_builtin_vga_hide_cursor(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    vga_hide_cursor();
+    return 0;
+}
+
+static uint32_t syscall_builtin_vga_set_palette(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc >= 4 && argv) {
+        vga_gfx_set_palette((uint8_t)argv[0], (uint8_t)argv[1], (uint8_t)argv[2], (uint8_t)argv[3]);
+    }
+    return 0;
+}
+
+static uint32_t syscall_builtin_audio_init(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    return audio_init() ? 1u : 0u;
+}
+
+static uint32_t syscall_builtin_audio_tick(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    audio_tick();
+    return 0;
+}
+
+static uint32_t syscall_builtin_audio_stop_all(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    audio_stop_all();
+    sb16_stop();
+    return 0;
+}
+
+static uint32_t syscall_builtin_audio_stream_create(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc >= 5 && argv) {
+        return (uint32_t)(uintptr_t)audio_stream_create((int)argv[0], (int)argv[1], (uint32_t)argv[2], (const void *)(uintptr_t)argv[3], (size_t)argv[4]);
+    }
+    return 0;
+}
+
+static uint32_t syscall_builtin_audio_stream_create_ring(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc >= 6 && argv) {
+        return (uint32_t)(uintptr_t)audio_stream_create_ring((int)argv[0], (int)argv[1], (uint32_t)argv[2],
+                                                             (const void *)(uintptr_t)argv[3], (size_t)argv[4], (size_t)argv[5]);
+    }
+    return 0;
+}
+
+static uint32_t syscall_builtin_audio_stream_destroy(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc >= 1 && argv && argv[0]) {
+        audio_stream_destroy((audio_stream_t *)(uintptr_t)argv[0]);
+    }
+    return 0;
+}
+
+static uint32_t syscall_builtin_audio_stream_play(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc >= 1 && argv && argv[0]) {
+        audio_stream_play((audio_stream_t *)(uintptr_t)argv[0]);
+    }
+    return 0;
+}
+
+static uint32_t syscall_builtin_audio_stream_pause(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc >= 1 && argv && argv[0]) {
+        audio_stream_pause((audio_stream_t *)(uintptr_t)argv[0]);
+    }
+    return 0;
+}
+
+static uint32_t syscall_builtin_audio_stream_stop(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc >= 1 && argv && argv[0]) {
+        audio_stream_stop((audio_stream_t *)(uintptr_t)argv[0]);
+    }
+    return 0;
+}
+
+static uint32_t syscall_builtin_audio_stream_seek(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc >= 2 && argv && argv[0]) {
+        double frac = *(const double *)(uintptr_t)argv[1];
+        audio_stream_seek((audio_stream_t *)(uintptr_t)argv[0], frac);
+    }
+    return 0;
+}
+
+static uint32_t syscall_builtin_audio_stream_set_vol(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc >= 2 && argv && argv[0]) {
+        float vol = *(const float *)(uintptr_t)argv[1];
+        audio_stream_set_volume((audio_stream_t *)(uintptr_t)argv[0], vol);
+    }
+    return 0;
+}
+
+static uint32_t syscall_builtin_audio_stream_progress(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc >= 2 && argv && argv[0] && argv[1]) {
+        double prog = audio_stream_get_progress((audio_stream_t *)(uintptr_t)argv[0]);
+        *(double *)(uintptr_t)argv[1] = prog;
+    }
+    return 0;
+}
+
+static uint32_t syscall_builtin_audio_stream_update(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc >= 3 && argv && argv[0]) {
+        audio_stream_update_buffered((audio_stream_t *)(uintptr_t)argv[0], (size_t)argv[1], (bool)(argv[2] != 0));
+    }
+    return 0;
+}
+
 void syscall_load_idt(void) {
 
     ipo_idt_ptr_t idt_ptr = {
@@ -2168,6 +2519,14 @@ void syscall_init(void) {
     ipo_register_syscall(
         IPO_SYSCALL_GET_EXIT_CODE,
         syscall_builtin_get_exit_code);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_SET_RETURN_VALUE,
+        syscall_builtin_set_return_value);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_GET_RETURN_VALUE,
+        syscall_builtin_get_return_value);
 
     ipo_register_syscall(
         IPO_SYSCALL_ASYNC_START,
@@ -2412,6 +2771,36 @@ void syscall_init(void) {
     ipo_register_syscall(
         IPO_SYSCALL_GETPID,
         syscall_builtin_getpid);
+
+    ipo_register_syscall(IPO_SYSCALL_KBD_GET_SCANCODE, syscall_builtin_kbd_get_scancode);
+    ipo_register_syscall(IPO_SYSCALL_KBD_WAIT_SCANCODE, syscall_builtin_kbd_wait_scancode);
+    ipo_register_syscall(IPO_SYSCALL_KBD_SET_APP_MODE, syscall_builtin_kbd_set_app_mode);
+    ipo_register_syscall(IPO_SYSCALL_KBD_FLUSH, syscall_builtin_kbd_flush);
+    ipo_register_syscall(IPO_SYSCALL_KBD_GET_MODIFIERS, syscall_builtin_kbd_get_modifiers);
+    ipo_register_syscall(IPO_SYSCALL_KBD_POLL, syscall_builtin_kbd_poll);
+    ipo_register_syscall(IPO_SYSCALL_KBD_GET_KEY_STRING, syscall_builtin_kbd_get_key_string);
+
+    ipo_register_syscall(IPO_SYSCALL_MOUSE_GET_STATE, syscall_builtin_mouse_get_state);
+
+    ipo_register_syscall(IPO_SYSCALL_VGA_SET_CURSOR, syscall_builtin_vga_set_cursor);
+    ipo_register_syscall(IPO_SYSCALL_VGA_GET_CURSOR, syscall_builtin_vga_get_cursor);
+    ipo_register_syscall(IPO_SYSCALL_VGA_SHOW_CURSOR, syscall_builtin_vga_show_cursor);
+    ipo_register_syscall(IPO_SYSCALL_VGA_HIDE_CURSOR, syscall_builtin_vga_hide_cursor);
+    ipo_register_syscall(IPO_SYSCALL_VGA_SET_PALETTE, syscall_builtin_vga_set_palette);
+
+    ipo_register_syscall(IPO_SYSCALL_AUDIO_INIT, syscall_builtin_audio_init);
+    ipo_register_syscall(IPO_SYSCALL_AUDIO_TICK, syscall_builtin_audio_tick);
+    ipo_register_syscall(IPO_SYSCALL_AUDIO_STOP_ALL, syscall_builtin_audio_stop_all);
+    ipo_register_syscall(IPO_SYSCALL_AUDIO_STREAM_CREATE, syscall_builtin_audio_stream_create);
+    ipo_register_syscall(IPO_SYSCALL_AUDIO_STREAM_CREATE_RING, syscall_builtin_audio_stream_create_ring);
+    ipo_register_syscall(IPO_SYSCALL_AUDIO_STREAM_DESTROY, syscall_builtin_audio_stream_destroy);
+    ipo_register_syscall(IPO_SYSCALL_AUDIO_STREAM_PLAY, syscall_builtin_audio_stream_play);
+    ipo_register_syscall(IPO_SYSCALL_AUDIO_STREAM_PAUSE, syscall_builtin_audio_stream_pause);
+    ipo_register_syscall(IPO_SYSCALL_AUDIO_STREAM_STOP, syscall_builtin_audio_stream_stop);
+    ipo_register_syscall(IPO_SYSCALL_AUDIO_STREAM_SEEK, syscall_builtin_audio_stream_seek);
+    ipo_register_syscall(IPO_SYSCALL_AUDIO_STREAM_SET_VOL, syscall_builtin_audio_stream_set_vol);
+    ipo_register_syscall(IPO_SYSCALL_AUDIO_STREAM_PROGRESS, syscall_builtin_audio_stream_progress);
+    ipo_register_syscall(IPO_SYSCALL_AUDIO_STREAM_UPDATE, syscall_builtin_audio_stream_update);
 
     for (int i = 0; i < 32; i++) {
         ipo_idt_set_gate(

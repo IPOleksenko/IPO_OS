@@ -89,6 +89,128 @@ static void stderr_print_strn(void *env, const char *str, size_t len) {
 
 const mp_print_t mp_stderr_print = {NULL, stderr_print_strn};
 
+void ipo_python_set_return_int(int val) {
+    uint32_t args[3];
+    args[0] = 0; /* PROC_RET_INT */
+    args[1] = (uint32_t)val;
+    args[2] = 0;
+    __asm__ volatile(
+        "int $0x80"
+        :
+        : "a"(0x1029), "c"(args), "b"(3)
+        : "memory"
+    );
+}
+
+void ipo_python_handle_return_obj(void *obj_in) {
+    mp_obj_t obj = (mp_obj_t)obj_in;
+    if (obj == mp_const_none) {
+        ipo_python_set_return_int(0);
+        return;
+    }
+
+    if (mp_obj_is_bool(obj)) {
+        bool b = (obj == mp_const_true);
+        uint32_t args[3];
+        args[0] = 2; /* PROC_RET_STRING */
+        args[1] = (uint32_t)(uintptr_t)(b ? "True" : "False");
+        args[2] = (uint32_t)(uintptr_t)"bool";
+        __asm__ volatile("int $0x80" : : "a"(0x1029), "c"(args), "b"(3) : "memory");
+        return;
+    }
+
+    if (mp_obj_is_int(obj)) {
+        mp_int_t val = 0;
+        if (mp_obj_get_int_maybe(obj, &val)) {
+            ipo_python_set_return_int((int)val);
+        } else {
+            vstr_t vstr;
+            mp_print_t print;
+            vstr_init_print(&vstr, 32, &print);
+            mp_obj_print_helper(&print, obj, PRINT_STR);
+            uint32_t args[3];
+            args[0] = 2; /* PROC_RET_STRING */
+            args[1] = (uint32_t)(uintptr_t)vstr.buf;
+            args[2] = (uint32_t)(uintptr_t)"int";
+            __asm__ volatile("int $0x80" : : "a"(0x1029), "c"(args), "b"(3) : "memory");
+            vstr_clear(&vstr);
+        }
+        return;
+    }
+
+    if (mp_obj_is_str(obj)) {
+        size_t len = 0;
+        const char *str = mp_obj_str_get_data(obj, &len);
+        uint32_t args[3];
+        args[0] = 2; /* PROC_RET_STRING */
+        args[1] = (uint32_t)(uintptr_t)str;
+        args[2] = (uint32_t)(uintptr_t)"char*";
+        __asm__ volatile("int $0x80" : : "a"(0x1029), "c"(args), "b"(3) : "memory");
+        return;
+    }
+
+    /* Any other object: repr string (list, dict, tuple, float, etc.) */
+    vstr_t vstr;
+    mp_print_t print;
+    vstr_init_print(&vstr, 64, &print);
+    mp_obj_print_helper(&print, obj, PRINT_REPR);
+    uint32_t args[3];
+    args[0] = 2; /* PROC_RET_STRING */
+    args[1] = (uint32_t)(uintptr_t)vstr.buf;
+    args[2] = (uint32_t)(uintptr_t)mp_obj_get_type_str(obj);
+    __asm__ volatile("int $0x80" : : "a"(0x1029), "c"(args), "b"(3) : "memory");
+    vstr_clear(&vstr);
+}
+
+static mp_obj_t ipo_clear_call(mp_obj_t self, size_t n_args, size_t n_kw, const mp_obj_t *args) {
+    (void)self; (void)n_args; (void)n_kw; (void)args;
+    fputs("\033[2J\033[H", stdout);
+    fflush(stdout);
+    return mp_const_none;
+}
+
+static void ipo_clear_print(const mp_print_t *print, mp_obj_t self, mp_print_kind_t kind) {
+    (void)self; (void)kind;
+    (void)print;
+    fputs("\033[2J\033[H", stdout);
+    fflush(stdout);
+}
+
+MP_DEFINE_CONST_OBJ_TYPE(
+    mp_type_ipo_clear,
+    MP_QSTR_clear,
+    MP_TYPE_FLAG_NONE,
+    call, ipo_clear_call,
+    print, ipo_clear_print
+);
+
+const mp_obj_base_t mp_builtin_ipo_clear_obj = { &mp_type_ipo_clear };
+
+static mp_obj_t ipo_exit_call(mp_obj_t self, size_t n_args, size_t n_kw, const mp_obj_t *args) {
+    (void)self;
+    mp_int_t code = 0;
+    if (n_args > 0) {
+        mp_obj_get_int_maybe(args[0], &code);
+    }
+    mp_raise_type_arg(&mp_type_SystemExit, MP_OBJ_NEW_SMALL_INT(code));
+    return mp_const_none;
+}
+
+static void ipo_exit_print(const mp_print_t *print, mp_obj_t self, mp_print_kind_t kind) {
+    (void)self; (void)kind;
+    mp_print_str(print, "Use exit() or Ctrl-D to exit\n");
+}
+
+MP_DEFINE_CONST_OBJ_TYPE(
+    mp_type_ipo_exit,
+    MP_QSTR_exit,
+    MP_TYPE_FLAG_NONE,
+    call, ipo_exit_call,
+    print, ipo_exit_print
+);
+
+const mp_obj_base_t mp_builtin_ipo_exit_obj = { &mp_type_ipo_exit };
+
 #define FORCED_EXIT (0x100)
 // If exc is SystemExit, return value where FORCED_EXIT bit set,
 // and lower 8 bits are SystemExit value. For all other exceptions,
@@ -98,6 +220,7 @@ static int handle_uncaught_exception(mp_obj_base_t *exc) {
     if (mp_obj_is_subclass_fast(MP_OBJ_FROM_PTR(exc->type), MP_OBJ_FROM_PTR(&mp_type_SystemExit))) {
         // None is an exit value of 0; an int is its value; anything else is 1
         mp_obj_t exit_val = mp_obj_exception_get_value(MP_OBJ_FROM_PTR(exc));
+        ipo_python_handle_return_obj(exit_val);
         mp_int_t val = 0;
         if (exit_val != mp_const_none && !mp_obj_get_int_maybe(exit_val, &val)) {
             val = 1;
@@ -107,6 +230,7 @@ static int handle_uncaught_exception(mp_obj_base_t *exc) {
 
     // Report all other exceptions
     mp_obj_print_exception(&mp_stderr_print, MP_OBJ_FROM_PTR(exc));
+    ipo_python_set_return_int(1);
     return 1;
 }
 
@@ -151,14 +275,26 @@ static int execute_from_lexer(int source_kind, const void *source, mp_parse_inpu
 
         mp_obj_t module_fun = mp_compile(&parse_tree, source_name, is_repl);
 
+        mp_obj_t ret_obj = mp_const_none;
         if (!mp_compile_only) {
             // execute it
-            mp_call_function_0(module_fun);
+            ret_obj = mp_call_function_0(module_fun);
         }
 
         mp_hal_set_interrupt_char(-1);
         mp_handle_pending(MP_HANDLE_PENDING_CALLBACKS_AND_EXCEPTIONS);
         nlr_pop();
+
+        if (ret_obj != mp_const_none) {
+            ipo_python_handle_return_obj(ret_obj);
+            if (is_repl) {
+                mp_int_t val = 0;
+                if (!mp_obj_get_int_maybe(ret_obj, &val)) {
+                    val = 0;
+                }
+                return FORCED_EXIT | (val & 255);
+            }
+        }
         return 0;
 
     } else {

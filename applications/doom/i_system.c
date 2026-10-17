@@ -21,7 +21,7 @@
 #include <system/timer.h>
 #include <syscall.h>
 
-extern void serial_printf(const char *fmt, ...);
+extern int serial_printf(const char *fmt, ...);
 extern boolean demorecording;
 
 static ticcmd_t s_empty_ticcmd;

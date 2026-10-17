@@ -53,18 +53,22 @@ int ip4_send(ip4_addr_t dst_ip, uint8_t protocol, uint8_t ttl, const void *paylo
         return -1;
     }
 
-    /* Determine next hop */
-    ip4_addr_t next_hop;
-    if ((dst_ip & netif->netmask) == (netif->ip & netif->netmask)) {
-        next_hop = dst_ip;
-    } else {
-        next_hop = netif->gateway;
-    }
-
     mac_addr_t next_hop_mac;
-    if (!arp_resolve(next_hop, &next_hop_mac, 1000)) {
-        kfree(tx_buf);
-        return -2; // ARP resolution failed
+    if (dst_ip == IP4_ADDR_BROADCAST || dst_ip == 0xFFFFFFFFu) {
+        memset(&next_hop_mac, 0xFF, sizeof(mac_addr_t));
+    } else {
+        /* Determine next hop */
+        ip4_addr_t next_hop;
+        if (netif->netmask != 0 && (dst_ip & netif->netmask) == (netif->ip & netif->netmask)) {
+            next_hop = dst_ip;
+        } else {
+            next_hop = netif->gateway;
+        }
+
+        if (!arp_resolve(next_hop, &next_hop_mac, 1000)) {
+            kfree(tx_buf);
+            return -2; // ARP resolution failed
+        }
     }
 
     /* Build IPv4 packet */
@@ -121,8 +125,8 @@ void ip4_receive(const void *packet, uint16_t len) {
     ip4_addr_t dst_ip = ntohl(hdr->dst_ip);
     ip4_addr_t src_ip = ntohl(hdr->src_ip);
 
-    /* Accept if destined to our IP, broadcast, or loopback */
-    if (netif && dst_ip != netif->ip && dst_ip != IP4_ADDR_BROADCAST && (dst_ip >> 24) != 127) {
+    /* Accept if destined to our IP, broadcast, loopback, or if interface IP is not yet set (during DHCP) */
+    if (netif && netif->ip != 0 && dst_ip != netif->ip && dst_ip != IP4_ADDR_BROADCAST && dst_ip != 0xFFFFFFFFu && (dst_ip >> 24) != 127) {
         return;
     }
 

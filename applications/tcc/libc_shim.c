@@ -567,52 +567,6 @@ int vsprintf(char *str, const char *format, va_list ap) {
 }
 
 /* -------------------------------------------------------------
- * Memory allocation shims
- * ------------------------------------------------------------- */
-
-typedef struct {
-    size_t size;
-    uint32_t magic;
-    uint32_t is_free;
-    uint32_t padding;
-} shim_kmalloc_block_t;
-
-void *malloc(size_t size) {
-    return kmalloc(size);
-}
-
-void free(void *ptr) {
-    kfree(ptr);
-}
-
-void *calloc(size_t nmemb, size_t size) {
-    size_t total = nmemb * size;
-    void *p = kmalloc(total);
-    if (p) memset(p, 0, total);
-    return p;
-}
-
-void *realloc(void *ptr, size_t new_size) {
-    if (!ptr) return malloc(new_size);
-    if (new_size == 0) {
-        free(ptr);
-        return NULL;
-    }
-
-    shim_kmalloc_block_t *block = (shim_kmalloc_block_t *)((uint8_t *)ptr - sizeof(shim_kmalloc_block_t));
-    size_t old_usable = (block->size > sizeof(shim_kmalloc_block_t)) ? (block->size - sizeof(shim_kmalloc_block_t)) : 0;
-    if (old_usable >= new_size) {
-        return ptr;
-    }
-
-    void *new_p = malloc(new_size);
-    if (!new_p) return NULL;
-    memcpy(new_p, ptr, old_usable);
-    free(ptr);
-    return new_p;
-}
-
-/* -------------------------------------------------------------
  * stdlib helpers (conversion, qsort, time)
  * ------------------------------------------------------------- */
 

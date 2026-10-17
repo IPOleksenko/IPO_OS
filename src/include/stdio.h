@@ -80,4 +80,11 @@ int itoa64(uint64_t num, char *str, int base);
  */
 int serial_printf(const char *format, ...);
 
+/**
+ * Standard output redirection controls for shell pipelines and file redirection.
+ */
+void stdout_redirect_start(void);
+void stdout_redirect_end(char **out_buf, size_t *out_len);
+bool stdout_is_redirected(void);
+
 #endif

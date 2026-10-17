@@ -3,21 +3,10 @@
 APPS_DIR     := applications
 APPS_BUILD   := build/applications
 APPS_SRCS_RAW := $(shell find $(APPS_DIR) -maxdepth 2 -name "*.c" -type f)
-GENERIC_APP_SRCS := $(filter-out $(APPS_DIR)/tcc/% $(APPS_DIR)/lua/% $(APPS_DIR)/micropython/% $(APPS_DIR)/nasm/% $(APPS_DIR)/doom/%, $(APPS_SRCS_RAW))
+GENERIC_APP_SRCS := $(filter-out $(APPS_DIR)/tcc/% $(APPS_DIR)/lua/% $(APPS_DIR)/micropython/% $(APPS_DIR)/nasm/% $(APPS_DIR)/doom/% $(APPS_DIR)/lib/%, $(APPS_SRCS_RAW))
 APPS_BINS    := $(patsubst $(APPS_DIR)/%.c, $(APPS_BUILD)/%.bin, $(GENERIC_APP_SRCS)) $(APPS_BUILD)/tcc/tcc.bin $(APPS_BUILD)/doom/doom.bin
 
-
-APP_ENTRY_OBJ   := $(APPS_BUILD)/entry.o
-APP_PRINTF_OBJ  := $(APPS_BUILD)/app_printf.o
-APP_KMALLOC_OBJ := $(APPS_BUILD)/app_kmalloc.o
-APP_WM_OBJ      := $(APPS_BUILD)/app_wm.o
-APP_TIMER_OBJ   := $(APPS_BUILD)/app_timer.o
-APP_NET_SOCKET_OBJ := $(APPS_BUILD)/app_net_socket.o
-APP_NET_API_OBJ := $(APPS_BUILD)/app_net_api.o
-APP_SYSCALL_OBJ := $(APPS_BUILD)/app_syscall.o
-
-NETWORK_APPS := hosting_client hosting_server
-NETWORK_APP_BINS := $(foreach app,$(NETWORK_APPS),$(APPS_BUILD)/$(app)/$(notdir $(app)).bin)
+APP_ENTRY_OBJ := $(APPS_BUILD)/entry.o
 
 # Applications are compiled as Position Independent Code (PIC).
 # This allows them to run from any memory address dynamically allocated
@@ -26,8 +15,6 @@ APPS_CFLAGS := -m32 -O2 \
 	-fno-pic -fno-pie \
 	-fno-builtin \
 	-nostdlib -nostartfiles \
-	-DIPO_APP \
-	-Isrc/include \
 	-I$(APPS_DIR)/include \
 	-I$(APPS_DIR)/micropython/lib/uzlib \
 	-I.
@@ -37,11 +24,10 @@ TCC_CFLAGS := -m32 \
 	-fno-pic -fno-pie \
 	-fno-builtin \
 	-nostdlib -nostartfiles \
-	-DIPO_APP \
 	-DONE_SOURCE=1 \
 	-I$(APPS_DIR)/tcc/include \
 	-I$(APPS_DIR)/tcc \
-	-Isrc/include
+	-I$(APPS_DIR)/include
 
 # Build all applications
 applications: $(APPS_BINS)
@@ -51,53 +37,20 @@ $(APP_ENTRY_OBJ): $(APPS_DIR)/entry.s
 	@mkdir -p $(dir $@)
 	$(CC) -c $< -o $@ $(APPS_CFLAGS)
 
-$(APP_PRINTF_OBJ): src/kernel/stdio/printf.c
-	@mkdir -p $(dir $@)
-	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS) -DIPO_APP
-
-$(APP_KMALLOC_OBJ): src/kernel/mm/kmalloc.c
-	@mkdir -p $(dir $@)
-	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS) -DIPO_APP
-
-$(APP_WM_OBJ): src/drivers/video/wm.c
-	@mkdir -p $(dir $@)
-	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS) -DIPO_APP
-
-$(APP_TIMER_OBJ): src/kernel/arch/x86/timer.c
-	@mkdir -p $(dir $@)
-	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS) -DIPO_APP
-
-$(APP_NET_SOCKET_OBJ): src/userland/lib/net_socket.c
-	@mkdir -p $(dir $@)
-	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS)
-
-$(APP_NET_API_OBJ): src/userland/lib/net_api.c
-	@mkdir -p $(dir $@)
-	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS)
-
-$(APP_SYSCALL_OBJ): src/userland/lib/syscall.c
-	@mkdir -p $(dir $@)
-	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS)
-
-$(NETWORK_APP_BINS): $(APP_NET_SOCKET_OBJ)
-
 $(APPS_BUILD)/tcc/setjmp.o: $(APPS_DIR)/tcc/setjmp.s
 	@mkdir -p $(dir $@)
 	$(ASM) -f elf32 $< -o $@
-
-$(APPS_BUILD)/tcc/libc_shim.o: $(APPS_DIR)/tcc/libc_shim.c
-	@mkdir -p $(dir $@)
-	$(CC) -c $< -o $@ -std=gnu11 $(TCC_CFLAGS)
 
 $(APPS_BUILD)/tcc/tcc.o: $(APPS_DIR)/tcc/tcc.c $(APPS_DIR)/tcc/libtcc.c $(APPS_DIR)/tcc/tcctools.c $(APPS_DIR)/tcc/tccpp.c $(APPS_DIR)/tcc/tccgen.c $(APPS_DIR)/tcc/tccelf.c $(APPS_DIR)/tcc/tccasm.c $(APPS_DIR)/tcc/tccrun.c $(APPS_DIR)/tcc/tccdbg.c $(APPS_DIR)/tcc/i386-gen.c $(APPS_DIR)/tcc/i386-link.c $(APPS_DIR)/tcc/i386-asm.c
 	@mkdir -p $(dir $@)
 	$(CC) -c $< -o $@ -std=gnu11 $(TCC_CFLAGS)
 
-$(APPS_BUILD)/tcc/tcc.bin: $(APPS_BUILD)/tcc/tcc.o $(APPS_BUILD)/tcc/libc_shim.o $(APPS_BUILD)/tcc/setjmp.o $(APP_ENTRY_OBJ) $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) $(APP_TIMER_OBJ) $(APP_SYSCALL_OBJ) $(APP_NET_API_OBJ) $(APP_LIB_A)
+$(APPS_BUILD)/tcc/tcc.bin: $(APPS_BUILD)/tcc/tcc.o $(APPS_BUILD)/tcc/setjmp.o $(APP_ENTRY_OBJ) $(APP_LIB_A) $(USER_LIBC_A) $(USER_LIBM_A)
 	@mkdir -p $(dir $@)
 	@echo "[applications] Building official TinyCC: $(APPS_DIR)/tcc/tcc.c → $@"
-	@$(CC) $(APPS_CFLAGS) -Wl,-T,$(APPS_DIR)/app.ld \
-		$(APP_ENTRY_OBJ) $(APPS_BUILD)/tcc/tcc.o $(APPS_BUILD)/tcc/libc_shim.o $(APPS_BUILD)/tcc/setjmp.o $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) $(APP_TIMER_OBJ) $(APP_SYSCALL_OBJ) $(APP_NET_API_OBJ) -Wl,--start-group $(APP_LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
+	@$(CC) $(APPS_CFLAGS) -no-pie -Wl,-T,$(APPS_DIR)/app.ld \
+		$(APP_ENTRY_OBJ) $(APPS_BUILD)/tcc/tcc.o $(APPS_BUILD)/tcc/setjmp.o \
+		-Wl,--start-group $(USER_LIBC_A) $(USER_LIBM_A) $(APP_LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
 	@$(OBJCOPY) --set-section-flags .bss=alloc,load,contents \
 		-j .text -j .rodata -j .data -j .bss -O binary $@.elf $@
 	@rm -f $@.elf
@@ -182,10 +135,8 @@ DOOM_CFLAGS := -m32 -O2 \
 	-fno-pic -fno-pie \
 	-fno-builtin \
 	-nostdlib -nostartfiles \
-	-DIPO_APP \
 	-DNORMALUNIX \
 	-I$(APPS_DIR)/include \
-	-Isrc/include \
 	-I$(DOOM_DIR)/include \
 	-I$(DOOM_CORE_DIR) \
 	-I$(DOOM_DIR) \
@@ -199,33 +150,33 @@ $(APPS_BUILD)/doom/%.o: $(APPS_DIR)/doom/%.c
 	@mkdir -p $(dir $@)
 	$(CC) -c $< -o $@ $(DOOM_CFLAGS)
 
-$(APPS_BUILD)/doom/doom.bin: $(DOOM_OBJS) $(APP_ENTRY_OBJ) $(APP_TIMER_OBJ) $(APP_SYSCALL_OBJ) $(APP_NET_API_OBJ) $(APP_LIB_A)
+$(APPS_BUILD)/doom/doom.bin: $(DOOM_OBJS) $(APP_ENTRY_OBJ) $(APP_LIB_A) $(USER_LIBC_A) $(USER_LIBM_A)
 	@mkdir -p $(dir $@)
 	@echo "[applications] Building DOOM: $(DOOM_DIR) → $@"
 	@$(CC) $(DOOM_CFLAGS) -Wl,-T,$(APPS_DIR)/app.ld \
-		$(APP_ENTRY_OBJ) $(DOOM_OBJS) $(APP_TIMER_OBJ) $(APP_SYSCALL_OBJ) $(APP_NET_API_OBJ) \
+		$(APP_ENTRY_OBJ) $(DOOM_OBJS) \
 		-Wl,--allow-multiple-definition \
-		-Wl,--start-group build/lib/libc.a build/lib/libm.a $(APP_LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
+		-Wl,--start-group $(USER_LIBC_A) $(USER_LIBM_A) $(APP_LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
 	@$(OBJCOPY) --set-section-flags .bss=alloc,load,contents \
 		-j .text -j .rodata -j .data -j .bss -O binary $@.elf $@
 	@rm -f $@.elf
 	@SIZE=$$(stat -c%s "$@" 2>/dev/null || stat -f%z "$@" 2>/dev/null); \
 	echo "[applications] ✓ Created: $@ ($$SIZE bytes)"
 
-
 # Rule: Compile .c to object file
 $(APPS_BUILD)/%.o: $(APPS_DIR)/%.c
 	@mkdir -p $(dir $@)
-	$(CC) -c $< -o $@ -std=gnu11 $(APPS_CFLAGS)
+	$(CC) -c $< -o $@ -std=gnu11 -g $(APPS_CFLAGS)
 
 # Rule: Create executable binary from object file
-$(APPS_BUILD)/%.bin: $(APPS_BUILD)/%.o $(APP_ENTRY_OBJ) $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) $(APP_WM_OBJ) $(APP_TIMER_OBJ) $(APP_SYSCALL_OBJ) $(APP_NET_API_OBJ) $(APP_LIB_A)
+$(APPS_BUILD)/%.bin: $(APPS_BUILD)/%.o $(APP_ENTRY_OBJ) $(APP_LIB_A) $(USER_LIBC_A) $(USER_LIBM_A)
 	@mkdir -p $(dir $@)
 	@echo "[applications] Building: $*.c → $@"
-	@$(CC) $(APPS_CFLAGS) -Wl,-T,$(APPS_DIR)/app.ld \
-		$(APP_ENTRY_OBJ) $< $(APP_PRINTF_OBJ) $(APP_KMALLOC_OBJ) $(APP_WM_OBJ) $(APP_TIMER_OBJ) $(APP_SYSCALL_OBJ) $(APP_NET_API_OBJ) $(if $(filter $(notdir $(@D)),$(NETWORK_APPS)),$(APP_NET_SOCKET_OBJ),) -Wl,--start-group $(APP_LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
-	@$(OBJCOPY) --set-section-flags .bss=alloc,load,contents \
-		-j .text -j .rodata -j .data -j .bss -O binary $@.elf $@
+	@$(CC) $(APPS_CFLAGS) -no-pie -Wl,-T,$(APPS_DIR)/app.ld \
+		$(APP_ENTRY_OBJ) $< \
+		-Wl,--allow-multiple-definition \
+		-Wl,--start-group $(USER_LIBC_A) $(USER_LIBM_A) $(APP_LIB_A) -lgcc -Wl,--end-group -o $@.elf -nostdlib -nostartfiles 2>&1 | grep -v "PIE\|relocation" || true
+	@cp $@.elf $@
 	@rm -f $@.elf
 	@SIZE=$$(stat -c%s "$@" 2>/dev/null || stat -f%z "$@" 2>/dev/null); \
 	echo "[applications] ✓ Created: $@ ($$SIZE bytes)"

@@ -488,48 +488,86 @@ static int exec_pipeline(const run_pipeline_t *pipe) {
             wait_for_command(ret);
             pipe_exit = process_get_exit_code();
             if (ret > 0 && ret != 1000 && terminal_get_show_return_value()) {
-                printf("Return value: %d\n", pipe_exit);
+                process_print_last_return_value();
             }
         } else {
-            /* Prepend pipe_exit as argv[1] */
-            char code_str[24];
-            snprintf(code_str, sizeof(code_str), "%d", pipe_exit);
-            size_t sl = strlen(code_str);
-            char *code_arg = kmalloc(sl + 1);
-            if (!code_arg) {
+            /* Prepend return values as arguments for the next command */
+            const process_return_value_t *last_val = process_get_last_return_value();
+            uint32_t pass_count = 0;
+            char **pass_args = NULL;
+            char *dynamic_exit_str = NULL;
+
+            if (last_val && last_val->arg_count > 0 && last_val->arg_vals) {
+                pass_count = last_val->arg_count;
+                pass_args = last_val->arg_vals;
+            } else {
+                bool neg = (pipe_exit < 0);
+                uint32_t uval = neg ? (uint32_t)(-pipe_exit) : (uint32_t)pipe_exit;
+                uint32_t temp = uval;
+                size_t elen = 0;
+                if (temp == 0) elen = 1;
+                else {
+                    while (temp > 0) { temp /= 10; elen++; }
+                }
+                if (neg) elen++;
+                dynamic_exit_str = kmalloc(elen + 1);
+                if (dynamic_exit_str) {
+                    dynamic_exit_str[elen] = '\0';
+                    if (uval == 0) {
+                        dynamic_exit_str[0] = '0';
+                    } else {
+                        int ej = (int)elen - 1;
+                        while (uval > 0) {
+                            dynamic_exit_str[ej--] = '0' + (char)(uval % 10);
+                            uval /= 10;
+                        }
+                        if (neg) dynamic_exit_str[0] = '-';
+                    }
+                }
+                pass_count = 1;
+            }
+
+            int new_argc = cmd->argc + (int)pass_count;
+            char **new_argv = kmalloc((size_t)(new_argc + 1) * sizeof(char *));
+            if (!new_argv) {
+                if (dynamic_exit_str) kfree(dynamic_exit_str);
                 ret = exec_one_pid(cmd->argc, cmd->argv);
                 wait_for_command(ret);
                 pipe_exit = process_get_exit_code();
                 if (ret > 0 && ret != 1000 && terminal_get_show_return_value()) {
-                    printf("Return value: %d\n", pipe_exit);
+                    process_print_last_return_value();
                 }
             } else {
-                memcpy(code_arg, code_str, sl + 1);
-                int new_argc = cmd->argc + 1;
-                char **new_argv = kmalloc((size_t)(new_argc + 1) * sizeof(char *));
-                if (!new_argv) {
-                    kfree(code_arg);
-                    ret = exec_one_pid(cmd->argc, cmd->argv);
-                    wait_for_command(ret);
-                    pipe_exit = process_get_exit_code();
-                    if (ret > 0 && ret != 1000 && terminal_get_show_return_value()) {
-                        printf("Return value: %d\n", pipe_exit);
+                new_argv[0] = cmd->argv[0];
+                if (pass_args) {
+                    for (uint32_t k = 0; k < pass_count; k++) {
+                        size_t alen = pass_args[k] ? strlen(pass_args[k]) : 0;
+                        new_argv[1 + k] = kmalloc(alen + 1);
+                        if (new_argv[1 + k]) {
+                            if (pass_args[k]) memcpy(new_argv[1 + k], pass_args[k], alen + 1);
+                            else new_argv[1 + k][0] = '\0';
+                        }
                     }
                 } else {
-                    new_argv[0] = cmd->argv[0];
-                    new_argv[1] = code_arg;
-                    for (int j = 1; j < cmd->argc; j++) {
-                        new_argv[j + 1] = cmd->argv[j];
+                    new_argv[1] = dynamic_exit_str;
+                    dynamic_exit_str = NULL;
+                }
+                for (int j = 1; j < cmd->argc; j++) {
+                    new_argv[pass_count + j] = cmd->argv[j];
+                }
+                new_argv[new_argc] = NULL;
+                ret = exec_one_pid(new_argc, new_argv);
+                wait_for_command(ret);
+                pipe_exit = process_get_exit_code();
+                for (uint32_t k = 0; k < pass_count; k++) {
+                    if (new_argv[1 + k]) {
+                        kfree(new_argv[1 + k]);
                     }
-                    new_argv[new_argc] = NULL;
-                    ret = exec_one_pid(new_argc, new_argv);
-                    wait_for_command(ret);
-                    pipe_exit = process_get_exit_code();
-                    kfree(code_arg);
-                    kfree(new_argv);
-                    if (ret > 0 && ret != 1000 && terminal_get_show_return_value()) {
-                        printf("Return value: %d\n", pipe_exit);
-                    }
+                }
+                kfree(new_argv);
+                if (dynamic_exit_str) kfree(dynamic_exit_str);
+                if (ret > 0 && ret != 1000 && terminal_get_show_return_value()) {
+                    process_print_last_return_value();
                 }
             }
         }
@@ -599,7 +637,7 @@ static int exec_stage(const run_stage_t *stage) {
         process_run_batch_windows(procs, total_procs, wins);
         if (terminal_get_show_return_value()) {
             for (int k = 0; k < total_procs; k++) {
-                printf("Return value: %d\n", process_get_batch_exit_code(k));
+                process_print_batch_return_value(k);
             }
         }
         stage_exit = process_get_batch_exit_code(total_procs - 1);

@@ -13,6 +13,42 @@
 #define PROT_WRITE 2
 #define PROT_EXEC  4
 
+// Return types and structure
+typedef enum {
+    PROC_RET_INT = 0,
+    PROC_RET_CHAR,
+    PROC_RET_STRING,
+    PROC_RET_STRUCT,
+    PROC_RET_POINTER
+} process_return_type_t;
+
+typedef struct {
+    process_return_type_t type;
+    int32_t int_val;
+    uint32_t raw_eax;
+    uint32_t raw_edx;
+
+    /* Self-expanding type name (no fixed 32-byte limit) */
+    char *type_name;
+    uint32_t type_name_len;
+    uint32_t type_name_cap;
+
+    /* Self-expanding formatted universal output string (no fixed 256-byte limit) */
+    char *str_val;
+    uint32_t str_val_len;
+    uint32_t str_val_cap;
+
+    /* Self-expanding raw struct/binary data (no fixed 64-byte limit) */
+    uint8_t *struct_data;
+    uint32_t struct_size;
+    uint32_t struct_data_cap;
+
+    /* Self-expanding argument array for pipeline execution via run */
+    char **arg_vals;
+    uint32_t arg_count;
+    uint32_t arg_cap;
+} process_return_value_t;
+
 // Process structure
 typedef struct process {
     uint32_t pid;
@@ -39,6 +75,8 @@ typedef struct process {
     
     // State
     int exit_code;          // Exit code
+    process_return_value_t return_val; // Full typed return value
+    bool return_val_explicit; // True if process explicitly set custom return value
     uint8_t is_running;     // Running flag
     bool waiting_for_input; // Blocked waiting for user input
     bool wants_graphics;    // Process requested VGA graphics mode (Mode 13h)
@@ -66,6 +104,7 @@ typedef struct process {
 
     // Debugging
     char *name;             // Process name (dynamically allocated)
+    char *return_format;    // Auto-detected format descriptor from DWARF
     
     // Links
     struct process *next;   // For process list
@@ -100,6 +139,20 @@ int universal_process_execute(const char *path, int argc, char **argv);
 int process_exec(const char *path, int argc, char **argv);
 int process_get_exit_code(void);
 void process_set_last_exit_code(int code);
+void process_print_last_return_value(void);
+void process_print_batch_return_value(int idx);
+const char* process_get_last_return_string(void);
+const process_return_value_t* process_get_last_return_value(void);
+void process_set_current_return_value(process_return_type_t type, const char *type_name, const char *str_val, int32_t int_val, const void *data, uint32_t size);
+void process_return_val_init(process_return_value_t *val);
+void process_return_val_free_fields(process_return_value_t *val);
+void process_return_val_reset(process_return_value_t *val);
+void process_return_val_set_type_name(process_return_value_t *val, const char *name);
+void process_return_val_set_str(process_return_value_t *val, const char *str);
+void process_return_val_append_str(process_return_value_t *val, const char *str);
+void process_return_val_set_struct_data(process_return_value_t *val, const void *data, uint32_t size);
+void process_return_val_add_arg(process_return_value_t *val, const char *arg);
+void process_return_val_copy(process_return_value_t *dst, const process_return_value_t *src);
 process_t *process_get_current(void);
 int process_adjust_stack_size(process_t *proc, int32_t delta);
 void process_set_keep_alive(process_t *proc, int enabled);

@@ -130,11 +130,15 @@ static int parse_compile_execute(const void *source, mp_parse_input_kind_t input
         #if MICROPY_REPL_INFO
         start = mp_hal_ticks_ms();
         #endif
+        mp_obj_t ret_obj = mp_const_none;
         #if MICROPY_PYEXEC_COMPILE_ONLY
         if (!mp_compile_only)
         #endif
         {
-            mp_call_function_0(module_fun);
+            ret_obj = mp_call_function_0(module_fun);
+        }
+        if (ret_obj != mp_const_none) {
+            ipo_python_handle_return_obj(ret_obj);
         }
         mp_hal_set_interrupt_char(-1); // disable interrupt
         mp_handle_pending(MP_HANDLE_PENDING_CALLBACKS_AND_EXCEPTIONS);
@@ -167,6 +171,7 @@ static int parse_compile_execute(const void *source, mp_parse_input_kind_t input
             #if MICROPY_PYEXEC_ENABLE_EXIT_CODE_HANDLING
             // None is an exit value of 0; an int is its value; anything else is 1
             mp_obj_t val = mp_obj_exception_get_value(MP_OBJ_FROM_PTR(nlr.ret_val));
+            ipo_python_handle_return_obj(val);
             if (val != mp_const_none) {
                 if (mp_obj_is_int(val)) {
                     ret = (int)mp_obj_int_get_truncated(val);

@@ -149,17 +149,21 @@ bool dns_resolve(const char *hostname, ip4_addr_t *out_ip, uint32_t timeout_ms) 
     uint8_t *qname = query_buf + sizeof(dns_header_t);
     const char *src = hostname;
 
-    while (*src) {
-        const char *dot = strchr(src, '.');
-        size_t label_len = dot ? (size_t)(dot - src) : strlen(src);
+    while (*src && *src != '/' && *src != ':') {
+        size_t label_len = 0;
+        while (src[label_len] && src[label_len] != '.' && src[label_len] != '/' && src[label_len] != ':') {
+            label_len++;
+        }
+        if (label_len == 0) break;
         if (label_len > 63) label_len = 63;
 
         *qname++ = (uint8_t)label_len;
         memcpy(qname, src, label_len);
         qname += label_len;
 
-        if (!dot) break;
-        src = dot + 1;
+        src += label_len;
+        if (*src == '.') src++;
+        else break;
     }
     *qname++ = 0x00; // Zero terminator for QNAME
 
@@ -170,10 +174,13 @@ bool dns_resolve(const char *hostname, ip4_addr_t *out_ip, uint32_t timeout_ms) 
     *qname++ = 0x01;
 
     uint16_t query_len = (uint16_t)(qname - query_buf);
-    udp_send(netif->dns, client_port, 53, query_buf, query_len);
+    ip4_addr_t primary_dns = (netif->dns != 0) ? netif->dns : IP4_ADDR(8, 8, 8, 8);
+    udp_send(primary_dns, client_port, 53, query_buf, query_len);
 
     uint32_t start = timer_millis();
     uint32_t last_send = start;
+    uint32_t retry_count = 0;
+
     while (timer_millis() - start < timeout_ms) {
         net_poll();
 
@@ -186,13 +193,16 @@ bool dns_resolve(const char *hostname, ip4_addr_t *out_ip, uint32_t timeout_ms) 
             }
         }
 
-        if (timer_millis() - last_send >= 400) {
+        if (timer_millis() - last_send >= 350) {
             ip4_addr_t target_dns = netif->dns;
-            if (target_dns == 0) {
+            if (target_dns == 0 || (retry_count % 3) == 1) {
                 target_dns = IP4_ADDR(8, 8, 8, 8);
+            } else if ((retry_count % 3) == 2) {
+                target_dns = IP4_ADDR(1, 1, 1, 1);
             }
             udp_send(target_dns, client_port, 53, query_buf, query_len);
             last_send = timer_millis();
+            retry_count++;
         }
 
         ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);

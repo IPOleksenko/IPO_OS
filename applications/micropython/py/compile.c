@@ -1036,7 +1036,7 @@ static void compile_break_cont_stmt(compiler_t *comp, mp_parse_node_struct_t *pn
 
 static void compile_return_stmt(compiler_t *comp, mp_parse_node_struct_t *pns) {
     #if MICROPY_CPYTHON_COMPAT
-    if (comp->scope_cur->kind != SCOPE_FUNCTION) {
+    if (comp->scope_cur->kind != SCOPE_FUNCTION && comp->scope_cur->kind != SCOPE_MODULE) {
         compile_syntax_error(comp, (mp_parse_node_t)pns, MP_ERROR_TEXT("'return' outside function"));
         return;
     }

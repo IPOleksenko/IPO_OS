@@ -184,4 +184,11 @@ void dynamic_keymap_reset(void);
  */
 void dynamic_keymap_set_app_mode(bool is_app);
 
+extern const char default_keymap_name[];
+extern const keymap_entry_t default_keymap_entries[];
+extern const uint32_t default_keymap_entries_count;
+
+uint32_t dynamic_keymap_get_entries_count(uint32_t slot_idx);
+uint32_t dynamic_keymap_copy_entries(uint32_t slot_idx, keymap_entry_t *out_entries, uint32_t max_count);
+
 #endif /* DYNAMIC_KEYMAP_H */

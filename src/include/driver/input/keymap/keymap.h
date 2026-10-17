@@ -44,9 +44,4 @@ const char* keyboard_get_key_string(uint8_t scancode);
 void hot_key_handler(uint8_t scancode);
 void update_hot_key_state(uint8_t scancode);
 
-/* DEFAULT ENGLISH KEYMAP */
-extern const char default_keymap_name[];
-extern const char keymap_english[128];
-extern const char keymap_english_shift[128];
-
 #endif
