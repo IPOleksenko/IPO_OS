@@ -26,10 +26,10 @@
  *      wm_session_run() (single-app blocking mode), but the async
  *      compositor never calls it — it only blits the pre-rendered buffer.
  *
- * startx / stopx
- * ==============
- *   startx  → wm_session_start() — starts async compositor, returns.
- *   stopx   → wm_session_stop()  — stops compositor, restores text mode.
+ * startwm / stopwm
+ * ================
+ *   startwm  → wm_session_start() — starts async compositor, returns.
+ *   stopwm   → wm_session_stop()  — stops compositor, restores text mode.
  *
  * Single-app blocking mode (for self-hosted event loops)
  * ======================================================

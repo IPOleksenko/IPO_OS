@@ -239,7 +239,7 @@ void gl_swap_buffers(GLContext *ctx, void *win_ptr) {
 
     if (win != NULL && win->framebuf != NULL && wm_is_window_valid(win)) {
         /*
-         * Multi-window startX mode (VGA Mode 13h or TrueColor window):
+         * Multi-window startwm mode (VGA Mode 13h or TrueColor window):
          * Strided quantization so window resizing or dimensions never shear or misalign scanlines.
          */
         int w = ctx->width  < (int)win->w ? ctx->width  : (int)win->w;

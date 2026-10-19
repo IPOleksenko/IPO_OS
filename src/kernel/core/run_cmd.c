@@ -657,8 +657,8 @@ int run_cmd_execute(const char *cmdline) {
     if (!cmdline || !*cmdline) {
         printf("Usage: run <prog> [args] [OP <prog> [args] ...]\n");
         printf("Operators:\n");
-        printf("  &   — run each program in a separate workspace (separate startx/terminal)\n");
-        printf("  &&  — run asynchronously in one workspace (shared startx desktop/terminal)\n");
+        printf("  &   — run each program in a separate workspace\n");
+        printf("  &&  — run asynchronously in one workspace\n");
         printf("  |   — wait for left program to complete and pass return code to right\n");
         printf("  ;   — wait until program completes, then run next program\n");
         printf("Hotkeys:\n");

@@ -1005,8 +1005,8 @@ bool terminal_is_builtin(const char *name) {
         "return",
         "ifconfig",
         "hardware",
-        "startx",
-        "stopx",
+        "startwm",
+        "stopwm",
         NULL
     };
     for (int i = 0; builtins[i] != NULL; i++) {
@@ -1053,17 +1053,17 @@ static void builtin_help(void) {
     printf("    run <prog> [args] [OP <prog> [args] ...]\n");
     printf("      - Launch executables with multitasking batch operators:\n");
     printf("          &   - run each program in a separate workspace\n");
-    printf("                (separate text buffers / separate startx workspaces).\n");
+    printf("                (separate text buffers / separate startwm workspaces).\n");
     printf("          &&  - run programs asynchronously in a single shared workspace\n");
-    printf("                (main terminal / same startx desktop with all windows open).\n");
+    printf("                (main terminal / same startwm desktop with all windows open).\n");
     printf("          |   - wait for left program to complete and pass return code to right.\n");
     printf("          ;   - wait until program completes, then run next program.\n");
     printf("        Switch workspaces: Ctrl + Page Up / Ctrl + Page Down; exit: Ctrl + C.\n");
-    printf("    startx\n");
+    printf("    startwm\n");
     printf("      - Enter VGA Mode 13h (320x200) and start the window manager compositor\n");
     printf("        as a background async task. Returns to the shell immediately.\n");
     printf("        The [Close] button in the bottom-left of the screen always exits.\n");
-    printf("    stopx\n");
+    printf("    stopwm\n");
     printf("      - Stop the WM compositor, destroy all windows, return to text mode.\n");
     printf("\n");
     printf("  [Output & Redirection]\n");
@@ -3111,7 +3111,7 @@ int try_execute_command(const char *cmdline) {
         if (res < 0) return res;
         process_set_last_exit_code(res);
         return 1000;
-    } else if (strcmp(name, "startx") == 0) {
+    } else if (strcmp(name, "startwm") == 0) {
         /* Start the WM video-mode session */
         if (!wm_session_active()) {
             wm_session_start();
@@ -3122,11 +3122,11 @@ int try_execute_command(const char *cmdline) {
                 process_exec(sub_path, argc - 1, argv + 1);
                 kfree(sub_path);
             } else {
-                printf("startx: '%s' not found\n", argv[1]);
+                printf("startwm: '%s' not found\n", argv[1]);
             }
         }
         builtin_handled = 1;
-    } else if (strcmp(name, "stopx") == 0) {
+    } else if (strcmp(name, "stopwm") == 0) {
         /* Stop the WM session and return to text mode */
         wm_session_stop();
         builtin_handled = 1;
