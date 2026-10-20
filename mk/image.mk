@@ -1,6 +1,10 @@
 .PHONY: image
 image: $(OS_IMAGE) disks live-image
 
+.PHONY: font-databases
+font-databases:
+	python3 tools/build_font_db.py
+
 $(OS_IMAGE): $(BOOT_BIN) $(KERNEL_BIN)
 	cat $^ > $@
 	@size=$$(stat -c %s $@); \
@@ -24,7 +28,7 @@ format-disk: $(BOOT_BIN) $(KERNEL_BIN) build/disk.img
 	python3 tools/format_disk_via_os.py --boot $(BOOT_BIN) --kernel $(KERNEL_BIN) --disk build/disk.img
 
 .PHONY: disks
-disks: $(BOOT_BIN) $(KERNEL_BIN) build/disk.img build/disk.iso toolchain format-disk
+disks: $(BOOT_BIN) $(KERNEL_BIN) build/disk.img build/disk.iso toolchain format-disk font-databases
 	python3 tools/load_applications.py
 
 .PHONY: live-image

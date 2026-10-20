@@ -117,14 +117,15 @@ def main():
         else:
             print(f"Notice: Toolchain binary not found: {tool_path}")
 
-    # 3. Bundled fonts (only if present)
+    # 3. Bundled fonts
     fonts_dir = project_root / "build" / "fonts"
-    if fonts_dir.exists():
-        font_files = list(fonts_dir.glob("*.fnt"))
-        if font_files:
-            safe_mkdir(disk, "/fonts")
-            for f in font_files:
-                safe_put(disk, f, f"/fonts/{f.name}")
+    font_files = sorted(fonts_dir.glob("*.fnt")) if fonts_dir.exists() else []
+    safe_mkdir(disk, "/fonts")
+    for font in font_files:
+        destination = f"/fonts/{font.name}"
+        disk.put(str(font), destination)
+        if disk.cat(destination) != font.read_bytes():
+            raise RuntimeError(f"Font copy verification failed: {font} -> {destination}")
 
     # 4. Bundled compiler headers (only if present)
     tcc_include = project_root / "applications" / "tcc" / "include"

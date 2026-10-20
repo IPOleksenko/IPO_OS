@@ -10,7 +10,7 @@
  * wm_session_stop()   — stops the async task, returns to text mode.
  *
  * Apps that want to show windows:
- *   1. Call wm_create_window() (or wm_register_window()) → window added to
+ *   1. Call wm_create_window() → window added to
  *      the shared global list.
  *   2. Return from main().  The compositor task keeps drawing their window.
  *   3. Optionally call wm_destroy_window() before returning to remove it.
@@ -59,7 +59,7 @@ typedef enum {
 #define WM_EVENT_CLOSE      0x00000100u
 #define WM_EVENT_RESIZE     0x00000200u
 #define WM_EVENT_MOVE       0x00000400u
-#define WM_EVENT_CLICK      0x00001000u  /* left mouse button down inside window */
+#define WM_EVENT_CLICK      0x00001000u  /* left mouse click inside window without dragging */
 
 /* =========================================================================
  * Forward declaration
@@ -255,17 +255,6 @@ void wm_buf_draw_string (uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, c
  * Kernel / driver code MUST NOT call this directly.
  */
 void wm_compositor_tick(void);
-
-/* =========================================================================
- * Legacy / convenience shim
- * ========================================================================= */
-wm_window_t *wm_register_window(const char *title,
-                                  int16_t x, int16_t y,
-                                  uint16_t w, uint16_t h,
-                                  wm_draw_cb_t  draw_cb,
-                                  wm_event_cb_t event_cb,
-                                  void *user_data);
-void wm_remove_window(wm_window_t *win);
 
 /**
  * Get current display/compositor screen bounds in pixels.

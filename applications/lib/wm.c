@@ -169,18 +169,6 @@ void wm_session_run(void) {
     ipo_syscall(IPO_SYSCALL_WM_SESSION_RUN, 0u, NULL);
 }
 
-wm_window_t *wm_register_window(const char *title, int16_t x, int16_t y, uint16_t w, uint16_t h,
-                                  wm_draw_cb_t draw_cb, wm_event_cb_t event_cb, void *user_data) {
-    wm_window_options_t opts = WM_WINDOW_OPTIONS_DEFAULT;
-    opts.title=title; opts.x=x; opts.y=y; opts.w=w; opts.h=h;
-    opts.draw_cb=draw_cb; opts.event_cb=event_cb; opts.user_data=user_data;
-    return wm_create_window(&opts);
-}
-
-void wm_remove_window(wm_window_t *win) {
-    wm_destroy_window(win);
-}
-
 /* Userland buffer drawing helpers */
 void wm_buf_put_pixel(uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, uint8_t c) {
     if (x >= 0 && x < (int)bw && y >= 0 && y < (int)bh && buf) {

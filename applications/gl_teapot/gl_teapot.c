@@ -667,7 +667,6 @@ static void draw_teapot_mesh(int vp_w, int vp_h) {
 
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
-    printf("[gl_teapot] Starting Optimized Realistic Utah Teapot...\n");
 
     uint32_t pid = (uint32_t)ipo_syscall(IPO_SYSCALL_GETPID, 0, NULL);
     if (pid == 0) pid = 1;
