@@ -295,6 +295,10 @@ bool process_in_process_context(void) {
 }
 
 void process_yield_kernel(void) {
+    if (current_process && current_process->demand_loading) {
+        process_demand_load_step(current_process);
+    }
+
     if (!batch_active || !in_process_context || !current_process) {
         return;
     }
@@ -741,23 +745,51 @@ void process_switch_foreground_prev(void) {
     process_yield_kernel();
 }
 
-bool process_is_foreground(void) {
-    if (batch_active) {
-        return (process_get_foreground() == current_process);
+void process_switch_foreground_to_workspace(int target_wid) {
+    if (!batch_active || batch_proc_count <= 1) return;
+    if (!batch_separate_windows) return;
+    process_t *cur_fg = process_get_foreground();
+    if (cur_fg && cur_fg->window_id == target_wid) return;
+
+    process_t *target_proc = NULL;
+    for (int i = 0; i < batch_proc_count; i++) {
+        if (batch_procs && batch_procs[i] && batch_procs[i]->window_id == target_wid &&
+            process_is_active_or_has_windows(batch_procs[i])) {
+            target_proc = batch_procs[i];
+            break;
+        }
     }
-    int res = ipo_syscall(IPO_SYSCALL_PROCESS_IS_FOREGROUND, 0, NULL);
-    if (res == (int)IPO_SYSCALL_ENOSYS) {
+    if (!target_proc) return;
+
+    serial_printf("[proc] switch_to_workspace: %s (win %d) -> %s (win %d)\n",
+        cur_fg ? cur_fg->name : "none",
+        cur_fg ? cur_fg->window_id : 0,
+        target_proc->name,
+        target_wid);
+
+    process_set_foreground(target_proc);
+    if (wm_session_active() && (!process_get_separate_windows() || target_proc->is_wm_app)) {
+        wm_focus_window_for_pid(target_proc->pid);
+        wm_invalidate_all();
+    }
+    process_yield_kernel();
+}
+
+bool process_is_foreground(void) {
+    if (!batch_active) {
         return true;
     }
-    return res != 0;
+    process_t *cur = process_get_current();
+    process_t *fg = process_get_foreground();
+    if (!fg || !cur) return true;
+    return (cur == fg);
 }
 
 void process_yield(void) {
-    if (batch_active) {
-        process_yield_kernel();
-        return;
+    if (current_process && current_process->demand_loading) {
+        process_demand_load_step(current_process);
     }
-    ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
+    process_yield_kernel();
 }
 
 static char *default_env[] = {
@@ -2220,6 +2252,172 @@ static void log_process_heap_state(const char *stage) {
                  stage, used, total, used_pct, remaining);
 }
 
+/* =========================================================================
+ * Process Isolated Heap Management
+ *
+ * Each process is allocated an independent, strictly isolated physical memory
+ * region for its heap (used by sbrk/malloc).
+ * - No hardcoded maximum slot limit: slot count scales dynamically with RAM.
+ * - Dynamic slot discovery: finds the first free, non-overlapping range.
+ * - Dynamic heap expansion: expands limit if contiguous physical RAM is free.
+ * - Automatic recycling: memory is immediately reclaimed on process exit.
+ * ========================================================================= */
+
+bool process_heap_init(process_t *proc) {
+    if (!proc) return false;
+
+    uint64_t total_ram = get_process_heap_capacity();
+    uint32_t heap_start = USER_HEAP_START;
+
+    if (total_ram > 0 && total_ram <= heap_start) {
+        /* On low-RAM systems (<= 128 MB), start heap at 80 MB (above kmalloc) */
+        heap_start = 0x05000000u;
+    }
+
+    uint32_t stride = USER_HEAP_PROCESS_STRIDE; /* 256 MB default */
+    if (total_ram > heap_start) {
+        uint32_t available = (uint32_t)(total_ram - heap_start);
+        if (stride > available / 2) {
+            stride = available / 2;
+        }
+    }
+    if (stride < 0x02000000u) {
+        stride = 0x02000000u; /* Minimum 32 MB stride */
+    }
+
+    uint32_t slot = 0;
+    while (1) {
+        uint32_t candidate_base = heap_start + slot * stride;
+
+        if (total_ram > 0 && candidate_base >= (uint32_t)total_ram) {
+            serial_printf("[process] Physical RAM exhausted for pid=%u heap (slot=%u base=0x%x total=0x%llx)\n",
+                          proc->pid, slot, candidate_base, total_ram);
+            return false;
+        }
+
+        /* Check if candidate_base or slot is in use by any other active process */
+        bool in_use = false;
+        process_t *curr = process_list;
+        while (curr) {
+            if (curr != proc && curr->user_heap_slot == (int32_t)slot) {
+                in_use = true;
+                break;
+            }
+            if (curr != proc && curr->user_heap_base > 0) {
+                uint32_t curr_limit = curr->user_heap_limit > curr->user_heap_base ?
+                                      curr->user_heap_limit : (curr->user_heap_base + stride);
+                if (candidate_base < curr_limit && (candidate_base + stride) > curr->user_heap_base) {
+                    in_use = true;
+                    break;
+                }
+            }
+            curr = curr->next;
+        }
+
+        if (!in_use) {
+            proc->user_heap_slot = (int32_t)slot;
+            proc->user_heap_base = candidate_base;
+            proc->user_heap_break = candidate_base;
+            proc->user_heap_limit = candidate_base; /* Starts at 0 bytes committed! Expands dynamically on demand! */
+            serial_printf("[process] Initialized dynamic on-demand heap for pid=%u at base=0x%x (slot=%u, stride=%u MB, total_ram=%llu MB)\n",
+                          proc->pid, proc->user_heap_base, slot, stride / (1024 * 1024), total_ram / (1024 * 1024));
+            return true;
+        }
+        slot++;
+    }
+}
+
+void process_heap_cleanup(process_t *proc) {
+    if (!proc) return;
+    if (proc->user_heap_base != 0) {
+        serial_printf("[process] Freed isolated heap for pid=%u: slot=%d [0x%x - 0x%x]\n",
+                      proc->pid, proc->user_heap_slot, proc->user_heap_base, proc->user_heap_limit);
+        proc->user_heap_base = 0;
+        proc->user_heap_break = 0;
+        proc->user_heap_limit = 0;
+        proc->user_heap_slot = -1;
+    }
+}
+
+bool process_heap_can_expand(process_t *proc, uint32_t new_limit) {
+    if (!proc || new_limit <= proc->user_heap_limit) {
+        return true;
+    }
+    uint64_t total_ram = get_process_heap_capacity();
+    if (total_ram > 0 && new_limit > (uint32_t)total_ram) {
+        return false;
+    }
+    uint32_t check_base = proc->user_heap_limit;
+    uint32_t check_limit = new_limit;
+
+    process_t *curr = process_list;
+    while (curr) {
+        if (curr != proc && curr->user_heap_limit > curr->user_heap_base) {
+            if (check_base < curr->user_heap_limit && check_limit > curr->user_heap_base) {
+                return false;
+            }
+        }
+        curr = curr->next;
+    }
+    return true;
+}
+
+/* =========================================================================
+ * Process Demand / Lazy Loading
+ *
+ * Binaries are loaded on demand: initial execution starts immediately with
+ * only headers + initial entry chunk (< 64KB). The remaining loadable
+ * segments are streamed in the background during yields or as needed.
+ * ========================================================================= */
+
+void process_demand_load_step(process_t *proc) {
+    if (!proc || !proc->demand_loading) return;
+    if (proc->demand_loaded_bytes >= proc->demand_total_bytes) {
+        proc->demand_loading = false;
+        return;
+    }
+
+    uint32_t chunk = 64 * 1024;
+    if (proc->demand_loaded_bytes + chunk > proc->demand_total_bytes) {
+        chunk = proc->demand_total_bytes - proc->demand_loaded_bytes;
+    }
+    if (proc->demand_mem_offset + chunk > proc->binary_size) {
+        chunk = proc->binary_size > proc->demand_mem_offset ? proc->binary_size - proc->demand_mem_offset : 0;
+    }
+
+    if (chunk > 0 && proc->binary_storage != NULL) {
+        int bytes = inode_read_bytes(&proc->exec_inode,
+                                     (uint8_t *)proc->binary_storage + proc->demand_mem_offset,
+                                     chunk, proc->demand_file_offset);
+        if (bytes > 0) {
+            if (currently_mapped_app == proc) {
+                memcpy((uint8_t *)PROCESS_HEAP_START + proc->demand_mem_offset,
+                       (uint8_t *)proc->binary_storage + proc->demand_mem_offset, (size_t)bytes);
+            }
+            proc->demand_loaded_bytes += (uint32_t)bytes;
+            proc->demand_file_offset += (uint32_t)bytes;
+            proc->demand_mem_offset += (uint32_t)bytes;
+        } else {
+            proc->demand_loading = false;
+        }
+    } else {
+        proc->demand_loading = false;
+    }
+
+    if (proc->demand_loaded_bytes >= proc->demand_total_bytes) {
+        proc->demand_loading = false;
+        serial_printf("[demand_loader] pid=%u: complete (%u bytes loaded)\n",
+                      proc->pid, proc->demand_total_bytes);
+    }
+}
+
+void process_demand_load_finish(process_t *proc) {
+    if (!proc) return;
+    while (proc->demand_loading) {
+        process_demand_load_step(proc);
+    }
+}
+
 /**
  * Add a memory block to tracking
  */
@@ -2561,7 +2759,7 @@ static int process_call_entry(process_entry_t entry, int argc, char **argv,
 /**
  * load_binary_file - Reads an executable file image into memory
  */
-static int load_binary_file(const char *path, void **data_out) {
+static int __attribute__((unused)) load_binary_file(const char *path, void **data_out) {
     if (data_out == NULL) {
         return -1;
     }
@@ -2633,7 +2831,12 @@ void process_cleanup(process_t *proc) {
     if (!proc) return;
     
     serial_printf("Cleaning up process %d\n", proc->pid);
-    audio_stop_all();
+    if (process_is_batch_active()) {
+        audio_cleanup_streams_for_owner(proc);
+    } else {
+        audio_cleanup_streams_for_owner(proc);
+        audio_stop_all();
+    }
 
     if (proc->async_task_count > 0) {
         proc->is_running = 0;
@@ -2739,6 +2942,8 @@ void process_cleanup(process_t *proc) {
     if (current_process == proc) {
         current_process = NULL;
     }
+
+    process_heap_cleanup(proc);
 
     process_return_val_free_fields(&proc->return_val);
     kfree(proc);
@@ -3261,84 +3466,122 @@ static char *dwarf_extract_main_return_format(const uint8_t *file_data, uint32_t
     return result;
 }
 
-static int universal_exec_load(process_t *proc, const uint8_t *file_data, uint32_t file_size) {
-    if (!proc || !file_data || file_size == 0) {
+static int universal_exec_load(process_t *proc, const uint8_t *hdr_buf, uint32_t hdr_bytes, struct ipo_inode *stat) {
+    if (!proc || !hdr_buf || hdr_bytes == 0 || !stat) {
         return -1;
     }
 
-    uint32_t total_memsz = file_size;
+    uint32_t total_memsz = stat->size;
     uint32_t entry_point = (uint32_t)PROCESS_HEAP_START;
-    bool is_elf = (file_size >= sizeof(elf32_header_t) &&
-                   file_data[0] == 0x7F && file_data[1] == 'E' &&
-                   file_data[2] == 'L'  && file_data[3] == 'F');
+    bool is_elf = (hdr_bytes >= sizeof(elf32_header_t) &&
+                   hdr_buf[0] == 0x7F && hdr_buf[1] == 'E' &&
+                   hdr_buf[2] == 'L'  && hdr_buf[3] == 'F');
 
-    if (!is_elf && is_text_file(file_data, file_size)) {
+    if (!is_elf && is_text_file(hdr_buf, hdr_bytes)) {
         serial_printf("[universal_exec_load] Rejected text file '%s' (not an executable binary)\n",
                       proc->name ? proc->name : "unknown");
         return -1;
     }
 
+    uint32_t data_off = 0;
+    uint32_t data_sz = 0;
+
     if (is_elf) {
-        proc->return_format = dwarf_extract_main_return_format(file_data, file_size);
+        proc->return_format = dwarf_extract_main_return_format(hdr_buf, hdr_bytes);
         if (proc->return_format) {
             serial_printf("[universal_exec_load] DWARF return format: '%s'\n", proc->return_format);
         }
-        const elf32_header_t *elf = (const elf32_header_t *)file_data;
-        if (elf->e_phoff > 0 && elf->e_phnum > 0 &&
-            elf->e_phoff + (uint32_t)elf->e_phnum * sizeof(elf32_program_header_t) <= file_size) {
-            uint32_t max_vaddr = PROCESS_HEAP_START;
-            const elf32_program_header_t *ph = (const elf32_program_header_t *)(file_data + elf->e_phoff);
-            for (uint16_t i = 0; i < elf->e_phnum; i++) {
-                if (ph[i].p_type == 1 /* PT_LOAD */) {
-                    uint32_t seg_end = ph[i].p_vaddr + ph[i].p_memsz;
-                    if (seg_end > max_vaddr) {
-                        max_vaddr = seg_end;
-                    }
+        const elf32_header_t *elf = (const elf32_header_t *)hdr_buf;
+        if (elf->e_phoff > 0 && elf->e_phnum > 0) {
+            uint32_t ph_table_sz = (uint32_t)elf->e_phnum * sizeof(elf32_program_header_t);
+            elf32_program_header_t ph_stack[16];
+            elf32_program_header_t *ph = ph_stack;
+            bool ph_allocated = false;
+
+            if (elf->e_phoff + ph_table_sz <= hdr_bytes) {
+                ph = (elf32_program_header_t *)(hdr_buf + elf->e_phoff);
+            } else {
+                if (elf->e_phnum > 16) {
+                    ph = (elf32_program_header_t *)kmalloc(ph_table_sz);
+                    ph_allocated = true;
+                }
+                if (ph) {
+                    inode_read_bytes(stat, ph, ph_table_sz, elf->e_phoff);
                 }
             }
-            if (max_vaddr > PROCESS_HEAP_START) {
-                total_memsz = max_vaddr - PROCESS_HEAP_START;
-            }
-            if (elf->e_entry >= PROCESS_HEAP_START) {
-                entry_point = elf->e_entry;
-            }
-        }
-    }
 
-    /* 4KB page align total_memsz */
-    total_memsz = (total_memsz + 4095u) & ~4095u;
-    if (total_memsz > UINT32_MAX - PROCESS_HEAP_START) {
-        return -1;
-    }
-
-    proc->binary_storage = kmalloc(total_memsz);
-    if (!proc->binary_storage) {
-        return -1;
-    }
-    memset(proc->binary_storage, 0, total_memsz);
-
-    uint32_t data_off = 0;
-    uint32_t data_sz = total_memsz;
-    if (is_elf) {
-        const elf32_header_t *elf = (const elf32_header_t *)file_data;
-        const elf32_program_header_t *ph = (const elf32_program_header_t *)(file_data + elf->e_phoff);
-        for (uint16_t i = 0; i < elf->e_phnum; i++) {
-            if (ph[i].p_type == 1 /* PT_LOAD */ && ph[i].p_filesz > 0) {
-                if (ph[i].p_vaddr >= PROCESS_HEAP_START) {
-                    uint32_t off = ph[i].p_vaddr - PROCESS_HEAP_START;
-                    if (ph[i].p_offset + ph[i].p_filesz <= file_size &&
-                        off + ph[i].p_filesz <= total_memsz) {
-                        memcpy((uint8_t *)proc->binary_storage + off, file_data + ph[i].p_offset, ph[i].p_filesz);
-                    }
-                    if (ph[i].p_flags & 2 /* PF_W: writeable data */) {
-                        data_off = off;
-                        data_sz = ph[i].p_memsz;
+            if (ph) {
+                uint32_t max_vaddr = PROCESS_HEAP_START;
+                for (uint16_t i = 0; i < elf->e_phnum; i++) {
+                    if (ph[i].p_type == 1 /* PT_LOAD */) {
+                        uint32_t seg_end = ph[i].p_vaddr + ph[i].p_memsz;
+                        if (seg_end > max_vaddr) {
+                            max_vaddr = seg_end;
+                        }
                     }
                 }
+                if (max_vaddr > PROCESS_HEAP_START) {
+                    total_memsz = max_vaddr - PROCESS_HEAP_START;
+                }
+                if (elf->e_entry >= PROCESS_HEAP_START) {
+                    entry_point = elf->e_entry;
+                }
+
+                /* 4KB page align total_memsz */
+                total_memsz = (total_memsz + 4095u) & ~4095u;
+                if (total_memsz > UINT32_MAX - PROCESS_HEAP_START) {
+                    if (ph_allocated) kfree(ph);
+                    return -1;
+                }
+
+                proc->binary_storage = kmalloc(total_memsz);
+                if (!proc->binary_storage) {
+                    if (ph_allocated) kfree(ph);
+                    return -1;
+                }
+                memset(proc->binary_storage, 0, total_memsz);
+
+                /* Initialize on-demand loading parameters */
+                proc->demand_loading = false;
+                proc->demand_loaded_bytes = total_memsz;
+                proc->demand_total_bytes = total_memsz;
+                proc->exec_inode = *stat;
+
+                /* Load segments directly from disk into binary storage */
+                for (uint16_t i = 0; i < elf->e_phnum; i++) {
+                    if (ph[i].p_type == 1 /* PT_LOAD */ && ph[i].p_filesz > 0) {
+                        if (ph[i].p_vaddr >= PROCESS_HEAP_START) {
+                            uint32_t off = ph[i].p_vaddr - PROCESS_HEAP_START;
+                            if (off + ph[i].p_filesz <= total_memsz) {
+                                if (ph[i].p_flags & 2 /* PF_W: writeable data */) {
+                                    data_off = off;
+                                    data_sz = ph[i].p_memsz;
+                                }
+                                inode_read_bytes(stat, (uint8_t *)proc->binary_storage + off,
+                                                 ph[i].p_filesz, ph[i].p_offset);
+                            }
+                        }
+                    }
+                }
+
+                if (ph_allocated) kfree(ph);
             }
         }
     } else {
-        memcpy(proc->binary_storage, file_data, file_size);
+        /* Flat binary (e.g. .bin) */
+        total_memsz = (stat->size + 4095u) & ~4095u;
+        proc->binary_storage = kmalloc(total_memsz);
+        if (!proc->binary_storage) {
+            return -1;
+        }
+        memset(proc->binary_storage, 0, total_memsz);
+        inode_read_bytes(stat, proc->binary_storage, stat->size, 0);
+        proc->demand_loading = false;
+        proc->demand_loaded_bytes = stat->size;
+        proc->demand_total_bytes = stat->size;
+        proc->exec_inode = *stat;
+        data_off = 0;
+        data_sz = total_memsz;
     }
 
     proc->binary_base = (void *)PROCESS_HEAP_START;
@@ -3348,8 +3591,8 @@ static int universal_exec_load(process_t *proc, const uint8_t *file_data, uint32
     proc->data_size = data_sz;
     proc->code_mapped = false;
 
-    serial_printf("[universal_exec_load] Universally loaded: file_size=%u, mem_size=%u, data_off=%u, data_sz=%u, entry=0x%x\n",
-                  file_size, total_memsz, proc->data_offset, proc->data_size, proc->entry_point);
+    serial_printf("[universal_exec_load] Loaded '%s': file_size=%u, mem_size=%u, data_off=%u, data_sz=%u, entry=0x%x\n",
+                  proc->name ? proc->name : "unknown", (uint32_t)stat->size, total_memsz, proc->data_offset, proc->data_size, proc->entry_point);
 
     return 0;
 }
@@ -3373,38 +3616,60 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
 
     serial_printf("process_spawn: %s (actual=%s), argc=%d\n", path, actual_path, argc);
 
-    // Read file contents into memory
-    void *binary_image = NULL;
-    int size = load_binary_file(actual_path, &binary_image);
-    if (size < 0) {
+    // Fast header check & on-demand load
+    struct ipo_inode stat;
+    if (!ipo_fs_stat(actual_path, &stat)) {
+        printf("File not found: %s\n", actual_path);
+        process_set_last_exit_code(127);
+        if (resolved != NULL) kfree(resolved);
+        return NULL;
+    }
+
+    if ((stat.mode & IPO_INODE_TYPE_DIR) != 0) {
+        printf("Cannot execute '%s': is a directory\n", actual_path);
+        process_set_last_exit_code(126);
+        if (resolved != NULL) kfree(resolved);
+        return NULL;
+    }
+
+    if (stat.size == 0) {
+        printf("Cannot execute '%s': file is empty\n", actual_path);
+        process_set_last_exit_code(126);
+        if (resolved != NULL) kfree(resolved);
+        return NULL;
+    }
+
+    uint8_t hdr_buf[4096];
+    uint32_t to_read = stat.size < sizeof(hdr_buf) ? stat.size : (uint32_t)sizeof(hdr_buf);
+    int hdr_bytes = inode_read_bytes(&stat, hdr_buf, to_read, 0);
+    if (hdr_bytes <= 0) {
+        printf("Failed to read header of '%s'\n", actual_path);
+        process_set_last_exit_code(126);
         if (resolved != NULL) kfree(resolved);
         return NULL;
     }
 
     // Check for shebang (#!) script
     static int shebang_depth = 0;
-    if (size >= 2 && ((const uint8_t *)binary_image)[0] == '#' && ((const uint8_t *)binary_image)[1] == '!') {
+    if (hdr_bytes >= 2 && hdr_buf[0] == '#' && hdr_buf[1] == '!') {
         if (shebang_depth >= 4) {
             printf("Cannot execute '%s': too many levels of interpreter recursion\n", actual_path);
-            kfree(binary_image);
             if (resolved != NULL) kfree(resolved);
             return NULL;
         }
 
-        const char *data = (const char *)binary_image;
+        const char *data = (const char *)hdr_buf;
         size_t line_len = 0;
-        while (2 + line_len < (size_t)size && data[2 + line_len] != '\r' && data[2 + line_len] != '\n') {
+        while (2 + line_len < (size_t)hdr_bytes && data[2 + line_len] != '\r' && data[2 + line_len] != '\n') {
             line_len++;
         }
         char *line = kmalloc(line_len + 1);
         if (!line) {
-            kfree(binary_image);
             if (resolved != NULL) kfree(resolved);
             return NULL;
         }
         memcpy(line, data + 2, line_len);
         line[line_len] = '\0';
-        kfree(binary_image);
 
         char *p = line;
         while (*p == ' ' || *p == '\t') p++;
@@ -3480,7 +3745,6 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
     process_t *proc = kmalloc(sizeof(process_t));
     if (!proc) {
         printf("Failed to allocate process structure\n");
-        kfree(binary_image);
         if (resolved != NULL) kfree(resolved);
         return NULL;
     }
@@ -3490,15 +3754,20 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
     proc->is_running = 1;
     proc->name = kstrdup(actual_path);
     proc->wants_graphics = false;
-    uint32_t heap_slot = (proc->pid > 0) ? ((proc->pid - 1) % 7) : 0;
-    proc->user_heap_break = 0x08000000u + heap_slot * 0x01000000u; /* Isolated 16MB slice per PID, fits within 256MB RAM */
+    if (!process_heap_init(proc)) {
+        printf("Cannot allocate isolated heap for '%s' (out of memory)\n", actual_path);
+        process_set_last_exit_code(126);
+        if (proc->name) kfree(proc->name);
+        kfree(proc);
+        if (resolved != NULL) kfree(resolved);
+        return NULL;
+    }
 
     proc->next = process_list;
     process_list = proc;
 
-    // Load executable via the Universal Executable Loader
-    int load_res = universal_exec_load(proc, (const uint8_t *)binary_image, (uint32_t)size);
-    kfree(binary_image);
+    // Load executable via the Universal Executable Loader with on-demand streaming
+    int load_res = universal_exec_load(proc, hdr_buf, (uint32_t)hdr_bytes, &stat);
     if (resolved != NULL) kfree(resolved);
 
     if (load_res < 0) {
@@ -3666,19 +3935,22 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
         had_graphics = true;
     }
 
+    bool wm_was_active_before_batch = wm_session_active();
+    bool batch_saved_was_text = !vga_is_graphics_mode() && !wm_session_active();
+
     /* Capture pristine text screen and cursor before any batch process alters them */
     uint16_t *batch_saved_screen = (uint16_t *)kmalloc(80 * 25 * sizeof(uint16_t));
     uint16_t batch_saved_cursor = vga_get_cursor_position();
     bool batch_saved_cursor_visible = vga_is_cursor_visible();
     if (batch_saved_screen) {
-        if (vga_is_graphics_mode()) {
+        if (!batch_saved_was_text) {
             for (int i = 0; i < 80 * 25; i++) batch_saved_screen[i] = 0x0720;
         } else {
             memcpy(batch_saved_screen, (const void *)0xB8000, 80 * 25 * sizeof(uint16_t));
             for (int i = 0; i < 80 * 25; i++) {
                 uint16_t ent = batch_saved_screen[i];
                 uint8_t attr = (uint8_t)(ent >> 8);
-                if (ent == 0xFFFF || attr == 0xFF || attr == 0x20) {
+                if (ent == 0xFFFF || attr == 0xFF) {
                     batch_saved_screen[i] = 0x0720;
                 }
             }
@@ -3703,6 +3975,7 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
 
     process_t *last_fg = NULL;
     system_clear_interrupt();
+    bool was_interrupted = false;
 
     while (1) {
         if (vga_is_graphics_mode() || wm_session_active()) {
@@ -3715,6 +3988,7 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
         }
 
         if (system_is_interrupted()) {
+            was_interrupted = true;
             system_clear_interrupt();
             if (separate_windows && fg) {
                 if (fg->is_running) {
@@ -3819,12 +4093,8 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
             }
         }
 
-        /* If all processes have finished and all separate workspaces closed:
-           the entire batch is finished -> return to console! */
+        /* If all processes have finished: the process batch has finished */
         if (active_count == 0) {
-            if (wm_session_active()) {
-                wm_session_stop();
-            }
             break;
         }
 
@@ -4073,14 +4343,20 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
         system_set_state(SYSTEM_STATE_TERMINAL_IDLE);
     }
 
-    if (system_is_interrupted()) {
-        if (wm_session_active()) {
+    /* Thoroughly flush keyboard input buffers to ensure zero residual characters leak into console */
+    keyboard_flush_hardware();
+    keyboard_flush_queue();
+    keyboard_flush_app_queue();
+    keyboard_clear_key_state();
+
+    if (was_interrupted || system_is_interrupted()) {
+        if (!wm_was_active_before_batch && wm_session_active()) {
             wm_session_stop();
         }
-        if (vga_is_graphics_mode()) {
+        if (vga_is_graphics_mode() && !wm_session_active()) {
             vga_set_mode_text_hardware();
         }
-        if ((had_graphics || separate_windows) && batch_saved_screen && !wm_session_active()) {
+        if (batch_saved_screen && batch_saved_was_text && !wm_session_active()) {
             memcpy((void *)0xB8000, batch_saved_screen, 80 * 25 * sizeof(uint16_t));
             vga_set_cursor(batch_saved_cursor);
             if (batch_saved_cursor_visible) {
@@ -4094,35 +4370,42 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
         vga_cursor_reset();
         vga_sanitize_text_vram();
         vga_show_cursor();
-        printf("Application stopped.\n");
-        system_clear_interrupt();
-    } else if (!wm_session_active()) {
-        if (vga_is_graphics_mode()) {
-            vga_set_mode_text_hardware();
+        if (!wm_session_active()) {
+            printf("Application stopped.\n");
         }
-        if ((had_graphics || separate_windows) && batch_saved_screen) {
-            memcpy((void *)0xB8000, batch_saved_screen, 80 * 25 * sizeof(uint16_t));
-            vga_set_cursor(batch_saved_cursor);
-            if (batch_saved_cursor_visible) {
-                vga_show_cursor();
-            } else {
-                vga_hide_cursor();
+        system_clear_interrupt();
+    } else {
+        if (!wm_was_active_before_batch && wm_session_active()) {
+            wm_session_stop();
+        }
+        if (!wm_session_active()) {
+            if (vga_is_graphics_mode()) {
+                vga_set_mode_text_hardware();
             }
+            if ((had_graphics || separate_windows) && batch_saved_screen && batch_saved_was_text) {
+                memcpy((void *)0xB8000, batch_saved_screen, 80 * 25 * sizeof(uint16_t));
+                vga_set_cursor(batch_saved_cursor);
+                if (batch_saved_cursor_visible) {
+                    vga_show_cursor();
+                } else {
+                    vga_hide_cursor();
+                }
 
-            /* Replay stdout produced by text processes only for single-workspace batches */
-            if (!separate_windows) {
-                for (int i = 0; i < count; i++) {
-                    if (procs[i] && procs[i]->text_output_buf && procs[i]->text_output_len > 0) {
-                        printf("%s", procs[i]->text_output_buf);
+                /* Replay stdout produced by text processes only for successful non-interactive single-workspace batches */
+                if (!separate_windows && !was_interrupted) {
+                    for (int i = 0; i < count; i++) {
+                        if (procs[i] && procs[i]->exit_code != 130 && procs[i]->text_output_buf && procs[i]->text_output_len > 0) {
+                            printf("%s", procs[i]->text_output_buf);
+                        }
                     }
                 }
             }
+            vga_font_set_app_mode(false);
+            dynamic_keymap_reapply_fonts();
+            vga_cursor_reset();
+            vga_sanitize_text_vram();
+            vga_show_cursor();
         }
-        vga_font_set_app_mode(false);
-        dynamic_keymap_reapply_fonts();
-        vga_cursor_reset();
-        vga_sanitize_text_vram();
-        vga_show_cursor();
     }
 
     if (batch_saved_screen) {

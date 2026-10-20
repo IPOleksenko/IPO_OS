@@ -78,14 +78,20 @@ def main():
         print(f"Disk {disk_path} is already formatted with IPO_FS.")
         return 0
 
-    print(f"Preparing {disk_path} ({args.size_mb} MB) for in-kernel formatting...")
-    disk_path.parent.mkdir(parents=True, exist_ok=True)
+    if disk_path.exists() and disk_path.stat().st_size >= 1024 * 1024:
+        total_bytes = disk_path.stat().st_size
+        size_mb = total_bytes // (1024 * 1024)
+    else:
+        size_mb = args.size_mb
+        total_bytes = size_mb * 1024 * 1024
 
-    total_bytes = args.size_mb * 1024 * 1024
     total_sectors = total_bytes // SECTOR_SIZE
 
+    print(f"Preparing {disk_path} ({size_mb} MB) for in-kernel formatting...")
+    disk_path.parent.mkdir(parents=True, exist_ok=True)
+
     # Create / zero the disk image if needed or forced
-    if not disk_path.exists() or args.force or disk_path.stat().st_size != total_bytes:
+    if not disk_path.exists() or args.force:
         with open(disk_path, "wb") as f:
             f.seek(total_bytes - 1)
             f.write(b"\x00")

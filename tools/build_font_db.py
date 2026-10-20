@@ -115,7 +115,6 @@ def main():
         if cp not in fixed_records:
             fixed_records[cp] = dash_bmp
     write_ifnt(fonts_dir / "fixed.fnt", fixed_records)
-    write_ifnt(fonts_dir / "default.fnt", fixed_records)
 
     # 2. Terminus font: FullCyrSlav-Terminus16 (including ASCII)
     print("Extracting Terminus console font...")

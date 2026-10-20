@@ -3,7 +3,11 @@ setup-tap:
 
 run:
 ifeq ($(NET_MODE),tap)
-	@ip link show $(TAP_DEV) >/dev/null 2>&1 || $(MAKE) setup-tap
+	@$(MAKE) setup-tap || { \
+		echo "[network] TAP setup failed; restarting with QEMU user networking."; \
+		$(MAKE) run NET_MODE=user; \
+		exit $$?; \
+	}
 endif
 	@python3 tools/create_live_image.py >/dev/null 2>&1 || true
 	$(QEMU) $(QEMU_FLAGS)

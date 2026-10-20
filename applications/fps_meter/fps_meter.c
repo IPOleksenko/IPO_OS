@@ -137,60 +137,71 @@ int main(int argc, char **argv) {
         /* Render UI */
         uint8_t *fb = win->framebuf;
         if (fb) {
+            int cur_w = win->w;
+            int cur_h = win->h;
+
             /* Background: dark theme */
-            wm_buf_fill_rect(fb, WIN_W, WIN_H, 0, 0, WIN_W, WIN_H, CLR_BLACK);
+            wm_buf_fill_rect(fb, cur_w, cur_h, 0, 0, cur_w, cur_h, CLR_BLACK);
 
             /* Top info bar */
             char buf[64];
             uint8_t fps_col = (cur_fps >= 28.0f) ? CLR_LIGHT_GREEN : ((cur_fps >= 18.0f) ? CLR_YELLOW : CLR_LIGHT_RED);
 
             snprintf(buf, sizeof(buf), "FPS: %d.%d", (int)cur_fps, (int)(cur_fps * 10.0f) % 10);
-            wm_buf_draw_string(fb, WIN_W, WIN_H, 8, 4, buf, fps_col);
+            wm_buf_draw_string(fb, cur_w, cur_h, 8, 4, buf, fps_col);
 
             snprintf(buf, sizeof(buf), "dt: %u ms", (unsigned int)cur_dt);
-            wm_buf_draw_string(fb, WIN_W, WIN_H, 95, 4, buf, CLR_LIGHT_CYAN);
+            wm_buf_draw_string(fb, cur_w, cur_h, 95, 4, buf, CLR_LIGHT_CYAN);
 
             snprintf(buf, sizeof(buf), "Avg: %d.%d", (int)avg_fps, (int)(avg_fps * 10.0f) % 10);
-            wm_buf_draw_string(fb, WIN_W, WIN_H, 155, 4, buf, CLR_WHITE);
+            wm_buf_draw_string(fb, cur_w, cur_h, 155, 4, buf, CLR_WHITE);
 
             /* Line 2: Min / Max / Windows count */
             int win_cnt = wm_get_window_count();
             snprintf(buf, sizeof(buf), "Min: %d.%d", (int)min_fps, (int)(min_fps * 10.0f) % 10);
-            wm_buf_draw_string(fb, WIN_W, WIN_H, 8, 14, buf, CLR_LIGHT_GRAY);
+            wm_buf_draw_string(fb, cur_w, cur_h, 8, 14, buf, CLR_LIGHT_GRAY);
 
             snprintf(buf, sizeof(buf), "Max: %d.%d", (int)max_fps, (int)(max_fps * 10.0f) % 10);
-            wm_buf_draw_string(fb, WIN_W, WIN_H, 85, 14, buf, CLR_LIGHT_GRAY);
+            wm_buf_draw_string(fb, cur_w, cur_h, 85, 14, buf, CLR_LIGHT_GRAY);
 
             snprintf(buf, sizeof(buf), "Wins: %d", win_cnt);
-            wm_buf_draw_string(fb, WIN_W, WIN_H, 160, 14, buf, CLR_LIGHT_MAGENTA);
+            wm_buf_draw_string(fb, cur_w, cur_h, 160, 14, buf, CLR_LIGHT_MAGENTA);
 
             /* Divider line */
-            wm_buf_draw_line(fb, WIN_W, WIN_H, 6, 24, WIN_W - 7, 24, CLR_DARK_GRAY);
+            wm_buf_draw_line(fb, cur_w, cur_h, 6, 24, cur_w - 7, 24, CLR_DARK_GRAY);
 
-            /* Performance Histogram Box (x: 8..200, y: 28..88, h: 60) */
-            int gx = 10, gy = 27, gw = 196, gh = 58;
-            wm_buf_fill_rect(fb, WIN_W, WIN_H, gx, gy, gw, gh, 23); /* Very dark navy */
-            wm_buf_draw_rect(fb, WIN_W, WIN_H, gx - 1, gy - 1, gw + 2, gh + 2, CLR_DARK_GRAY);
+            /* Performance Histogram Box */
+            int gx = 10, gy = 27;
+            int gw = cur_w - 20;
+            int gh = cur_h - 55;
+            if (gw < 20) gw = 20;
+            if (gh < 15) gh = 15;
+
+            wm_buf_fill_rect(fb, cur_w, cur_h, gx, gy, gw, gh, 23); /* Very dark navy */
+            wm_buf_draw_rect(fb, cur_w, cur_h, gx - 1, gy - 1, gw + 2, gh + 2, CLR_DARK_GRAY);
 
             /* Target reference lines:
-             * 1 ms = 0.8 pixel height (scale: max dt 70ms = 56px)
-             * 33 ms (30 FPS) -> y = (gy + gh) - (33 * 56 / 70) = gy + gh - 26
-             * 16 ms (60 FPS) -> y = gy + gh - 13
+             * 33 ms (30 FPS) -> y = (gy + gh) - (33 * gh / 70)
+             * 16 ms (60 FPS) -> y = (gy + gh) - (16 * gh / 70)
              */
-            int y_30fps = gy + gh - 27;
-            int y_60fps = gy + gh - 13;
+            int y_30fps = gy + gh - (33 * gh / 70);
+            int y_60fps = gy + gh - (16 * gh / 70);
 
             /* 60 FPS reference line (dotted) */
-            for (int lx = gx; lx < gx + gw; lx += 4) {
-                wm_buf_put_pixel(fb, WIN_W, WIN_H, lx, y_60fps, CLR_DARK_GRAY);
+            if (y_60fps > gy && y_60fps < gy + gh) {
+                for (int lx = gx; lx < gx + gw; lx += 4) {
+                    wm_buf_put_pixel(fb, cur_w, cur_h, lx, y_60fps, CLR_DARK_GRAY);
+                }
+                wm_buf_draw_string(fb, cur_w, cur_h, gx + 2, y_60fps - 7, "60fps", CLR_DARK_GRAY);
             }
-            wm_buf_draw_string(fb, WIN_W, WIN_H, gx + 2, y_60fps - 7, "60fps", CLR_DARK_GRAY);
 
             /* 30 FPS reference line (dotted) */
-            for (int lx = gx; lx < gx + gw; lx += 4) {
-                wm_buf_put_pixel(fb, WIN_W, WIN_H, lx, y_30fps, CLR_LIGHT_BLUE);
+            if (y_30fps > gy && y_30fps < gy + gh) {
+                for (int lx = gx; lx < gx + gw; lx += 4) {
+                    wm_buf_put_pixel(fb, cur_w, cur_h, lx, y_30fps, CLR_LIGHT_BLUE);
+                }
+                wm_buf_draw_string(fb, cur_w, cur_h, gx + 2, y_30fps - 7, "30fps", CLR_LIGHT_BLUE);
             }
-            wm_buf_draw_string(fb, WIN_W, WIN_H, gx + 2, y_30fps - 7, "30fps", CLR_LIGHT_BLUE);
 
             /* Draw history bars */
             int bar_w = 2;
@@ -212,17 +223,18 @@ int main(int argc, char **argv) {
 
                 int bx = gx + i * bar_w;
                 int by = gy + gh - 1 - bar_h;
-                wm_buf_fill_rect(fb, WIN_W, WIN_H, bx, by, bar_w - 1, bar_h, bar_col);
+                wm_buf_fill_rect(fb, cur_w, cur_h, bx, by, bar_w - 1, bar_h, bar_col);
             }
 
             /* Bottom status / controls */
-            wm_buf_draw_line(fb, WIN_W, WIN_H, 6, 90, WIN_W - 7, 90, CLR_DARK_GRAY);
-
-            uint32_t uptime = timer_seconds();
-            snprintf(buf, sizeof(buf), "Uptime: %02u:%02u", uptime / 60, uptime % 60);
-            wm_buf_draw_string(fb, WIN_W, WIN_H, 8, 95, buf, CLR_LIGHT_GRAY);
-
-            wm_buf_draw_string(fb, WIN_W, WIN_H, 115, 95, "[R]eset  [Esc]Exit", CLR_WHITE);
+            int bot_y = cur_h - 18;
+            if (bot_y > gy + gh) {
+                wm_buf_draw_line(fb, cur_w, cur_h, 6, bot_y, cur_w - 7, bot_y, CLR_DARK_GRAY);
+                uint32_t uptime = timer_seconds();
+                snprintf(buf, sizeof(buf), "Uptime: %02u:%02u", uptime / 60, uptime % 60);
+                wm_buf_draw_string(fb, cur_w, cur_h, 8, bot_y + 4, buf, CLR_LIGHT_GRAY);
+                wm_buf_draw_string(fb, cur_w, cur_h, cur_w > 200 ? cur_w - 110 : 85, bot_y + 4, "[R]eset [Esc]Exit", CLR_WHITE);
+            }
 
             wm_invalidate(win);
         }

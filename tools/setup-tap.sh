@@ -42,20 +42,45 @@ sudo ip link set dev "${TAP_DEV}" up
 # Ensure host routes guest IP directly into TAP interface
 sudo ip route replace "${GUEST_IP}/32" dev "${TAP_DEV}" 2>/dev/null || true
 
-# Enable IP forwarding and NAT so guest can access the internet
-sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+# Enable IP forwarding and NAT so the guest can reach external networks.
 DEFAULT_IF=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1)
 if [ -n "$DEFAULT_IF" ]; then
-    sudo iptables -A FORWARD -i "${TAP_DEV}" -o "${DEFAULT_IF}" -j ACCEPT 2>/dev/null || true
-    sudo iptables -A FORWARD -i "${DEFAULT_IF}" -o "${TAP_DEV}" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-    sudo iptables -t nat -A POSTROUTING -o "${DEFAULT_IF}" -j MASQUERADE 2>/dev/null || true
-fi
+    NAT_READY=1
+    if ! sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null; then
+        echo "[TAP] Could not enable host IP forwarding."
+        NAT_READY=0
+    fi
 
-# Forward DNS requests from guest to 8.8.8.8 if host doesn't listen on 53
-sudo iptables -t nat -A PREROUTING -i "${TAP_DEV}" -p udp --dport 53 -j DNAT --to-destination 8.8.8.8:53 2>/dev/null || true
+    if command -v iptables >/dev/null 2>&1; then
+        if ! sudo iptables -C FORWARD -i "${TAP_DEV}" -o "${DEFAULT_IF}" -j ACCEPT 2>/dev/null &&
+           ! sudo iptables -I FORWARD 1 -i "${TAP_DEV}" -o "${DEFAULT_IF}" -j ACCEPT; then
+            echo "[TAP] Could not add the outbound forwarding rule."
+            NAT_READY=0
+        fi
+        if ! sudo iptables -C FORWARD -i "${DEFAULT_IF}" -o "${TAP_DEV}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null &&
+           ! sudo iptables -I FORWARD 1 -i "${DEFAULT_IF}" -o "${TAP_DEV}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; then
+            echo "[TAP] Could not add the return forwarding rule."
+            NAT_READY=0
+        fi
+        if ! sudo iptables -t nat -C POSTROUTING -s 192.168.7.0/24 -o "${DEFAULT_IF}" -j MASQUERADE 2>/dev/null &&
+           ! sudo iptables -t nat -A POSTROUTING -s 192.168.7.0/24 -o "${DEFAULT_IF}" -j MASQUERADE; then
+            echo "[TAP] Could not add the NAT masquerade rule."
+            NAT_READY=0
+        fi
+    else
+        echo "[TAP] iptables is unavailable; TAP guest Internet access will not work."
+        NAT_READY=0
+    fi
+    if [ "$NAT_READY" -ne 1 ]; then
+        echo "[TAP] Internet NAT setup failed; QEMU user networking can be used instead."
+        exit 1
+    fi
+else
+    echo "[TAP] No host default route found; TAP guest Internet access cannot be configured."
+    exit 1
+fi
 
 echo "[TAP] ✓ Interface ${TAP_DEV} is UP and active."
 echo "[TAP] Host IP           : ${HOST_IP}"
 echo "[TAP] Guest (IPO_OS) IP : ${GUEST_IP}"
 echo "[TAP] All 65535 ports are directly reachable at http://${GUEST_IP}:<PORT>/"
-

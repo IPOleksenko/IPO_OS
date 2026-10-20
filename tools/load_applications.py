@@ -2,7 +2,6 @@
 
 import argparse
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -87,6 +86,8 @@ def main():
         if doom_wad.exists():
             safe_put(disk, doom_wad, "/applications/doom1.wad")
 
+        # Ensure /lib directory exists on disk
+        safe_mkdir(disk, "/lib")
 
     # 2. Upload toolchain binaries to /applications
     toolchain_dir = project_root / "build" / "toolchain"
@@ -187,6 +188,7 @@ def main():
         safe_mkdir(disk, "/lib/python")
 
     disk.close()
+
     print("✓ Successfully populated IPO_OS filesystem image.")
     return 0
 

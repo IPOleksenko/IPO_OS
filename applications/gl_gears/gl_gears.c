@@ -126,9 +126,14 @@ int main(int argc, char **argv) {
         gl_make_current(gl);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
+        int cur_w = (win && win->w > 0) ? (int)win->w : WIN_W;
+        int cur_h = (win && win->h > 0) ? (int)win->h : WIN_H;
+        glViewport(0, 0, cur_w, cur_h);
+
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
-        glFrustum(-1.0, 1.0, -1.0, 1.0, 5.0, 60.0);
+        double aspect = (double)cur_w / (double)cur_h;
+        glFrustum(-aspect, aspect, -1.0, 1.0, 5.0, 60.0);
 
         glMatrixMode(GL_MODELVIEW);
         glLoadIdentity();

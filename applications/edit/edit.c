@@ -1255,6 +1255,17 @@ int main(int argc, char **argv) {
 
         /* Ctrl+C: Global interrupt and exit */
         if (keyboard_is_ctrl_pressed() && (sc == 0x2E || sc == 0xAE)) {
+            uint32_t t0 = timer_millis();
+            while (timer_elapsed_ms(t0) < 50u) {
+                while (inb(0x64) & 0x01) {
+                    (void)inb(0x60);
+                }
+                io_wait();
+            }
+            keyboard_flush_hardware();
+            keyboard_flush_queue();
+            keyboard_flush_app_queue();
+            keyboard_clear_key_state();
             system_request_interrupt();
             running = false;
             break;
@@ -1554,6 +1565,10 @@ int main(int argc, char **argv) {
     vga_font_set_app_mode(false);
     dynamic_keymap_set_app_mode(false);
     keyboard_set_app_input_mode(false);
+    keyboard_flush_hardware();
+    keyboard_flush_queue();
+    keyboard_flush_app_queue();
+    keyboard_clear_key_state();
 
     buffer_clear();
     undo_clear();

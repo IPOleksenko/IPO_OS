@@ -13,7 +13,7 @@
 #include <memory/kmalloc.h>
 #include <string.h>
 
-/* Dynamic Self-Expanding Keyboard Queue (no fixed size limit) */
+/* Dynamic Self-Expanding Keyboard Queue */
 #define KEYBOARD_QUEUE_INITIAL 32
 
 struct keyboard_queue {
@@ -91,30 +91,23 @@ static uint8_t keyboard_queue_pop(struct keyboard_queue *queue) {
 
 
 static bool is_batch_running(void) {
-    if (process_is_batch_active()) {
-        return true;
-    }
-    int res = ipo_syscall(IPO_SYSCALL_PROCESS_IS_BATCH_ACTIVE, 0, NULL);
-    if (res == (int)IPO_SYSCALL_ENOSYS) {
-        return process_is_batch_active();
-    }
-    return res != 0;
+    return process_is_batch_active();
+}
+
+static bool is_foreground_process(void) {
+    return process_is_foreground();
 }
 
 static bool is_wm_active(void) {
-    if (wm_session_active()) {
-        return true;
-    }
-    int res = ipo_syscall(IPO_SYSCALL_WM_SESSION_ACTIVE, 0, NULL);
-    if (res == (int)IPO_SYSCALL_ENOSYS) {
-        return wm_session_active();
-    }
-    return res != 0;
+    return wm_session_active();
 }
 
 static void trigger_switch_fg(bool prev) {
-    uint32_t arg = prev ? 1 : 0;
-    ipo_syscall(IPO_SYSCALL_PROCESS_SWITCH_FG, 1, &arg);
+    if (prev) {
+        process_switch_foreground_prev();
+    } else {
+        process_switch_foreground_next();
+    }
 }
 
 static bool pending_e0 = false;
@@ -203,6 +196,14 @@ void keyboard_poll(void) {
                 continue;
             }
 
+            /* Alt + 1..9: Switch directly to workspace N */
+            if (scancode >= 0x02 && scancode <= 0x0A && keyboard_is_alt_pressed() && is_batch_running() && !is_wm_active()) {
+                serial_printf("[kbd] Alt+%d switch detected!\n", scancode - 0x01);
+                pending_e0 = false;
+                process_switch_foreground_to_workspace((int)(scancode - 0x02));
+                continue;
+            }
+
             struct keyboard_queue *q = (keyboard_app_input_mode || is_wm_active()) ? &app_queue : &shell_queue;
             if (pending_e0) {
                 keyboard_queue_push(q, 0xE0u);
@@ -214,12 +215,14 @@ void keyboard_poll(void) {
 }
 
 void keyboard_flush_hardware(void) {
+    if (is_batch_running() && !is_foreground_process()) return;
     while (inb(KBD_STATUS_PORT) & KBD_STATUS_OUTPUT_BUFFER) {
         (void)inb(KBD_DATA_PORT);
     }
 }
 
 void keyboard_flush_queue(void) {
+    if (is_batch_running() && !is_foreground_process()) return;
     shell_queue.head = 0;
     shell_queue.tail = 0;
     app_queue.head   = 0;
@@ -227,6 +230,7 @@ void keyboard_flush_queue(void) {
 }
 
 void keyboard_flush_app_queue(void) {
+    if (is_batch_running() && !is_foreground_process()) return;
     app_queue.head = 0;
     app_queue.tail = 0;
 }
@@ -234,6 +238,7 @@ void keyboard_flush_app_queue(void) {
 static uint32_t app_input_mode_start_ms = 0;
 
 void keyboard_set_app_input_mode(bool enabled) {
+    if (is_batch_running() && !is_foreground_process()) return;
     if (keyboard_app_input_mode == enabled) {
         return;
     }
@@ -259,17 +264,10 @@ void keyboard_enqueue_scancode(uint8_t scancode) {
     keyboard_queue_push(&shell_queue, scancode);
 }
 
-static bool is_foreground_process(void) {
-    int res = ipo_syscall(IPO_SYSCALL_PROCESS_IS_FOREGROUND, 0, NULL);
-    if (res == (int)IPO_SYSCALL_ENOSYS) {
-        return true;
-    }
-    return res != 0;
-}
 
 static void yield_waiting(bool waiting) {
-    uint32_t arg = waiting ? 1 : 0;
-    ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 1, &arg);
+    (void)waiting;
+    process_yield();
 }
 
 uint8_t keyboard_get_scancode(void) {

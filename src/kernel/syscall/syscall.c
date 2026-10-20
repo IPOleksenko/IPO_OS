@@ -1616,10 +1616,6 @@ static uint32_t syscall_builtin_stack_shrink(uint32_t num,
     return (uint32_t)result;
 }
 
-#define USER_HEAP_START 0x08000000u
-#define USER_HEAP_PER_PROC 0x01000000u /* 16 MB per process */
-#define USER_HEAP_MAX_SLOTS 7
-
 static uint32_t user_heap_break = USER_HEAP_START;
 
 static uint32_t syscall_builtin_sbrk(uint32_t num, uint32_t argc, uint32_t *argv) {
@@ -1629,27 +1625,65 @@ static uint32_t syscall_builtin_sbrk(uint32_t num, uint32_t argc, uint32_t *argv
         inc = (int32_t)argv[0];
     }
     process_t *proc = process_get_current();
-    uint32_t slot = (proc && proc->pid > 0) ? ((proc->pid - 1) % USER_HEAP_MAX_SLOTS) : 0;
-    uint32_t proc_base = USER_HEAP_START + slot * USER_HEAP_PER_PROC;
-    uint32_t proc_limit = proc_base + USER_HEAP_PER_PROC;
-    uint32_t *pbreak = (proc && proc->user_heap_break >= proc_base && proc->user_heap_break <= proc_limit)
-                       ? &proc->user_heap_break : &user_heap_break;
-    uint32_t prev = *pbreak;
+
+    if (proc && proc->user_heap_base != 0) {
+        uint32_t prev = proc->user_heap_break;
+        if (inc == 0) {
+            return prev;
+        }
+        if (inc > 0) {
+            uint32_t needed = proc->user_heap_break + (uint32_t)inc;
+            if (needed > proc->user_heap_limit) {
+                /* Dynamically expand process heap limit if contiguous physical RAM is free */
+                if (process_heap_can_expand(proc, needed)) {
+                    uint32_t aligned_limit = (needed + 0x0000FFFFu) & ~0x0000FFFFu;
+                    if (!process_heap_can_expand(proc, aligned_limit)) {
+                        aligned_limit = needed;
+                    }
+                    proc->user_heap_limit = aligned_limit;
+                    serial_printf("[process] Dynamic on-demand heap expanded for pid=%u: limit=0x%x (+%u KB, total=%u MB)\n",
+                                  proc->pid, proc->user_heap_limit, (uint32_t)inc / 1024,
+                                  (proc->user_heap_limit - proc->user_heap_base) / (1024 * 1024));
+                } else {
+                    serial_printf("[process] Out of physical RAM for pid=%u heap: need=0x%x limit=0x%x\n",
+                                  proc->pid, needed, proc->user_heap_limit);
+                    return (uint32_t)-1;
+                }
+            }
+            /* Guarantee complete memory isolation: zero-fill newly allocated memory */
+            memset((void *)(uintptr_t)prev, 0, (uint32_t)inc);
+            proc->user_heap_break = needed;
+            return prev;
+        } else {
+            uint32_t dec = (uint32_t)(-inc);
+            if (proc->user_heap_break - dec < proc->user_heap_base) {
+                return (uint32_t)-1;
+            }
+            proc->user_heap_break -= dec;
+            /* Reclaim physical memory immediately when break decreases */
+            proc->user_heap_limit = (proc->user_heap_break + 0x0000FFFFu) & ~0x0000FFFFu;
+            return prev;
+        }
+    }
+
+    /* Fallback for system / non-process context */
+    uint32_t prev = user_heap_break;
     if (inc == 0) {
         return prev;
     }
     if (inc > 0) {
-        if (*pbreak + (uint32_t)inc > proc_limit) {
+        if (user_heap_break + (uint32_t)inc > USER_HEAP_START + USER_HEAP_PROCESS_STRIDE) {
             return (uint32_t)-1;
         }
-        *pbreak += (uint32_t)inc;
+        memset((void *)(uintptr_t)prev, 0, (uint32_t)inc);
+        user_heap_break += (uint32_t)inc;
         return prev;
     } else {
         uint32_t dec = (uint32_t)(-inc);
-        if (*pbreak - dec < proc_base) {
+        if (user_heap_break - dec < USER_HEAP_START) {
             return (uint32_t)-1;
         }
-        *pbreak -= dec;
+        user_heap_break -= dec;
         return prev;
     }
 }
@@ -2159,8 +2193,14 @@ static uint32_t syscall_builtin_process_is_batch_active(uint32_t num, uint32_t a
 static uint32_t syscall_builtin_process_switch_fg(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num;
     if (!process_is_batch_active()) return 0;
-    if (argc > 0 && argv && argv[0] == 1) {
-        process_switch_foreground_prev();
+    if (argc > 0 && argv) {
+        if (argv[0] == 1) {
+            process_switch_foreground_prev();
+        } else if (argv[0] >= 10) {
+            process_switch_foreground_to_workspace((int)(argv[0] - 10));
+        } else {
+            process_switch_foreground_next();
+        }
     } else {
         process_switch_foreground_next();
     }
@@ -2222,6 +2262,11 @@ static uint32_t syscall_builtin_kbd_wait_scancode(uint32_t num, uint32_t argc, u
 
 static uint32_t syscall_builtin_kbd_set_app_mode(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num;
+    if (process_is_batch_active() && process_in_process_context()) {
+        process_t *cur = process_get_current();
+        process_t *fg = process_get_foreground();
+        if (cur && fg && cur != fg) return 0;
+    }
     if (argc > 0 && argv) {
         keyboard_set_app_input_mode(argv[0] != 0);
     }
@@ -2230,6 +2275,11 @@ static uint32_t syscall_builtin_kbd_set_app_mode(uint32_t num, uint32_t argc, ui
 
 static uint32_t syscall_builtin_kbd_flush(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num; (void)argc; (void)argv;
+    if (process_is_batch_active() && process_in_process_context()) {
+        process_t *cur = process_get_current();
+        process_t *fg = process_get_foreground();
+        if (cur && fg && cur != fg) return 0;
+    }
     keyboard_flush_queue();
     keyboard_flush_app_queue();
     keyboard_flush_hardware();
@@ -2318,6 +2368,13 @@ static uint32_t syscall_builtin_audio_tick(uint32_t num, uint32_t argc, uint32_t
 
 static uint32_t syscall_builtin_audio_stop_all(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num; (void)argc; (void)argv;
+    if (process_is_batch_active()) {
+        process_t *cur = process_get_current();
+        if (cur) {
+            audio_cleanup_streams_for_owner(cur);
+        }
+        return 0;
+    }
     audio_stop_all();
     sb16_stop();
     return 0;
@@ -2828,10 +2885,13 @@ void syscall_init(void) {
 }
 
 uint32_t syscall_dispatch(uint32_t num,
-
                           uint32_t argc,
                           uint32_t *argv)
 {
+    process_t *curr = process_get_current();
+    if (curr && curr->demand_loading) {
+        process_demand_load_step(curr);
+    }
     ipo_syscall_handler_t fn = (ipo_syscall_table && num < ipo_syscall_table_size) ? ipo_syscall_table[num] : NULL;
     if (fn == NULL) {
         return IPO_SYSCALL_ENOSYS;

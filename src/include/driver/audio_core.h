@@ -30,6 +30,7 @@ typedef struct audio_stream {
     size_t       ring_size;      /* 0 = linear buffer, >0 = circular ring buffer in samples */
     size_t       buffered_samples;/* Total samples decoded/written so far */
     bool         is_eof;         /* True when streaming decoder reached end of file */
+    void        *owner;          /* Process owner */
     struct audio_stream *next;
 } audio_stream_t;
 
@@ -37,6 +38,7 @@ typedef struct audio_stream {
 bool            audio_init(void);
 int             audio_get_active_backend(void);
 const char     *audio_get_backend_name(void);
+void            audio_cleanup_streams_for_owner(void *owner);
 
 audio_stream_t *audio_stream_create(int format, int channels, uint32_t sample_rate, const void *data, size_t size);
 audio_stream_t *audio_stream_create_ring(int format, int channels, uint32_t sample_rate,

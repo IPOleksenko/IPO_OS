@@ -26,10 +26,6 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         printf("Current system font: %s (%u glyphs)\n\n",
                current_name[0] ? current_name : "default", glyph_count);
-        printf("Available system fonts in /fonts:\n");
-        printf("  - /fonts/default.fnt   (Fixed16 + Hanzi)\n");
-        printf("  - /fonts/terminus.fnt  (Terminus regular)\n");
-        printf("  - /fonts/bold.fnt      (Terminus bold)\n\n");
         printf("Usage:\n");
         printf("  setfont terminus\n");
         printf("  setfont bold\n");
@@ -45,17 +41,7 @@ int main(int argc, char **argv) {
     const char *target = argv[1];
     char resolved_path[128];
 
-    if (strcmp(target, "default") == 0 || strcmp(target, "-r") == 0 || strcmp(target, "--reset") == 0) {
-        strncpy(resolved_path, "/fonts/default.fnt", sizeof(resolved_path) - 1);
-    } else if (strcmp(target, "terminus") == 0) {
-        strncpy(resolved_path, "/fonts/terminus.fnt", sizeof(resolved_path) - 1);
-    } else if (strcmp(target, "bold") == 0) {
-        strncpy(resolved_path, "/fonts/bold.fnt", sizeof(resolved_path) - 1);
-    } else if (target[0] == '/') {
-        strncpy(resolved_path, target, sizeof(resolved_path) - 1);
-    } else {
-        snprintf(resolved_path, sizeof(resolved_path), "/fonts/%s.fnt", target);
-    }
+    snprintf(resolved_path, sizeof(resolved_path), "/fonts/%s.fnt", target);
     resolved_path[sizeof(resolved_path) - 1] = '\0';
 
     printf("Loading system font from: %s...\n", resolved_path);

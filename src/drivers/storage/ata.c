@@ -3,6 +3,7 @@
 #include <driver/storage/block_dev.h>
 #include <storage/storage_pool.h>
 #include <memory/kmalloc.h>
+#include <system/timer.h>
 #include <ioport.h>
 #include <stdio.h>
 #include <string.h>
@@ -154,23 +155,76 @@ static inline void ata_io_wait(void) {
     ata_io_wait_port(ATA_PRIMARY_CTRL);
 }
 
+#define ATA_TIMEOUT_MS  3000
+
 static bool ata_wait_bsy_clear(uint16_t base) {
-    for (int i = 0; i < 100000; i++) {
-        if (!(inb(base + ATA_REG_STATUS) & ATA_SR_BSY))
+    uint32_t start = timer_millis();
+    while (timer_elapsed_ms(start) < ATA_TIMEOUT_MS) {
+        uint8_t st = inb(base + ATA_REG_STATUS);
+        if (!(st & ATA_SR_BSY)) {
             return true;
+        }
+        ata_io_wait();
     }
+
+    /* Timer elapsed: if drive is still busy (BSY=1) writing/reading large files,
+     * do NOT fail or abort! As long as there is no hardware error (ERR=0),
+     * keep waiting for the write or cache flush to finish. */
+    uint8_t st = inb(base + ATA_REG_STATUS);
+    if ((st & ATA_SR_BSY) && !(st & ATA_SR_ERR)) {
+        while ((st = inb(base + ATA_REG_STATUS)) & ATA_SR_BSY) {
+            if (st & ATA_SR_ERR) {
+                serial_printf("ata_wait_bsy_clear: ERR while busy: 0x%02X\n", (unsigned)st);
+                return false;
+            }
+            ata_io_wait();
+        }
+        return true;
+    }
+
+    if (!(st & ATA_SR_BSY)) return true;
+
+    serial_printf("ata_wait_bsy_clear: timeout status=0x%02X\n", (unsigned)st);
     return false;
 }
 
 static bool ata_wait_drq(uint16_t base) {
-    for (int i = 0; i < 100000; i++) {
+    uint32_t start = timer_millis();
+    while (timer_elapsed_ms(start) < ATA_TIMEOUT_MS) {
         uint8_t st = inb(base + ATA_REG_STATUS);
-        if (st & ATA_SR_ERR) { serial_printf("ata_wait_drq: ERR status=%u\n", (unsigned)st); return false; }
-        if (st & ATA_SR_DRQ) return true;
+        if (st & ATA_SR_BSY) {
+            ata_io_wait();
+            continue;
+        }
+        /* Hard drive error */
+        if (st & ATA_SR_ERR) {
+            serial_printf("ata_wait_drq: ERR status=0x%02X\n", (unsigned)st);
+            return false;
+        }
+        /* Data Request ready */
+        if (st & ATA_SR_DRQ) {
+            return true;
+        }
         ata_io_wait();
     }
+
+    /* Timer elapsed: if drive is still busy (BSY=1) processing data (e.g. streaming
+     * large files), do NOT treat it as an error! Wait for BSY to clear and DRQ to be asserted. */
     uint8_t st = inb(base + ATA_REG_STATUS);
-    serial_printf("ata_wait_drq: timeout status=%u\n", (unsigned)st);
+    if ((st & ATA_SR_BSY) && !(st & ATA_SR_ERR)) {
+        while ((st = inb(base + ATA_REG_STATUS)) & ATA_SR_BSY) {
+            if (st & ATA_SR_ERR) {
+                serial_printf("ata_wait_drq: ERR while busy: 0x%02X\n", (unsigned)st);
+                return false;
+            }
+            ata_io_wait();
+        }
+        if (st & ATA_SR_DRQ) return true;
+    }
+
+    if (st & ATA_SR_DRQ) return true;
+
+    serial_printf("ata_wait_drq: timeout status=0x%02X\n", (unsigned)st);
     return false;
 }
 
@@ -387,7 +441,11 @@ bool ata_read_drive_sectors_lba28(uint32_t drive_idx, uint32_t lba, uint8_t coun
 
     uint16_t *wptr = (uint16_t *)buf;
     for (int s = 0; s < count; s++) {
-        if (!ata_wait_drq(base)) return false;
+        if (!ata_wait_drq(base)) {
+            int retry = 0;
+            while (retry < 5 && !ata_wait_drq(base)) { ata_io_wait_port(ctrl); retry++; }
+            if (retry == 5) return false;
+        }
         insw(base + ATA_REG_DATA, wptr, 256);
         wptr += 256;
     }
@@ -465,7 +523,11 @@ bool ata_read_drive_sectors_lba48(uint32_t drive_idx, uint64_t lba, uint16_t cou
 
     uint16_t *wptr = (uint16_t *)buf;
     for (int s = 0; s < count; s++) {
-        if (!ata_wait_drq(base)) return false;
+        if (!ata_wait_drq(base)) {
+            int retry = 0;
+            while (retry < 5 && !ata_wait_drq(base)) { ata_io_wait_port(ctrl); retry++; }
+            if (retry == 5) return false;
+        }
         insw(base + ATA_REG_DATA, wptr, 256);
         wptr += 256;
     }

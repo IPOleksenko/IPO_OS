@@ -999,7 +999,6 @@ bool terminal_is_builtin(const char *name) {
         "free",
         "drivers",
         "symbols",
-        "ksyms",
         "storage",
         "keymap",
         "return",
@@ -1077,7 +1076,7 @@ static void builtin_help(void) {
     printf("  [Drivers & Kernel Modules]\n");
     printf("    drivers [list | info <id/name> | load <path> | unload <id/name> | status | symbols [filter]]\n");
     printf("      - Manage kernel drivers and dynamic runtime modules (KMOD ABI 0x0100).\n");
-    printf("    symbols [filter] | ksyms [filter]\n");
+    printf("    symbols [filter]\n");
     printf("      - Inspect all exported kernel function symbols, memory addresses, and OS entry points.\n");
     printf("\n");
     printf("  [Hardware Resources & Infrastructure]\n");
@@ -1129,13 +1128,13 @@ static void builtin_help(void) {
     printf("\n");
     printf("2. FILE & DIRECTORY PATH SYNTAX\n");
     printf("  IPO_OS uses unified path resolution across all shell commands and applications:\n");
-    printf("  - Absolute paths : Start with '/' (e.g. /applications/edit, /fonts/default.fnt).\n");
-    printf("  - Relative paths : Relative to current working directory (e.g. file.txt, dir/sub.txt).\n");
-    printf("  - Current dir    : '.' refers to current directory (e.g. ./prog, ./data).\n");
-    printf("  - Parent dir     : '..' ascends to parent directory (e.g. ../file, ../../dir).\n");
-    printf("  - Root           : '~' represents the root directory '/' (e.g. cd ~).\n");
+    printf("  - Absolute paths : Start with '/'.\n");
+    printf("  - Relative paths : Relative to current working directory.\n");
+    printf("  - Current dir    : '.' refers to current directory.\n");
+    printf("  - Parent dir     : '..' ascends to parent directory.\n");
+    printf("  - Root           : '~' represents the root directory '/'.\n");
     printf("  - Redundant '/'  : Multiple slashes '//', '///' are automatically collapsed to a single '/'.\n");
-    printf("  - Paths w/spaces : Wrap path in quotes (\"my file.txt\", 'my file.txt') or escape with '\\' (my\\ file.txt).\n");
+    printf("  - Paths w/spaces : Wrap path in quotes or escape with '\\'.\n");
     printf("\n");
     printf("3. APPLICATION EXECUTION (Launch Methods & Resolution)\n");
     printf("  IPO_OS executes Position Independent Executables via three methods:\n");
@@ -3082,7 +3081,7 @@ int try_execute_command(const char *cmdline) {
     } else if (strcmp(name, "drivers") == 0) {
         builtin_drivers(argc, argv);
         builtin_handled = 1;
-    } else if (strcmp(name, "symbols") == 0 || strcmp(name, "ksyms") == 0) {
+    } else if (strcmp(name, "symbols") == 0) {
         builtin_symbols(argc, argv);
         builtin_handled = 1;
     } else if (strcmp(name, "storage") == 0) {

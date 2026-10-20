@@ -1,5 +1,6 @@
 #include <driver/input/keymap/keymap.h>
 #include <memory/kmalloc.h>
+#include <kernel/process.h>
 #include <string.h>
 
 static bool s_default_key_state[256] = {false};
@@ -147,6 +148,9 @@ void hot_key_handler(uint8_t scancode) {
 static bool e0_prefix = false;
 
 void keyboard_clear_key_state(void) {
+    if (process_is_batch_active() && !process_is_foreground()) {
+        return;
+    }
     if (key_state && key_state_cap > 0) {
         memset(key_state, 0, key_state_cap * sizeof(bool));
     }

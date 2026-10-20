@@ -19,11 +19,7 @@
 #define VGA_VRAM_ADDR 0xA0000
 
 static inline bool is_foreground_process(void) {
-    int res = ipo_syscall(IPO_SYSCALL_PROCESS_IS_FOREGROUND, 0, NULL);
-    if (res == (int)IPO_SYSCALL_ENOSYS) {
-        return true;
-    }
-    return res != 0;
+    return process_is_foreground();
 }
 
 typedef struct {
@@ -598,22 +594,40 @@ int vga_gfx_get_height(void) {
 }
 
 void vga_set_mode_13h(void) {
-    uint32_t arg = 1;
-    int res = ipo_syscall(IPO_SYSCALL_VGA_SET_MODE, 1, &arg);
-    if (res == (int)IPO_SYSCALL_ENOSYS) {
+    process_t *cur = process_get_current();
+    process_t *fg = process_get_foreground();
+    if (cur) cur->wants_graphics = true;
+    if (!fg || cur == fg) {
         vga_set_mode_13h_hardware();
     }
 }
 
 void vga_set_mode_text(void) {
-    uint32_t arg = 0;
-    int res = ipo_syscall(IPO_SYSCALL_VGA_SET_MODE, 1, &arg);
-    if (res == (int)IPO_SYSCALL_ENOSYS) {
-        vga_set_mode_text_hardware();
+    process_t *cur = process_get_current();
+    process_t *fg = process_get_foreground();
+    if (cur) cur->wants_graphics = false;
+    if (!fg || cur == fg) {
+        if (vga_is_graphics_mode()) {
+            vga_set_mode_text_hardware();
+        }
     }
 }
 
 void vga_gfx_set_palette(uint8_t idx, uint8_t r, uint8_t g, uint8_t b) {
+    process_t *cur = process_get_current();
+    if (cur) {
+        if (!cur->gfx_palette_backup) {
+            cur->gfx_palette_backup = (uint8_t *)kmalloc(768);
+            if (cur->gfx_palette_backup) {
+                memset(cur->gfx_palette_backup, 0, 768);
+            }
+        }
+        if (cur->gfx_palette_backup) {
+            cur->gfx_palette_backup[idx * 3 + 0] = r & 0x3F;
+            cur->gfx_palette_backup[idx * 3 + 1] = g & 0x3F;
+            cur->gfx_palette_backup[idx * 3 + 2] = b & 0x3F;
+        }
+    }
     if (!is_foreground_process()) return;
     outb(0x3C8, idx);
     outb(0x3C9, r & 0x3F);
@@ -852,15 +866,15 @@ void vga_gfx_buf_fill_circle(uint8_t *buf, int xc, int yc, int r, uint8_t color)
 
 void vga_gfx_flip(const uint8_t *buf) {
     process_t *cur = process_get_current();
-    if (!is_foreground_process()) {
-        if (cur) {
-            if (!cur->gfx_vram_backup) {
-                cur->gfx_vram_backup = (uint8_t *)kmalloc(VGA_GFX_SIZE);
-            }
-            if (cur->gfx_vram_backup) {
-                memcpy(cur->gfx_vram_backup, buf, VGA_GFX_SIZE);
-            }
+    if (cur && process_get_separate_windows()) {
+        if (!cur->gfx_vram_backup) {
+            cur->gfx_vram_backup = (uint8_t *)kmalloc(VGA_GFX_SIZE);
         }
+        if (cur->gfx_vram_backup) {
+            memcpy(cur->gfx_vram_backup, buf, VGA_GFX_SIZE);
+        }
+    }
+    if (!is_foreground_process()) {
         process_yield();
         return;
     }

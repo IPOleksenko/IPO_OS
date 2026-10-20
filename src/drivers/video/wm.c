@@ -74,6 +74,8 @@
 #define WM_FONT_W 6
 #define WM_FONT_H 8
 #define TITLEBAR_H 11
+#define TASKBAR_Y  186
+#define TASKBAR_H  14
 
 static const uint8_t wm_font[95][WM_FONT_H] = {
 /*sp*/{0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
@@ -196,15 +198,19 @@ void wm_buf_draw_line(uint8_t *buf, uint16_t bw, uint16_t bh, int x0, int y0, in
     }
 }
 void wm_buf_fill_rect(uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, int w, int h, uint8_t c) {
-    if(w<=0||h<=0) return;
-    if (x < 0) x = 0;
-    if (y < 0) y = 0;
+    if (w <= 0 || h <= 0) return;
+    int x1 = x;
+    int y1 = y;
     int x2 = x + w;
     int y2 = y + h;
+    if (x1 < 0) x1 = 0;
+    if (y1 < 0) y1 = 0;
     if (x2 > (int)bw) x2 = (int)bw;
     if (y2 > (int)bh) y2 = (int)bh;
-    if(x2<=x || y2<=y) return;
-    for(int cy=y;cy<y2;cy++) memset(buf+(size_t)cy*bw+x,c,(size_t)(x2-x));
+    if (x2 <= x1 || y2 <= y1) return;
+    for (int cy = y1; cy < y2; cy++) {
+        memset(buf + (size_t)cy * bw + x1, c, (size_t)(x2 - x1));
+    }
 }
 void wm_buf_draw_rect(uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, int w, int h, uint8_t c) {
     if(w<=0||h<=0) return;
@@ -419,10 +425,12 @@ wm_window_t *wm_create_window(const wm_window_options_t *opts) {
     if (opts->framebuf) {
         win->framebuf = opts->framebuf; win->framebuf_owned = false;
     } else {
-        win->framebuf = kmalloc(fsz);
+        size_t cap = VGA_GFX_SIZE; /* 64000 bytes - full screen capacity so resize never reallocates */
+        if (cap < fsz) cap = fsz;
+        win->framebuf = kmalloc(cap);
         if (!win->framebuf) { if(win->title) kfree(win->title); kfree(win); return NULL; }
         win->framebuf_owned = true;
-        memset(win->framebuf, win->bg_color, fsz);
+        memset(win->framebuf, win->bg_color, cap);
     }
 
     list_append(win);
@@ -608,45 +616,60 @@ void wm_invalidate_all(void)         { for(wm_window_t *w=wm_head;w;w=w->next) w
 
 void wm_move(wm_window_t *win, int16_t nx, int16_t ny) {
     if (!win || win->fullscreen) return;
-    if (nx<-(int16_t)win->w+8)         nx=-(int16_t)win->w+8;
-    if (ny<0)                           ny=0;
-    if (nx>(int16_t)(VGA_GFX_WIDTH-8))  nx=(int16_t)(VGA_GFX_WIDTH-8);
-    if (ny>(int16_t)(VGA_GFX_HEIGHT-8)) ny=(int16_t)(VGA_GFX_HEIGHT-8);
-    win->x=nx; win->y=ny;
+    /* Ensure title bar remains completely accessible and on screen */
+    if (ny < TITLEBAR_H + 2) ny = TITLEBAR_H + 2;
+    if (ny > (int16_t)(TASKBAR_Y - 16)) ny = (int16_t)(TASKBAR_Y - 16);
+    if (nx < -(int16_t)win->w + 30) nx = -(int16_t)win->w + 30;
+    if (nx > (int16_t)(VGA_GFX_WIDTH - 30)) nx = (int16_t)(VGA_GFX_WIDTH - 30);
+    win->x = nx;
+    win->y = ny;
     if (!win->maximized) {
         win->saved_x = nx;
         win->saved_y = ny;
     }
-    wm_dispatch_window_event(win, WM_EVENT_MOVE, 0);
+    win->dirty = true;
+    uint32_t pos_data = (((uint32_t)(uint16_t)nx) << 16) | (uint32_t)(uint16_t)ny;
+    wm_dispatch_window_event(win, WM_EVENT_MOVE, pos_data);
 }
 
 bool wm_resize(wm_window_t *win, uint16_t nw, uint16_t nh) {
     if (!win || win->fullscreen || !nw || !nh) return false;
+    if (nw < 40) nw = 40;
+    if (nw > 316) nw = 316;
+    if (nh < 20) nh = 20;
+    if (nh > 168) nh = 168;
+
     if (win->w == nw && win->h == nh) return true;
 
-    /* Dynamic nearest-neighbor 2D scaling of framebuffer */
-    if (win->framebuf_owned && win->framebuf && win->w > 0 && win->h > 0) {
-        uint8_t *nb = kmalloc((size_t)nw * nh);
-        if (!nb) return false;
-        uint16_t old_w = win->w;
-        uint16_t old_h = win->h;
+    uint16_t old_w = win->w;
+    uint16_t old_h = win->h;
+
+    /* Dynamic fast fixed-point 16.16 2D scaling of framebuffer using static scratch: ZERO HEAP CHURN */
+    if (win->framebuf_owned && win->framebuf && old_w > 0 && old_h > 0) {
+        static uint8_t scale_scratch[VGA_GFX_SIZE];
+        size_t cur_sz = (size_t)old_w * old_h;
+        if (cur_sz > VGA_GFX_SIZE) cur_sz = VGA_GFX_SIZE;
+        memcpy(scale_scratch, win->framebuf, cur_sz);
+
+        uint32_t step_y = ((uint32_t)old_h << 16) / nh;
+        uint32_t step_x = ((uint32_t)old_w << 16) / nw;
+        uint32_t cur_y = 0;
         for (uint16_t dy = 0; dy < nh; dy++) {
-            uint16_t sy = (uint16_t)(((uint32_t)dy * old_h) / nh);
+            uint16_t sy = (uint16_t)(cur_y >> 16);
+            if (sy >= old_h) sy = old_h - 1;
             size_t dst_row = (size_t)dy * nw;
             size_t src_row = (size_t)sy * old_w;
+            uint32_t cur_x = 0;
             for (uint16_t dx = 0; dx < nw; dx++) {
-                uint16_t sx = (uint16_t)(((uint32_t)dx * old_w) / nw);
-                nb[dst_row + dx] = win->framebuf[src_row + sx];
+                uint16_t sx = (uint16_t)(cur_x >> 16);
+                if (sx >= old_w) sx = old_w - 1;
+                win->framebuf[dst_row + dx] = scale_scratch[src_row + sx];
+                cur_x += step_x;
             }
+            cur_y += step_y;
         }
-        kfree(win->framebuf);
-        win->framebuf = nb;
-    } else if (win->framebuf_owned) {
-        uint8_t *nb = kmalloc((size_t)nw * nh);
-        if (!nb) return false;
-        memset(nb, win->bg_color, (size_t)nw * nh);
-        if (win->framebuf) kfree(win->framebuf);
-        win->framebuf = nb;
+    } else if (win->framebuf_owned && win->framebuf) {
+        memset(win->framebuf, win->bg_color, (size_t)nw * nh);
     }
 
     /* Scale shape mask if window has custom shape */
@@ -655,14 +678,22 @@ bool wm_resize(wm_window_t *win, uint16_t nw, uint16_t nh) {
         if (nm) {
             uint16_t old_mw = win->mask_w;
             uint16_t old_mh = win->mask_h;
+            uint32_t step_my = ((uint32_t)old_mh << 16) / nh;
+            uint32_t step_mx = ((uint32_t)old_mw << 16) / nw;
+            uint32_t cur_my = 0;
             for (uint16_t dy = 0; dy < nh; dy++) {
-                uint16_t sy = (uint16_t)(((uint32_t)dy * old_mh) / nh);
+                uint16_t sy = (uint16_t)(cur_my >> 16);
+                if (sy >= old_mh) sy = old_mh - 1;
                 size_t dst_row = (size_t)dy * nw;
                 size_t src_row = (size_t)sy * old_mw;
+                uint32_t cur_mx = 0;
                 for (uint16_t dx = 0; dx < nw; dx++) {
-                    uint16_t sx = (uint16_t)(((uint32_t)dx * old_mw) / nw);
+                    uint16_t sx = (uint16_t)(cur_mx >> 16);
+                    if (sx >= old_mw) sx = old_mw - 1;
                     nm[dst_row + dx] = win->shape_mask[src_row + sx];
+                    cur_mx += step_mx;
                 }
+                cur_my += step_my;
             }
             kfree((void *)win->shape_mask);
             win->shape_mask = nm;
@@ -678,7 +709,8 @@ bool wm_resize(wm_window_t *win, uint16_t nw, uint16_t nh) {
         win->saved_w = nw;
         win->saved_h = nh;
     }
-    wm_dispatch_window_event(win, WM_EVENT_RESIZE, 0);
+    uint32_t dim_data = ((uint32_t)nw << 16) | (uint32_t)nh;
+    wm_dispatch_window_event(win, WM_EVENT_RESIZE, dim_data);
     return true;
 }
 
@@ -702,20 +734,25 @@ void wm_restore(wm_window_t *win) {
 void wm_toggle_maximize(wm_window_t *win) {
     if (!win || win->fullscreen) return;
     if (win->maximized) {
-        win->x = win->saved_x;
-        win->y = win->saved_y;
         win->maximized = false;
-        wm_resize(win, win->saved_w, win->saved_h);
+        int16_t rx = win->saved_x >= 2 ? win->saved_x : 2;
+        int16_t ry = win->saved_y >= (TITLEBAR_H + 2) ? win->saved_y : (TITLEBAR_H + 2);
+        uint16_t rw = win->saved_w >= 40 ? win->saved_w : 140;
+        uint16_t rh = win->saved_h >= 20 ? win->saved_h : 100;
+        win->x = rx;
+        win->y = ry;
+        wm_resize(win, rw, rh);
     } else {
         win->saved_x = win->x;
         win->saved_y = win->y;
         win->saved_w = win->w;
         win->saved_h = win->h;
-        win->x = 2;
-        win->y = 13;
         win->maximized = true;
-        wm_resize(win, 316, 171);
+        win->x = 2;
+        win->y = TITLEBAR_H + 2;
+        wm_resize(win, VGA_GFX_WIDTH - 4, (uint16_t)(TASKBAR_Y - (TITLEBAR_H + 4)));
     }
+    wm_invalidate_all();
 }
 
 
@@ -1169,16 +1206,46 @@ void wm_compose(uint8_t *backbuf) {
     for (wm_window_t *win = wm_head; win; win = win->next) {
         if (!wm_window_is_visible_for_fg(win)) continue;
         if (win->minimized) continue;
-        for (int row = 0; row < (int)win->h; row++) {
-            int sy = (int)win->y + row;
-            if (sy < 0 || sy >= max_y) continue;
-            for (int col = 0; col < (int)win->w; col++) {
-                int sx = (int)win->x + col;
-                if (sx < 0 || sx >= VGA_GFX_WIDTH) continue;
-                if (win->shape_mask && win->mask_w == win->w && win->mask_h == win->h) {
-                    if (!win->shape_mask[(size_t)row * win->w + col]) continue;
+        if (!win->framebuf) continue;
+
+        int win_w = (int)win->w;
+        int win_h = (int)win->h;
+        int win_x = (int)win->x;
+        int win_y = (int)win->y;
+
+        int row_start = 0;
+        int row_end = win_h;
+        if (win_y < 0) row_start = -win_y;
+        if (win_y + row_end > max_y) row_end = max_y - win_y;
+
+        int col_start = 0;
+        int col_end = win_w;
+        if (win_x < 0) col_start = -win_x;
+        if (win_x + col_end > VGA_GFX_WIDTH) col_end = VGA_GFX_WIDTH - win_x;
+
+        int visible_width = col_end - col_start;
+
+        if (visible_width > 0 && row_start < row_end) {
+            bool has_mask = (win->shape_mask && win->mask_w == win->w && win->mask_h == win->h);
+            if (!has_mask) {
+                /* Ultra-fast scanline copy: replaces 64,000 slow per-pixel iterations with memcpy */
+                for (int row = row_start; row < row_end; row++) {
+                    int sy = win_y + row;
+                    uint8_t *dst = &backbuf[(size_t)sy * VGA_GFX_WIDTH + (win_x + col_start)];
+                    const uint8_t *src = &win->framebuf[(size_t)row * win_w + col_start];
+                    memcpy(dst, src, (size_t)visible_width);
                 }
-                backbuf[(size_t)sy * VGA_GFX_WIDTH + sx] = win->framebuf[(size_t)row * win->w + col];
+            } else {
+                for (int row = row_start; row < row_end; row++) {
+                    int sy = win_y + row;
+                    size_t dst_base = (size_t)sy * VGA_GFX_WIDTH + win_x;
+                    size_t src_base = (size_t)row * win_w;
+                    for (int col = col_start; col < col_end; col++) {
+                        if (win->shape_mask[src_base + col]) {
+                            backbuf[dst_base + col] = win->framebuf[src_base + col];
+                        }
+                    }
+                }
             }
         }
         draw_decorations(win, backbuf);
@@ -1230,10 +1297,13 @@ enum {
     DRAG_MOVE,
     DRAG_RESIZE_BR,
     DRAG_RESIZE_R,
-    DRAG_RESIZE_B
+    DRAG_RESIZE_B,
+    DRAG_RESIZE_BL,
+    DRAG_RESIZE_L
 };
 static int16_t drag_offset_x = 0, drag_offset_y = 0;
 static uint16_t drag_start_w = 0, drag_start_h = 0;
+static int16_t drag_start_x = 0, drag_start_y = 0;
 static int32_t drag_start_mx = 0, drag_start_my = 0;
 
 void wm_compositor_tick(void) {
@@ -1375,12 +1445,10 @@ void wm_compositor_tick(void) {
                         if (new_fg) {
                             process_set_foreground(new_fg);
                         }
-                        if (wm_count == 0) {
-                            wm_session_stop();
+                        if (new_fg && (new_fg->wants_graphics || new_fg->is_wm_app)) {
+                            wm_invalidate_all();
                         } else {
-                            if (new_fg && (new_fg->wants_graphics || new_fg->is_wm_app)) {
-                                wm_invalidate_all();
-                            }
+                            wm_invalidate_all();
                         }
                         return;
                     }
@@ -1468,78 +1536,128 @@ void wm_compositor_tick(void) {
                     handled = true;
 
                     if (w->decor_style == WM_DECOR_DEFAULT) {
-                        int btn_y = (int)w->y - TITLEBAR_H + 1;
-
-                        /* Close button [X] */
-                        int bx_close = (int)w->x + (int)w->w - 9;
-                        if (ms.x >= bx_close && ms.x <= bx_close + 8 && ms.y >= btn_y && ms.y <= btn_y + 8) {
-                            wm_destroy_window(w);
-                            break;
-                        }
-
-                        /* Maximize button [^] */
-                        int bx_max = (int)w->x + (int)w->w - 18;
-                        if (ms.x >= bx_max && ms.x <= bx_max + 8 && ms.y >= btn_y && ms.y <= btn_y + 8) {
-                            wm_toggle_maximize(w);
-                            break;
-                        }
-
-                        /* Minimize button [_] */
-                        int bx_min = (int)w->x + (int)w->w - 27;
-                        if (ms.x >= bx_min && ms.x <= bx_min + 8 && ms.y >= btn_y && ms.y <= btn_y + 8) {
-                            wm_minimize(w);
-                            break;
-                        }
-
-                        /* Bottom-right corner resize */
-                        if (ms.x >= (int)w->x + (int)w->w - 6 && ms.y >= (int)w->y + (int)w->h - 6) {
-                            drag_mode = DRAG_RESIZE_BR;
-                            drag_win = w;
-                            drag_start_w = w->w;
-                            drag_start_h = w->h;
-                            drag_start_mx = ms.x;
-                            drag_start_my = ms.y;
-                            break;
-                        }
-
-                        /* Right border resize */
-                        if (ms.x >= (int)w->x + (int)w->w - 2) {
-                            drag_mode = DRAG_RESIZE_R;
-                            drag_win = w;
-                            drag_start_w = w->w;
-                            drag_start_h = w->h;
-                            drag_start_mx = ms.x;
-                            drag_start_my = ms.y;
-                            break;
-                        }
-
-                        /* Bottom border resize */
-                        if (ms.y >= (int)w->y + (int)w->h - 2) {
-                            drag_mode = DRAG_RESIZE_B;
-                            drag_win = w;
-                            drag_start_w = w->w;
-                            drag_start_h = w->h;
-                            drag_start_mx = ms.x;
-                            drag_start_my = ms.y;
-                            break;
-                        }
-
-                        /* Title bar drag to move */
+                        /* Check Titlebar (any click at or above client top edge y) */
                         if (ms.y < (int)w->y) {
+                            /* Close button [X] - rightmost 10px */
+                            if (ms.x >= (int)w->x + (int)w->w - 10) {
+                                wm_destroy_window(w);
+                                break;
+                            }
+
+                            /* Maximize / Restore button [□] - next 10px */
+                            if (ms.x >= (int)w->x + (int)w->w - 20) {
+                                wm_toggle_maximize(w);
+                                break;
+                            }
+
+                            /* Minimize button [_] - next 10px */
+                            if (ms.x >= (int)w->x + (int)w->w - 30) {
+                                wm_minimize(w);
+                                break;
+                            }
+
+                            /* Title bar double-click to toggle maximize */
+                            static uint32_t last_title_click_time = 0;
+                            static wm_window_t *last_title_click_win = NULL;
+                            uint32_t now = timer_millis();
+                            if (last_title_click_win == w && (now - last_title_click_time) < 400) {
+                                last_title_click_win = NULL;
+                                wm_toggle_maximize(w);
+                                break;
+                            }
+                            last_title_click_win = w;
+                            last_title_click_time = now;
+
+                            /* Title bar drag to move */
                             drag_mode = DRAG_MOVE;
                             drag_win = w;
                             drag_offset_x = (int16_t)(ms.x - w->x);
                             drag_offset_y = (int16_t)(ms.y - w->y);
+                            drag_start_x = w->x;
+                            drag_start_y = w->y;
+                            drag_start_mx = ms.x;
+                            drag_start_my = ms.y;
+                            break;
+                        }
+
+                        /* Bottom-right corner resize: strictly at corner */
+                        if (ms.x >= (int)w->x + (int)w->w - 6 && ms.x <= (int)w->x + (int)w->w + 4 &&
+                            ms.y >= (int)w->y + (int)w->h - 6 && ms.y <= (int)w->y + (int)w->h + 4) {
+                            drag_mode = DRAG_RESIZE_BR;
+                            drag_win = w;
+                            drag_start_w = w->w;
+                            drag_start_h = w->h;
+                            drag_start_x = w->x;
+                            drag_start_y = w->y;
+                            drag_start_mx = ms.x;
+                            drag_start_my = ms.y;
+                            break;
+                        }
+
+                        /* Bottom-left corner resize: strictly at corner */
+                        if (ms.x >= (int)w->x - 4 && ms.x <= (int)w->x + 6 &&
+                            ms.y >= (int)w->y + (int)w->h - 6 && ms.y <= (int)w->y + (int)w->h + 4) {
+                            drag_mode = DRAG_RESIZE_BL;
+                            drag_win = w;
+                            drag_start_w = w->w;
+                            drag_start_h = w->h;
+                            drag_start_x = w->x;
+                            drag_start_y = w->y;
+                            drag_start_mx = ms.x;
+                            drag_start_my = ms.y;
+                            break;
+                        }
+
+                        /* Left border resize: on left edge frame */
+                        if (ms.x >= (int)w->x - 4 && ms.x <= (int)w->x + 1 &&
+                            ms.y >= (int)w->y && ms.y <= (int)w->y + (int)w->h) {
+                            drag_mode = DRAG_RESIZE_L;
+                            drag_win = w;
+                            drag_start_w = w->w;
+                            drag_start_h = w->h;
+                            drag_start_x = w->x;
+                            drag_start_y = w->y;
+                            drag_start_mx = ms.x;
+                            drag_start_my = ms.y;
+                            break;
+                        }
+
+                        /* Right border resize: on right edge frame */
+                        if (ms.x >= (int)w->x + (int)w->w - 2 && ms.x <= (int)w->x + (int)w->w + 4 &&
+                            ms.y >= (int)w->y && ms.y <= (int)w->y + (int)w->h) {
+                            drag_mode = DRAG_RESIZE_R;
+                            drag_win = w;
+                            drag_start_w = w->w;
+                            drag_start_h = w->h;
+                            drag_start_x = w->x;
+                            drag_start_y = w->y;
+                            drag_start_mx = ms.x;
+                            drag_start_my = ms.y;
+                            break;
+                        }
+
+                        /* Bottom border resize: on bottom edge frame */
+                        if (ms.y >= (int)w->y + (int)w->h - 2 && ms.y <= (int)w->y + (int)w->h + 4 &&
+                            ms.x >= (int)w->x && ms.x <= (int)w->x + (int)w->w) {
+                            drag_mode = DRAG_RESIZE_B;
+                            drag_win = w;
+                            drag_start_w = w->w;
+                            drag_start_h = w->h;
+                            drag_start_x = w->x;
+                            drag_start_y = w->y;
                             drag_start_mx = ms.x;
                             drag_start_my = ms.y;
                             break;
                         }
                     }
 
-                    /* Client area click */
-                    if (w->event_cb && (w->owner_pid == 0 || process_is_alive(w->owner_pid))) {
-                        uint32_t click_data = (((uint32_t)(ms.x - w->x) & 0xFFFF) << 16) | ((uint32_t)(ms.y - w->y) & 0xFFFF);
-                        wm_dispatch_window_event(w, WM_EVENT_CLICK, click_data);
+                    /* Client area click - strictly inside client bounds! */
+                    if (ms.x >= (int)w->x && ms.x < (int)w->x + (int)w->w &&
+                        ms.y >= (int)w->y && ms.y < (int)w->y + (int)w->h) {
+                        if (w->event_cb && (w->owner_pid == 0 || process_is_alive(w->owner_pid))) {
+                            uint32_t click_data = (((uint32_t)(ms.x - w->x) & 0xFFFF) << 16) | ((uint32_t)(ms.y - w->y) & 0xFFFF);
+                            wm_dispatch_window_event(w, WM_EVENT_CLICK, click_data);
+                        }
                     }
                     break;
                 }
@@ -1586,9 +1704,53 @@ void wm_compositor_tick(void) {
             if (nh > 165) nh = 165;
             drag_win->maximized = false;
             wm_resize(drag_win, drag_win->w, (uint16_t)nh);
+        } else if (drag_mode == DRAG_RESIZE_L) {
+            int dx = (int)ms.x - (int)drag_start_mx;
+            int nw = (int)drag_start_w - dx;
+            int nx = (int)drag_start_x + dx;
+            if (nw < 40) {
+                nx = (int)drag_start_x + (int)drag_start_w - 40;
+                nw = 40;
+            }
+            if (nw > 316) {
+                nx = (int)drag_start_x + (int)drag_start_w - 316;
+                nw = 316;
+            }
+            if (nx < 2) {
+                nw -= (2 - nx);
+                nx = 2;
+                if (nw < 40) nw = 40;
+            }
+            drag_win->maximized = false;
+            drag_win->x = (int16_t)nx;
+            wm_resize(drag_win, (uint16_t)nw, drag_win->h);
+        } else if (drag_mode == DRAG_RESIZE_BL) {
+            int dx = (int)ms.x - (int)drag_start_mx;
+            int dy = (int)ms.y - (int)drag_start_my;
+            int nw = (int)drag_start_w - dx;
+            int nx = (int)drag_start_x + dx;
+            int nh = (int)drag_start_h + dy;
+            if (nw < 40) {
+                nx = (int)drag_start_x + (int)drag_start_w - 40;
+                nw = 40;
+            }
+            if (nw > 316) {
+                nx = (int)drag_start_x + (int)drag_start_w - 316;
+                nw = 316;
+            }
+            if (nx < 2) {
+                nw -= (2 - nx);
+                nx = 2;
+                if (nw < 40) nw = 40;
+            }
+            if (nh < 20) nh = 20;
+            if (nh > 165) nh = 165;
+            drag_win->maximized = false;
+            drag_win->x = (int16_t)nx;
+            wm_resize(drag_win, (uint16_t)nw, (uint16_t)nh);
         }
     } else if (!left_now && wm_prev_left) {
-        if (drag_win && (drag_mode == DRAG_RESIZE_BR || drag_mode == DRAG_RESIZE_R || drag_mode == DRAG_RESIZE_B)) {
+        if (drag_win && (drag_mode == DRAG_RESIZE_BR || drag_mode == DRAG_RESIZE_R || drag_mode == DRAG_RESIZE_B || drag_mode == DRAG_RESIZE_L || drag_mode == DRAG_RESIZE_BL)) {
             drag_win->saved_w = drag_win->w;
             drag_win->saved_h = drag_win->h;
             drag_win->saved_x = drag_win->x;

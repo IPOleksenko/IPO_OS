@@ -3,6 +3,7 @@
 #include <system/pit.h>
 #include <system/timer.h>
 #include <memory/kmalloc.h>
+#include <kernel/process.h>
 #include <ioport.h>
 #include <string.h>
 
@@ -93,6 +94,10 @@ void audio_stop_all(void) {
 }
 
 bool audio_init(void) {
+    if (g_active_backend != AUDIO_BACKEND_NONE) {
+        return true;
+    }
+
     /* 1. Try Sound Blaster 16 on standard I/O port 0x220 */
     if (sb16_reset()) {
         g_active_backend = AUDIO_BACKEND_SB16;
@@ -144,6 +149,7 @@ audio_stream_t *audio_stream_create(int format, int channels, uint32_t sample_ra
     stream->ring_size      = 0;
     stream->buffered_samples = 0;
     stream->is_eof         = false;
+    stream->owner          = (void *)process_get_current();
 
     /* Add to active streams linked list */
     stream->next = g_stream_list;
@@ -174,6 +180,7 @@ audio_stream_t *audio_stream_create_ring(int format, int channels, uint32_t samp
     stream->ring_size        = ring_size_samples;
     stream->buffered_samples = 0;
     stream->is_eof           = false;
+    stream->owner            = (void *)process_get_current();
 
     /* Add to active streams linked list */
     stream->next = g_stream_list;
@@ -205,6 +212,24 @@ void audio_stream_destroy(audio_stream_t *stream) {
         sound_stop();
     }
     kfree(stream);
+}
+
+void audio_cleanup_streams_for_owner(void *owner) {
+    if (!owner) return;
+    audio_stream_t **curr = &g_stream_list;
+    while (*curr) {
+        if ((*curr)->owner == owner) {
+            audio_stream_t *to_free = *curr;
+            *curr = to_free->next;
+            kfree(to_free);
+        } else {
+            curr = &((*curr)->next);
+        }
+    }
+    if (g_stream_list == NULL) {
+        sb16_stop();
+        sound_stop();
+    }
 }
 
 void audio_stream_play(audio_stream_t *stream) {
@@ -322,10 +347,17 @@ void audio_tick(void) {
 
     if (g_active_backend == AUDIO_BACKEND_SB16) {
         uint32_t now = timer_millis();
+        process_t *fg_proc = process_get_foreground();
+        bool batch_mode = process_is_batch_active();
 
         int playing_count = 0;
         for (audio_stream_t *s = g_stream_list; s; s = s->next) {
-            if (s->is_playing && s->data_size > 0) playing_count++;
+            if (s->is_playing && s->data_size > 0) {
+                if (batch_mode && s->owner && s->owner != (void *)fg_proc) {
+                    continue;
+                }
+                playing_count++;
+            }
         }
 
         if (playing_count == 0) {
@@ -357,6 +389,7 @@ void audio_tick(void) {
         /* Mix all active streams into buffer */
         for (audio_stream_t *s = g_stream_list; s; s = s->next) {
             if (!s->is_playing || s->data_size == 0) continue;
+            if (batch_mode && s->owner && s->owner != (void *)fg_proc) continue;
 
             size_t b_per_s = get_bytes_per_sample(s->format);
             size_t total_samples = s->data_size / (b_per_s * (size_t)s->channels);
@@ -564,8 +597,12 @@ void audio_tick(void) {
     uint32_t pt_stride = num_mixer_samples / test_pts;
     if (pt_stride == 0) pt_stride = 1;
 
+    process_t *fg_proc = process_get_foreground();
+    bool batch_mode = process_is_batch_active();
+
     for (audio_stream_t *s = g_stream_list; s; s = s->next) {
         if (!s->is_playing || s->data_size == 0) continue;
+        if (batch_mode && s->owner && s->owner != (void *)fg_proc) continue;
 
         size_t b_per_s = get_bytes_per_sample(s->format);
         size_t total_samples = s->data_size / (b_per_s * (size_t)s->channels);

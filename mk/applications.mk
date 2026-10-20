@@ -3,7 +3,7 @@
 APPS_DIR     := applications
 APPS_BUILD   := build/applications
 APPS_SRCS_RAW := $(shell find $(APPS_DIR) -maxdepth 2 -name "*.c" -type f)
-GENERIC_APP_SRCS := $(filter-out $(APPS_DIR)/tcc/% $(APPS_DIR)/lua/% $(APPS_DIR)/micropython/% $(APPS_DIR)/nasm/% $(APPS_DIR)/doom/% $(APPS_DIR)/lib/%, $(APPS_SRCS_RAW))
+GENERIC_APP_SRCS := $(filter-out $(APPS_DIR)/tcc/% $(APPS_DIR)/lua/% $(APPS_DIR)/micropython/% $(APPS_DIR)/nasm/% $(APPS_DIR)/doom/% $(APPS_DIR)/lib/% $(APPS_DIR)/dltest/plugin_sample.c, $(APPS_SRCS_RAW))
 APPS_BINS    := $(patsubst $(APPS_DIR)/%.c, $(APPS_BUILD)/%.bin, $(GENERIC_APP_SRCS)) $(APPS_BUILD)/tcc/tcc.bin $(APPS_BUILD)/doom/doom.bin
 
 APP_ENTRY_OBJ := $(APPS_BUILD)/entry.o

@@ -14,7 +14,8 @@ USER_LIBC_OBJS := \
 	$(LIB_BUILD_DIR)/libc/sys.o \
 	$(LIB_BUILD_DIR)/libc/init.o \
 	$(LIB_BUILD_DIR)/libc/setjmp.o \
-	$(LIB_BUILD_DIR)/libc/math.o
+	$(LIB_BUILD_DIR)/libc/math.o \
+	$(LIB_BUILD_DIR)/libc/dlfcn.o
 
 USER_LIBM_OBJS := \
 	$(LIB_BUILD_DIR)/libc/math.o

@@ -121,7 +121,7 @@ def main():
     parser.add_argument("--kernel", type=Path, default=repo_root / "build" / "kernel" / "kernel.bin")
     parser.add_argument("--disk", type=Path, default=repo_root / "build" / "disk.img")
     parser.add_argument("--output", type=Path, default=repo_root / "build" / "IPO_OS.img")
-    parser.add_argument("--size-mb", type=int, default=128)
+    parser.add_argument("--size-mb", type=int, default=512)
 
     args = parser.parse_args()
 

@@ -197,7 +197,7 @@ python3 tools/generate_ksyms.py -e build/kernel/kernel.elf -o build/kernel/kerne
 
 ### **6. build_font_db.py — VGA & Graphical Font Compiler**
 - **File:** [tools/build_font_db.py](tools/build_font_db.py)
-- **Purpose:** Compiles Cyrillic and Latin 8x16 bitmap font definitions into the binary font database `build/fonts/default.fnt`.
+- **Purpose:** Compiles 8x16 bitmap font definitions into the binary font database.
 - **Invoked by:** `make image`
 - **Manual Usage:**
 ```bash

@@ -3,9 +3,12 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <file_system/ipo_fs.h>
 
 // Dynamic memory allocation for processes
-#define PROCESS_HEAP_START  0x00800000  // Start of process heap area
+#define PROCESS_HEAP_START       0x00800000   // Start of process heap area
+#define USER_HEAP_START          0x08000000u  // Start of isolated user process heaps (128 MB)
+#define USER_HEAP_PROCESS_STRIDE 0x10000000u  // Dynamic stride between process heaps (256 MB)
 
 // Protection flags
 #define PROT_NONE  0
@@ -82,7 +85,18 @@ typedef struct process {
     bool wants_graphics;    // Process requested VGA graphics mode (Mode 13h)
     bool is_wm_app;         // Process created a Window Manager window
     uint32_t async_task_count; // number of active async tasks owned by this process
+    uint32_t user_heap_base;   // Per-process isolated heap start address
     uint32_t user_heap_break;  // Per-process sbrk break point
+    uint32_t user_heap_limit;  // Per-process isolated heap limit address
+    int32_t  user_heap_slot;   // Dynamic slot index (-1 if none)
+
+    // Demand Loading
+    struct ipo_inode exec_inode;        // Executable inode for on-demand progressive loading
+    bool     demand_loading;            // True if executable is being loaded on demand
+    uint32_t demand_file_offset;        // Current offset in binary on disk
+    uint32_t demand_mem_offset;         // Current offset in process memory
+    uint32_t demand_loaded_bytes;       // Bytes loaded into memory so far
+    uint32_t demand_total_bytes;        // Total bytes of loadable segments
 
     uint16_t *text_vram_backup; // Backup of 80x25 text VRAM when swapped to background
     uint8_t *gfx_vram_backup;   // Backup of 320x200 graphics VRAM when swapped to background
@@ -185,5 +199,14 @@ process_t *process_find_by_pid(uint32_t pid);
 void process_set_current(process_t *proc);
 bool process_is_valid(process_t *proc);
 void process_crash_exit(void);
+
+/* Process isolated heap management (dynamic on-demand, no static limits) */
+bool process_heap_init(process_t *proc);
+void process_heap_cleanup(process_t *proc);
+bool process_heap_can_expand(process_t *proc, uint32_t new_limit);
+
+/* Demand / Lazy Loading */
+void process_demand_load_step(process_t *proc);
+void process_demand_load_finish(process_t *proc);
 
 #endif
