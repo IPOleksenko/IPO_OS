@@ -14,22 +14,22 @@ $(OS_IMAGE): $(BOOT_BIN) $(KERNEL_BIN)
 	truncate -s $$padded $@
 
 # Create a 512MB raw virtual disk if missing
-build/disk.img:
-	@mkdir -p build
+$(DISK_IMG):
+	@mkdir -p $(DISKS_DIR)
 	@if [ ! -f "$@" ]; then \
 		dd if=/dev/zero of=$@ bs=1M count=512 status=none; \
 		echo "[image] Created 512MB virtual disk: $@"; \
 	fi
 
 # Create a 5MB ISO disk if missing
-build/disk.iso:
-	@mkdir -p build
+$(DISK_ISO):
+	@mkdir -p $(DISKS_DIR)
 	@if [ ! -f "$@" ]; then \
 		dd if=/dev/zero of=$@ bs=1M count=5 status=none; \
 		echo "[image] Created 5MB ISO disk: $@"; \
 	fi
 
-disks: $(BOOT_BIN) $(KERNEL_BIN) build/disk.img build/disk.iso
+disks: $(BOOT_BIN) $(KERNEL_BIN) $(DISK_IMG) $(DISK_ISO)
 
 clean-disks:
-	rm -f build/disk.img build/disk.iso
+	rm -rf $(DISKS_DIR)

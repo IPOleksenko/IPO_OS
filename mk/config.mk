@@ -28,6 +28,10 @@ KERNEL_ELF := $(BUILD)/kernel/kernel.elf
 KERNEL_BIN := $(BUILD)/kernel/kernel.bin
 OS_IMAGE   := $(BUILD)/IPO_OS.img
 
+DISKS_DIR  := $(BUILD)/disks
+DISK_IMG   := $(DISKS_DIR)/disk.img
+DISK_ISO   := $(DISKS_DIR)/disk.iso
+
 
 # ==================================================
 #                 LIBRARY PATHS
@@ -122,8 +126,8 @@ QEMU_SERIAL_FLAGS := -serial stdio
 
 QEMU_FLAGS := 	-m 2048 \
 				-drive format=raw,file=$(OS_IMAGE),if=ide,index=0,file.locking=off \
-              	-drive format=raw,file=build/disk.img,if=ide,index=1,file.locking=off \
-               	-cdrom build/disk.iso \
+              	-drive format=raw,file=$(DISK_IMG),if=ide,index=1,file.locking=off \
+               	-cdrom $(DISK_ISO) \
                	-device sb16,audiodev=snd \
                	-audiodev $(AUDIODEV),id=snd -machine pcspk-audiodev=snd \
                	$(QEMU_NET_FLAGS) \

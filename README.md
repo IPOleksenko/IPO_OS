@@ -40,7 +40,7 @@ make boot
 ```
 
 #### `make image` — Create OS Images
-Builds the bootable OS image (`build/IPO_OS.img`) and ensures virtual disks (`build/disk.img`, `build/disk.iso`) exist:
+Builds the bootable OS image (`build/IPO_OS.img`) and ensures virtual disks (`build/disks/disk.img`, `build/disks/disk.iso`) exist:
 ```bash
 make image
 ```
