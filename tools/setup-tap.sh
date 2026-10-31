@@ -8,7 +8,7 @@ GUEST_IP="${4:-192.168.7.2}"
 
 echo "[TAP] Setting up virtual interface: ${TAP_DEV} with Host IP ${HOST_IP}/${NETMASK}..."
 
-# Ensure tun kernel module is loaded
+# Attempt to load the tun kernel module if it is not already loaded
 if ! lsmod | grep -q "^tun"; then
     echo "[TAP] Loading tun kernel module (modprobe tun)..."
     sudo modprobe tun 2>/dev/null || true
@@ -42,7 +42,7 @@ sudo ip link set dev "${TAP_DEV}" up
 # Ensure host routes guest IP directly into TAP interface
 sudo ip route replace "${GUEST_IP}/32" dev "${TAP_DEV}" 2>/dev/null || true
 
-# Enable IP forwarding and NAT so the guest can reach external networks.
+# Enable IP forwarding and NAT for the hard-coded 192.168.7.0/24 guest subnet.
 DEFAULT_IF=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1)
 if [ -n "$DEFAULT_IF" ]; then
     NAT_READY=1
@@ -83,4 +83,4 @@ fi
 echo "[TAP] ✓ Interface ${TAP_DEV} is UP and active."
 echo "[TAP] Host IP           : ${HOST_IP}"
 echo "[TAP] Guest (IPO_OS) IP : ${GUEST_IP}"
-echo "[TAP] All 65535 ports are directly reachable at http://${GUEST_IP}:<PORT>/"
+echo "[TAP] Guest IP: ${GUEST_IP}; ports require a listening service and permitted network/firewall rules."

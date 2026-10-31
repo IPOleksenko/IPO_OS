@@ -56,6 +56,22 @@ void timer_tick(void) {
     }
 }
 
+void timer_irq_handler(void) {
+    uint32_t prev_ms = timer_ms;
+    timer_update();
+    if (timer_ms == prev_ms) {
+        timer_ms++;
+        timer_ticks++;
+        last_tsc_value = read_tsc();
+    }
+    if (process_is_batch_active() && process_in_process_context() && !putchar_is_locked()) {
+        if (timer_ms - last_slice_yield_ms >= 10u) {
+            last_slice_yield_ms = timer_ms;
+            process_yield_kernel();
+        }
+    }
+}
+
 uint32_t timer_millis(void) {
     timer_update();
     return timer_ms;

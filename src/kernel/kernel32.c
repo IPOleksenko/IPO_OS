@@ -55,15 +55,14 @@ static void ensure_fs_mounted(void) {
         return;
     }
 
-    /* Disk too small (< 10 sectors / ~5 KB) */
+    /* Disk too small (< 10 sectors / 5 KiB) */
     if (pool_capacity < 10) {
-        printf("[ipo_fs] Disk too small for filesystem (< 5 KB)\n");
+        printf("[ipo_fs] Disk too small for filesystem (< 5 KiB)\n");
         return;
     }
 
-    /* Adaptive partition offset:
-     * - Disks > 1 MB use standard partition offset FS_START_LBA (2048)
-     * - Disks <= 1 MB use LBA 0 (whole-disk / floppy mode) */
+    /* Use the standard FS_START_LBA offset only when the pool has room for it
+     * plus at least 10 sectors; otherwise use LBA 0. */
     uint64_t start_lba = 0;
     uint64_t available_sectors = pool_capacity;
     if (pool_capacity > FS_START_LBA + 10) {
@@ -158,6 +157,8 @@ void kmain(void) {
     }
 
     device_init();
+
+    paging_init();
 
     ipo_fs_init();
 

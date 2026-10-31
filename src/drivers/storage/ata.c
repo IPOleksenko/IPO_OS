@@ -29,7 +29,7 @@
 #define ATA_SR_DRQ  0x08
 #define ATA_SR_ERR  0x01
 
-/* Dynamic self-expanding array for ATA devices (unlimited capacity) */
+/* Dynamically growing array for discovered ATA devices. */
 static ata_device_t *ata_devices = NULL;
 static uint32_t ata_device_count = 0;
 static uint32_t ata_device_capacity = 0;
@@ -415,7 +415,7 @@ void ata_print_devices(void) {
         serial_printf("  Model: %s\n", d->model ? d->model : "");
         serial_printf("  Serial: %s\n", d->serial ? d->serial : "");
         serial_printf("  Sectors: %llu\n", d->capacity_sectors);
-        serial_printf("  Size: %llu MB\n", d->capacity_sectors / 2048);
+        serial_printf("  Size: %llu MiB\n", d->capacity_sectors / 2048);
     }
 }
 
@@ -725,4 +725,3 @@ static bool ata_bdev_flush(block_device_t *bdev) {
     (void)bdev;
     return true;
 }
-

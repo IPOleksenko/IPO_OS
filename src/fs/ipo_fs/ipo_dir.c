@@ -35,7 +35,7 @@ int inode_read_bytes(struct ipo_inode *inode, void *buffer, uint32_t size, uint6
             continue;
         }
 
-        /* For aligned full blocks, batch up to 128 sectors (64 KB) directly into buffer */
+        /* For aligned full blocks, batch up to 128 sectors (64 KiB) directly into buffer */
         uint64_t full_blocks = (size - copied) / IPO_FS_BLOCK_SIZE;
         uint64_t batch_blocks = (max_contig < full_blocks) ? max_contig : full_blocks;
         if (batch_blocks > 128) batch_blocks = 128;

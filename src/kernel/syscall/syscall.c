@@ -17,6 +17,7 @@
 #include <vga.h>
 #include <vga_gfx.h>
 #include <wm.h>
+#include <ioport.h>
 #include <net/dns.h>
 #include <net/icmp.h>
 #include <net/net.h>
@@ -54,6 +55,20 @@ static uint32_t ipo_shared_var_capacity = 0u;
 
 extern void syscall_isr_entry(void);
 extern uint32_t isr_stub_table[32];
+extern void irq0_isr(void);
+extern void irq_ignore_master(void);
+extern void irq_ignore_slave(void);
+
+static uint32_t kernel_gs_tls_area[16] __attribute__((aligned(16))) = {
+    0, 0, 0, 0, 0, 0x595e9fbdU, 0, 0
+};
+
+static uint64_t kernel_gdt[4] __attribute__((aligned(8))) = {
+    0x0000000000000000ULL,
+    0x00CF9B000000FFFFULL, /* 0x08: 32-bit Kernel Code, base=0, limit=4GB (Accessed=1) */
+    0x00CF93000000FFFFULL, /* 0x10: 32-bit Kernel Data, base=0, limit=4GB (Accessed=1) */
+    0x00CF93000000FFFFULL  /* 0x18: 32-bit TLS/GS Data, base=kernel_gs_tls_area, limit=4GB */
+};
 
 static const char *exception_names[32] = {
     "Divide-by-zero (#DE)", "Debug (#DB)", "Non-maskable Interrupt (#NMI)", "Breakpoint (#BP)",
@@ -70,22 +85,31 @@ void cpu_exception_handler(uint32_t *frame) {
     uint32_t vector = frame[7];
     uint32_t err_code = frame[8];
     uint32_t eip = frame[9];
+    uint32_t cr2 = 0;
+    if (vector == 14) {
+        __asm__ volatile("movl %%cr2, %0" : "=r"(cr2));
+    }
     const char *name = (vector < 32) ? exception_names[vector] : "Unknown Exception";
+
+    putchar_unlock();
 
     process_t *proc = process_get_current();
     if (proc != NULL) {
+        if (vga_is_graphics_mode() && !wm_session_active()) {
+            vga_set_mode_text_hardware();
+        }
         printf("\n[Process %u] Terminated: CPU Exception %u (%s) at 0x%08x (err=0x%x)\n",
                proc->pid, vector, name, eip, err_code);
-        serial_printf("[cpu_exception] Process %u crashed: vec=%u (%s) eip=0x%08x err=0x%x\n",
-                      proc->pid, vector, name, eip, err_code);
-        frame[9] = (uint32_t)process_crash_exit;
+        serial_printf("[cpu_exception] Process %u crashed: vec=%u (%s) eip=0x%08x err=0x%x cr2=0x%08x\n",
+                      proc->pid, vector, name, eip, err_code, cr2);
+        process_emergency_crash_exit();
         return;
     }
 
     printf("\nKERNEL PANIC: CPU Exception %u (%s) at 0x%08x (err=0x%x)\n",
            vector, name, eip, err_code);
-    serial_printf("KERNEL PANIC: CPU Exception %u (%s) at 0x%08x (err=0x%x)\n",
-                  vector, name, eip, err_code);
+    serial_printf("KERNEL PANIC: CPU Exception %u (%s) at 0x%08x (err=0x%x cr2=0x%08x)\n",
+                  vector, name, eip, err_code, cr2);
     while (1) {
         __asm__ volatile("cli; hlt");
     }
@@ -672,6 +696,11 @@ static uint32_t syscall_builtin_set_return_value(uint32_t num, uint32_t argc, ui
     } else if (type == PROC_RET_POINTER) {
         data = (const void *)(uintptr_t)argv[1];
         type_name = "void*";
+    } else if ((uint32_t)type == 99u) {
+        if (argc > 1u && argv[1] != 0) {
+            process_set_return_format(process_get_current(), (const char *)(uintptr_t)argv[1]);
+        }
+        return 0;
     }
 
     process_set_current_return_value(type, type_name, str_val, int_val, data, size);
@@ -963,6 +992,43 @@ static uint32_t syscall_builtin_driver_set_desc(uint32_t num,
     const char *desc = (const char *)(uintptr_t)argv[1];
     int res = driver_set_description(name, desc);
     return (uint32_t)res;
+}
+
+static uint32_t syscall_builtin_binfmt_register(uint32_t num,
+                                                uint32_t argc,
+                                                uint32_t *argv) {
+    (void)num;
+    if (argc < 5u || argv == NULL) {
+        return IPO_SYSCALL_ENOSYS;
+    }
+    const char *name = (const char *)(uintptr_t)argv[0];
+    const uint8_t *magic = (const uint8_t *)(uintptr_t)argv[1];
+    uint32_t magic_len = argv[2];
+    uint32_t offset = argv[3];
+    const char *runner_path = (const char *)(uintptr_t)argv[4];
+
+    int res = binfmt_register(name, magic, magic_len, offset, runner_path);
+    return (uint32_t)res;
+}
+
+static uint32_t syscall_builtin_binfmt_unregister(uint32_t num,
+                                                  uint32_t argc,
+                                                  uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || argv == NULL) {
+        return IPO_SYSCALL_ENOSYS;
+    }
+    const char *name = (const char *)(uintptr_t)argv[0];
+    int res = binfmt_unregister(name);
+    return (uint32_t)res;
+}
+
+static uint32_t syscall_builtin_binfmt_list(uint32_t num,
+                                            uint32_t argc,
+                                            uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    binfmt_list();
+    return IPO_SYSCALL_OK;
 }
 
 static size_t syscall_read_visual_offset(const char *buf, uint32_t len, uint32_t index) {
@@ -1641,7 +1707,7 @@ static uint32_t syscall_builtin_sbrk(uint32_t num, uint32_t argc, uint32_t *argv
                         aligned_limit = needed;
                     }
                     proc->user_heap_limit = aligned_limit;
-                    serial_printf("[process] Dynamic on-demand heap expanded for pid=%u: limit=0x%x (+%u KB, total=%u MB)\n",
+                    serial_printf("[process] Dynamic on-demand heap expanded for pid=%u: limit=0x%x (+%u KiB, total=%u MiB)\n",
                                   proc->pid, proc->user_heap_limit, (uint32_t)inc / 1024,
                                   (proc->user_heap_limit - proc->user_heap_base) / (1024 * 1024));
                 } else {
@@ -1944,7 +2010,11 @@ static uint32_t syscall_builtin_exit(uint32_t num, uint32_t argc, uint32_t *argv
     if (proc != NULL) {
         proc->is_running = 0;
         proc->exit_code = code;
-        proc->completed_and_acknowledged = true;
+        if (!process_get_separate_windows() ||
+            (proc->is_wm_app && !wm_has_windows_for_pid(proc->pid)) ||
+            (proc->wants_graphics && !proc->is_wm_app)) {
+            proc->completed_and_acknowledged = true;
+        }
         if (!proc->return_val_explicit) {
             process_set_current_return_value(PROC_RET_INT, "int", NULL, code, NULL, 0);
         }
@@ -2210,6 +2280,10 @@ static uint32_t syscall_builtin_process_switch_fg(uint32_t num, uint32_t argc, u
 static uint32_t syscall_builtin_vga_set_mode(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num;
     if (argc == 0 || !argv) return 0;
+    if (argv[0] == 2 && argc >= 2 && argv[1] != 0) {
+        vga_gfx_flip((const uint8_t *)(uintptr_t)argv[1]);
+        return 0;
+    }
     process_t *cur = process_get_current();
     process_t *fg = process_get_foreground();
     if (argv[0] == 1) {
@@ -2353,6 +2427,21 @@ static uint32_t syscall_builtin_vga_set_palette(uint32_t num, uint32_t argc, uin
         vga_gfx_set_palette((uint8_t)argv[0], (uint8_t)argv[1], (uint8_t)argv[2], (uint8_t)argv[3]);
     }
     return 0;
+}
+
+static uint32_t syscall_builtin_vga_set_overlay_flags(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    process_t *cur = process_get_current();
+    if (cur && argc > 0 && argv) {
+        cur->gfx_overlay_flags = argv[0];
+    }
+    return 0;
+}
+
+static uint32_t syscall_builtin_vga_get_overlay_flags(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    process_t *cur = process_get_current();
+    return cur ? cur->gfx_overlay_flags : 0;
 }
 
 static uint32_t syscall_builtin_audio_init(uint32_t num, uint32_t argc, uint32_t *argv) {
@@ -2844,6 +2933,8 @@ void syscall_init(void) {
     ipo_register_syscall(IPO_SYSCALL_VGA_SHOW_CURSOR, syscall_builtin_vga_show_cursor);
     ipo_register_syscall(IPO_SYSCALL_VGA_HIDE_CURSOR, syscall_builtin_vga_hide_cursor);
     ipo_register_syscall(IPO_SYSCALL_VGA_SET_PALETTE, syscall_builtin_vga_set_palette);
+    ipo_register_syscall(IPO_SYSCALL_VGA_SET_OVERLAY_FLAGS, syscall_builtin_vga_set_overlay_flags);
+    ipo_register_syscall(IPO_SYSCALL_VGA_GET_OVERLAY_FLAGS, syscall_builtin_vga_get_overlay_flags);
 
     ipo_register_syscall(IPO_SYSCALL_AUDIO_INIT, syscall_builtin_audio_init);
     ipo_register_syscall(IPO_SYSCALL_AUDIO_TICK, syscall_builtin_audio_tick);
@@ -2859,12 +2950,36 @@ void syscall_init(void) {
     ipo_register_syscall(IPO_SYSCALL_AUDIO_STREAM_PROGRESS, syscall_builtin_audio_stream_progress);
     ipo_register_syscall(IPO_SYSCALL_AUDIO_STREAM_UPDATE, syscall_builtin_audio_stream_update);
 
+    ipo_register_syscall(IPO_SYSCALL_BINFMT_REGISTER, syscall_builtin_binfmt_register);
+    ipo_register_syscall(IPO_SYSCALL_BINFMT_UNREGISTER, syscall_builtin_binfmt_unregister);
+    ipo_register_syscall(IPO_SYSCALL_BINFMT_LIST, syscall_builtin_binfmt_list);
+
     for (int i = 0; i < 32; i++) {
         ipo_idt_set_gate(
             (uint8_t)i,
             isr_stub_table[i],
             IPO_KERNEL_CODE_SEG,
             IPO_IDT_ENTRY_FLAGS);
+    }
+
+    /* Remap 8259 PIC to vectors 0x20..0x2F and enable IRQ0 (PIT timer) for preemptive scheduling */
+    outb(0x20, 0x11); io_wait();
+    outb(0xA0, 0x11); io_wait();
+    outb(0x21, 0x20); io_wait();
+    outb(0xA1, 0x28); io_wait();
+    outb(0x21, 0x04); io_wait();
+    outb(0xA1, 0x02); io_wait();
+    outb(0x21, 0x01); io_wait();
+    outb(0xA1, 0x01); io_wait();
+    outb(0x21, 0xFE); io_wait(); /* Unmask only IRQ0 (PIT timer); keep keyboard/mouse/ATA polled */
+    outb(0xA1, 0xFF); io_wait();
+
+    ipo_idt_set_gate(0x20, (uint32_t)irq0_isr, IPO_KERNEL_CODE_SEG, 0x8Eu);
+    for (int i = 0x21; i <= 0x27; i++) {
+        ipo_idt_set_gate((uint8_t)i, (uint32_t)irq_ignore_master, IPO_KERNEL_CODE_SEG, 0x8Eu);
+    }
+    for (int i = 0x28; i <= 0x2F; i++) {
+        ipo_idt_set_gate((uint8_t)i, (uint32_t)irq_ignore_slave, IPO_KERNEL_CODE_SEG, 0x8Eu);
     }
 
     ipo_idt_set_gate(
@@ -2879,6 +2994,22 @@ void syscall_init(void) {
         (uint32_t)smp_ipi_isr,
         IPO_KERNEL_CODE_SEG,
         0x8Eu);
+
+    uint32_t tls_base = (uint32_t)(uintptr_t)kernel_gs_tls_area;
+    kernel_gdt[3] = 0x00CF93000000FFFFULL
+                  | ((uint64_t)(tls_base & 0x00FFFFFFu) << 16)
+                  | ((uint64_t)(tls_base & 0xFF000000u) << 32);
+
+    ipo_idt_ptr_t gdt_ptr = {
+        .limit = (uint16_t)(sizeof(kernel_gdt) - 1),
+        .base = (uint32_t)(uintptr_t)kernel_gdt
+    };
+    __asm__ volatile(
+        "lgdt %0\n\t"
+        "movw $0x18, %%ax\n\t"
+        "movw %%ax, %%gs"
+        : : "m"(gdt_ptr) : "eax", "memory"
+    );
 
     syscall_load_idt();
     printf("[syscall] System call dispatch table initialized (IDT vector 0x80 registered).\n");

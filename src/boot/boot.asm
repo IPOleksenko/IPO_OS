@@ -64,15 +64,16 @@ start:
     or al, 00000010b
     out 0x92, al
 
-    ; detect RAM size using BIOS E820 and store total bytes at 0x8FF0
+    ; collect the BIOS E820 map; store a 32-bit usable-length sum at 0x8FF0 for fallback
     call detect_memory
 
     cli
     jmp pm_setup
 
 ; ---------------------------------------------------------------
-; Detect available RAM using BIOS E820.
-; Writes total RAM size in bytes to memory location 0x8FF0.
+; Collect BIOS E820 entries at physical 0x6000 and store their count/pointer.
+; Also stores the low 32 bits of the sum of usable-entry lengths at 0x8FF0;
+; memory_map_init() uses this value only if the E820 table is unavailable.
 ; ---------------------------------------------------------------
 detect_memory:
     xor ebx, ebx
@@ -206,10 +207,10 @@ times 446-($-$$) db 0
 ; Partition 1: Active, Type 0x83 (Linux / IPO_FS), Start LBA 2048
 db 0x80                 ; Bootable / Active flag
 db 0x00, 0x20, 0x21     ; CHS start
-db 0x83                 ; Partition Type (0x83 = Linux / IPO_FS)
+db 0x83                 ; Generic Linux filesystem partition type (not an IPO_FS identifier)
 db 0xFE, 0xFF, 0xFF     ; CHS end
-dd 2048                 ; LBA start (1 MB offset)
-dd 260096               ; Sector count (127 MB default)
+dd MBR_PARTITION_START_LBA ; LBA start (1 MiB offset)
+dd MBR_PARTITION_SECTORS   ; Sector count (127 MiB)
 
 ; Partitions 2, 3, 4 (empty)
 times 48 db 0

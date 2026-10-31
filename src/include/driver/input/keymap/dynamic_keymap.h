@@ -64,8 +64,8 @@
 #define KEY_SPACE       0x39
 
 /**
- * Single dictionary entry:
- * Maps a hardware scancode to output strings (arbitrary length: char, UTF-8, word, emoji).
+ * One dictionary entry mapping a hardware scancode to fixed-size normal and
+ * shifted output strings.
  */
 typedef struct {
     uint8_t scancode;          /* Key scancode */
@@ -76,7 +76,8 @@ typedef struct {
 #include <vga.h>
 
 /**
- * Register or replace active dynamic keymap with optional dynamic font glyphs.
+ * Register or replace the active dynamic keymap. The glyph arguments are
+ * currently ignored.
  */
 int dynamic_keymap_register_with_font(const char *name,
                                       const keymap_entry_t *entries,

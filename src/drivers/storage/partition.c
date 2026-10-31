@@ -761,7 +761,7 @@ void partition_print_table(const partition_table_t *table) {
         return;
     }
 
-    printf("    #  Boot  Start LBA       End LBA         Sectors     Size (MB)  Type/Label\n");
+    printf("    #  Boot  Start LBA       End LBA         Sectors     Size (MiB) Type/Label\n");
     printf("    --------------------------------------------------------------------------\n");
 
     for (uint32_t i = 0; i < table->count; i++) {
@@ -769,7 +769,7 @@ void partition_print_table(const partition_table_t *table) {
         if (!p->valid) continue;
 
         uint64_t end_lba = p->start_lba + p->sector_count - 1;
-        uint32_t size_mb = (uint32_t)((p->sector_count * 512ull) / (1024ull * 1024ull));
+        uint32_t size_mib = (uint32_t)((p->sector_count * 512ull) / (1024ull * 1024ull));
 
         printf("    %u   %s   %-15llu %-15llu %-11llu %-10u ",
                p->part_number,
@@ -777,7 +777,7 @@ void partition_print_table(const partition_table_t *table) {
                p->start_lba,
                end_lba,
                p->sector_count,
-               size_mb);
+               size_mib);
         if (table->type == PARTITION_TABLE_MBR) {
             if (p->name && p->name[0]) {
                 printf("0x%02X (%s)\n", p->mbr_type, p->name);
@@ -825,5 +825,4 @@ int partition_table_add(partition_table_t *table, const partition_info_t *part) 
     table->count++;
     return 0;
 }
-
 

@@ -33,6 +33,7 @@ typedef struct {
 } memory_region_t;
 
 void memory_map_init(void);
+void paging_init(void);
 uint32_t memory_map_get_region_count(void);
 const memory_region_t *memory_map_get_region(uint32_t index);
 uint64_t memory_map_get_total_ram(void);

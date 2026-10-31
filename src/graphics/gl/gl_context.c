@@ -239,13 +239,6 @@ void gl_swap_buffers(GLContext *ctx, void *win_ptr) {
 
     if (win != NULL && win->framebuf != NULL && wm_is_window_valid(win)) {
         /*
-         * Automatically adapt GL rendering context dimensions to window size on resize
-         */
-        if (win->w > 0 && win->h > 0 && (ctx->width != (int)win->w || ctx->height != (int)win->h)) {
-            gl_resize_context(ctx, win->w, win->h);
-        }
-
-        /*
          * Multi-window startwm mode (VGA Mode 13h or TrueColor window):
          * Strided quantization so window resizing or dimensions never shear or misalign scanlines.
          */
@@ -330,6 +323,10 @@ void glClear(GLbitfield mask) {
 void glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
     GLContext *ctx = gl_get_current_context();
     if (!ctx) return;
+    if (x == 0 && y == 0 && width > 0 && height > 0 &&
+        (ctx->width != width || ctx->height != height)) {
+        gl_resize_context(ctx, width, height);
+    }
     ctx->vp_x = x;
     ctx->vp_y = y;
     ctx->vp_w = width;

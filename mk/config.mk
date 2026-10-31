@@ -124,7 +124,27 @@ AUDIODEV ?= pa
 
 QEMU_SERIAL_FLAGS := -serial stdio
 
-QEMU_FLAGS := 	-m 2048 \
+# ==================================================
+#            FIRMWARE & BOOT ROM
+# ==================================================
+
+# Optional complete BIOS firmware image (not the <32 KiB payload; e.g. IPO_Firmware/build/firmware.bin)
+FIRMWARE ?=
+
+# Optional custom Boot ROM (e.g. make run BOOTROM=../IPO_Boot_ROM/build/bootrom.bin)
+BOOTROM  ?=
+
+# If both are specified, BOOTROM takes precedence. Either selected file is attached as the system BIOS ROM.
+ifneq ($(BOOTROM),)
+  QEMU_BIOS_FLAGS := -bios $(BOOTROM)
+else ifneq ($(FIRMWARE),)
+  QEMU_BIOS_FLAGS := -bios $(FIRMWARE)
+endif
+
+CPU ?= pentium3
+
+QEMU_FLAGS := 	-M pc -cpu $(CPU) -m 2048 \
+				$(QEMU_BIOS_FLAGS) \
 				-drive format=raw,file=$(OS_IMAGE),if=ide,index=0,file.locking=off \
               	-drive format=raw,file=$(DISK_IMG),if=ide,index=1,file.locking=off \
                	-cdrom $(DISK_ISO) \

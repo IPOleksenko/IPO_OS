@@ -80,6 +80,7 @@ ISR_ERR   30
 ISR_NOERR 31
 
 isr_common:
+    cld
     push eax
     push ecx
     push edx
@@ -87,9 +88,20 @@ isr_common:
     push ebp
     push esi
     push edi
-    push esp
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov ax, 0x18
+    mov gs, ax
+    mov ebx, esp
+    cmp esp, 0x10000
+    jae .stack_ok
+    mov esp, exception_stack_top
+.stack_ok:
+    push ebx
     call cpu_exception_handler
-    add esp, 4
+    mov esp, ebx
     pop edi
     pop esi
     pop ebp
@@ -100,6 +112,64 @@ isr_common:
     add esp, 8
     iretd
 
+extern timer_irq_handler
+global irq0_isr
+irq0_isr:
+    cld
+    push eax
+    push ecx
+    push edx
+    push ebx
+    push ebp
+    push esi
+    push edi
+    push ds
+    push es
+    push fs
+    push gs
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov ax, 0x18
+    mov gs, ax
+    sub esp, 108
+    fnsave [esp]
+    mov al, 0x20
+    out 0x20, al
+    call timer_irq_handler
+    frstor [esp]
+    add esp, 108
+    pop gs
+    pop fs
+    pop es
+    pop ds
+    pop edi
+    pop esi
+    pop ebp
+    pop ebx
+    pop edx
+    pop ecx
+    pop eax
+    iretd
+
+global irq_ignore_master
+irq_ignore_master:
+    push eax
+    mov al, 0x20
+    out 0x20, al
+    pop eax
+    iretd
+
+global irq_ignore_slave
+irq_ignore_slave:
+    push eax
+    mov al, 0x20
+    out 0xA0, al
+    out 0x20, al
+    pop eax
+    iretd
+
 global isr_stub_table
 isr_stub_table:
 %assign i 0
@@ -107,3 +177,10 @@ isr_stub_table:
     dd isr_%+i
 %assign i i+1
 %endrep
+
+section .bss
+align 16
+exception_stack_bottom:
+    resb 8192
+global exception_stack_top
+exception_stack_top:

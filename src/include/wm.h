@@ -3,33 +3,36 @@
  *
  * Architecture
  * ============
- * The WM runs as a persistent kernel async task — not inside any single app.
+ * The WM session is serviced by kernel paths that invoke
+ * wm_compositor_tick(); it does not register a periodic async task.
  *
- * wm_session_start()  — enters VGA mode, allocates backbuffer, registers the
- *                        compositor as an async task, returns immediately.
- * wm_session_stop()   — stops the async task, returns to text mode.
+ * wm_session_start()  — activates the session, conditionally switches to
+ *                        VGA mode, and returns immediately.
+ * wm_session_stop()   — ends the session, destroys its windows, and restores
+ *                        text mode.
  *
  * Apps that want to show windows:
  *   1. Call wm_create_window() → window added to
  *      the shared global list.
- *   2. Return from main().  The compositor task keeps drawing their window.
+ *   2. Return from main().  Kernel paths continue servicing the WM session.
  *   3. Optionally call wm_destroy_window() before returning to remove it.
  *
  * This means `run wm_demo & wm_demo2` works correctly:
  *   - wm_demo  creates its windows, returns.
  *   - wm_demo2 creates its windows, returns.
- *   - The WM async task composites both window sets every tick.
+ *   - WM ticks composite the visible windows.
  *
  * System overlay
  * ==============
- * The compositor always draws a small [✕] button in the bottom-left corner.
- * Clicking it (left mouse button) calls wm_session_stop().
+ * The close button in the bottom-left corner can be hidden with
+ * VGA_OVERLAY_HIDE_BUTTON. Clicking it invokes the close handler, which
+ * closes the displayed workspace or stops the WM session depending on mode.
  *
  * Mouse cursor
  * ============
- * The compositor draws a software arrow cursor on every frame using the
- * position from mouse_get_state(). Mouse boundaries are dynamically derived
- * from the active display area during session start/mode switches.
+ * The compositor draws a software arrow cursor using the position from
+ * mouse_get_state(), unless VGA_OVERLAY_HIDE_CURSOR is set. Mouse boundaries
+ * are derived from the active display area during session start/mode switches.
  */
 
 #ifndef LIB_WM_H
@@ -163,22 +166,21 @@ struct wm_window {
  * Session API  (video-mode lifecycle)
  * =========================================================================
  *
- * wm_session_start() — NON-BLOCKING (async compositor).
- *   Enters VGA Mode 13h, registers an async compositor task that fires
- *   every 16 ms.  Returns immediately so the calling app / terminal
- *   can continue running.  All windows added via wm_create_window() are
- *   composited by this task.  wm_create_window() calls wm_session_start()
- *   automatically if no session is running yet.
- *   Exit: left-click [X Exit] button or press ESC/Q.
+ * wm_session_start() — NON-BLOCKING.
+ *   Activates the session and switches to VGA Mode 13h only when required.
+ *   Returns immediately. Kernel/process paths invoke wm_compositor_tick() to
+ *   service the session. wm_create_window() starts the session automatically
+ *   if no session is running.
+ *   ESC/Q are not session-exit shortcuts; close-button behavior depends on
+ *   the current mode.
  *
- * wm_session_run() — BLOCKING (single-app animated mode).
- *   Like wm_session_start() but blocks in a loop, calling draw_cb every
- *   frame so windows can animate.  Only the calling app's code is alive,
- *   so only its draw_cb pointers are guaranteed valid.
- *   Exit: same as above.
+ * wm_session_run() — BLOCKING animated mode.
+ *   Blocks in a loop and calls each window's draw_cb every frame. Callback
+ *   code must remain valid while the session is running.
+ *   The loop ends when the session is stopped.
  *
- * wm_session_stop() — stop compositor (or blocking loop), destroy all
- *   windows, restore text mode.  Safe to call from event/draw callbacks.
+ * wm_session_stop() — end the session, destroy all windows, and restore
+ *   text mode.
  *
  * wm_session_active() — true while either mode is running.
  */
@@ -196,6 +198,7 @@ void wm_init(void);
 
 wm_window_t *wm_create_window(const wm_window_options_t *opts);
 void         wm_destroy_window(wm_window_t *win);
+void         wm_destroy_windows_for_pid(uint32_t pid);
 bool         wm_is_window_valid(wm_window_t *win);
 
 int          wm_get_window_count(void);
@@ -221,15 +224,14 @@ void wm_set_title(wm_window_t *win, const char *title);
 void wm_set_shape(wm_window_t *win, const uint8_t *mask, uint16_t mw, uint16_t mh);
 
 /**
- * wm_dispatch_key - Route a keyboard scancode.
- * Returns false if ESC/Q pressed and caller should exit.
- * NOTE: The session's async tick calls this automatically.
- * Apps using the old single-loop model can call it too.
+ * Route a keyboard scancode. Returns true for every scancode.
+ * Call explicitly; wm_compositor_tick() handles keyboard input separately.
  */
 bool wm_dispatch_key(uint8_t scancode);
 
 /**
- * wm_compose - Composite all windows + system overlay + cursor onto @backbuf.
+ * Composite visible windows and the taskbar onto @backbuf. The cursor is
+ * drawn separately.
  */
 void wm_compose(uint8_t *backbuf);
 
@@ -247,14 +249,13 @@ void wm_buf_draw_string (uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, c
  * Compositor tick  (called from terminal_console each kernel loop iteration)
  * =========================================================================
  *
- * Polls keyboard and mouse, composites all windows, draws cursor and the
- * system exit button, then flips the backbuffer to VRAM.
- * Stops the session on ESC/Q or left-click of the [X Exit] button.
- *
- * Called automatically by terminal_console() when wm_session_active().
- * Kernel / driver code MUST NOT call this directly.
+ * Called by terminal_console() and other kernel/process paths. When
+ * applicable, the tick processes input and composes/flips a frame; overlay
+ * flags may hide the cursor or button. ESC/Q are not session-exit shortcuts,
+ * and close-button behavior depends on mode.
  */
 void wm_compositor_tick(void);
+void wm_raw_gfx_overlay_tick(void);
 
 /**
  * Get current display/compositor screen bounds in pixels.

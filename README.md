@@ -3,7 +3,7 @@
 ## ⚙️ Compilation Commands
 
 ### 📦 Install Dependencies
-Install all necessary build tools and dependencies:
+Install the build tools and dependencies:
 ```bash
 ./install-dependencies.sh
 ```
@@ -33,21 +33,21 @@ Compiles kernel, drivers, filesystems, networking, graphics and arch HAL:
 make kernel
 ```
 
-#### `make boot` — Build Bootloader Only
-Assembles the bootloader with kernel configuration:
+#### `make boot` — Build Bootloader
+Builds the kernel prerequisite used to calculate boot configuration, then assembles the bootloader:
 ```bash
 make boot
 ```
 
 #### `make image` — Create OS Images
-Builds the bootable OS image (`build/IPO_OS.img`) and ensures virtual disks (`build/disks/disk.img`, `build/disks/disk.iso`) exist:
+Builds the bootable OS image (`build/IPO_OS.img`) and ensures the raw data disk (`build/disks/disk.img`) and CD-ROM image (`build/disks/disk.iso`) exist. Newly created images are blank: the data disk is 512 MiB, and the CD-ROM image is 5 MiB (not an ISO-9660 filesystem):
 ```bash
 make image
 ```
 
 #### `make setup-tap` — Setup TAP Network Interface
 Configures the host virtual TAP interface (`tap0`) for direct L2 communication with IPO_OS:
-- Automatically loads the `tun` kernel module (`modprobe tun`)
+- Attempts to load the `tun` kernel module (`modprobe tun`)
 - Configures `/dev/net/tun`
 - Assigns host IP `192.168.7.1/24` to `tap0`
 - Provides direct host/guest networking without QEMU port forwarding; a port is reachable only when an application is listening and the host firewall permits the connection
@@ -57,9 +57,18 @@ make setup-tap
 ```
 
 #### `make run` — Launch in QEMU
-Runs the OS image in QEMU emulator:
+Runs the OS image in QEMU emulator (default: standard QEMU BIOS):
 ```bash
 make run
+```
+
+You can also run with explicit paths to a full BIOS ROM image or Boot ROM image:
+```bash
+# Launch with a full BIOS ROM image:
+make run FIRMWARE=path/to/firmware.bin
+
+# Launch with explicit Boot ROM:
+make run BOOTROM=path/to/bootrom.bin
 ```
 
 #### `make` — Same as `make all`
@@ -70,8 +79,8 @@ make
 
 ### 🧹 Cleanup Commands
 
-#### `make clean` — Full Cleanup
-Removes the entire build directory:
+#### `make clean` — Remove Build Outputs
+Removes non-hidden entries inside the build directory and the OS image:
 ```bash
 make clean
 ```
@@ -98,7 +107,7 @@ The `tools/` directory contains host-side build automation scripts, symbol gener
 
 ### **1. generate_ksyms.py — Kernel Symbol Table Generator**
 - **File:** [tools/generate_ksyms.py](tools/generate_ksyms.py)
-- **Purpose:** Extracts public symbols (functions, global variables, syscall dispatchers) from `build/kernel/kernel.elf` using `nm`, formats them into sorted lookup arrays, and outputs `build/kernel/kernel_syms_autogen.c`.
+- **Purpose:** Extracts defined symbols from `build/kernel/kernel.elf` using `nm` and outputs a sorted symbol table in `build/kernel/kernel_syms_autogen.c`.
 - **Invoked by:** `make kernel`
 - **Manual Usage:**
 ```bash
@@ -106,29 +115,30 @@ python3 tools/generate_ksyms.py -e build/kernel/kernel.elf -o build/kernel/kerne
 ```
 - **Features:**
   - Provides the symbol database for the dynamic driver subsystem (`kmod`).
-  - Powers the OS shell's runtime `symbols` command to view all active kernel routines and memory addresses.
+  - Powers the OS shell's runtime `symbols` command to list generated symbol-table entries and addresses.
 
 ---
 
 ### **2. setup-tap.sh — Virtual TAP Network Interface Setup**
 - **File:** [tools/setup-tap.sh](tools/setup-tap.sh)
-- **Purpose:** Automatically provisions the host `tap0` virtual interface with IP `192.168.7.1/24` and loads the Linux `tun` kernel driver for direct networking with IPO_OS inside QEMU.
+- **Purpose:** Automatically provisions the host `tap0` virtual interface with IP `192.168.7.1/24` and attempts to load the Linux `tun` kernel driver for direct networking with IPO_OS inside QEMU.
 - **Invoked by:** `make setup-tap`, `make run`
 - **Manual Usage:**
 ```bash
 ./tools/setup-tap.sh [tap_dev] [host_ip] [netmask] [guest_ip]
 ```
 - **Defaults:** `tap_dev=tap0`, `host_ip=192.168.7.1`, `netmask=24`, `guest_ip=192.168.7.2`.
+- Guest Internet NAT is configured only for `192.168.7.0/24`; changing the subnet requires updating the NAT rule in `tools/setup-tap.sh`.
 
 ---
 
 ## 🌐 Networking (TAP Mode & Direct Port Access)
 
-IPO_OS implements a native bare-metal TCP/IP stack (RTL8139 NIC driver, Ethernet, ARP, IPv4 with routing table and default gateway, TCP with RFC 793/RFC 9293 state machine, and a POSIX-like Socket API).
+IPO_OS implements a native bare-metal TCP/IP stack (RTL8139 NIC driver, Ethernet, ARP, IPv4 with routing table and default gateway, TCP connection-state handling, and a POSIX-like stream-socket API).
 
 ### 🚀 TAP Network Interface Setup (`setup-tap.sh`)
 
-By default, QEMU is configured in **TAP networking mode** (`NET_MODE ?= tap` in `mk/config.mk`). TAP connects the host and guest directly, without QEMU port-forwarding rules. A service is reachable only if it is listening on the requested port and the host firewall permits the connection.
+By default, QEMU is configured in **TAP networking mode** (`NET_MODE ?= tap` in `mk/config.mk`). TAP connects the host and guest directly, without QEMU port-forwarding rules. If TAP setup fails during `make run`, the target retries with QEMU user networking. A service is reachable only if it is listening on the requested port and the host firewall permits the connection.
 
 #### Script: `tools/setup-tap.sh`
 ```bash
@@ -155,48 +165,15 @@ ifconfig
 ```
 Use the address reported by `ifconfig` in the commands below. With the default TAP setup it is typically `192.168.7.2`.
 
-#### Manually test `hosting_client`
-On the host, start a small HTTP server bound to the TAP host address:
-```bash
-mkdir -p /tmp/hosting-client-test
-printf 'Hello from host\n' > /tmp/hosting-client-test/index.html
-python3 -m http.server 9000 --bind 192.168.7.1 --directory /tmp/hosting-client-test
-```
-
-In the IPO_OS console, fetch the test page:
-```text
-hosting_client 192.168.7.1 9000 /
-hosting_client 192.168.7.1 9000 /index.html
-```
-The response should contain `200 OK` and `Hello from host`.
-
-#### Manually test `hosting_server`
-In the IPO_OS console, start the server:
-```text
-hosting_server 8000
-```
-
-On the host, replace `192.168.7.2` with the guest IP reported by `ifconfig`, then try:
-```bash
-curl -i http://192.168.7.2:8000/
-curl -I http://192.168.7.2:8000/
-curl -i -X OPTIONS http://192.168.7.2:8000/
-curl -i http://192.168.7.2:8000/no-such-file
-
-# Upload, read back, and delete a test file
-printf 'Upload test\n' > /tmp/hosting-upload.txt
-curl -i -T /tmp/hosting-upload.txt http://192.168.7.2:8000/manual-test.txt
-curl -i http://192.168.7.2:8000/manual-test.txt
-curl -i -X DELETE http://192.168.7.2:8000/manual-test.txt
-```
-The first request should return the directory listing; the missing path should return `404`. The upload, read-back, and delete commands exercise the server's `PUT`, `GET`, and `DELETE` handlers. Stop the server in IPO_OS with `q`, `Esc`, or `Ctrl+C`.
+#### HTTP client/server applications
+IPO_OS provides TCP/IP and socket support, but this repository does not include HTTP client/server programs or shell commands named `hosting_client` and `hosting_server`. HTTP examples require separately supplied applications.
 
 #### QEMU user networking
-TAP is the recommended mode for direct host/guest testing. To use QEMU user networking instead, launch with:
+TAP is the default mode for direct host/guest testing. To use QEMU user networking instead, launch with:
 ```bash
 make run NET_MODE=user
 ```
-In this mode, QEMU forwards only host TCP ports `8000` and `8080` to the guest by default. For example, if `hosting_server` is listening on guest port `8000`, access it from the host at `http://localhost:8000/`. Other guest ports require adding corresponding `hostfwd` rules in `mk/config.mk`.
+In this mode, QEMU forwards host TCP ports `8000` and `8080` to the guest by default. A forwarded port is accessible only when a guest application is listening on that port. Other guest ports require adding corresponding `hostfwd` rules in `mk/config.mk`.
 
 #### Connecting across routed networks or virtual environments:
 If running in an environment where the TAP network needs to be reached from other machines or interfaces:

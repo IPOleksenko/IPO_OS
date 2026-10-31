@@ -321,7 +321,7 @@ void terminal_render_language_bar(void) {
             kfree(bar_text);
         }
     } else {
-        /* Longer than 80 characters: infinite circular marquee! */
+        /* Longer names scroll through the circular marquee. */
         const char *sep = "   ***   ";
         size_t sep_len = strlen(sep);
         size_t loop_len = len + sep_len;
@@ -478,7 +478,6 @@ static void render_input_line(size_t previous_len) {
             vcol += tab_spaces;
             i++;
         } else {
-            unsigned char b1 = (unsigned char)input_buf[i];
             size_t bytes = 1;
             uint8_t glyph = utf8_to_vga_glyph(&input_buf[i], input_len - i, &bytes);
 
@@ -928,12 +927,11 @@ char* resolve_command_path(const char *cmd) {
             return path;
         }
     }
-    // Simple command name: search in order: cwd, /app
+    // Simple command name: search in order: cwd, /applications
     else {
         static const char * const search_paths[] = {
             NULL, /* indicates cwd */
             "/applications",
-            "/app",
             NULL
         };
 
@@ -1059,9 +1057,8 @@ static void builtin_help(void) {
     printf("          ;   - wait until program completes, then run next program.\n");
     printf("        Switch workspaces: Ctrl + Page Up / Ctrl + Page Down; exit: Ctrl + C.\n");
     printf("    startwm\n");
-    printf("      - Enter VGA Mode 13h (320x200) and start the window manager compositor\n");
-    printf("        as a background async task. Returns to the shell immediately.\n");
-    printf("        The [Close] button in the bottom-left of the screen always exits.\n");
+    printf("      - Start the WM session.\n");
+    printf("        The [Close] button closes the displayed workspace or stops the session.\n");
     printf("    stopwm\n");
     printf("      - Stop the WM compositor, destroy all windows, return to text mode.\n");
     printf("\n");
@@ -1077,7 +1074,7 @@ static void builtin_help(void) {
     printf("    drivers [list | info <id/name> | load <path> | unload <id/name> | status | symbols [filter]]\n");
     printf("      - Manage kernel drivers and dynamic runtime modules (KMOD ABI 0x0100).\n");
     printf("    symbols [filter]\n");
-    printf("      - Inspect all exported kernel function symbols, memory addresses, and OS entry points.\n");
+    printf("      - Inspect generated kernel symbol names and addresses.\n");
     printf("\n");
     printf("  [Hardware Resources & Infrastructure]\n");
     printf("    hardware [overview | list | cpu | memory | pci | storage | network | usb | refresh | info <id> | status]\n");
@@ -1136,14 +1133,16 @@ static void builtin_help(void) {
     printf("  - Redundant '/'  : Multiple slashes '//', '///' are automatically collapsed to a single '/'.\n");
     printf("  - Paths w/spaces : Wrap path in quotes or escape with '\\'.\n");
     printf("\n");
-    printf("3. APPLICATION EXECUTION (Launch Methods & Resolution)\n");
-    printf("  IPO_OS executes Position Independent Executables via three methods:\n");
-    printf("  [Method 1: Direct Name (Automatic PATH Resolution)]\n");
+    printf("3. RUNNING COMMANDS AND APPLICATIONS\n");
+    printf("  Run built-in system commands or executable applications in three ways:\n");
+    printf("  - Built-in system commands take priority over applications with the same name.\n");
+    printf("    Use an explicit path to run an application that has a built-in command name.\n");
+    printf("  [Method 1: Direct Name (Directory Search)]\n");
     printf("    Syntax: <command> [arguments...]\n");
-    printf("    - Searches current directory, /applications directory, then root directory.\n");
+    printf("    - Searches the current directory, then /applications.\n");
     printf("  [Method 2: Explicit Path]\n");
-    printf("    Syntax: <path/to/application> [arguments...]\n");
-    printf("    - Execute application specifying a path.\n");
+    printf("    Syntax: <path/to/command-or-application> [arguments...]\n");
+    printf("    - Run a command or application by specifying its path.\n");
     printf("  [Method 3: Batch Startup Script]\n");
     printf("    - Reads commands line-by-line from '/autorun' during kernel boot.\n");
     printf("\n");
@@ -1703,7 +1702,7 @@ static void builtin_reinstall_fs(void) {
         return;
     }
     if (pool_capacity < 10) {
-        printf("reinstall: disk too small for filesystem (< 5 KB)\n");
+        printf("reinstall: disk too small for filesystem (< 5 KiB)\n");
         return;
     }
 
@@ -1715,9 +1714,8 @@ static void builtin_reinstall_fs(void) {
     if (start_lba > 0 && start_lba < pool_capacity) {
         available_sectors = pool_capacity - start_lba;
     } else {
-        /* Adaptive partition offset (same as kernel boot):
-         * - Disks > 1 MB use standard partition offset 2048
-         * - Disks <= 1 MB use LBA 0 (whole-disk / floppy mode) */
+        /* Use the standard offset only when the pool has room for it plus
+         * at least 10 sectors; otherwise use LBA 0. */
         start_lba = 0;
         if (pool_capacity > 2048 + 10) {
             start_lba = 2048;
@@ -1846,12 +1844,12 @@ static void builtin_df(void) {
     printf("Block size   : %u bytes\n", bs);
     printf("Blocks       : %u total, %u used, %u free\n",
            blk_total, blk_used, blk_free);
-    printf("Space        : %u KB total, %u KB used, %u KB free  (%u%% used)\n",
+    printf("Space        : %u KiB total, %u KiB used, %u KiB free  (%u%% used)\n",
            total_kb, used_kb, free_kb, used_pct);
     printf("Inodes       : %u total, %u used, %u free\n",
            ino_total, ino_used,
            (ino_total >= ino_used) ? ino_total - ino_used : 0);
-    printf("Partition    : Start LBA %u, Total %u blocks (%u KB)\n",
+    printf("Partition    : Start LBA %u, Total %u blocks (%u KiB)\n",
            (uint32_t)fs_start_lba, (uint32_t)sb.fs_size_blocks, (uint32_t)((sb.fs_size_blocks * bs) / 1024));
 }
 
@@ -1924,19 +1922,19 @@ static void builtin_meminfo(void) {
 
     printf("=== Memory (Kernel Heap) ===\n");
     printf("Heap start : 0x%x\n", 0x1000000);
-    printf("Heap total : %u KB  (%u MB)\n",
+    printf("Heap total : %u KiB  (%u MiB)\n",
            (uint32_t)(st.heap_total / 1024),
            (uint32_t)(st.heap_total / 1024 / 1024));
-    printf("Heap used  : %u KB  (watermark, %u%% of capacity)\n",
+    printf("Heap used  : %u KiB  (watermark, %u%% of capacity)\n",
            (uint32_t)(st.heap_used / 1024), (uint32_t)used_pct);
-    printf("Heap avail : %u KB  (never-touched tail)\n",
+    printf("Heap avail : %u KiB  (never-touched tail)\n",
            (uint32_t)(heap_avail / 1024));
     printf("\n");
-    printf("Alloc'd    : %u KB  in %u block(s)\n",
+    printf("Alloc'd    : %u KiB  in %u block(s)\n",
            (uint32_t)(st.alloc_bytes / 1024), (uint32_t)st.alloc_blocks);
-    printf("Freed      : %u KB  in %u block(s)\n",
+    printf("Freed      : %u KiB  in %u block(s)\n",
            (uint32_t)(st.free_bytes / 1024), (uint32_t)st.free_blocks);
-    printf("Total free : %u KB  (freed blocks + untouched tail)\n",
+    printf("Total free : %u KiB  (freed blocks + untouched tail)\n",
            (uint32_t)(real_free / 1024));
     printf("Overhead   : %u bytes  (%u block headers)\n",
            (uint32_t)header_overhead,
@@ -2247,7 +2245,7 @@ static void builtin_hardware(int argc, char **argv) {
         if (size_buf) kfree(size_buf);
 
         printf("  PCI:       %u PCI device(s) detected on bus\n", pci_get_count());
-        printf("  Storage:   %u ATA/IDE drive(s) present, pool capacity: %u MB\n",
+        printf("  Storage:   %u ATA/IDE drive(s) present, pool capacity: %u MiB\n",
                ata_get_device_count(), (uint32_t)(ata_get_pool_capacity() / 2048ull));
 
         uint32_t net_devs = device_get_count_by_type(DEVICE_TYPE_NETWORK);
@@ -2739,10 +2737,10 @@ static void builtin_symbols(int argc, char **argv) {
     size_t count = 0;
     const kernel_sym_entry_t *syms = kmod_get_symbols(&count);
     if (!syms || count == 0) {
-        printf("symbols: No exported kernel symbols found.\n");
+        printf("symbols: No kernel symbols found.\n");
         return;
     }
-    printf("=== Exported Kernel Symbols (%u total) ===\n", (uint32_t)count);
+    printf("=== Kernel Symbols (%u total) ===\n", (uint32_t)count);
     size_t shown = 0;
     for (size_t i = 0; i < count; i++) {
         if (!filter || strstr(syms[i].name, filter)) {
@@ -2773,7 +2771,7 @@ static void builtin_drivers(int argc, char **argv) {
         printf("  Loaded Dynamic Drivers:  %u active\n", driver_count_kernel() + driver_count_user());
         printf("  Dynamic Modules (KMOD):  %u loaded\n", kmod_count());
         printf("  KMOD ABI Version:        0x%04x (v1.0)\n", KMOD_ABI_VERSION);
-        printf("  Exported Kernel Symbols: %u functions\n", (uint32_t)ksym_cnt);
+        printf("  Kernel Symbols:          %u entries\n", (uint32_t)ksym_cnt);
         printf("  KMOD Executable Format:  IKMD Header, Relocatable 32-bit ELF payload\n");
         return;
     }
@@ -2978,6 +2976,7 @@ static bool parse_command_redirection(const char *cmdline, char **out_cmd, char 
     return true;
 }
 
+
 int try_execute_command(const char *cmdline) {
     if (!cmdline) return -1;
 
@@ -3004,6 +3003,7 @@ int try_execute_command(const char *cmdline) {
         kfree(redir_file);
         return res;
     }
+
 
     int argc = 0;
     char **argv = NULL;

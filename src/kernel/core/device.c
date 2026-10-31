@@ -550,11 +550,8 @@ static bool acpi_check_range_for_rsdp(uint32_t start, uint32_t end, uint32_t *ou
 }
 
 static bool acpi_find_rsdp_dyn(uint32_t *out_addr, uint8_t *out_rev, char **out_oem, uint32_t *out_rsdt) {
-    uint32_t ebda = ((uint32_t)*(volatile uint16_t *)0x40E) << 4;
-    if (ebda >= 0x80000 && ebda < 0xA0000) {
-        if (acpi_check_range_for_rsdp(ebda, ebda + 1024, out_addr, out_rev, out_oem, out_rsdt)) {
-            return true;
-        }
+    if (acpi_check_range_for_rsdp(0x9F000, 0xA0000, out_addr, out_rev, out_oem, out_rsdt)) {
+        return true;
     }
     return acpi_check_range_for_rsdp(0xE0000, 0x100000, out_addr, out_rev, out_oem, out_rsdt);
 }

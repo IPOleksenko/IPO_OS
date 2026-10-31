@@ -148,14 +148,15 @@ void keyboard_poll(void) {
                 continue;
             }
 
-            bool wm_active_and_focused = is_wm_active();
-            if (wm_active_and_focused && is_batch_running() && process_get_separate_windows()) {
-                process_t *cur_fg = process_get_foreground();
-                if (cur_fg && !cur_fg->is_wm_app && !cur_fg->wants_graphics) {
-                    wm_active_and_focused = false;
+            process_t *cur_fg = process_get_foreground();
+            bool gfx_active_and_focused = is_wm_active() || vga_is_graphics_mode() ||
+                                          (cur_fg && (cur_fg->is_wm_app || cur_fg->wants_graphics));
+            if (gfx_active_and_focused && is_batch_running() && process_get_separate_windows()) {
+                if (cur_fg && !cur_fg->is_wm_app && !cur_fg->wants_graphics && !vga_is_graphics_mode()) {
+                    gfx_active_and_focused = false;
                 }
             }
-            if (scancode == 0x2E && keyboard_is_ctrl_pressed() && !wm_active_and_focused) {
+            if (scancode == 0x2E && keyboard_is_ctrl_pressed() && !gfx_active_and_focused) {
                 system_request_interrupt();
                 /* When an app or batch process is active, consume the key
                  * so the running app gets interrupted via system_is_interrupted().

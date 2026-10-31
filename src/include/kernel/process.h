@@ -7,8 +7,8 @@
 
 // Dynamic memory allocation for processes
 #define PROCESS_HEAP_START       0x00800000   // Start of process heap area
-#define USER_HEAP_START          0x08000000u  // Start of isolated user process heaps (128 MB)
-#define USER_HEAP_PROCESS_STRIDE 0x10000000u  // Dynamic stride between process heaps (256 MB)
+#define USER_HEAP_START          0x08000000u  // Start of isolated user process heaps (128 MiB)
+#define USER_HEAP_PROCESS_STRIDE 0x10000000u  // Dynamic stride between process heaps (256 MiB)
 
 // Protection flags
 #define PROT_NONE  0
@@ -83,6 +83,7 @@ typedef struct process {
     uint8_t is_running;     // Running flag
     bool waiting_for_input; // Blocked waiting for user input
     bool wants_graphics;    // Process requested VGA graphics mode (Mode 13h)
+    uint32_t gfx_overlay_flags; // Flags for raw VGA overlay (VGA_OVERLAY_HIDE_BUTTON, etc.)
     bool is_wm_app;         // Process created a Window Manager window
     uint32_t async_task_count; // number of active async tasks owned by this process
     uint32_t user_heap_base;   // Per-process isolated heap start address
@@ -116,9 +117,9 @@ typedef struct process {
     uint32_t text_output_len;
     uint32_t text_output_cap;
 
-    // Debugging
+    // Debugging and Reflection
     char *name;             // Process name (dynamically allocated)
-    char *return_format;    // Auto-detected format descriptor from DWARF
+    char *return_format;    // Format descriptor for returned data (int, string, struct, etc.)
     
     // Links
     struct process *next;   // For process list
@@ -200,6 +201,7 @@ process_t *process_find_by_pid(uint32_t pid);
 void process_set_current(process_t *proc);
 bool process_is_valid(process_t *proc);
 void process_crash_exit(void);
+void process_emergency_crash_exit(void);
 
 /* Process isolated heap management (dynamic on-demand, no static limits) */
 bool process_heap_init(process_t *proc);
@@ -209,5 +211,14 @@ bool process_heap_can_expand(process_t *proc, uint32_t new_limit);
 /* Demand / Lazy Loading */
 void process_demand_load_step(process_t *proc);
 void process_demand_load_finish(process_t *proc);
+
+/* Return Reflection */
+void process_set_return_format(process_t *proc, const char *fmt);
+const char *process_get_return_format(const process_t *proc);
+
+/* Custom Binary Format Registry */
+int binfmt_register(const char *name, const uint8_t *magic, uint32_t magic_len, uint32_t offset, const char *runner_path);
+int binfmt_unregister(const char *name);
+void binfmt_list(void);
 
 #endif

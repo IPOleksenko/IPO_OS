@@ -11,7 +11,7 @@
 extern "C" {
 #endif
 
-/* Dynamic 4x4 matrix stack without fixed limits */
+/* Dynamically growing 4x4 matrix stack */
 typedef struct {
     GLfloat *data;       /* 16 floats per matrix */
     int      top;        /* index of current matrix (0 = bottom) */

@@ -8,10 +8,10 @@
 
 #define STORAGE_POOL_MAGIC          0x504F4F4C /* 'POOL' */
 #define STORAGE_POOL_SB_VERSION     2
+#define STORAGE_POOL_MAX_MEMBERS    8
 
-/* Safe primary locations in the MBR boot gap immediately preceding FS_START_LBA (2048).
- * This ensures storage pool metadata never collides with the kernel code (LBA 1..~1024)
- * when running from a single bootable Live USB drive. */
+/* Storage pool metadata occupies LBA 2030..2039, in the MBR gap before FS_START_LBA (2048).
+ * The kernel image is loaded from LBA 1 and its sector count depends on the build. */
 #define STORAGE_POOL_PRIMARY_SB_LBA      2030
 #define STORAGE_POOL_JOURNAL_LBA         2031
 #define STORAGE_POOL_JOURNAL_SECTORS     8
@@ -52,7 +52,7 @@ typedef struct __attribute__((packed)) {
     uint64_t capacity_sectors;        /* 8 bytes: Member capacity in sectors */
 } storage_pool_raw_member_t;
 
-/* Dynamic In-Memory Member Descriptor (self-expanding, no fixed array limits) */
+/* Dynamically allocated in-memory member descriptor. */
 typedef struct {
     uint8_t  *uuid;                   /* Member UUID */
     size_t   uuid_len;
@@ -75,7 +75,8 @@ int  storage_pool_disk_member_copy(storage_pool_disk_member_t *dst, const storag
 void storage_pool_disk_member_from_raw(storage_pool_disk_member_t *m, const storage_pool_raw_member_t *raw);
 void storage_pool_disk_member_to_raw(const storage_pool_disk_member_t *m, storage_pool_raw_member_t *raw);
 
-/* Packed On-Disk Raw Superblock (flexible on-disk member array, no fixed slot limit) */
+/* Packed 512-byte on-disk superblock. Eight 48-byte member descriptors fit
+ * between the 68-byte header and the fixed recovery/reserved fields. */
 typedef struct __attribute__((packed)) {
     uint32_t magic;                    /* 4 bytes: 0x504F4F4C */
     uint32_t version;                  /* 4 bytes: 2 */
@@ -87,10 +88,10 @@ typedef struct __attribute__((packed)) {
     uint32_t chunk_size_sectors;       /* 4 bytes: Extent chunk size */
     uint32_t generation;               /* 4 bytes: Generation counter */
     uint32_t state;                    /* 4 bytes: storage_pool_state_t */
-    storage_pool_raw_member_t members[]; /* Unlimited/dynamically sized on-disk member array */
+    storage_pool_raw_member_t members[]; /* Up to STORAGE_POOL_MAX_MEMBERS descriptors */
 } storage_pool_raw_sb_t;
 
-/* Dynamic In-Memory Superblock Descriptor (self-expanding, no fixed array limits) */
+/* Dynamic in-memory descriptor; its serialized member count is format-limited. */
 typedef struct {
     uint32_t magic;
     uint32_t version;
@@ -106,7 +107,7 @@ typedef struct {
     uint32_t chunk_size_sectors;
     uint32_t generation;
     uint32_t state;
-    storage_pool_disk_member_t *members; /* Self-expanding array of member descriptors */
+    storage_pool_disk_member_t *members; /* Heap-allocated member descriptors */
     size_t   members_count;
     size_t   members_cap;
     uint32_t recovery_count;
@@ -263,4 +264,3 @@ int  storage_pool_save_metadata(void);
 int  storage_pool_load_metadata(void);
 
 #endif /* _STORAGE_POOL_H */
-

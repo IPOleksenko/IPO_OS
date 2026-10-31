@@ -254,13 +254,13 @@ int format_size(uint64_t bytes, char *buf, size_t buf_size) {
     if (bytes >= (1024ull * 1024ull * 1024ull)) {
         uint32_t gb = (uint32_t)(bytes / (1024ull * 1024ull * 1024ull));
         uint32_t rem_mb = (uint32_t)(((bytes % (1024ull * 1024ull * 1024ull)) * 10ull) / (1024ull * 1024ull * 1024ull));
-        return snprintf(buf, buf_size, "%u.%u GB", gb, rem_mb);
+        return snprintf(buf, buf_size, "%u.%u GiB", gb, rem_mb);
     } else if (bytes >= (1024ull * 1024ull)) {
         uint32_t mb = (uint32_t)(bytes / (1024ull * 1024ull));
-        return snprintf(buf, buf_size, "%u MB", mb);
+        return snprintf(buf, buf_size, "%u MiB", mb);
     } else if (bytes >= 1024ull) {
         uint32_t kb = (uint32_t)(bytes / 1024ull);
-        return snprintf(buf, buf_size, "%u KB", kb);
+        return snprintf(buf, buf_size, "%u KiB", kb);
     } else {
         return snprintf(buf, buf_size, "%u B", (uint32_t)bytes);
     }
@@ -427,4 +427,3 @@ char* strcat(char *dest, const char *src) {
     while ((*dest++ = *src++));
     return rdest;
 }
-

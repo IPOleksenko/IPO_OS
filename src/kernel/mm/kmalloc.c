@@ -6,8 +6,8 @@
 
 static spinlock_t s_kmalloc_lock = {0};
 
-#define KMALLOC_HEAP_START  (0x1000000)  // 16 MB kernel heap start
-#define KMALLOC_HEAP_SIZE   (0x4000000)  // 64 MB kernel heap
+#define KMALLOC_HEAP_START  (0x1000000)  // 16 MiB kernel heap start
+#define KMALLOC_HEAP_SIZE   (0x4000000)  // 64 MiB kernel heap
 #define KMALLOC_MAGIC       (0xDEADBEEF)
 #define KMALLOC_FREED_MAGIC (0xDEADC0DE)
 

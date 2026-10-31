@@ -191,7 +191,7 @@ int64_t get_contiguous_data_blocks_for_inode(struct ipo_inode *inode, uint64_t l
     return -1;
 }
 
-/* Find physical block for logical block index in Linked Extents (infinite file growth) */
+/* Find physical block for a logical block index in the linked extents */
 int64_t get_data_block_for_inode(struct ipo_inode *inode, uint64_t logical_index, bool alloc) {
     int64_t existing = get_contiguous_data_blocks_for_inode(inode, logical_index, NULL);
     if (existing >= 0) return existing;

@@ -124,6 +124,12 @@ static bool lex_cmdline(const char *src, token_list_t *out) {
         }
 
         if (c == '&' || c == ';' || c == '|') {
+            if (c == '|' && *src == '|') {
+                if (!cbuf_append(&cb, '|')) goto oom;
+                if (!cbuf_append(&cb, *src++)) goto oom;
+                have_content = true;
+                continue;
+            }
             if (have_content || cb.len > 0) { if (!cbuf_flush(&cb, out, false)) goto oom; have_content = false; cb.len = 0; }
             if (c == '&' && *src == '&') {
                 src++;

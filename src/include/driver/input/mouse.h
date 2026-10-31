@@ -22,7 +22,7 @@ typedef struct {
     bool left_button;      /* True if left button is currently pressed */
     bool right_button;     /* True if right button is currently pressed */
     bool middle_button;    /* True if middle button is currently pressed */
-    bool has_wheel;        /* True if scroll wheel (IntelliMouse) is enabled */
+    bool has_wheel;        /* True if scroll wheel is enabled */
     uint8_t dev_id;        /* PS/2 device ID (0x00, 0x03, 0x04) */
     uint8_t packet_size;   /* Packet size in bytes (3 or 4) */
     uint8_t raw_packet[4]; /* Most recent raw packet bytes */
@@ -66,5 +66,30 @@ void mouse_set_bounds_from_display(void);
  * Get current mouse screen boundaries.
  */
 void mouse_get_bounds(int32_t *out_x, int32_t *out_y);
+
+/**
+ * Get current mouse position (X, Y coordinates).
+ */
+void mouse_get_position(int32_t *out_x, int32_t *out_y);
+
+/**
+ * Check if a specific mouse button is currently pressed (MOUSE_BTN_LEFT, MOUSE_BTN_RIGHT, MOUSE_BTN_MIDDLE).
+ */
+bool mouse_is_pressed(int button);
+
+/**
+ * Check if the mouse cursor is located inside the specified rectangular region [x, x+w) x [y, y+h).
+ */
+bool mouse_is_in_region(int32_t x, int32_t y, int32_t w, int32_t h);
+
+/**
+ * Check if a mouse click / press occurred inside the specified rectangular region.
+ */
+bool mouse_is_clicked_in_region(int32_t x, int32_t y, int32_t w, int32_t h, int button);
+
+/**
+ * Convenience function: checks if left mouse button is pressed inside rectangular region.
+ */
+bool mouse_check_click(int32_t x, int32_t y, int32_t w, int32_t h);
 
 #endif /* _MOUSE_H */

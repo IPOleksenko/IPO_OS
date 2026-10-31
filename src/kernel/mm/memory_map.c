@@ -88,17 +88,17 @@ void memory_map_init(void) {
 
             if (len == 0) continue;
 
-            printf("[mem]   Entry %u: 0x%llx - 0x%llx (%llu KB) [%s]\n",
+            printf("[mem]   Entry %u: 0x%llx - 0x%llx (%llu KiB) [%s]\n",
                           i, base, base + len, len / 1024ull, memory_map_e820_type_name(type));
 
             if (type == E820_TYPE_USABLE) {
                 total_usable_ram += len;
 
                 /* Filter usable memory for dynamic allocator:
-                 * Skip conventional low memory (< 1MB) and kernel static reserved space (1MB - 16MB).
-                 * Only register usable regions above 16MB (0x1000000) for general dynamic allocation.
-                 * The first 64 MB (0x1000000 - 0x5000000) is reserved for the kernel kmalloc heap,
-                 * so regions[0].used is initialized to 64 MB to prevent collision with kmalloc. */
+                 * Skip conventional low memory (< 1 MiB) and kernel static reserved space (1-16 MiB).
+                 * Only register usable regions above 16 MiB (0x1000000) for general dynamic allocation.
+                 * The first 64 MiB (0x1000000 - 0x5000000) is reserved for the kernel kmalloc heap,
+                 * so regions[0].used is initialized to 64 MiB to prevent collision with kmalloc. */
                 if (base >= 0x1000000ull && base < 0xFFFFFFFFull) {
                     uint64_t usable_len = len;
                     if (base + usable_len > 0xFFFFFFFFull) {
@@ -131,10 +131,10 @@ void memory_map_init(void) {
         }
     }
 
-    printf("[mem] Total Usable RAM: %llu MB (%llu bytes) across %u usable allocatable regions\n",
+    printf("[mem] Total Usable RAM: %llu MiB (%llu bytes) across %u usable allocatable regions\n",
                   total_usable_ram / (1024ull * 1024ull), total_usable_ram, region_count);
     for (uint32_t r = 0; r < region_count; r++) {
-        serial_printf("[mem]   Pool %u: 0x%x - 0x%x (%u MB, used/reserved: %u MB)\n",
+        serial_printf("[mem]   Pool %u: 0x%x - 0x%x (%u MiB, used/reserved: %u MiB)\n",
                       r, regions[r].base, regions[r].base + regions[r].size,
                       regions[r].size / (1024u * 1024u),
                       regions[r].used / (1024u * 1024u));
@@ -209,3 +209,74 @@ bool memory_map_is_valid_ram(uint32_t addr, uint32_t len) {
     return false;
 }
 
+extern uint8_t _kernel_text_start[];
+extern uint8_t _kernel_rodata_end[];
+
+void paging_init(void) {
+    uint32_t *page_dir = (uint32_t *)memory_map_alloc(4096, 4096);
+    uint32_t *pt_low   = (uint32_t *)memory_map_alloc(4 * 4096, 4096);
+    if (!page_dir || !pt_low) {
+        serial_printf("[paging] Failed to allocate page tables\n");
+        return;
+    }
+
+    memset(page_dir, 0, 4096);
+    memset(pt_low, 0, 4 * 4096);
+
+    uint32_t ktext_start = (uint32_t)(uintptr_t)_kernel_text_start;
+    uint32_t krodata_end = ((uint32_t)(uintptr_t)_kernel_rodata_end) & ~0xFFFu;
+
+    /* Map 0x00000000 - 0x00FFFFFF (first 16 MiB) using 4 KiB pages */
+    for (uint32_t page = 0; page < 4096; page++) {
+        uint32_t addr = page * 4096u;
+        if (page == 0) {
+            /* Page 0 (0x00000000 - 0x00000FFF): Unmapped to trap NULL pointer reads/writes/jumps */
+            pt_low[page] = 0;
+        } else if (page >= 2 && page <= 5) {
+            /* 0x00002000 - 0x00005FFF: Unmapped low memory guard */
+            pt_low[page] = 0;
+        } else if (page == 7) {
+            /* 0x00007000 - 0x00007FFF (old bootloader at 0x7C00): Unmapped guard */
+            pt_low[page] = 0;
+        } else if (page >= 9 && page <= 15) {
+            /* 0x00009000 - 0x0000FFFF: Unmapped guard before kernel .text at 0x10000 */
+            pt_low[page] = 0;
+        } else if (addr >= ktext_start && addr < krodata_end) {
+            /* Kernel .text and .rodata: Present + Read-Only (enforced by CR0.WP in Ring 0) */
+            pt_low[page] = addr | 0x01u;
+        } else if (addr >= 0x000C0000u && addr < 0x00100000u) {
+            /* BIOS ROM area: Present + Read-Only */
+            pt_low[page] = addr | 0x01u;
+        } else {
+            /* Writable RAM & VGA VRAM (0x1000, 0x6000, 0x8000, kernel .data/.bss, stack, 0x800000 process area) */
+            pt_low[page] = addr | 0x03u;
+        }
+    }
+
+    for (uint32_t pde = 0; pde < 4; pde++) {
+        page_dir[pde] = ((uint32_t)(uintptr_t)&pt_low[pde * 1024]) | 0x03u;
+    }
+
+    /* Map 16 MiB .. 4 GiB using 4 MiB PSE pages (Present + RW + PS) */
+    for (uint32_t pde = 4; pde < 1024; pde++) {
+        uint32_t addr = pde << 22;
+        page_dir[pde] = addr | 0x83u;
+    }
+
+    /* Enable CR4.PSE (bit 4) for 4 MB pages, load CR3, and enable CR0.PG (bit 31) + CR0.WP (bit 16) */
+    __asm__ volatile(
+        "movl %%cr4, %%eax\n\t"
+        "orl $0x00000010, %%eax\n\t"
+        "movl %%eax, %%cr4\n\t"
+        "movl %0, %%cr3\n\t"
+        "movl %%cr0, %%eax\n\t"
+        "orl $0x80010001, %%eax\n\t"
+        "movl %%eax, %%cr0\n\t"
+        :
+        : "r"(page_dir)
+        : "eax", "memory"
+    );
+
+    serial_printf("[paging] Paging enabled (NULL guard active, kernel .text/.rodata write-protected [0x%x - 0x%x])\n",
+                  ktext_start, krodata_end);
+}

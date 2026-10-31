@@ -176,6 +176,11 @@ static bool disk_journal_write_entry(uint32_t slot, const storage_disk_tx_entry_
 /* Save persistent metadata (Primary SB and Backup SB) - Unlocked */
 static int storage_pool_save_metadata_unlocked(void) {
     if (!s_storage_pool.initialized || s_storage_pool.member_count == 0) return -1;
+    if (s_storage_pool.member_count > STORAGE_POOL_MAX_MEMBERS) {
+        serial_printf("[storage_pool] Cannot save metadata: on-disk format supports at most %u members.\n",
+                      STORAGE_POOL_MAX_MEMBERS);
+        return -1;
+    }
 
     s_storage_pool.generation++;
     uint64_t sb_lba = s_storage_pool.sb_lba ? s_storage_pool.sb_lba : STORAGE_POOL_PRIMARY_SB_LBA;
@@ -291,8 +296,11 @@ static int storage_pool_load_metadata_unlocked(void) {
                 if (raw->magic == STORAGE_POOL_MAGIC && raw->version == STORAGE_POOL_SB_VERSION) {
                     uint32_t calc_crc = partition_crc32(raw_buf, 508);
                     uint32_t stored_crc = *(uint32_t *)(raw_buf + 508);
-                    if (calc_crc == stored_crc) {
+                    if (calc_crc == stored_crc && raw->member_count <= STORAGE_POOL_MAX_MEMBERS) {
                         sb_ok = true;
+                    } else if (raw->member_count > STORAGE_POOL_MAX_MEMBERS) {
+                        serial_printf("[storage_pool] '%s': Primary SB member count %u exceeds format limit %u\n",
+                                      curr->name, raw->member_count, STORAGE_POOL_MAX_MEMBERS);
                     } else {
                         serial_printf("[storage_pool] '%s': Primary SB (LBA %llu) CRC mismatch\n",
                                       curr->name, curr_sb_lba);
@@ -308,7 +316,8 @@ static int storage_pool_load_metadata_unlocked(void) {
                     if (backup_raw->magic == STORAGE_POOL_MAGIC && backup_raw->version == STORAGE_POOL_SB_VERSION) {
                         uint32_t b_crc = partition_crc32(backup_buf, 508);
                         uint32_t stored_b_crc = *(uint32_t *)(backup_buf + 508);
-                        if (b_crc == stored_b_crc) {
+                        if (b_crc == stored_b_crc &&
+                            backup_raw->member_count <= STORAGE_POOL_MAX_MEMBERS) {
                             serial_printf("[storage_pool] '%s': Primary SB corrupted. Recovered from Backup SB (LBA %llu)!\n",
                                           curr->name, curr_backup_lba);
                             memcpy(raw_buf, backup_buf, 512);
@@ -318,6 +327,9 @@ static int storage_pool_load_metadata_unlocked(void) {
                             /* Repair corrupted Primary Superblock */
                             block_dev_write(curr, curr_sb_lba, 1, raw_buf);
                             block_dev_flush(curr);
+                        } else if (backup_raw->member_count > STORAGE_POOL_MAX_MEMBERS) {
+                            serial_printf("[storage_pool] '%s': Backup SB member count %u exceeds format limit %u\n",
+                                          curr->name, backup_raw->member_count, STORAGE_POOL_MAX_MEMBERS);
                         }
                     }
                 }
@@ -592,7 +604,7 @@ int storage_pool_create_ex(const char *pool_uuid, const char *bdev_name) {
     memset(s_storage_pool.members, 0, s_storage_pool.member_capacity * sizeof(pool_member_t));
     s_storage_pool.magic = STORAGE_POOL_MAGIC;
     s_storage_pool.version = STORAGE_POOL_SB_VERSION;
-    s_storage_pool.chunk_size_sectors = 2048; /* 1MB extents */
+    s_storage_pool.chunk_size_sectors = 2048; /* 1 MiB extents */
     s_storage_pool.generation = 1;
     s_storage_pool.recovery_count = 0;
     s_storage_pool.state = STORAGE_POOL_STATE_ONLINE;
@@ -639,7 +651,7 @@ int storage_pool_create_ex(const char *pool_uuid, const char *bdev_name) {
 
     spin_unlock(&s_pool_lock);
 
-    serial_printf("[storage_pool] Created persistent pool '%.16s' on '%s': %u members, %llu sectors (%llu MB)\n",
+    serial_printf("[storage_pool] Created persistent pool '%.16s' on '%s': %u members, %llu sectors (%llu MiB)\n",
                   s_storage_pool.pool_uuid ? (const char *)s_storage_pool.pool_uuid : "Unknown",
                   target_bdev->name,
                   s_storage_pool.member_count,
@@ -671,7 +683,7 @@ int storage_pool_init(void) {
 
         spin_unlock(&s_pool_lock);
 
-        printf("[storage_pool] Restored from persistent disk metadata: state=%s, %u member(s), %llu sectors (%llu MB)\n",
+        printf("[storage_pool] Restored from persistent disk metadata: state=%s, %u member(s), %llu sectors (%llu MiB)\n",
                       storage_pool_get_state_str(),
                       s_storage_pool.member_count,
                       s_storage_pool.total_capacity_sectors,
@@ -772,6 +784,13 @@ int storage_pool_add_device(block_device_t *bdev) {
             spin_unlock(&s_pool_lock);
             return 0;
         }
+    }
+
+    if (s_storage_pool.member_count >= STORAGE_POOL_MAX_MEMBERS) {
+        spin_unlock(&s_pool_lock);
+        serial_printf("[storage_pool] Cannot attach '%s': on-disk format supports at most %u members.\n",
+                      bdev->name ? bdev->name : "unknown", STORAGE_POOL_MAX_MEMBERS);
+        return -3;
     }
 
     if (s_storage_pool.member_count >= s_storage_pool.member_capacity) {
@@ -1038,7 +1057,6 @@ int storage_pool_check(void) {
         /* 2. Primary Superblock Test */
         uint64_t sb_lba = s_storage_pool.sb_lba ? s_storage_pool.sb_lba : STORAGE_POOL_PRIMARY_SB_LBA;
         uint64_t backup_sb_lba = s_storage_pool.backup_sb_lba ? s_storage_pool.backup_sb_lba : STORAGE_POOL_BACKUP_SB_LBA;
-        uint64_t journal_start = s_storage_pool.journal_lba ? s_storage_pool.journal_lba : STORAGE_POOL_JOURNAL_LBA;
 
         uint8_t psb_buf[512];
         storage_pool_raw_sb_t *psb = (storage_pool_raw_sb_t *)psb_buf;
@@ -1159,15 +1177,15 @@ void storage_pool_print_status(void) {
            journal_start,
            journal_start + STORAGE_POOL_JOURNAL_SECTORS - 1,
            STORAGE_POOL_JOURNAL_SECTORS, (uint32_t)STORAGE_DISK_WAL_SLOTS);
-    printf("  Total Capacity:   %llu sectors (%u MB)\n", cap, cap_mb);
-    printf("  Chunk/Extent:     %u sectors (%u KB)\n",
+    printf("  Total Capacity:   %llu sectors (%u MiB)\n", cap, cap_mb);
+    printf("  Chunk/Extent:     %u sectors (%u KiB)\n",
            s_storage_pool.chunk_size_sectors, (s_storage_pool.chunk_size_sectors * 512u) / 1024u);
     printf("  Member Disks:     %u\n", s_storage_pool.member_count);
 
     for (uint32_t m = 0; m < s_storage_pool.member_count; m++) {
         pool_member_t *mem = &s_storage_pool.members[m];
         uint32_t mem_mb = (uint32_t)((mem->capacity_sectors * 512ull) / (1024ull * 1024ull));
-        printf("    [%u] %-10s Offset: %-10llu Sectors: %-10llu Size: %-6u MB Status: %s\n",
+        printf("    [%u] %-10s Offset: %-10llu Sectors: %-10llu Size: %-6u MiB Status: %s\n",
                m, (mem->bdev_name && mem->bdev_name[0]) ? mem->bdev_name : "Unknown",
                mem->start_pool_lba, mem->capacity_sectors,
                mem_mb, mem->online ? "ONLINE" : "OFFLINE / MISSING");
@@ -1199,9 +1217,9 @@ void storage_pool_print_usage(void) {
     uint32_t pct = (cap_sectors > 0) ? (uint32_t)((used_sectors * 100ull) / cap_sectors) : 0;
 
     printf("=== Storage Pool Usage ===\n");
-    printf("  Total Volume Size: %u MB (%llu sectors)\n", cap_mb, cap_sectors);
-    printf("  Used Volume Space: %u MB (%llu sectors, %u%%)\n", used_mb, used_sectors, pct);
-    printf("  Free Volume Space: %u MB (%llu sectors)\n", free_mb, free_sectors);
+    printf("  Total Volume Size: %u MiB (%llu sectors)\n", cap_mb, cap_sectors);
+    printf("  Used Volume Space: %u MiB (%llu sectors, %u%%)\n", used_mb, used_sectors, pct);
+    printf("  Free Volume Space: %u MiB (%llu sectors)\n", free_mb, free_sectors);
     printf("  Pool Status:       %s\n", storage_pool_get_state_str());
 
     if (fs_mounted) {
@@ -1216,7 +1234,7 @@ void storage_pool_print_usage(void) {
         pool_member_t *mem = &s_storage_pool.members[m];
         uint32_t m_mb = (uint32_t)((mem->capacity_sectors * 512ull) / (1024ull * 1024ull));
         uint32_t m_pct = (cap_sectors > 0) ? (uint32_t)((mem->capacity_sectors * 100ull) / cap_sectors) : 0;
-        printf("    %-10s: %-6u MB (Pool Extent [%llu..%llu], %u%% of Pool) [%s]\n",
+        printf("    %-10s: %-6u MiB (Pool Extent [%llu..%llu], %u%% of Pool) [%s]\n",
                mem->bdev_name, m_mb, mem->start_pool_lba,
                mem->start_pool_lba + mem->capacity_sectors - 1, m_pct,
                mem->online ? "ONLINE" : "OFFLINE");
@@ -1490,6 +1508,7 @@ int storage_pool_disk_sb_set_reserved(storage_pool_disk_sb_t *sb, const uint8_t 
 
 int storage_pool_disk_sb_add_member(storage_pool_disk_sb_t *sb, const storage_pool_disk_member_t *m) {
     if (!sb || !m) return -1;
+    if (sb->members_count >= STORAGE_POOL_MAX_MEMBERS) return -1;
     if (sb->members_count >= sb->members_cap) {
         size_t nc = sb->members_cap ? sb->members_cap * 2 : 4;
         storage_pool_disk_member_t *nm = (storage_pool_disk_member_t *)krealloc(sb->members, nc * sizeof(*nm));
@@ -1505,7 +1524,7 @@ int storage_pool_disk_sb_add_member(storage_pool_disk_sb_t *sb, const storage_po
 }
 
 void storage_pool_disk_sb_from_raw(storage_pool_disk_sb_t *sb, const storage_pool_raw_sb_t *raw) {
-    if (!sb || !raw) return;
+    if (!sb || !raw || raw->member_count > STORAGE_POOL_MAX_MEMBERS) return;
     sb->magic = raw->magic;
     sb->version = raw->version;
     storage_pool_disk_sb_set_pool_uuid(sb, raw->pool_uuid, sizeof(raw->pool_uuid));
@@ -1522,7 +1541,7 @@ void storage_pool_disk_sb_from_raw(storage_pool_disk_sb_t *sb, const storage_poo
     storage_pool_disk_sb_set_reserved(sb, sec + 456, 52);
     sb->crc32 = *(const uint32_t *)(sec + 508);
 
-    /* Unlimited: add all members configured in on-disk header */
+    /* Load the member descriptors that fit in this superblock version. */
     for (uint32_t i = 0; i < raw->member_count; i++) {
         storage_pool_disk_member_t dm;
         storage_pool_disk_member_init(&dm);
@@ -1533,7 +1552,7 @@ void storage_pool_disk_sb_from_raw(storage_pool_disk_sb_t *sb, const storage_poo
 }
 
 void storage_pool_disk_sb_to_raw(const storage_pool_disk_sb_t *sb, storage_pool_raw_sb_t *raw) {
-    if (!sb || !raw) return;
+    if (!sb || !raw || sb->members_count > STORAGE_POOL_MAX_MEMBERS) return;
     uint8_t *sec = (uint8_t *)raw;
     memset(sec, 0, 512);
     raw->magic = sb->magic;
@@ -1549,7 +1568,7 @@ void storage_pool_disk_sb_to_raw(const storage_pool_disk_sb_t *sb, storage_pool_
     raw->generation = sb->generation;
     raw->state = sb->state;
 
-    /* Unlimited: write all members without arbitrary fixed slot cap */
+    /* Serialize the member descriptors supported by the fixed sector layout. */
     for (size_t i = 0; i < sb->members_count; i++) {
         storage_pool_disk_member_to_raw(&sb->members[i], &raw->members[i]);
     }

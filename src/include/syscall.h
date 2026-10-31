@@ -198,6 +198,8 @@
 #define IPO_SYSCALL_VGA_SHOW_CURSOR       0x10C2u
 #define IPO_SYSCALL_VGA_HIDE_CURSOR       0x10C3u
 #define IPO_SYSCALL_VGA_SET_PALETTE       0x10C4u
+#define IPO_SYSCALL_VGA_SET_OVERLAY_FLAGS 0x10C5u
+#define IPO_SYSCALL_VGA_GET_OVERLAY_FLAGS 0x10C6u
 
 /* Audio Core Syscalls */
 #define IPO_SYSCALL_AUDIO_INIT            0x10D0u
@@ -213,6 +215,10 @@
 #define IPO_SYSCALL_AUDIO_STREAM_SET_VOL  0x10DAu
 #define IPO_SYSCALL_AUDIO_STREAM_PROGRESS 0x10DBu
 #define IPO_SYSCALL_AUDIO_STREAM_UPDATE   0x10DCu
+
+#define IPO_SYSCALL_BINFMT_REGISTER   0x10E0u
+#define IPO_SYSCALL_BINFMT_UNREGISTER 0x10E1u
+#define IPO_SYSCALL_BINFMT_LIST       0x10E2u
 
 #define IPO_SYSCALL_EXIT         0xFFFFu
 
@@ -539,6 +545,26 @@ static inline int ipo_driver_set_description(const char *name, const char *desc)
 
 static inline int ipo_driver_list(void) {
     return ipo_syscall(IPO_SYSCALL_DRIVER_LIST, 0u, (void *)0);
+}
+
+static inline int ipo_binfmt_register(const char *name, const void *magic, uint32_t magic_len, uint32_t offset, const char *runner_path) {
+    uint32_t args[5];
+    args[0] = (uint32_t)(uintptr_t)name;
+    args[1] = (uint32_t)(uintptr_t)magic;
+    args[2] = magic_len;
+    args[3] = offset;
+    args[4] = (uint32_t)(uintptr_t)runner_path;
+    return ipo_syscall(IPO_SYSCALL_BINFMT_REGISTER, 5u, args);
+}
+
+static inline int ipo_binfmt_unregister(const char *name) {
+    uint32_t args[1];
+    args[0] = (uint32_t)(uintptr_t)name;
+    return ipo_syscall(IPO_SYSCALL_BINFMT_UNREGISTER, 1u, args);
+}
+
+static inline int ipo_binfmt_list(void) {
+    return ipo_syscall(IPO_SYSCALL_BINFMT_LIST, 0u, NULL);
 }
 
 void syscall_reset_user_heap(void);

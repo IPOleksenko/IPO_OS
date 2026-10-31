@@ -13,6 +13,7 @@ static const int8_t bayer4x4[4][4] = {
 static bool g_palette_initialized = false;
 
 void gl_palette_init(void) {
+    if (!vga_is_graphics_mode()) return;
     if (g_palette_initialized) return;
 
     /* 16..31: 16-level monochrome grayscale ramp */

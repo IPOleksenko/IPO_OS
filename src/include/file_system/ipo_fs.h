@@ -18,7 +18,7 @@
 
 struct ipo_superblock {
     char magic[8];             /* "IPO_FS\0\0" */
-    uint64_t fs_size_blocks;    /* Total blocks in storage pool (up to 9.44 Zettabytes!) */
+    uint64_t fs_size_blocks;    /* Total blocks in storage pool (64-bit block count) */
     uint32_t block_size;        /* 512 bytes */
     uint32_t flags;             /* Feature flags (1 = linked extents) */
     uint64_t inode_count;       /* Total inodes */
@@ -38,16 +38,16 @@ struct ipo_extent {
 struct ipo_inode {
     uint32_t mode;            /* Type and flags (IPO_INODE_TYPE_DIR, FILE, PROTECTED) */
     uint32_t links_count;     /* Hard links count */
-    uint64_t size;            /* 64-bit file size (unlimited) */
+    uint64_t size;            /* 64-bit file-size field; practical size is storage/API limited */
     struct ipo_extent extents[IPO_INODE_EXTENTS]; /* 4 embedded primary extents (96 bytes) */
-    uint64_t next_extent_node;/* Physical block of next chained extent node (0 if none) */
+    uint64_t next_extent_node;/* Physical block of next extent node (0 if none) */
     uint8_t  _pad[8];         /* Inode size = exactly 128 bytes (4 inodes / 512-byte block) */
 };
 
 struct ipo_extent_node {
     uint32_t count;           /* Number of active extents in this node */
     uint32_t flags;
-    uint64_t next_node;       /* Physical block of next extent node (infinite chain) */
+    uint64_t next_node;       /* Physical block of next extent node (0 if none) */
     struct ipo_extent extents[IPO_EXTENT_NODE_EXTENTS]; /* 20 extents * 24 bytes = 480 bytes */
     uint8_t  _pad[16];        /* Exactly 512 bytes */
 };

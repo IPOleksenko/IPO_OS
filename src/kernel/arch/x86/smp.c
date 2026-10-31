@@ -1062,7 +1062,7 @@ void smp_print_summary(void) {
 
     /* Per-CPU Stacks & State */
     if (arch_status.per_cpu_structures == SMP_STATUS_ACTIVE) {
-        serial_printf("    Per-CPU Stacks & State:  ACTIVE (%u stack(s) allocated, 16KB/core)\n", cpu_count);
+        serial_printf("    Per-CPU Stacks & State:  ACTIVE (%u stack(s) allocated, 16KiB/core)\n", cpu_count);
     } else {
         serial_printf("    Per-CPU Stacks & State:  BLOCKED (Stack allocation failure)\n");
     }

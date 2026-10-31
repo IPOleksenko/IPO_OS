@@ -1,56 +1,3 @@
-/**
- * wm.c  —  Window Manager for IPO_OS
- *
- * Architecture
- * ============
- *
- * The WM compositor runs as an ASYNC TASK ("wm_session") that fires
- * every 16 ms inside the kernel's main loop:
- *
- *   for(;;) {
- *       async_scheduler_tick();    ← compositor fires here
- *       terminal_console();        ← skips keyboard when WM active
- *   }
- *
- * This means the terminal stays alive between compositor frames and apps
- * can be launched, add their windows, and exit immediately.
- *
- * Window creation
- * ===============
- * wm_create_window() does THREE things:
- *   1. Auto-starts the WM session if it isn't running yet.
- *   2. Allocates the window struct and kernel-heap framebuffer.
- *   3. Calls opts->draw_cb(win) ONCE (while the app's code is still in
- *      memory) to render the initial frame into the framebuffer.
- *      After that the draw_cb pointer is kept in win->draw_cb for
- *      wm_session_run() (single-app blocking mode), but the async
- *      compositor never calls it — it only blits the pre-rendered buffer.
- *
- * startwm / stopwm
- * ================
- *   startwm  → wm_session_start() — starts async compositor, returns.
- *   stopwm   → wm_session_stop()  — stops compositor, restores text mode.
- *
- * Single-app blocking mode (for self-hosted event loops)
- * ======================================================
- *   wm_session_run() — enters VGA mode, runs compositor loop with
- *   per-frame draw_cb re-render (for animation), blocks until exit.
- *   Equivalent to the old architecture.  Use if you do NOT need other
- *   apps to run simultaneously.
- *
- * Keyboard routing while WM is active
- * =====================================
- * keyboard_set_app_input_mode(false) — scancodes stay in shell_queue.
- * terminal_console() checks wm_session_active() and skips its keyboard
- * read, leaving scancodes for the compositor task to consume.
- * This avoids any race between terminal and compositor.
- *
- * Exit button
- * ===========
- * A red [X Exit] button is always drawn in the bottom-left corner of the
- * screen.  Left-clicking it (or pressing ESC/Q) stops the session.
- */
-
 #include <wm.h>
 #include <vga_gfx.h>
 #include <vga.h>
@@ -307,7 +254,7 @@ static bool wm_sess_active = false;
 static bool wm_prev_left   = false;
 static bool wm_prev_right  = false;
 
-/* Dynamically allocated 64 KB backbuffer (allocated on first use from kernel heap) */
+/* Dynamically allocated 64,000-byte Mode 13h backbuffer (allocated on first use) */
 static uint8_t *wm_backbuf = NULL;
 
 static uint8_t *wm_get_backbuf(void) {
@@ -347,7 +294,21 @@ wm_window_t *wm_create_window(const wm_window_options_t *opts) {
     }
 
     /* Auto-start WM session if not already running */
-    if (!wm_sess_active) wm_session_start();
+    if (!wm_sess_active) {
+        wm_session_start();
+    } else if (!vga_is_graphics_mode()) {
+        process_t *fg = process_get_foreground();
+        bool should_switch_hw = (!process_is_batch_active() || !process_get_separate_windows() ||
+                                 (fg && (fg->wants_graphics || fg->is_wm_app ||
+                                         (cur_proc && fg->window_id == cur_proc->window_id))));
+        if (should_switch_hw) {
+            vga_set_mode_13h_hardware();
+            vga_gfx_init_default_palette();
+            int screen_w = 0, screen_h = 0;
+            wm_get_screen_bounds(&screen_w, &screen_h);
+            mouse_set_bounds(screen_w, screen_h);
+        }
+    }
 
     wm_window_t *win = kmalloc(sizeof(wm_window_t));
     if (!win) return NULL;
@@ -356,27 +317,38 @@ wm_window_t *wm_create_window(const wm_window_options_t *opts) {
     if (opts->fullscreen) {
         win->x=0; win->y=0; win->w=VGA_GFX_WIDTH; win->h=VGA_GFX_HEIGHT; win->fullscreen=true;
     } else {
-        int16_t req_x = opts->x;
-        int16_t req_y = opts->y;
-        /* If multiple windows share identical coordinates, cascade them slightly so they don't occlude */
-        for (wm_window_t *w = wm_head; w; w = w->next) {
-            if (wm_window_is_visible_for_fg(w) && w->x == req_x && w->y == req_y && !w->fullscreen) {
-                req_x = (int16_t)((req_x + 22) % (VGA_GFX_WIDTH - 60));
-                req_y = (int16_t)((req_y + 16) % (VGA_GFX_HEIGHT - 40));
-                if (req_y < 12) req_y = 12;
-            }
-        }
-        win->x=req_x; win->y=req_y;
         win->w = opts->w>0 ? opts->w : 80;
         win->h = opts->h>0 ? opts->h : 50;
-        if(win->x<2) win->x=2;
-        if(opts->decor_style != WM_DECOR_NONE && win->y < TITLEBAR_H + 2) {
-            win->y = TITLEBAR_H + 2;
-        } else if (win->y < 0) {
-            win->y = 0;
+        if (win->w > WM_MAX_WIDTH)  win->w = WM_MAX_WIDTH;
+        if (win->h > WM_MAX_HEIGHT) win->h = WM_MAX_HEIGHT;
+
+        int16_t req_x = opts->x;
+        int16_t req_y = opts->y;
+        int16_t min_y = (opts->decor_style != WM_DECOR_NONE) ? (TITLEBAR_H + 2) : 0;
+        int16_t max_x = (int16_t)(VGA_GFX_WIDTH - 2 - win->w);
+        int16_t max_y = (int16_t)(TASKBAR_Y - 2 - win->h);
+        if (max_x < 2) max_x = 2;
+        if (max_y < min_y) max_y = min_y;
+
+        if (req_x < 2) req_x = 2;
+        if (req_x > max_x) req_x = max_x;
+        if (req_y < min_y) req_y = min_y;
+        if (req_y > max_y) req_y = max_y;
+
+        /* If multiple windows in the same workspace share identical coordinates, cascade them slightly so they don't occlude */
+        int cur_wid = cur_proc ? cur_proc->window_id : 0;
+        bool sep_wins = process_is_batch_active() && process_get_separate_windows();
+        for (wm_window_t *w = wm_head; w; w = w->next) {
+            bool same_ws = sep_wins ? (w->window_id == cur_wid) : wm_window_is_visible_for_fg(w);
+            if (same_ws && w->x == req_x && w->y == req_y && !w->fullscreen) {
+                int16_t range_x = (int16_t)(max_x - 2);
+                int16_t range_y = (int16_t)(max_y - min_y);
+                req_x = (range_x > 0) ? (int16_t)(2 + ((req_x - 2 + 22) % (range_x + 1))) : 2;
+                req_y = (range_y > 0) ? (int16_t)(min_y + ((req_y - min_y + 12) % (range_y + 1))) : min_y;
+            }
         }
-        if(win->x>=VGA_GFX_WIDTH)  win->x=(int16_t)(VGA_GFX_WIDTH-1);
-        if(win->y>=VGA_GFX_HEIGHT) win->y=(int16_t)(VGA_GFX_HEIGHT-1);
+        win->x = req_x;
+        win->y = req_y;
     }
 
     win->saved_x = win->x;
@@ -440,13 +412,15 @@ wm_window_t *wm_create_window(const wm_window_options_t *opts) {
     list_append(win);
 
     /*
-     * Render initial frame NOW, while the calling app's code is still
-     * in memory.  The async compositor will blit this framebuffer and
-     * will NOT call draw_cb again — so there's no dangling-pointer risk
-     * when the app exits after returning from wm_create_window().
+     * Render the initial frame while the calling app's code is still in
+     * memory. The compositor tick blits this framebuffer and does not call
+     * draw_cb again.
      */
     if (win->draw_cb) {
+        bool in_proc = process_in_process_context();
+        if (in_proc) __asm__ volatile("sti" ::: "memory");
         win->draw_cb(win);
+        if (in_proc) __asm__ volatile("cli" ::: "memory");
     }
 
     return win;
@@ -486,6 +460,7 @@ bool wm_is_window_valid(wm_window_t *win) {
 
 void wm_destroy_window(wm_window_t *win) {
     if (!win || !wm_is_window_valid(win)) return;
+    uint32_t owner_pid = win->owner_pid;
     if (drag_win == win) {
         drag_win = NULL;
         drag_mode = 0;
@@ -512,8 +487,46 @@ void wm_destroy_window(wm_window_t *win) {
     if (win->title) kfree(win->title);
     kfree(win);
 
+    if (owner_pid != 0 && !wm_has_windows_for_pid(owner_pid)) {
+        process_t *owner = process_find_by_pid(owner_pid);
+        if (owner) {
+            if (!process_in_process_context()) {
+                owner->is_running = 0;
+            }
+            owner->completed_and_acknowledged = true;
+        }
+    }
+
     if (wm_sess_active) {
         wm_invalidate_all();
+    }
+}
+
+void wm_destroy_windows_for_pid(uint32_t pid) {
+    if (pid == 0) return;
+    wm_window_t *w = wm_head;
+    while (w) {
+        wm_window_t *next = w->next;
+        if (w->owner_pid == pid) {
+            w->event_cb = NULL;
+            if (drag_win == w) {
+                drag_win = NULL;
+                drag_mode = 0;
+            }
+            list_remove(w);
+            if (w->framebuf_owned && w->framebuf) kfree(w->framebuf);
+            if (w->shape_mask_owned && w->shape_mask) kfree((void *)w->shape_mask);
+            if (w->title) kfree(w->title);
+            kfree(w);
+        }
+        w = next;
+    }
+    if (wm_sess_active) {
+        if (wm_count == 0) {
+            wm_session_stop();
+        } else {
+            wm_invalidate_all();
+        }
     }
 }
 
@@ -577,6 +590,12 @@ void wm_focus_window_for_pid(uint32_t pid) {
     for (wm_window_t *w = wm_tail; w; w = w->prev) {
         if (w->owner_pid == pid) {
             w->minimized = false;
+            wm_set_focus(w);
+            return;
+        }
+    }
+    for (wm_window_t *w = wm_tail; w; w = w->prev) {
+        if (wm_window_is_visible_for_fg(w) && !w->minimized) {
             wm_set_focus(w);
             return;
         }
@@ -913,7 +932,7 @@ static void draw_cursor(uint8_t *bb, int cx, int cy) {
  * ========================================================================= */
 static void draw_decorations(wm_window_t *win, uint8_t *bb) {
     if (win->fullscreen || win->minimized || win->decor_style==WM_DECOR_NONE || win->decor_style==WM_DECOR_CUSTOM) return;
-    bool focused = (wm_tail==win);
+    bool focused = (wm_get_focused() == win);
 
     if (win->decor_style == WM_DECOR_THIN) {
         wm_buf_draw_rect(bb, VGA_GFX_WIDTH, VGA_GFX_HEIGHT, (int)win->x-1, (int)win->y-1, (int)win->w+2, (int)win->h+2,
@@ -1136,15 +1155,105 @@ static void wm_language_name_to_ascii(const char *name, char *out, size_t out_si
     out[used] = '\0';
 }
 
+static void wm_draw_close_button(uint8_t *bb, int x, int y, int w, int h, bool pressed) {
+    bool is_wm = wm_session_active();
+    uint8_t clr_face      = is_wm ? WIN_CLR_FACE : 7;
+    uint8_t clr_hilight   = is_wm ? WIN_CLR_HILIGHT : 15;
+    uint8_t clr_shadow    = is_wm ? WIN_CLR_DKSHADOW : 0;
+    uint8_t clr_icon      = is_wm ? WIN_CLR_ACTIVE_TITLE : 1;
+    uint8_t clr_text      = is_wm ? WIN_CLR_DKSHADOW : 0;
+
+    uint8_t topleft = pressed ? clr_shadow : clr_hilight;
+    uint8_t botright = pressed ? clr_hilight : clr_shadow;
+
+    /* 3D button frame */
+    wm_buf_fill_rect(bb, VGA_GFX_WIDTH, VGA_GFX_HEIGHT, x, y, w, h, clr_face);
+    wm_buf_draw_line(bb, VGA_GFX_WIDTH, VGA_GFX_HEIGHT, x, y, x + w - 1, y, topleft);
+    wm_buf_draw_line(bb, VGA_GFX_WIDTH, VGA_GFX_HEIGHT, x, y, x, y + h - 1, topleft);
+    wm_buf_draw_line(bb, VGA_GFX_WIDTH, VGA_GFX_HEIGHT, x, y + h - 1, x + w - 1, y + h - 1, botright);
+    wm_buf_draw_line(bb, VGA_GFX_WIDTH, VGA_GFX_HEIGHT, x + w - 1, y, x + w - 1, y + h - 1, botright);
+
+    /* Indicator icon (6x6) */
+    wm_buf_fill_rect(bb, VGA_GFX_WIDTH, VGA_GFX_HEIGHT, x + 2, y + 2, 6, 6, clr_icon);
+
+    /* Text: "Close" */
+    wm_buf_draw_string(bb, VGA_GFX_WIDTH, VGA_GFX_HEIGHT, x + 10, y + 2, "Close", clr_text);
+}
+
+static void wm_handle_close_button_click(void) {
+    if (wm_session_active()) {
+        if (process_is_batch_active() && process_get_separate_windows()) {
+            process_t *fg = process_get_displayed_foreground();
+            if (fg) {
+                int wid = fg->window_id;
+                wm_window_t *w = wm_head;
+                while (w) {
+                    wm_window_t *next = w->next;
+                    process_t *owner = w->owner_pid ? process_find_by_pid(w->owner_pid) : NULL;
+                    int window_id = owner ? owner->window_id : w->window_id;
+                    if (window_id == wid) {
+                        if (owner) {
+                            owner->is_running = 0;
+                            owner->completed_and_acknowledged = true;
+                        }
+                        wm_destroy_window(w);
+                    }
+                    w = next;
+                }
+                fg->is_running = 0;
+                fg->completed_and_acknowledged = true;
+                process_t *new_fg = process_get_foreground();
+                if (new_fg) {
+                    process_set_foreground(new_fg);
+                }
+                wm_invalidate_all();
+                return;
+            }
+        }
+        for (wm_window_t *w = wm_head; w; w = w->next) {
+            if (w->owner_pid) {
+                process_t *owner = process_find_by_pid(w->owner_pid);
+                if (owner) {
+                    owner->is_running = 0;
+                    owner->completed_and_acknowledged = true;
+                }
+            }
+        }
+        process_t *fg = process_get_displayed_foreground();
+        if (fg) {
+            fg->is_running = 0;
+            fg->completed_and_acknowledged = true;
+        }
+        wm_session_stop();
+    } else {
+        process_t *fg = process_get_displayed_foreground();
+        if (!fg) fg = process_get_foreground();
+        if (fg) {
+            fg->is_running = 0;
+            fg->completed_and_acknowledged = true;
+        }
+        if (!process_get_separate_windows()) {
+            vga_set_mode_text_hardware();
+            dynamic_keymap_reapply_fonts();
+            mouse_set_bounds_from_display();
+        }
+    }
+}
+
 static void draw_taskbar(uint8_t *bb) {
     /* 3D raised taskbar across the bottom */
     wm_buf_fill_rect(bb, VGA_GFX_WIDTH, VGA_GFX_HEIGHT, 0, TASKBAR_Y, VGA_GFX_WIDTH, TASKBAR_H, WIN_CLR_FACE);
     wm_buf_draw_line(bb, VGA_GFX_WIDTH, VGA_GFX_HEIGHT, 0, TASKBAR_Y, VGA_GFX_WIDTH - 1, TASKBAR_Y, WIN_CLR_HILIGHT);
 
-    /* Start button on the left (distinct from window tabs) */
-    draw_3d_box(bb, 2, TASKBAR_Y + 2, 40, 10, false);
-    wm_buf_fill_rect(bb, VGA_GFX_WIDTH, VGA_GFX_HEIGHT, 4, TASKBAR_Y + 4, 6, 6, WIN_CLR_ACTIVE_TITLE);
-    wm_buf_draw_string(bb, VGA_GFX_WIDTH, VGA_GFX_HEIGHT, 11, TASKBAR_Y + 3, "Close", WIN_CLR_DKSHADOW);
+    /* Close button on the left */
+    process_t *fg = process_get_displayed_foreground();
+    if (!fg) fg = process_get_foreground();
+    uint32_t overlay_flags = fg ? fg->gfx_overlay_flags : 0;
+    bool show_button = !(overlay_flags & VGA_OVERLAY_HIDE_BUTTON);
+
+    if (show_button) {
+        wm_draw_close_button(bb, 2, TASKBAR_Y + 2, 40, 10, false);
+    }
 
     /* Left scroll button '<' */
     draw_3d_box(bb, 44, TASKBAR_Y + 2, 9, 10, false);
@@ -1163,7 +1272,7 @@ static void draw_taskbar(uint8_t *bb) {
 
         int tx = 54 + visible_tab * 43;
         int ty = TASKBAR_Y + 2;
-        bool is_active = (w == wm_tail && !w->minimized);
+        bool is_active = (w == wm_get_focused() && !w->minimized);
 
         if (is_active) {
             draw_3d_box(bb, tx, ty, tab_w, tab_h, true);
@@ -1549,45 +1658,16 @@ void wm_compositor_tick(void) {
         drag_win = NULL;
         drag_mode = DRAG_NONE;
 
+        process_t *fg = process_get_displayed_foreground();
+        if (!fg) fg = process_get_foreground();
+        uint32_t overlay_flags = fg ? fg->gfx_overlay_flags : 0;
+        bool show_button = !(overlay_flags & VGA_OVERLAY_HIDE_BUTTON);
+
         /* 1. Check Taskbar */
         if (ms.y >= TASKBAR_Y && !top_fullscreen) {
-            /* Start / Exit button */
-            if (ms.x >= 2 && ms.x <= 42) {
-                if (process_is_batch_active() && process_get_separate_windows()) {
-                    process_t *fg = process_get_displayed_foreground();
-                    if (fg) {
-                        int wid = fg->window_id;
-                        wm_window_t *w = wm_head;
-                        while (w) {
-                            wm_window_t *next = w->next;
-                            process_t *owner = w->owner_pid ? process_find_by_pid(w->owner_pid) : NULL;
-                            int window_id = owner ? owner->window_id : w->window_id;
-                            if (window_id == wid) {
-                                if (w->owner_pid) {
-                                    if (owner) owner->completed_and_acknowledged = true;
-                                }
-                                wm_destroy_window(w);
-                            }
-                            w = next;
-                        }
-                        fg->completed_and_acknowledged = true;
-                        process_t *new_fg = process_get_foreground();
-                        if (new_fg) {
-                            process_set_foreground(new_fg);
-                        }
-                        if (new_fg && (new_fg->wants_graphics || new_fg->is_wm_app)) {
-                            wm_invalidate_all();
-                        } else {
-                            wm_invalidate_all();
-                        }
-                        return;
-                    }
-                }
-                process_t *fg = process_get_displayed_foreground();
-                if (fg) {
-                    fg->completed_and_acknowledged = true;
-                }
-                wm_session_stop();
+            /* Close button */
+            if (show_button && ms.x >= 2 && ms.x <= 42) {
+                wm_handle_close_button_click();
                 return;
             }
             /* Scroll left '<' */
@@ -1623,7 +1703,7 @@ void wm_compositor_tick(void) {
                             if (w->minimized) {
                                 w->minimized = false;
                                 wm_set_focus(w);
-                            } else if (w != wm_tail) {
+                            } else if (w != wm_get_focused()) {
                                 wm_set_focus(w);
                             } else {
                                 /* Already active and focused -> minimize */
@@ -1917,7 +1997,13 @@ void wm_compositor_tick(void) {
     uint8_t *bb = wm_get_backbuf();
     if (bb) {
         wm_compose(bb);
-        draw_cursor(bb, (int)ms.x, (int)ms.y);
+        process_t *fg = process_get_displayed_foreground();
+        if (!fg) fg = process_get_foreground();
+        uint32_t overlay_flags = fg ? fg->gfx_overlay_flags : 0;
+        bool show_cursor = !(overlay_flags & VGA_OVERLAY_HIDE_CURSOR);
+        if (show_cursor) {
+            draw_cursor(bb, (int)ms.x, (int)ms.y);
+        }
         vga_gfx_flip(bb);
     }
 }
@@ -1932,24 +2018,29 @@ void wm_get_screen_bounds(int *out_w, int *out_h) {
     vga_gfx_get_screen_bounds(out_w, out_h);
 }
 
-/** wm_session_start — start async compositor, return immediately. */
+/** wm_session_start — activate the compositor session and return immediately. */
 void wm_session_start(void) {
     if (wm_sess_active) return;
 
     process_t *fg = process_get_foreground();
-    bool should_switch_hw = (!process_is_batch_active() || !process_get_separate_windows() || (fg && (fg->wants_graphics || fg->is_wm_app)));
+    process_t *cur_proc = process_get_current();
+    bool should_switch_hw = (!process_is_batch_active() || !process_get_separate_windows() ||
+                             (fg && (fg->wants_graphics || fg->is_wm_app ||
+                                     (cur_proc && fg->window_id == cur_proc->window_id))));
 
+    int screen_w = 0, screen_h = 0;
     if (should_switch_hw) {
         vga_set_mode_13h_hardware();
         vga_gfx_init_default_palette();
+        wm_get_screen_bounds(&screen_w, &screen_h);
+        mouse_set_bounds(screen_w, screen_h);
+        keyboard_flush_queue();
+        keyboard_flush_hardware();
+    } else {
+        screen_w = VGA_GFX_WIDTH;
+        screen_h = VGA_GFX_HEIGHT;
     }
 
-    int screen_w = 0, screen_h = 0;
-    wm_get_screen_bounds(&screen_w, &screen_h);
-    mouse_set_bounds(screen_w, screen_h);
-
-    keyboard_flush_queue();
-    keyboard_flush_hardware();
     wm_sess_active = true;
     wm_prev_left   = false;
     drag_mode      = DRAG_NONE;
@@ -1995,10 +2086,87 @@ void wm_session_run(void) {
                 process_t *prev_mapped = process_get_mapped_app();
                 process_t *prev_cur = process_get_current();
                 if (owner) { process_map_app(owner); process_set_current(owner); }
+                bool in_proc = process_in_process_context();
+                if (in_proc) __asm__ volatile("sti" ::: "memory");
                 w->draw_cb(w);
+                if (in_proc) __asm__ volatile("cli" ::: "memory");
                 if (owner) { process_map_app(prev_mapped); process_set_current(prev_cur); }
             }
         }
         wm_compositor_tick();
+    }
+}
+
+void wm_raw_gfx_overlay_tick(void) {
+    if (!vga_is_graphics_mode() || wm_sess_active) return;
+
+    /* Get overlay flags from the foreground graphics process */
+    process_t *fg = process_get_displayed_foreground();
+    if (!fg) fg = process_get_foreground();
+    uint32_t overlay_flags = fg ? fg->gfx_overlay_flags : 0;
+
+    /* If everything is hidden, skip overlay entirely */
+    if ((overlay_flags & VGA_OVERLAY_HIDE_ALL) == VGA_OVERLAY_HIDE_ALL) return;
+
+    mouse_poll();
+    mouse_state_t ms;
+    mouse_get_state(&ms);
+    bool left_now = ms.left_button;
+    bool left_pressed = left_now && !wm_prev_left;
+    wm_prev_left = left_now;
+
+    uint8_t *vram = (uint8_t *)0xA0000;
+
+    static int prev_cx = -1, prev_cy = -1;
+    static uint8_t saved_under[64];
+    static bool has_saved = false;
+
+    bool show_cursor = !(overlay_flags & VGA_OVERLAY_HIDE_CURSOR);
+    bool show_button = !(overlay_flags & VGA_OVERLAY_HIDE_BUTTON);
+
+    /* Restore pixels under the previous cursor position */
+    if (has_saved && prev_cx >= 0 && prev_cy >= 0) {
+        for (int row = 0; row < 8; row++) {
+            int py = prev_cy + row;
+            if (py < 0 || py >= VGA_GFX_HEIGHT) continue;
+            for (int col = 0; col < 8; col++) {
+                int px = prev_cx + col;
+                if (px >= 0 && px < VGA_GFX_WIDTH) {
+                    vram[py * VGA_GFX_WIDTH + px] = saved_under[row * 8 + col];
+                }
+            }
+        }
+        has_saved = false;
+    }
+
+    /* Draw Close button only if not hidden */
+    if (show_button) {
+        wm_draw_close_button(vram, 2, TASKBAR_Y + 2, 40, 10, false);
+    }
+
+    /* Handle Close button click only if visible */
+    if (show_button && left_pressed && ms.x >= 2 && ms.x <= 42 && ms.y >= TASKBAR_Y) {
+        has_saved = false;
+        wm_handle_close_button_click();
+        return;
+    }
+
+    /* Draw software mouse cursor if not hidden */
+    if (show_cursor) {
+        prev_cx = (int)ms.x;
+        prev_cy = (int)ms.y;
+        for (int row = 0; row < 8; row++) {
+            int py = prev_cy + row;
+            for (int col = 0; col < 8; col++) {
+                int px = prev_cx + col;
+                if (px >= 0 && px < VGA_GFX_WIDTH && py >= 0 && py < VGA_GFX_HEIGHT) {
+                    saved_under[row * 8 + col] = vram[py * VGA_GFX_WIDTH + px];
+                } else {
+                    saved_under[row * 8 + col] = 0;
+                }
+            }
+        }
+        has_saved = true;
+        draw_cursor(vram, prev_cx, prev_cy);
     }
 }

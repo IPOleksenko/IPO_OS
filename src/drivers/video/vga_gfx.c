@@ -635,40 +635,61 @@ void vga_gfx_set_palette(uint8_t idx, uint8_t r, uint8_t g, uint8_t b) {
     outb(0x3C9, b & 0x3F);
 }
 
+static void vga_dac_write_entry(uint8_t idx, uint8_t r, uint8_t g, uint8_t b) {
+    process_t *cur = process_get_current();
+    if (cur) {
+        if (!cur->gfx_palette_backup) {
+            cur->gfx_palette_backup = (uint8_t *)kmalloc(768);
+            if (cur->gfx_palette_backup) {
+                memset(cur->gfx_palette_backup, 0, 768);
+            }
+        }
+        if (cur->gfx_palette_backup) {
+            cur->gfx_palette_backup[idx * 3 + 0] = r & 0x3F;
+            cur->gfx_palette_backup[idx * 3 + 1] = g & 0x3F;
+            cur->gfx_palette_backup[idx * 3 + 2] = b & 0x3F;
+        }
+    }
+    outb(0x3C8, idx);
+    outb(0x3C9, r & 0x3F);
+    outb(0x3C9, g & 0x3F);
+    outb(0x3C9, b & 0x3F);
+}
+
 void vga_gfx_init_default_palette(void) {
     /* 16 Standard Colors */
-    vga_gfx_set_palette(0,  0,  0,  0);
-    vga_gfx_set_palette(1,  0,  0, 42);
-    vga_gfx_set_palette(2,  0, 42,  0);
-    vga_gfx_set_palette(3,  0, 42, 42);
-    vga_gfx_set_palette(4, 42,  0,  0);
-    vga_gfx_set_palette(5, 42,  0, 42);
-    vga_gfx_set_palette(6, 42, 21,  0);
-    vga_gfx_set_palette(7, 42, 42, 42);
-    vga_gfx_set_palette(8, 21, 21, 21);
-    vga_gfx_set_palette(9, 21, 21, 63);
-    vga_gfx_set_palette(10, 21, 63, 21);
-    vga_gfx_set_palette(11, 21, 63, 63);
-    vga_gfx_set_palette(12, 63, 21, 21);
-    vga_gfx_set_palette(13, 63, 21, 63);
-    vga_gfx_set_palette(14, 63, 63, 21);
-    vga_gfx_set_palette(15, 63, 63, 63);
+    vga_dac_write_entry(0,  0,  0,  0);
+    vga_dac_write_entry(1,  0,  0, 42);
+    vga_dac_write_entry(2,  0, 42,  0);
+    vga_dac_write_entry(3,  0, 42, 42);
+    vga_dac_write_entry(4, 42,  0,  0);
+    vga_dac_write_entry(5, 42,  0, 42);
+    vga_dac_write_entry(6, 42, 21,  0);
+    vga_dac_write_entry(7, 42, 42, 42);
+    vga_dac_write_entry(8, 21, 21, 21);
+    vga_dac_write_entry(9, 21, 21, 63);
+    vga_dac_write_entry(10, 21, 63, 21);
+    vga_dac_write_entry(11, 21, 63, 63);
+    vga_dac_write_entry(12, 63, 21, 21);
+    vga_dac_write_entry(13, 63, 21, 63);
+    vga_dac_write_entry(14, 63, 63, 21);
+    vga_dac_write_entry(15, 63, 63, 63);
 
-    /* 16..31: Grayscale */
+    /* 16..31: 16-level monochrome grayscale ramp */
     for (int i = 0; i < 16; i++) {
-        uint8_t v = (uint8_t)(i * 4);
-        vga_gfx_set_palette((uint8_t)(16 + i), v, v, v);
+        uint8_t v = (uint8_t)(i * 63 / 15);
+        vga_dac_write_entry((uint8_t)(16 + i), v, v, v);
     }
 
-    /* 32..247: Vibrant 6x6x6 color cube */
+    /* 32..247: 6x6x6 RGB color cube (216 colors) */
     int idx = 32;
     for (int r = 0; r < 6; r++) {
         for (int g = 0; g < 6; g++) {
             for (int b = 0; b < 6; b++) {
-                vga_gfx_set_palette((uint8_t)idx++,
-                                    (uint8_t)(r * 12 + 3),
-                                    (uint8_t)(g * 12 + 3),
-                                    (uint8_t)(b * 12 + 3));
+                vga_dac_write_entry((uint8_t)idx++,
+                                    (uint8_t)(r * 63 / 5),
+                                    (uint8_t)(g * 63 / 5),
+                                    (uint8_t)(b * 63 / 5));
             }
         }
     }

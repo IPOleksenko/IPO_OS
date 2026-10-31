@@ -15,6 +15,10 @@ bool putchar_is_locked(void) {
     return output_lock != 0;
 }
 
+void putchar_unlock(void) {
+    output_lock = 0;
+}
+
 static void acquire_output_lock(void) {
     while (__sync_lock_test_and_set(&output_lock, 1)) {
         if (process_is_batch_active() && process_in_process_context()) {

@@ -81,7 +81,6 @@ int socket(int domain, int type, int protocol) {
         return -1;
     }
     if (type != SOCK_STREAM) {
-        /* Currently implementing TCP Stream Socket */
         return -1;
     }
 
@@ -468,4 +467,3 @@ int socket_close(int sockfd) {
 __attribute__((weak)) int close(int sockfd) {
     return socket_close(sockfd);
 }
-

@@ -9,6 +9,12 @@
 #define VGA_GFX_SIZE    (VGA_GFX_WIDTH * VGA_GFX_HEIGHT)
 #define VGA_GFX_VRAM_ADDR 0xA0000
 
+/* VGA Raw Graphics Overlay Flags */
+#define VGA_OVERLAY_SHOW_ALL     0x00u
+#define VGA_OVERLAY_HIDE_BUTTON  0x01u
+#define VGA_OVERLAY_HIDE_CURSOR  0x02u
+#define VGA_OVERLAY_HIDE_ALL     (VGA_OVERLAY_HIDE_BUTTON | VGA_OVERLAY_HIDE_CURSOR)
+
 /* Mode switching */
 void vga_set_mode_13h(void);
 void vga_set_mode_text(void);
@@ -45,5 +51,13 @@ void vga_gfx_flip(const uint8_t *buf);
 void vga_gfx_get_screen_bounds(int *out_w, int *out_h);
 int  vga_gfx_get_width(void);
 int  vga_gfx_get_height(void);
+
+/* Overlay controls */
+void vga_set_overlay_flags(uint32_t flags);
+uint32_t vga_get_overlay_flags(void);
+void vga_hide_close_button(void);
+void vga_show_close_button(void);
+void vga_hide_overlay_cursor(void);
+void vga_show_overlay_cursor(void);
 
 #endif /* LIB_VGA_GFX_H */

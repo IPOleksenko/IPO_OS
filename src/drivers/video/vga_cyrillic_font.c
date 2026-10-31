@@ -135,7 +135,7 @@ void vga_load_font(uint8_t start_code, uint32_t count, const uint8_t *glyphs) {
 }
 
 /* =========================================================================
- * UNIVERSAL DYNAMIC SELF-EXPANDING FONT DATABASE (No limits, no hardcoded arrays)
+ * Dynamically allocated font database
  * ========================================================================= */
 
 typedef struct {
@@ -507,7 +507,7 @@ static const uint8_t* vga_font_lookup_in_db(uint32_t codepoint) {
     return NULL;
 }
 
-/* Custom user-registered glyphs stored dynamically in heap (unlimited / infinite) */
+/* Custom user-registered glyphs stored dynamically in the heap. */
 typedef struct custom_glyph_node {
     uint32_t codepoint;
     uint8_t  *bitmap;

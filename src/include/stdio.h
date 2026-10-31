@@ -16,6 +16,7 @@
 void putchar_color(char c, uint8_t fg, uint8_t bg);
 
 bool putchar_is_locked(void);
+void putchar_unlock(void);
 
 /**
  * Low-level serial output (COM1)

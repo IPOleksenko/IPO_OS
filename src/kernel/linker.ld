@@ -3,6 +3,7 @@ ENTRY(_start)
 SECTIONS
 {
     . = 0x10000;
+    _kernel_text_start = .;
 
     .text :
     {
@@ -14,6 +15,9 @@ SECTIONS
         *(.rodata*)
     }
 
+    . = ALIGN(4096);
+    _kernel_rodata_end = .;
+
     .data :
     {
         *(.data*)
@@ -24,6 +28,7 @@ SECTIONS
         *(COMMON)
         *(.bss*)
     }
+    _kernel_bss_end = .;
 
     /DISCARD/ :
     {

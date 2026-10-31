@@ -108,7 +108,6 @@ void mouse_init(void) {
     mouse_write(0xF6);
     (void)mouse_read(); // ACK (0xFA)
 
-    // Microsoft IntelliMouse sequence to enable scroll wheel:
     // Set sample rate 200, then 100, then 80
     mouse_write(0xF3);
     (void)mouse_read(); // ACK
@@ -138,8 +137,8 @@ void mouse_init(void) {
         current_mouse_state.has_wheel = true;
         current_mouse_state.dev_id = dev_id;
         current_mouse_state.packet_size = 4;
-        printf("[mouse] IntelliMouse with wheel enabled (4-byte packets, ID=0x%x)\n", dev_id);
-    } else {
+        printf("[mouse] PS/2 extended protocol enabled (wheel, 4-byte packets, ID=0x%02x)\n",
+       (unsigned int)dev_id);    } else {
         mouse_packet_size = 3;
         mouse_has_wheel = false;
         current_mouse_state.has_wheel = false;
@@ -197,14 +196,12 @@ static void mouse_process_packet(void) {
     if (mouse_packet_size >= 4 && mouse_has_wheel) {
         int8_t z_raw = (int8_t)mouse_packet[3];
         if (mouse_device_id == 0x04) {
-            /* 5-button IntelliMouse Explorer: lower 4 bits are signed movement */
             int8_t z_4bit = (int8_t)(mouse_packet[3] & 0x0F);
             if (z_4bit & 0x08) {
                 z_4bit |= (int8_t)0xF0;
             }
             dz = (int32_t)z_4bit;
         } else {
-            /* Standard 3-button IntelliMouse: signed 8-bit movement */
             if (z_raw >= -8 && z_raw <= 8) {
                 dz = (int32_t)z_raw;
             } else {
@@ -339,4 +336,39 @@ void mouse_set_bounds_from_display(void) {
 void mouse_get_bounds(int32_t *out_x, int32_t *out_y) {
     if (out_x) *out_x = current_mouse_state.max_x;
     if (out_y) *out_y = current_mouse_state.max_y;
+}
+
+void mouse_get_position(int32_t *out_x, int32_t *out_y) {
+    if (!wm_session_active()) {
+        mouse_poll();
+    }
+    if (out_x) *out_x = current_mouse_state.x;
+    if (out_y) *out_y = current_mouse_state.y;
+}
+
+bool mouse_is_pressed(int button) {
+    if (!wm_session_active()) {
+        mouse_poll();
+    }
+    if (button == MOUSE_BTN_LEFT) return current_mouse_state.left_button;
+    if (button == MOUSE_BTN_RIGHT) return current_mouse_state.right_button;
+    if (button == MOUSE_BTN_MIDDLE) return current_mouse_state.middle_button;
+    return (current_mouse_state.buttons & (uint32_t)button) != 0;
+}
+
+bool mouse_is_in_region(int32_t x, int32_t y, int32_t w, int32_t h) {
+    if (!wm_session_active()) {
+        mouse_poll();
+    }
+    int32_t mx = current_mouse_state.x;
+    int32_t my = current_mouse_state.y;
+    return (mx >= x && mx < (x + w) && my >= y && my < (y + h));
+}
+
+bool mouse_is_clicked_in_region(int32_t x, int32_t y, int32_t w, int32_t h, int button) {
+    return mouse_is_in_region(x, y, w, h) && mouse_is_pressed(button);
+}
+
+bool mouse_check_click(int32_t x, int32_t y, int32_t w, int32_t h) {
+    return mouse_is_clicked_in_region(x, y, w, h, MOUSE_BTN_LEFT);
 }

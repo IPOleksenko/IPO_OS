@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 tools/generate_ksyms.py
-Extracts ALL defined function symbols (global, static, weak, assembly) from
-the pre-linked kernel ELF image and generates a compiled kernel symbol table (C source file).
+Extracts defined symbols from the pre-linked kernel ELF image and generates
+a compiled kernel symbol table (C source file).
 """
 
 import sys
@@ -80,7 +80,7 @@ def generate_c_file_from_elf(sym_map, output_path):
     lines.append("    void       *addr;")
     lines.append("} kernel_sym_entry_t;")
     lines.append("")
-    lines.append("/* Exported kernel symbol table sorted alphabetically by name */")
+    lines.append("/* Kernel symbol table sorted alphabetically by name */")
     lines.append("const kernel_sym_entry_t s_kernel_syms[] = {")
     for sym in sorted_syms:
         addr = sym_map[sym]
@@ -96,7 +96,7 @@ def generate_c_file_from_elf(sym_map, output_path):
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(content)
 
-    print(f"[generate_ksyms] Generated {output_path} with {len(sorted_syms)} exported kernel symbols.")
+    print(f"[generate_ksyms] Generated {output_path} with {len(sorted_syms)} kernel symbols.")
 
 def generate_c_file_from_objects(symbols, output_path):
     sorted_syms = sorted(symbols)
@@ -111,7 +111,7 @@ def generate_c_file_from_objects(symbols, output_path):
     lines.append("    void       *addr;")
     lines.append("} kernel_sym_entry_t;")
     lines.append("")
-    lines.append("/* Forward declarations of exported kernel functions */")
+    lines.append("/* Forward declarations for defined kernel symbols */")
     for sym in sorted_syms:
         if sym == "s_kernel_syms":
             continue
@@ -120,7 +120,7 @@ def generate_c_file_from_objects(symbols, output_path):
         else:
             lines.append(f"extern void {sym}(void);")
     lines.append("")
-    lines.append("/* Exported kernel symbol table sorted alphabetically by name */")
+    lines.append("/* Kernel symbol table sorted alphabetically by name */")
     lines.append("const kernel_sym_entry_t s_kernel_syms[] = {")
     for sym in sorted_syms:
         if sym == "s_kernel_syms_count":
@@ -138,7 +138,7 @@ def generate_c_file_from_objects(symbols, output_path):
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(content)
 
-    print(f"[generate_ksyms] Generated {output_path} with {len(sorted_syms)} exported kernel symbols.")
+    print(f"[generate_ksyms] Generated {output_path} with {len(sorted_syms)} kernel symbols.")
 
 def main():
     parser = argparse.ArgumentParser(description="Generate kernel symbol table")
