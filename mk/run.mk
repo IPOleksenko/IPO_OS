@@ -9,5 +9,4 @@ ifeq ($(NET_MODE),tap)
 		exit $$?; \
 	}
 endif
-	@python3 tools/create_live_image.py >/dev/null 2>&1 || true
 	$(QEMU) $(QEMU_FLAGS)

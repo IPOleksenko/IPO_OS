@@ -1,40 +1,35 @@
-.PHONY: image
-image: $(OS_IMAGE) disks live-image
+# ==============================================================================
+# IPO_OS - OS Image & Virtual Disks
+# ==============================================================================
 
-.PHONY: font-databases
-font-databases:
-	python3 tools/build_font_db.py
+.PHONY: image disks clean-disks
+
+image: $(OS_IMAGE) disks
 
 $(OS_IMAGE): $(BOOT_BIN) $(KERNEL_BIN)
+	@mkdir -p $(dir $@)
 	cat $^ > $@
 	@size=$$(stat -c %s $@); \
 	padded=$$(( ($$size + 511) / 512 * 512 )); \
 	truncate -s $$padded $@
 
-# Create a 512MB IMG disk (raw format)
+# Create a 512MB raw virtual disk if missing
 build/disk.img:
-	mkdir -p build
-	dd if=/dev/zero of=$@ bs=1M count=512
-	@echo "Created 512MB virtual disk: $@"
+	@mkdir -p build
+	@if [ ! -f "$@" ]; then \
+		dd if=/dev/zero of=$@ bs=1M count=512 status=none; \
+		echo "[image] Created 512MB virtual disk: $@"; \
+	fi
 
-# Create a 5MB ISO disk
+# Create a 5MB ISO disk if missing
 build/disk.iso:
-	mkdir -p build
-	dd if=/dev/zero of=$@ bs=1M count=5
-	@echo "Created 5MB ISO disk: $@"
+	@mkdir -p build
+	@if [ ! -f "$@" ]; then \
+		dd if=/dev/zero of=$@ bs=1M count=5 status=none; \
+		echo "[image] Created 5MB ISO disk: $@"; \
+	fi
 
-.PHONY: format-disk
-format-disk: $(BOOT_BIN) $(KERNEL_BIN) build/disk.img
-	python3 tools/format_disk_via_os.py --boot $(BOOT_BIN) --kernel $(KERNEL_BIN) --disk build/disk.img
+disks: $(BOOT_BIN) $(KERNEL_BIN) build/disk.img build/disk.iso
 
-.PHONY: disks
-disks: $(BOOT_BIN) $(KERNEL_BIN) build/disk.img build/disk.iso toolchain format-disk font-databases
-	python3 tools/load_applications.py
-
-.PHONY: live-image
-live-image: $(OS_IMAGE) disks
-	python3 tools/create_live_image.py
-
-.PHONY: clean-disks
 clean-disks:
 	rm -f build/disk.img build/disk.iso

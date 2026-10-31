@@ -15,7 +15,6 @@ QEMU    := qemu-system-i386
 # ==================================================
 
 SRC          := src
-APPS_DIR     := applications
 BUILD        := build
 
 
@@ -36,13 +35,6 @@ OS_IMAGE   := $(BUILD)/IPO_OS.img
 
 LIB_BUILD_DIR := $(BUILD)/lib
 LIB_A         := $(LIB_BUILD_DIR)/libk.a
-
-USER_LIBC_A   := $(LIB_BUILD_DIR)/libc.a
-USER_LIBM_A   := $(LIB_BUILD_DIR)/libm.a
-USER_LIBCXX_A := $(LIB_BUILD_DIR)/libstdc++.a
-USER_CRT0     := $(LIB_BUILD_DIR)/crt0.o
-USER_CRTI     := $(LIB_BUILD_DIR)/crti.o
-USER_CRTN     := $(LIB_BUILD_DIR)/crtn.o
 
 
 # ==================================================

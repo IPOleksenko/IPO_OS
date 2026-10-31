@@ -6,7 +6,12 @@ $(BUILD)/boot/config.inc: $(SRC)/boot/config.inc.in $(KERNEL_BIN)
 	@size=$$(stat -c %s $(KERNEL_BIN)); \
 	sectors=$$(( ($$size + 511) / 512 )); \
 	echo "KERNEL: $$size bytes -> $$sectors sectors"; \
-	sed "s/@KERNEL_SECTORS@/$$sectors/g" $< > $@
+	new_content=$$(sed "s/@KERNEL_SECTORS@/$$sectors/g" $<); \
+	if [ -f "$@" ] && [ "$$(cat "$@")" = "$$new_content" ]; then \
+		echo "Config already up to date"; \
+	else \
+		echo "$$new_content" > $@ 2>/dev/null || true; \
+	fi
 
 patch-config: $(KERNEL_BIN) $(BUILD)/boot/config.inc
 	@echo "Config updated"
