@@ -994,6 +994,38 @@ static uint32_t syscall_builtin_driver_set_desc(uint32_t num,
     return (uint32_t)res;
 }
 
+static uint32_t syscall_builtin_port_io(uint32_t num,
+                                        uint32_t argc,
+                                        uint32_t *argv) {
+    if (argv == NULL) return IPO_SYSCALL_ENOSYS;
+
+    switch (num) {
+        case IPO_SYSCALL_PORT_IN8:
+            if (argc < 1u) return IPO_SYSCALL_ENOSYS;
+            return inb((uint16_t)argv[0]);
+        case IPO_SYSCALL_PORT_OUT8:
+            if (argc < 2u) return IPO_SYSCALL_ENOSYS;
+            outb((uint16_t)argv[0], (uint8_t)argv[1]);
+            return IPO_SYSCALL_OK;
+        case IPO_SYSCALL_PORT_IN16:
+            if (argc < 1u) return IPO_SYSCALL_ENOSYS;
+            return inw((uint16_t)argv[0]);
+        case IPO_SYSCALL_PORT_OUT16:
+            if (argc < 2u) return IPO_SYSCALL_ENOSYS;
+            outw((uint16_t)argv[0], (uint16_t)argv[1]);
+            return IPO_SYSCALL_OK;
+        case IPO_SYSCALL_PORT_IN32:
+            if (argc < 1u) return IPO_SYSCALL_ENOSYS;
+            return inl((uint16_t)argv[0]);
+        case IPO_SYSCALL_PORT_OUT32:
+            if (argc < 2u) return IPO_SYSCALL_ENOSYS;
+            outl((uint16_t)argv[0], argv[1]);
+            return IPO_SYSCALL_OK;
+        default:
+            return IPO_SYSCALL_ENOSYS;
+    }
+}
+
 static uint32_t syscall_builtin_binfmt_register(uint32_t num,
                                                 uint32_t argc,
                                                 uint32_t *argv) {
@@ -2284,6 +2316,16 @@ static uint32_t syscall_builtin_vga_set_mode(uint32_t num, uint32_t argc, uint32
         vga_gfx_flip((const uint8_t *)(uintptr_t)argv[1]);
         return 0;
     }
+    if (argv[0] == 3 && argc >= 2 && argv[1] != 0) {
+        if (argc >= 4u) {
+            vga_gfx_flip_scaled_buffer((const uint8_t *)(uintptr_t)argv[1],
+                                       (int)argv[2],
+                                       (int)argv[3]);
+        } else {
+            vga_gfx_flip_desktop((const uint8_t *)(uintptr_t)argv[1]);
+        }
+        return 0;
+    }
     process_t *cur = process_get_current();
     process_t *fg = process_get_foreground();
     if (argv[0] == 1) {
@@ -2305,6 +2347,22 @@ static uint32_t syscall_builtin_vga_set_mode(uint32_t num, uint32_t argc, uint32
 static uint32_t syscall_builtin_vga_get_mode(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num; (void)argc; (void)argv;
     return vga_is_graphics_mode() ? 1 : 0;
+}
+
+static uint32_t syscall_builtin_vga_get_bounds(uint32_t num,
+                                                uint32_t argc,
+                                                uint32_t *argv) {
+    (void)num;
+    if (argc < 2u || !argv || !argv[0] || !argv[1]) {
+        return IPO_SYSCALL_ENOSYS;
+    }
+
+    int width;
+    int height;
+    vga_gfx_get_screen_bounds(&width, &height);
+    *(int32_t *)(uintptr_t)argv[0] = width;
+    *(int32_t *)(uintptr_t)argv[1] = height;
+    return 0;
 }
 
 static volatile bool kernel_system_interrupted = false;
@@ -2393,6 +2451,16 @@ static uint32_t syscall_builtin_mouse_get_state(uint32_t num, uint32_t argc, uin
     if (argc > 0 && argv && argv[0]) {
         mouse_get_state((mouse_state_t *)(uintptr_t)argv[0]);
     }
+    return 0;
+}
+
+static uint32_t syscall_builtin_mouse_get_motion(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 2u || !argv || !argv[0] || !argv[1]) {
+        return IPO_SYSCALL_ENOSYS;
+    }
+    mouse_get_cumulative_motion((int64_t *)(uintptr_t)argv[0],
+                                (int64_t *)(uintptr_t)argv[1]);
     return 0;
 }
 
@@ -2819,6 +2887,10 @@ void syscall_init(void) {
         syscall_builtin_vga_get_mode);
 
     ipo_register_syscall(
+        IPO_SYSCALL_VGA_GET_BOUNDS,
+        syscall_builtin_vga_get_bounds);
+
+    ipo_register_syscall(
         IPO_SYSCALL_SYSTEM_INTERRUPT,
         syscall_builtin_system_interrupt);
 
@@ -2837,6 +2909,13 @@ void syscall_init(void) {
     ipo_register_syscall(
         IPO_SYSCALL_DRIVER_SET_DESC,
         syscall_builtin_driver_set_desc);
+
+    ipo_register_syscall(IPO_SYSCALL_PORT_IN8, syscall_builtin_port_io);
+    ipo_register_syscall(IPO_SYSCALL_PORT_OUT8, syscall_builtin_port_io);
+    ipo_register_syscall(IPO_SYSCALL_PORT_IN16, syscall_builtin_port_io);
+    ipo_register_syscall(IPO_SYSCALL_PORT_OUT16, syscall_builtin_port_io);
+    ipo_register_syscall(IPO_SYSCALL_PORT_IN32, syscall_builtin_port_io);
+    ipo_register_syscall(IPO_SYSCALL_PORT_OUT32, syscall_builtin_port_io);
 
     ipo_register_syscall(
         IPO_SYSCALL_WM_CREATE_WINDOW,
@@ -2927,6 +3006,7 @@ void syscall_init(void) {
     ipo_register_syscall(IPO_SYSCALL_KBD_GET_KEY_STRING, syscall_builtin_kbd_get_key_string);
 
     ipo_register_syscall(IPO_SYSCALL_MOUSE_GET_STATE, syscall_builtin_mouse_get_state);
+    ipo_register_syscall(IPO_SYSCALL_MOUSE_GET_MOTION, syscall_builtin_mouse_get_motion);
 
     ipo_register_syscall(IPO_SYSCALL_VGA_SET_CURSOR, syscall_builtin_vga_set_cursor);
     ipo_register_syscall(IPO_SYSCALL_VGA_GET_CURSOR, syscall_builtin_vga_get_cursor);

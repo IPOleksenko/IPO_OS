@@ -73,6 +73,11 @@ void mouse_get_bounds(int32_t *out_x, int32_t *out_y);
 void mouse_get_position(int32_t *out_x, int32_t *out_y);
 
 /**
+ * Get cumulative relative mouse motion since initialization.
+ */
+void mouse_get_cumulative_motion(int64_t *out_x, int64_t *out_y);
+
+/**
  * Check if a specific mouse button is currently pressed (MOUSE_BTN_LEFT, MOUSE_BTN_RIGHT, MOUSE_BTN_MIDDLE).
  */
 bool mouse_is_pressed(int button);

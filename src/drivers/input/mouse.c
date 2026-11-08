@@ -33,6 +33,8 @@ static mouse_state_t current_mouse_state = {
     .event_count = 0
 };
 
+static int64_t cumulative_motion_x;
+static int64_t cumulative_motion_y;
 static uint8_t mouse_cycle = 0;
 static uint8_t mouse_packet[4] = {0, 0, 0, 0};
 static uint8_t mouse_packet_size = 3;
@@ -219,6 +221,8 @@ static void mouse_process_packet(void) {
 
     current_mouse_state.dx = dx;
     current_mouse_state.dy = dy;
+    cumulative_motion_x += dx;
+    cumulative_motion_y += dy;
     current_mouse_state.dz = dz;
     current_mouse_state.scroll_pos += dz;
 
@@ -289,10 +293,20 @@ void mouse_get_state(mouse_state_t *out_state) {
     *out_state = current_mouse_state;
 }
 
+void mouse_get_cumulative_motion(int64_t *out_x, int64_t *out_y) {
+    if (!wm_session_active()) {
+        mouse_poll();
+    }
+    if (out_x) *out_x = cumulative_motion_x;
+    if (out_y) *out_y = cumulative_motion_y;
+}
+
 void mouse_set_bounds(int32_t max_x, int32_t max_y) {
     if (max_x <= 0 || max_y <= 0) {
-        int w = 640, h = 400;
+        int w = VGA_TEXT_PIXEL_WIDTH, h = VGA_TEXT_PIXEL_HEIGHT;
         vga_gfx_get_screen_bounds(&w, &h);
+        if (w <= 0) w = VGA_GFX_WIDTH;
+        if (h <= 0) h = VGA_GFX_HEIGHT;
         if (max_x <= 0) max_x = w;
         if (max_y <= 0) max_y = h;
     }
@@ -330,7 +344,11 @@ void mouse_set_bounds(int32_t max_x, int32_t max_y) {
 }
 
 void mouse_set_bounds_from_display(void) {
-    mouse_set_bounds(0, 0);
+    if (wm_session_active()) {
+        mouse_set_bounds(VGA_GFX_WIDTH, VGA_GFX_HEIGHT);
+    } else {
+        mouse_set_bounds(0, 0);
+    }
 }
 
 void mouse_get_bounds(int32_t *out_x, int32_t *out_y) {

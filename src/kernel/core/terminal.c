@@ -1,6 +1,7 @@
 #include <kernel/terminal.h>
 
 #include <vga.h>
+#include <vga_gfx.h>
 #include <driver/input/keyboard.h>
 #include <driver/input/keymap/keymap.h>
 #include <driver/input/keymap/dynamic_keymap.h>
@@ -191,60 +192,6 @@ static inline uint16_t terminal_top_row(void) {
 
 static inline uint16_t terminal_rows(void) {
     return VGA_HEIGHT - terminal_top_row();
-}
-
-static char *make_abs_path_dyn(const char *rel_or_abs) {
-    size_t cwd_l = terminal_cwd ? strlen(terminal_cwd) : 0u;
-    size_t rel_l = rel_or_abs ? strlen(rel_or_abs) : 0u;
-    size_t temp_size = cwd_l + rel_l + 32u;
-    if (temp_size < 256u) temp_size = 256u;
-
-    char *temp = kmalloc(temp_size);
-    if (!temp) return NULL;
-
-    if (!rel_or_abs || rel_or_abs[0] == '\0') {
-        strncpy(temp, (terminal_cwd && terminal_cwd[0]) ? terminal_cwd : "/", temp_size - 1u);
-        temp[temp_size - 1u] = '\0';
-    } else if (rel_or_abs[0] == '/') {
-        strncpy(temp, rel_or_abs, temp_size - 1u);
-        temp[temp_size - 1u] = '\0';
-    } else {
-        if (strcmp(terminal_cwd, "/") == 0) {
-            snprintf(temp, temp_size, "/%s", rel_or_abs);
-        } else {
-            snprintf(temp, temp_size, "%s/%s", terminal_cwd, rel_or_abs);
-        }
-    }
-
-    char *out = kmalloc(temp_size);
-    if (!out) {
-        kfree(temp);
-        return NULL;
-    }
-    fs_canonicalize(temp, out, temp_size);
-    kfree(temp);
-    return out;
-}
-
-static char *path_combine_and_canonicalize(const char *dir, const char *file) {
-    if (!dir) return make_abs_path_dyn(file);
-    if (!file) return make_abs_path_dyn(dir);
-    size_t needed = strlen(dir) + strlen(file) + 32u;
-    char *combined = kmalloc(needed);
-    if (!combined) return NULL;
-    if (strcmp(dir, "/") == 0) {
-        snprintf(combined, needed, "/%s", file);
-    } else {
-        snprintf(combined, needed, "%s/%s", dir, file);
-    }
-    char *out = kmalloc(needed);
-    if (!out) {
-        kfree(combined);
-        return NULL;
-    }
-    fs_canonicalize(combined, out, needed);
-    kfree(combined);
-    return out;
 }
 
 void print_header(void) {
@@ -854,7 +801,7 @@ const char *terminal_get_cwd(void) {
 
 int terminal_set_cwd(const char *path) {
     if (!path || !*path) return -1;
-    char *target = make_abs_path_dyn(path);
+    char *target = fs_make_absolute_path(path, NULL);
     if (!target) return -1;
     uint32_t ino;
     struct ipo_inode st;
@@ -870,103 +817,29 @@ int terminal_set_cwd(const char *path) {
 char* resolve_command_path(const char *cmd) {
     if (!cmd || !cmd[0]) return NULL;
 
-    size_t cmd_len = strlen(cmd);
-    size_t cwd_len = terminal_cwd ? strlen(terminal_cwd) : 0u;
-    size_t buf_size = cmd_len + cwd_len + 64u;
-    if (buf_size < 256u) {
-        buf_size = 256u;
-    }
-
-    char *to_check = kmalloc(buf_size);
-    char *canonical = kmalloc(buf_size);
-    char *path = kmalloc(buf_size);
-
-    if (!to_check || !canonical || !path) {
-        if (to_check) kfree(to_check);
-        if (canonical) kfree(canonical);
-        if (path) kfree(path);
+    struct ipo_inode stat;
+    bool explicit_path = cmd[0] == '/' || cmd[0] == '.' || strchr(cmd, '/') != NULL;
+    char *candidate = fs_make_absolute_path(cmd, NULL);
+    if (explicit_path) {
+        if (candidate && ipo_fs_stat(candidate, &stat) &&
+            (stat.mode & IPO_INODE_TYPE_DIR) == 0) {
+            return candidate;
+        }
+        if (candidate) kfree(candidate);
         return NULL;
     }
-
-    uint32_t inode;
-    struct ipo_inode stat;
-
-    // Absolute path
-    if (cmd[0] == '/') {
-        strncpy(to_check, cmd, buf_size - 1);
-        to_check[buf_size - 1] = '\0';
-        fs_canonicalize(to_check, canonical, buf_size);
-        if (path_resolve(canonical, &inode) == 0 && 
-            ipo_fs_stat(canonical, &stat) && 
-            (stat.mode & IPO_INODE_TYPE_DIR) == 0) {
-            strncpy(path, canonical, buf_size - 1);
-            path[buf_size - 1] = '\0';
-            kfree(to_check);
-            kfree(canonical);
-            return path;
-        }
-    } 
-    // Relative path with ./ or ../ or subdirectories
-    else if (cmd[0] == '.' || strchr(cmd, '/')) {
-        char *abs = make_abs_path_dyn(cmd);
-        if (abs) {
-            strncpy(to_check, abs, buf_size - 1);
-            to_check[buf_size - 1] = '\0';
-            kfree(abs);
-        } else {
-            to_check[0] = '\0';
-        }
-        fs_canonicalize(to_check, canonical, buf_size);
-        if (path_resolve(canonical, &inode) == 0 && 
-            ipo_fs_stat(canonical, &stat) && 
-            (stat.mode & IPO_INODE_TYPE_DIR) == 0) {
-            strncpy(path, canonical, buf_size - 1);
-            path[buf_size - 1] = '\0';
-            kfree(to_check);
-            kfree(canonical);
-            return path;
-        }
+    if (candidate && ipo_fs_stat(candidate, &stat) &&
+        (stat.mode & IPO_INODE_TYPE_DIR) == 0) {
+        return candidate;
     }
-    // Simple command name: search in order: cwd, /applications
-    else {
-        static const char * const search_paths[] = {
-            NULL, /* indicates cwd */
-            "/applications",
-            NULL
-        };
+    if (candidate) kfree(candidate);
 
-        for (int i = 0; search_paths[i] != NULL || i == 0; i++) {
-            if (search_paths[i] == NULL && i == 0) {
-                char *abs = make_abs_path_dyn(cmd);
-                if (abs) {
-                    strncpy(to_check, abs, buf_size - 1);
-                    to_check[buf_size - 1] = '\0';
-                    kfree(abs);
-                } else {
-                    to_check[0] = '\0';
-                }
-            } else if (search_paths[i] != NULL) {
-                snprintf(to_check, buf_size, "%s/%s", search_paths[i], cmd);
-            } else {
-                break;
-            }
-
-            fs_canonicalize(to_check, canonical, buf_size);
-            if (path_resolve(canonical, &inode) == 0 && 
-                ipo_fs_stat(canonical, &stat) && 
-                (stat.mode & IPO_INODE_TYPE_DIR) == 0) {
-                strncpy(path, canonical, buf_size - 1);
-                path[buf_size - 1] = '\0';
-                kfree(to_check);
-                kfree(canonical);
-                return path;
-            }
-        }
+    candidate = fs_make_absolute_path(cmd, "/applications");
+    if (candidate && ipo_fs_stat(candidate, &stat) &&
+        (stat.mode & IPO_INODE_TYPE_DIR) == 0) {
+        return candidate;
     }
-
-    kfree(to_check);
-    kfree(canonical);
-    kfree(path);
+    if (candidate) kfree(candidate);
     return NULL;
 }
 
@@ -1004,6 +877,7 @@ bool terminal_is_builtin(const char *name) {
         "hardware",
         "startwm",
         "stopwm",
+        "resolution",
         NULL
     };
     for (int i = 0; builtins[i] != NULL; i++) {
@@ -1056,11 +930,19 @@ static void builtin_help(void) {
     printf("          |   - wait for left program to complete and pass return code to right.\n");
     printf("          ;   - wait until program completes, then run next program.\n");
     printf("        Switch workspaces: Ctrl + Page Up / Ctrl + Page Down; exit: Ctrl + C.\n");
+    printf("\n");
+    printf("  [Graphics & Display]\n");
     printf("    startwm\n");
     printf("      - Start the WM session.\n");
     printf("        The [Close] button closes the displayed workspace or stops the session.\n");
     printf("    stopwm\n");
     printf("      - Stop the WM compositor, destroy all windows, return to text mode.\n");
+    printf("    resolution <show | default | width height>\n");
+    printf("      - Use 'show' to display the selected graphics output size.\n");
+    printf("        Use 'default' for terminal size, or width and height in pixels to select a mode.\n");
+    printf("        width height - Horizontal and vertical resolution in pixels.\n");
+    printf("        The request is sent to the video device without checking its supported modes.\n");
+    printf("        BGA registers encode dimensions from 0 to 65535; rejected modes are not restored.\n");
     printf("\n");
     printf("  [Output & Redirection]\n");
     printf("    echo [text] [> file | >> file]\n");
@@ -1231,8 +1113,76 @@ static void builtin_pwd(void) {
     printf("%s\n", terminal_cwd);
 }
 
+static bool parse_resolution_dimension(const char *text, int *out_value,
+                                      bool *out_of_range) {
+    if (out_of_range) *out_of_range = false;
+    if (!text || !*text || !out_value) return false;
+    uint32_t value = 0;
+    for (const char *p = text; *p; p++) {
+        if (*p < '0' || *p > '9') return false;
+        uint32_t digit = (uint32_t)(*p - '0');
+        if (value > (0x7FFFFFFFu - digit) / 10u) {
+            if (out_of_range) *out_of_range = true;
+            return false;
+        }
+        value = value * 10u + digit;
+    }
+    *out_value = (int)value;
+    return true;
+}
+
+static void builtin_resolution(int argc, char **argv) {
+    int width;
+    int height;
+    bool width_out_of_range = false;
+    bool height_out_of_range = false;
+    if (argc == 1) {
+        printf("resolution: missing argument; use 'show', 'default', or 'width height'\n");
+        return;
+    }
+
+    if (argc == 2 && strcmp(argv[1], "show") == 0) {
+        vga_gfx_get_resolution(&width, &height);
+        printf("Selected graphics output: %d x %d\n", width, height);
+        return;
+    } else if (argc == 2 && strcmp(argv[1], "default") == 0) {
+        width = VGA_TEXT_PIXEL_WIDTH;
+        height = VGA_TEXT_PIXEL_HEIGHT;
+    } else if (argc == 3) {
+        bool width_valid = parse_resolution_dimension(
+            argv[1], &width, &width_out_of_range);
+        bool height_valid = parse_resolution_dimension(
+            argv[2], &height, &height_out_of_range);
+        if (!width_valid || !height_valid) {
+            if (width_out_of_range || height_out_of_range) {
+                printf("resolution: dimension exceeds the supported numeric range (0..2147483647)\n");
+            } else {
+                printf("Usage: resolution <show | default | width height>\n");
+            }
+            return;
+        }
+    } else {
+        printf("Usage: resolution <show | default | width height>\n");
+        return;
+    }
+
+    if (!vga_gfx_set_resolution(width, height)) {
+        int active_width;
+        int active_height;
+        vga_gfx_get_resolution(&active_width, &active_height);
+        printf("resolution: device did not apply %d x %d; active output is %d x %d\n",
+               width, height, active_width, active_height);
+        return;
+    }
+    if (argc == 2) {
+        printf("Graphics output reset to terminal size: %d x %d\n", width, height);
+    } else {
+        printf("Selected graphics output: %d x %d\n", width, height);
+    }
+}
+
 static void builtin_cd(int argc, char **argv) {
-    if (argc < 2 || strcmp(argv[1], "~") == 0) {
+    if (argc < 2) {
         terminal_cwd_set("/");
         return;
     }
@@ -1253,7 +1203,7 @@ static void builtin_cd(int argc, char **argv) {
             path_arg = combined_arg;
         }
     }
-    char *target = make_abs_path_dyn(path_arg);
+    char *target = fs_make_absolute_path(path_arg, NULL);
     if (!target) {
         if (combined_arg) kfree(combined_arg);
         printf("cd: out of memory\n");
@@ -1280,9 +1230,9 @@ static void builtin_cd(int argc, char **argv) {
 static void builtin_ls(int argc, char **argv) {
     char *target;
     if (argc >= 2) {
-        target = make_abs_path_dyn(argv[1]);
+        target = fs_make_absolute_path(argv[1], NULL);
     } else {
-        target = make_abs_path_dyn(terminal_cwd ? terminal_cwd : "/");
+        target = fs_make_absolute_path(terminal_cwd ? terminal_cwd : "/", NULL);
     }
     if (!target) { printf("ls: out of memory\n"); return; }
 
@@ -1339,7 +1289,7 @@ static void builtin_cat(int argc, char **argv) {
         return;
     }
     for (int a = 1; a < argc; a++) {
-        char *target = make_abs_path_dyn(argv[a]);
+        char *target = fs_make_absolute_path(argv[a], NULL);
         if (!target) continue;
 
         struct ipo_inode stat;
@@ -1395,7 +1345,7 @@ static void builtin_touch(int argc, char **argv) {
         return;
     }
     for (int a = 1; a < argc; a++) {
-        char *target = make_abs_path_dyn(argv[a]);
+        char *target = fs_make_absolute_path(argv[a], NULL);
         if (!target) continue;
 
         struct ipo_inode stat;
@@ -1418,7 +1368,7 @@ static void builtin_mkdir(int argc, char **argv) {
         return;
     }
     for (int a = 1; a < argc; a++) {
-        char *target = make_abs_path_dyn(argv[a]);
+        char *target = fs_make_absolute_path(argv[a], NULL);
         if (!target) continue;
 
         int ino = ipo_fs_create(target, IPO_INODE_TYPE_DIR);
@@ -1435,7 +1385,7 @@ static void builtin_rm(int argc, char **argv) {
         return;
     }
     for (int a = 1; a < argc; a++) {
-        char *target = make_abs_path_dyn(argv[a]);
+        char *target = fs_make_absolute_path(argv[a], NULL);
         if (!target) continue;
 
         struct ipo_inode stat;
@@ -1457,8 +1407,8 @@ static void builtin_cp(int argc, char **argv) {
         printf("Usage: cp <source> <dest>\n");
         return;
     }
-    char *src = make_abs_path_dyn(argv[1]);
-    char *dst = make_abs_path_dyn(argv[2]);
+    char *src = fs_make_absolute_path(argv[1], NULL);
+    char *dst = fs_make_absolute_path(argv[2], NULL);
     if (!src || !dst) {
         if (src) kfree(src);
         if (dst) kfree(dst);
@@ -1483,7 +1433,7 @@ static void builtin_cp(int argc, char **argv) {
     if (ipo_fs_stat(dst, &dst_stat) && (dst_stat.mode & IPO_INODE_TYPE_DIR) != 0) {
         const char *slash = strrchr(src, '/');
         const char *filename = slash ? (slash + 1) : src;
-        char *expanded_dst = path_combine_and_canonicalize(dst, filename);
+        char *expanded_dst = fs_make_absolute_path(filename, dst);
         if (expanded_dst) {
             kfree(dst);
             dst = expanded_dst;
@@ -1562,8 +1512,8 @@ static void builtin_mv(int argc, char **argv) {
         printf("Usage: mv <source> <dest>\n");
         return;
     }
-    char *src = make_abs_path_dyn(argv[1]);
-    char *dst = make_abs_path_dyn(argv[2]);
+    char *src = fs_make_absolute_path(argv[1], NULL);
+    char *dst = fs_make_absolute_path(argv[2], NULL);
     if (!src || !dst) {
         if (src) kfree(src);
         if (dst) kfree(dst);
@@ -1574,7 +1524,7 @@ static void builtin_mv(int argc, char **argv) {
     if (ipo_fs_stat(dst, &dst_stat) && (dst_stat.mode & IPO_INODE_TYPE_DIR) != 0) {
         const char *slash = strrchr(src, '/');
         const char *filename = slash ? (slash + 1) : src;
-        char *expanded_dst = path_combine_and_canonicalize(dst, filename);
+        char *expanded_dst = fs_make_absolute_path(filename, dst);
         if (expanded_dst) {
             kfree(dst);
             dst = expanded_dst;
@@ -1595,7 +1545,7 @@ static void builtin_stat(int argc, char **argv) {
         return;
     }
     for (int a = 1; a < argc; a++) {
-        char *target = make_abs_path_dyn(argv[a]);
+        char *target = fs_make_absolute_path(argv[a], NULL);
         if (!target) continue;
 
         uint32_t inode_num = 0;
@@ -2991,7 +2941,7 @@ int try_execute_command(const char *cmdline) {
         size_t redir_len = 0;
         stdout_redirect_end(&redir_buf, &redir_len);
 
-        char *target_path = make_abs_path_dyn(redir_file);
+        char *target_path = fs_make_absolute_path(redir_file, NULL);
 
         if (!ipo_fs_write_text(target_path ? target_path : redir_file, redir_buf ? redir_buf : "", append_mode)) {
             printf("redirection: failed to write to '%s'\n", redir_file);
@@ -3128,6 +3078,9 @@ int try_execute_command(const char *cmdline) {
     } else if (strcmp(name, "stopwm") == 0) {
         /* Stop the WM session and return to text mode */
         wm_session_stop();
+        builtin_handled = 1;
+    } else if (strcmp(name, "resolution") == 0) {
+        builtin_resolution(argc, argv);
         builtin_handled = 1;
     } else if (driver_dispatch_command(name, argc, argv) == 0) {
         builtin_handled = 1;

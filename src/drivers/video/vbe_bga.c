@@ -83,6 +83,21 @@ bool vbe_bga_is_enabled(void) {
     return (en & VBE_DISPI_ENABLED) != 0;
 }
 
+bool vbe_bga_mode_request_valid(int width, int height, int bpp) {
+    if (!vbe_bga_is_available() || width < 0 || height < 0 ||
+        (bpp != 8 && bpp != 15 && bpp != 16 && bpp != 24 && bpp != 32)) {
+        return false;
+    }
+
+    return true;
+}
+
+void vbe_bga_disable(void) {
+    if (vbe_bga_is_available()) {
+        bga_write_register(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_DISABLED);
+    }
+}
+
 uint32_t vbe_bga_get_lfb_address(void) {
     if (!g_bga_info.available) {
         vbe_bga_probe(NULL);
@@ -91,9 +106,11 @@ uint32_t vbe_bga_get_lfb_address(void) {
 }
 
 bool vbe_bga_set_mode(int width, int height, int bpp) {
-    if (!vbe_bga_is_available()) {
+    if (!vbe_bga_mode_request_valid(width, height, bpp)) {
         return false;
     }
+
+    serial_printf("[vbe_bga] requesting mode %dx%d at %d bpp\n", width, height, bpp);
 
     /* Save pristine standard VGA text state (fonts, registers, cursor, palette) */
     vga_save_text_state();
@@ -104,10 +121,20 @@ bool vbe_bga_set_mode(int width, int height, int bpp) {
     bga_write_register(VBE_DISPI_INDEX_BPP, (uint16_t)bpp);
     bga_write_register(VBE_DISPI_INDEX_ENABLE, VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED);
 
-    g_bga_info.width  = width;
-    g_bga_info.height = height;
-    g_bga_info.bpp    = bpp;
+    uint16_t actual_width = bga_read_register(VBE_DISPI_INDEX_XRES);
+    uint16_t actual_height = bga_read_register(VBE_DISPI_INDEX_YRES);
+    uint16_t actual_bpp = bga_read_register(VBE_DISPI_INDEX_BPP);
+    g_bga_info.width = actual_width;
+    g_bga_info.height = actual_height;
+    g_bga_info.bpp = actual_bpp;
     mouse_set_bounds_from_display();
+
+    if (actual_width != width || actual_height != height || actual_bpp != bpp) {
+        serial_printf("[vbe_bga] device rejected mode; read back %ux%u at %u bpp\n",
+                      actual_width, actual_height, actual_bpp);
+        return false;
+    }
+
     return true;
 }
 

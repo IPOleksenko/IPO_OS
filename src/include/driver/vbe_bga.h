@@ -49,6 +49,8 @@ typedef struct {
 bool     vbe_bga_probe(vbe_bga_info_t *out_info);
 bool     vbe_bga_is_available(void);
 bool     vbe_bga_is_enabled(void);
+bool     vbe_bga_mode_request_valid(int width, int height, int bpp);
+void     vbe_bga_disable(void);
 uint32_t vbe_bga_get_lfb_address(void);
 bool     vbe_bga_set_mode(int width, int height, int bpp);
 void     vbe_bga_restore_text_mode(void);
@@ -58,4 +60,3 @@ int      vbe_bga_get_height(void);
 int      vbe_bga_get_bpp(void);
 
 #endif /* LIB_DRIVER_VBE_BGA_H */
-

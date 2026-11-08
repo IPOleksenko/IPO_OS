@@ -103,6 +103,8 @@ int dir_find_entry(uint32_t dir_inode_no, const char *name, struct ipo_dir_entry
 bool is_valid_filename(const char *name);
 bool dir_add_entry(uint32_t dir_inode_no, const char *name, uint32_t inode_no, uint8_t type);
 bool dir_remove_entry(uint32_t dir_inode_no, const char *name);
+/* Returns a kmalloc-allocated absolute, canonical path; release it with kfree. */
+char *fs_make_absolute_path(const char *path, const char *base);
 void fs_canonicalize(const char *in, char *out, size_t out_size);
 int path_resolve_parent(const char *path, uint32_t *out_parent_inode, char *out_name);
 int path_resolve(const char *path, uint32_t *out_inode);

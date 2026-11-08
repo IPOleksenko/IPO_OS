@@ -137,6 +137,15 @@
 
 #define IPO_SYSCALL_FS_STATVFS        0x1064u
 
+#define IPO_SYSCALL_VGA_GET_BOUNDS    0x1065u
+
+#define IPO_SYSCALL_PORT_IN8          0x1066u
+#define IPO_SYSCALL_PORT_OUT8         0x1067u
+#define IPO_SYSCALL_PORT_IN16         0x1068u
+#define IPO_SYSCALL_PORT_OUT16        0x1069u
+#define IPO_SYSCALL_PORT_IN32         0x106Au
+#define IPO_SYSCALL_PORT_OUT32        0x106Bu
+
 #define IPO_SYSCALL_WM_CREATE_WINDOW   0x1070u
 
 #define IPO_SYSCALL_WM_DESTROY_WINDOW  0x1071u
@@ -191,6 +200,7 @@
 
 /* Mouse Syscalls */
 #define IPO_SYSCALL_MOUSE_GET_STATE       0x10B0u
+#define IPO_SYSCALL_MOUSE_GET_MOTION      0x10B1u
 
 /* VGA Hardware Syscalls */
 #define IPO_SYSCALL_VGA_SET_CURSOR        0x10C0u
@@ -499,6 +509,14 @@ static inline int ipo_vga_glyph(uint32_t codepoint) {
     return ipo_syscall(IPO_SYSCALL_VGA_GLYPH, 1u, args);
 }
 
+static inline int ipo_vga_get_screen_bounds(int32_t *width, int32_t *height) {
+    if (width == NULL || height == NULL) return -1;
+    uint32_t args[2];
+    args[0] = (uint32_t)(uintptr_t)width;
+    args[1] = (uint32_t)(uintptr_t)height;
+    return ipo_syscall(IPO_SYSCALL_VGA_GET_BOUNDS, 2u, args);
+}
+
 static inline int ipo_font_load_cyrillic(const char *path) {
     return ipo_font_load(path);
 }
@@ -545,6 +563,36 @@ static inline int ipo_driver_set_description(const char *name, const char *desc)
 
 static inline int ipo_driver_list(void) {
     return ipo_syscall(IPO_SYSCALL_DRIVER_LIST, 0u, (void *)0);
+}
+
+static inline uint8_t ipo_port_in8(uint16_t port) {
+    uint32_t args[1] = {port};
+    return (uint8_t)ipo_syscall(IPO_SYSCALL_PORT_IN8, 1u, args);
+}
+
+static inline int ipo_port_out8(uint16_t port, uint8_t value) {
+    uint32_t args[2] = {port, value};
+    return (int)ipo_syscall(IPO_SYSCALL_PORT_OUT8, 2u, args);
+}
+
+static inline uint16_t ipo_port_in16(uint16_t port) {
+    uint32_t args[1] = {port};
+    return (uint16_t)ipo_syscall(IPO_SYSCALL_PORT_IN16, 1u, args);
+}
+
+static inline int ipo_port_out16(uint16_t port, uint16_t value) {
+    uint32_t args[2] = {port, value};
+    return (int)ipo_syscall(IPO_SYSCALL_PORT_OUT16, 2u, args);
+}
+
+static inline uint32_t ipo_port_in32(uint16_t port) {
+    uint32_t args[1] = {port};
+    return ipo_syscall(IPO_SYSCALL_PORT_IN32, 1u, args);
+}
+
+static inline int ipo_port_out32(uint16_t port, uint32_t value) {
+    uint32_t args[2] = {port, value};
+    return (int)ipo_syscall(IPO_SYSCALL_PORT_OUT32, 2u, args);
 }
 
 static inline int ipo_binfmt_register(const char *name, const void *magic, uint32_t magic_len, uint32_t offset, const char *runner_path) {

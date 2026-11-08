@@ -162,7 +162,7 @@ bool ipo_fs_mount(uint64_t disk_start_lba) {
 }
 
 int ipo_fs_create(const char *path, uint8_t type) {
-    if (!fs_mounted) return -1;
+    if (!fs_mounted || !path) return -1;
     size_t plen = strlen(path);
     char *name = (char *)kmalloc(plen + 16);
     if (!name) return -1;
@@ -293,7 +293,7 @@ int ipo_fs_write(int fd, const void *buffer, uint32_t size, uint32_t offset) {
 }
 
 bool ipo_fs_delete(const char *path) {
-    if (!fs_mounted) return false;
+    if (!fs_mounted || !path) return false;
     size_t plen = strlen(path);
     char *name = (char *)kmalloc(plen + 16);
     if (!name) return false;

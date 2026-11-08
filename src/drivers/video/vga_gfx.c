@@ -195,6 +195,8 @@ static bool saved_cursor_visible = false;
 static bool has_saved_text_vram = false;
 static bool text_state_saved = false;
 static bool is_gfx = false;
+static int requested_gfx_width = VGA_TEXT_PIXEL_WIDTH;
+static int requested_gfx_height = VGA_TEXT_PIXEL_HEIGHT;
 
 static inline void crtc_write(uint8_t index, uint8_t val) {
     outb(0x3D4, index);
@@ -327,6 +329,40 @@ void vga_save_text_state(void) {
 
 void vga_set_mode_13h_hardware(void) {
     serial_printf("[vga] 13h hardware mode set (is_gfx=%d)\n", (int)is_gfx);
+    if (vbe_bga_is_available()) {
+        bool output_was_active = vga_is_graphics_mode() || vbe_bga_is_enabled();
+        if (vbe_bga_is_enabled() &&
+            vbe_bga_get_width() == requested_gfx_width &&
+            vbe_bga_get_height() == requested_gfx_height &&
+            vbe_bga_get_bpp() == 8) {
+            is_gfx = true;
+            return;
+        }
+        if (vbe_bga_set_mode(requested_gfx_width, requested_gfx_height, 8)) {
+            is_gfx = true;
+            vga_gfx_init_default_palette();
+            mouse_set_bounds_from_display();
+            return;
+        }
+        if (vbe_bga_is_enabled()) {
+            is_gfx = true;
+            mouse_set_bounds_from_display();
+            serial_printf("[vga] keeping device-applied mode %dx%d\n",
+                          vbe_bga_get_width(), vbe_bga_get_height());
+            return;
+        }
+        if (output_was_active) {
+            serial_printf("[vga] BGA did not apply requested mode %dx%d; keeping device state\n",
+                          requested_gfx_width, requested_gfx_height);
+            return;
+        }
+        serial_printf("[vga] requested BGA mode %dx%d unavailable; using Mode 13h\n",
+                      requested_gfx_width, requested_gfx_height);
+    }
+
+    if (vbe_bga_is_enabled()) {
+        vbe_bga_disable();
+    }
     if (vga_is_graphics_mode()) {
         return;
     }
@@ -409,6 +445,7 @@ void vga_set_mode_13h_hardware(void) {
 
 void vga_set_mode_text_hardware(void) {
     serial_printf("[vga] text hardware mode set (is_gfx=%d)\n", (int)is_gfx);
+    vbe_bga_disable();
     /* Always restore hardware text mode registers, sequencer, CRTC, GC, AC, DAC and font */
 
     /* Misc */
@@ -554,27 +591,27 @@ void vga_set_mode_text_hardware(void) {
 }
 
 bool vga_is_graphics_mode(void) {
+    if (vbe_bga_is_enabled()) return true;
     outb(0x3CE, 0x06);
     return (inb(0x3CF) & 0x01) != 0;
 }
 
 void vga_gfx_get_screen_bounds(int *out_w, int *out_h) {
-    int w = 640;
-    int h = 400;
+    int w = VGA_TEXT_PIXEL_WIDTH;
+    int h = VGA_TEXT_PIXEL_HEIGHT;
+    bool graphics_mode = is_gfx || vga_is_graphics_mode();
 
     if (vbe_bga_is_available() && vbe_bga_is_enabled()) {
         int bga_w = vbe_bga_get_width();
         int bga_h = vbe_bga_get_height();
-        if (bga_w > 0 && bga_h > 0) {
-            w = bga_w;
-            h = bga_h;
-        }
-    } else if (is_gfx || vga_is_graphics_mode()) {
+        w = bga_w;
+        h = bga_h;
+    } else if (graphics_mode) {
         w = VGA_GFX_WIDTH;
         h = VGA_GFX_HEIGHT;
     } else {
-        w = 640;
-        h = 400;
+        w = VGA_TEXT_PIXEL_WIDTH;
+        h = VGA_TEXT_PIXEL_HEIGHT;
     }
 
     if (out_w) *out_w = w;
@@ -591,6 +628,41 @@ int vga_gfx_get_height(void) {
     int w = 0, h = 0;
     vga_gfx_get_screen_bounds(&w, &h);
     return h;
+}
+
+bool vga_gfx_set_resolution(int width, int height) {
+    if (width < 0 || height < 0) return false;
+
+    bool output_was_active = vga_is_graphics_mode() || vbe_bga_is_enabled();
+    requested_gfx_width = width;
+    requested_gfx_height = height;
+
+    if (output_was_active) {
+        vga_set_mode_13h_hardware();
+        if (vbe_bga_is_enabled())
+            return vbe_bga_get_width() == width &&
+                   vbe_bga_get_height() == height &&
+                   vbe_bga_get_bpp() == 8;
+
+        return width == VGA_GFX_WIDTH && height == VGA_GFX_HEIGHT;
+    }
+    return true;
+}
+
+void vga_gfx_get_resolution(int *out_w, int *out_h) {
+    if (vbe_bga_is_enabled()) {
+        if (out_w) *out_w = vbe_bga_get_width();
+        if (out_h) *out_h = vbe_bga_get_height();
+        return;
+    }
+
+    if (vga_is_graphics_mode()) {
+        vga_gfx_get_screen_bounds(out_w, out_h);
+        return;
+    }
+
+    if (out_w) *out_w = requested_gfx_width;
+    if (out_h) *out_h = requested_gfx_height;
 }
 
 void vga_set_mode_13h(void) {
@@ -885,7 +957,20 @@ void vga_gfx_buf_fill_circle(uint8_t *buf, int xc, int yc, int r, uint8_t color)
     }
 }
 
-void vga_gfx_flip(const uint8_t *buf) {
+static void vga_gfx_present(const uint8_t *buf,
+                            bool scale_to_display,
+                            int source_width,
+                            int source_height) {
+    if (!buf) {
+        process_yield();
+        return;
+    }
+    if (source_width <= 0 || source_height <= 0 ||
+        (size_t)source_width > SIZE_MAX / (size_t)source_height) {
+        process_yield();
+        return;
+    }
+
     process_t *cur = process_get_current();
     if (cur && process_get_separate_windows()) {
         if (!cur->gfx_vram_backup) {
@@ -899,9 +984,109 @@ void vga_gfx_flip(const uint8_t *buf) {
         process_yield();
         return;
     }
+    if (vbe_bga_is_enabled()) {
+        if (vbe_bga_get_bpp() != 8) {
+            process_yield();
+            return;
+        }
+        int width = vbe_bga_get_width();
+        int height = vbe_bga_get_height();
+        uint8_t *framebuffer = (uint8_t *)vbe_bga_get_framebuffer();
+        if (!framebuffer || width <= 0 || height <= 0) {
+            process_yield();
+            return;
+        }
+
+        if (scale_to_display) {
+            for (int y = 0; y < height; y++) {
+                int source_y = (int)(((uint64_t)y * (uint32_t)source_height) /
+                                     (uint32_t)height);
+                uint8_t *dst = framebuffer + (size_t)y * (size_t)width;
+                const uint8_t *src = buf + (size_t)source_y * (size_t)source_width;
+                for (int x = 0; x < width; x++) {
+                    int source_x = (int)(((uint64_t)x * (uint32_t)source_width) /
+                                         (uint32_t)width);
+                    dst[x] = src[source_x];
+                }
+            }
+        } else {
+            int copy_width = width < source_width ? width : source_width;
+            int copy_height = height < source_height ? height : source_height;
+            int source_x = (source_width - copy_width) / 2;
+            int source_y = (source_height - copy_height) / 2;
+            int target_x = (width - copy_width) / 2;
+            int target_y = (height - copy_height) / 2;
+            for (int y = 0; y < target_y; y++) {
+                memset(framebuffer + (size_t)y * (size_t)width, 0, (size_t)width);
+            }
+            for (int y = 0; y < copy_height; y++) {
+                uint8_t *dst = framebuffer + (size_t)(target_y + y) * (size_t)width;
+                if (target_x > 0) {
+                    memset(dst, 0, (size_t)target_x);
+                }
+                memcpy(dst + target_x,
+                       buf + (size_t)(source_y + y) * (size_t)source_width + source_x,
+                       (size_t)copy_width);
+                if (target_x + copy_width < width) {
+                    memset(dst + target_x + copy_width, 0,
+                           (size_t)(width - target_x - copy_width));
+                }
+            }
+            for (int y = target_y + copy_height; y < height; y++) {
+                memset(framebuffer + (size_t)y * (size_t)width, 0, (size_t)width);
+            }
+        }
+        process_yield();
+        return;
+    }
     if (!vga_is_graphics_mode()) return;
 
     volatile uint8_t *vram = (volatile uint8_t *)VGA_VRAM_ADDR;
-    memcpy((void *)vram, buf, VGA_GFX_SIZE);
+    if (scale_to_display) {
+        for (int y = 0; y < VGA_GFX_HEIGHT; y++) {
+            int source_y = (int)(((uint64_t)y * (uint32_t)source_height) /
+                                 VGA_GFX_HEIGHT);
+            for (int x = 0; x < VGA_GFX_WIDTH; x++) {
+                int source_x = (int)(((uint64_t)x * (uint32_t)source_width) /
+                                     VGA_GFX_WIDTH);
+                vram[y * VGA_GFX_WIDTH + x] =
+                    buf[(size_t)source_y * (size_t)source_width + source_x];
+            }
+        }
+    } else {
+        int copy_width = source_width < VGA_GFX_WIDTH ? source_width : VGA_GFX_WIDTH;
+        int copy_height = source_height < VGA_GFX_HEIGHT ? source_height : VGA_GFX_HEIGHT;
+        int source_x = (source_width - copy_width) / 2;
+        int source_y = (source_height - copy_height) / 2;
+        int target_x = (VGA_GFX_WIDTH - copy_width) / 2;
+        int target_y = (VGA_GFX_HEIGHT - copy_height) / 2;
+        for (int y = 0; y < target_y; y++) {
+            memset((void *)(vram + (size_t)y * VGA_GFX_WIDTH), 0, VGA_GFX_WIDTH);
+        }
+        for (int y = 0; y < copy_height; y++) {
+            memset((void *)(vram + (size_t)(target_y + y) * VGA_GFX_WIDTH),
+                   0, VGA_GFX_WIDTH);
+            memcpy((void *)(vram + (size_t)(target_y + y) * VGA_GFX_WIDTH + target_x),
+                   buf + (size_t)(source_y + y) * (size_t)source_width + source_x,
+                   (size_t)copy_width);
+        }
+        for (int y = target_y + copy_height; y < VGA_GFX_HEIGHT; y++) {
+            memset((void *)(vram + (size_t)y * VGA_GFX_WIDTH), 0, VGA_GFX_WIDTH);
+        }
+    }
     process_yield();
+}
+
+void vga_gfx_flip(const uint8_t *buf) {
+    vga_gfx_present(buf, false, VGA_GFX_WIDTH, VGA_GFX_HEIGHT);
+}
+
+void vga_gfx_flip_desktop(const uint8_t *buf) {
+    vga_gfx_present(buf, true, VGA_GFX_WIDTH, VGA_GFX_HEIGHT);
+}
+
+void vga_gfx_flip_scaled_buffer(const uint8_t *buf,
+                                int source_width,
+                                int source_height) {
+    vga_gfx_present(buf, true, source_width, source_height);
 }

@@ -304,9 +304,7 @@ wm_window_t *wm_create_window(const wm_window_options_t *opts) {
         if (should_switch_hw) {
             vga_set_mode_13h_hardware();
             vga_gfx_init_default_palette();
-            int screen_w = 0, screen_h = 0;
-            wm_get_screen_bounds(&screen_w, &screen_h);
-            mouse_set_bounds(screen_w, screen_h);
+            mouse_set_bounds(VGA_GFX_WIDTH, VGA_GFX_HEIGHT);
         }
     }
 
@@ -2004,7 +2002,7 @@ void wm_compositor_tick(void) {
         if (show_cursor) {
             draw_cursor(bb, (int)ms.x, (int)ms.y);
         }
-        vga_gfx_flip(bb);
+        vga_gfx_flip_desktop(bb);
     }
 }
 
@@ -2028,17 +2026,13 @@ void wm_session_start(void) {
                              (fg && (fg->wants_graphics || fg->is_wm_app ||
                                      (cur_proc && fg->window_id == cur_proc->window_id))));
 
-    int screen_w = 0, screen_h = 0;
+    int screen_w = VGA_GFX_WIDTH, screen_h = VGA_GFX_HEIGHT;
     if (should_switch_hw) {
         vga_set_mode_13h_hardware();
         vga_gfx_init_default_palette();
-        wm_get_screen_bounds(&screen_w, &screen_h);
-        mouse_set_bounds(screen_w, screen_h);
+        mouse_set_bounds(VGA_GFX_WIDTH, VGA_GFX_HEIGHT);
         keyboard_flush_queue();
         keyboard_flush_hardware();
-    } else {
-        screen_w = VGA_GFX_WIDTH;
-        screen_h = VGA_GFX_HEIGHT;
     }
 
     wm_sess_active = true;
@@ -2053,7 +2047,7 @@ void wm_session_start(void) {
         wm_compose(init_bb);
         draw_cursor(init_bb, screen_w / 2, screen_h / 2);
         if (should_switch_hw) {
-            vga_gfx_flip(init_bb);
+            vga_gfx_flip_desktop(init_bb);
         }
     }
 }
