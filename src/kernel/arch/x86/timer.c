@@ -2,6 +2,7 @@
 #include <system/pit.h>
 #include <kernel/terminal.h>
 #include <kernel/process.h>
+#include <driver/audio_core.h>
 #include <stdio.h>
 #include <ioport.h>
 
@@ -48,6 +49,7 @@ void timer_update(void) {
 
 void timer_tick(void) {
     timer_update();
+    audio_poll();
     if (process_is_batch_active() && process_in_process_context() && !putchar_is_locked()) {
         if (timer_ms - last_slice_yield_ms >= 10u) {
             last_slice_yield_ms = timer_ms;
@@ -64,6 +66,7 @@ void timer_irq_handler(void) {
         timer_ticks++;
         last_tsc_value = read_tsc();
     }
+    audio_poll();
     if (process_is_batch_active() && process_in_process_context() && !putchar_is_locked()) {
         if (timer_ms - last_slice_yield_ms >= 10u) {
             last_slice_yield_ms = timer_ms;

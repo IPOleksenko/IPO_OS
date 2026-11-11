@@ -231,12 +231,15 @@ int scanf(const char *format, ...) {
                     invert = true;
                     pattern++;
                 }
-                char set_chars[256] = {0};
+                uint8_t *set_chars = (uint8_t *)kmalloc(256);
+                if (!set_chars) break;
+                memset(set_chars, 0, 256);
                 while (*pattern != ']' && *pattern != '\0') {
                     set_chars[(unsigned char)*pattern] = 1;
                     pattern++;
                 }
                 if (*pattern != ']') {
+                    kfree(set_chars);
                     break;
                 }
                 char *output = va_arg(args, char *);
@@ -252,6 +255,7 @@ int scanf(const char *format, ...) {
                     copied++;
                     text++;
                 }
+                kfree(set_chars);
                 if (copied == 0u) {
                     break;
                 }

@@ -531,6 +531,22 @@ bool pci_find_device(uint16_t vendor_id, uint16_t device_id, pci_device_t *out_d
     return false;
 }
 
+bool pci_find_class(uint8_t class_code, uint8_t subclass, pci_device_t *out_dev) {
+    if (s_pci_count == 0) {
+        pci_scan_all(NULL, NULL);
+    }
+
+    for (uint32_t i = 0; i < s_pci_count; i++) {
+        if (s_pci_devices[i].class_code == class_code && s_pci_devices[i].subclass == subclass) {
+            if (out_dev) {
+                *out_dev = s_pci_devices[i];
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 void pci_enable_bus_mastering(const pci_device_t *dev) {
     if (!dev) return;
     uint16_t cmd = pci_read_word(dev->bus, dev->slot, dev->func, 0x04);

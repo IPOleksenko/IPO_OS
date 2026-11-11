@@ -9,9 +9,30 @@
 
 #include <memory/kmalloc.h>
 
+void icmp_echo_reply_init(icmp_echo_reply_t *reply) {
+    if (!reply) return;
+    memset(reply, 0, sizeof(*reply));
+    reply->data = NULL;
+    reply->data_cap = 0;
+    reply->data_len = 0;
+}
+
+void icmp_echo_reply_free(icmp_echo_reply_t *reply) {
+    if (!reply) return;
+    if (reply->data) {
+        kfree(reply->data);
+        reply->data = NULL;
+    }
+    reply->data_cap = 0;
+    reply->data_len = 0;
+}
+
 void icmp_init(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
-    if (ctx->icmp_queue_capacity > 0) {
+    if (ctx->icmp_queue_capacity > 0 && ctx->icmp_queue) {
+        for (size_t i = 0; i < ctx->icmp_queue_capacity; i++) {
+            icmp_echo_reply_free(&ctx->icmp_queue[i]);
+        }
         memset(ctx->icmp_queue, 0, ctx->icmp_queue_capacity * sizeof(*ctx->icmp_queue));
     }
     ctx->icmp_q_idx = 0;
@@ -77,8 +98,17 @@ void icmp_receive(ip4_addr_t src_ip, uint8_t ttl, const void *data, uint16_t len
         
         /* Store reply in queue with dynamic expansion */
         net_shared_ctx_t *ctx = net_get_shared_context();
-        if (ctx->icmp_queue_capacity == 0) {
-            return;
+        if (ctx->icmp_queue_capacity == 0 || !ctx->icmp_queue) {
+            size_t init_cap = 16;
+            icmp_echo_reply_t *init_q = (icmp_echo_reply_t *)kmalloc(init_cap * sizeof(icmp_echo_reply_t));
+            if (!init_q) return;
+            for (size_t i = 0; i < init_cap; i++) {
+                init_q[i].id = 0xFFFF;
+                init_q[i].seq = 0xFFFF;
+            }
+            ctx->icmp_queue = init_q;
+            ctx->icmp_queue_capacity = init_cap;
+            ctx->icmp_q_idx = 0;
         }
         size_t free_slot = ctx->icmp_queue_capacity;
         for (size_t i = 0; i < ctx->icmp_queue_capacity; i++) {
@@ -118,12 +148,22 @@ void icmp_receive(ip4_addr_t src_ip, uint8_t ttl, const void *data, uint16_t len
         slot->recv_tsc = read_tsc();
 
         uint16_t payload_len = len - (uint16_t)sizeof(icmp_header_t);
-        if (payload_len > sizeof(slot->data)) {
-            payload_len = sizeof(slot->data);
-        }
-        slot->data_len = payload_len;
         if (payload_len > 0) {
-            memcpy(slot->data, (const uint8_t *)data + sizeof(icmp_header_t), payload_len);
+            if (payload_len > slot->data_cap || !slot->data) {
+                uint8_t *new_buf = (uint8_t *)krealloc(slot->data, payload_len);
+                if (new_buf) {
+                    slot->data = new_buf;
+                    slot->data_cap = payload_len;
+                }
+            }
+            if (slot->data) {
+                memcpy(slot->data, (const uint8_t *)data + sizeof(icmp_header_t), payload_len);
+                slot->data_len = payload_len;
+            } else {
+                slot->data_len = 0;
+            }
+        } else {
+            slot->data_len = 0;
         }
 
         ctx->icmp_q_idx = (free_slot + 1) % ctx->icmp_queue_capacity;
@@ -140,7 +180,26 @@ bool icmp_poll_reply(uint16_t id, uint16_t seq, icmp_echo_reply_t *out_reply, ui
         for (size_t i = 0; i < ctx->icmp_queue_capacity; i++) {
             if (ctx->icmp_queue[i].id == id && ctx->icmp_queue[i].seq == seq) {
                 if (out_reply) {
-                    memcpy(out_reply, &ctx->icmp_queue[i], sizeof(icmp_echo_reply_t));
+                    out_reply->src_ip = ctx->icmp_queue[i].src_ip;
+                    out_reply->ttl = ctx->icmp_queue[i].ttl;
+                    out_reply->type = ctx->icmp_queue[i].type;
+                    out_reply->code = ctx->icmp_queue[i].code;
+                    out_reply->id = ctx->icmp_queue[i].id;
+                    out_reply->seq = ctx->icmp_queue[i].seq;
+                    out_reply->recv_tsc = ctx->icmp_queue[i].recv_tsc;
+                    out_reply->data_len = ctx->icmp_queue[i].data_len;
+                    if (ctx->icmp_queue[i].data_len > 0 && ctx->icmp_queue[i].data) {
+                        if (ctx->icmp_queue[i].data_len > out_reply->data_cap || !out_reply->data) {
+                            uint8_t *new_buf = (uint8_t *)krealloc(out_reply->data, ctx->icmp_queue[i].data_len);
+                            if (new_buf) {
+                                out_reply->data = new_buf;
+                                out_reply->data_cap = ctx->icmp_queue[i].data_len;
+                            }
+                        }
+                        if (out_reply->data) {
+                            memcpy(out_reply->data, ctx->icmp_queue[i].data, ctx->icmp_queue[i].data_len);
+                        }
+                    }
                 }
                 /* Consume entry */
                 ctx->icmp_queue[i].id = 0xFFFF;
@@ -148,6 +207,40 @@ bool icmp_poll_reply(uint16_t id, uint16_t seq, icmp_echo_reply_t *out_reply, ui
                 return true;
             }
         }
+        ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
+        io_wait();
+    }
+
+    return false;
+}
+
+bool icmp_ping_ex(ip4_addr_t dst_ip, uint16_t id, uint16_t seq, uint8_t ttl,
+                  const void *payload, uint16_t len,
+                  uint32_t timeout_ms, uint32_t max_retries, uint32_t retry_interval_ms,
+                  icmp_echo_reply_t *out_reply) {
+    if (retry_interval_ms == 0) retry_interval_ms = 1000;
+    if (timeout_ms == 0) timeout_ms = 2000;
+
+    uint32_t retries_sent = 0;
+    uint32_t start = timer_millis();
+    uint32_t last_send = 0;
+
+    while (timer_millis() - start < timeout_ms) {
+        if (last_send == 0 || (timer_millis() - last_send >= retry_interval_ms)) {
+            if (last_send > 0 && max_retries > 0 && retries_sent >= max_retries) {
+                break;
+            }
+            if (icmp_send_echo(dst_ip, id, seq, ttl, payload, len) < 0) {
+                return false;
+            }
+            last_send = timer_millis();
+            if (last_send > start) retries_sent++;
+        }
+
+        if (icmp_poll_reply(id, seq, out_reply, 50)) {
+            return true;
+        }
+
         ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
         io_wait();
     }

@@ -2,6 +2,7 @@
 #include <net/udp.h>
 #include <net/ipv4.h>
 #include <net/net_state.h>
+#include <memory/kmalloc.h>
 #include <system/timer.h>
 #include <string.h>
 #include <stdio.h>
@@ -23,6 +24,17 @@ static ip4_addr_t s_offered_gateway = 0;
 static ip4_addr_t s_offered_dns = 0;
 static ip4_addr_t s_dhcp_server_id = 0;
 static volatile bool s_dhcp_ack_received = false;
+static uint16_t s_dhcp_max_msg_size = DHCP_DEFAULT_MAX_MSG_SIZE;
+
+uint16_t dhcp_get_max_message_size(void) {
+    return s_dhcp_max_msg_size > 0 ? s_dhcp_max_msg_size : DHCP_DEFAULT_MAX_MSG_SIZE;
+}
+
+void dhcp_set_max_message_size(uint16_t max_size) {
+    if (max_size >= 576) {
+        s_dhcp_max_msg_size = max_size;
+    }
+}
 
 typedef struct {
     uint8_t  op;
@@ -252,6 +264,10 @@ void dhcp_process_packet(const void *data, uint16_t len) {
         if (dns != 0) s_offered_dns = dns;
         s_dhcp_ack_received = true;
         s_dhcp_state = DHCP_STATE_ACK_RECEIVED;
+    } else if (msg_type == DHCP_NAK && s_dhcp_state == DHCP_STATE_REQUEST_SENT) {
+        serial_printf("[dhcp] Received DHCPNAK from server\n");
+        s_dhcp_state = DHCP_STATE_IDLE;
+        s_offered_ip = 0;
     }
 
     dhcp_packet_free(&pkt);
@@ -281,19 +297,62 @@ bool dhcp_request_lease(uint32_t timeout_ms) {
     dhcp_packet_init(&discover_pkt);
     discover_pkt.op = DHCP_OP_BOOTREQUEST;
     discover_pkt.htype = DHCP_HTYPE_ETHERNET;
-    discover_pkt.hlen = DHCP_HLEN_ETHERNET;
+    discover_pkt.hlen = (uint8_t)(mac_get_len(&netif->mac) <= 16 ? mac_get_len(&netif->mac) : 6);
     discover_pkt.hops = 0;
     discover_pkt.xid = htonl(s_dhcp_xid);
     discover_pkt.secs = 0;
     discover_pkt.flags = htons(0x8000); // Broadcast response requested
-    dyn_buf_append(&discover_pkt.chaddr, netif->mac.mac, 6);
+    const uint8_t *chaddr_bytes = mac_get_bytes(&netif->mac);
+    size_t mac_l = mac_get_len(&netif->mac);
+    if (chaddr_bytes && mac_l > 0) {
+        size_t chaddr_copy = mac_l <= 16 ? mac_l : 16;
+        dyn_buf_append(&discover_pkt.chaddr, chaddr_bytes, chaddr_copy);
+    } else {
+        size_t zlen = mac_l ? mac_l : 6;
+        uint8_t *zero_mac = (uint8_t *)kmalloc(zlen);
+        if (zero_mac) {
+            memset(zero_mac, 0, zlen);
+            dyn_buf_append(&discover_pkt.chaddr, zero_mac, zlen <= 16 ? zlen : 16);
+            kfree(zero_mac);
+        }
+    }
     discover_pkt.magic_cookie = htonl(DHCP_MAGIC_COOKIE);
 
     /* Options appended dynamically to self-expanding discover_pkt.options */
     uint8_t opt_msg_type[3] = { DHCP_OPT_MESSAGE_TYPE, 1, DHCP_DISCOVER };
     dyn_buf_append(&discover_pkt.options, opt_msg_type, sizeof(opt_msg_type));
 
-    uint8_t opt_params[5] = { DHCP_OPT_PARAM_REQUEST, 3, DHCP_OPT_SUBNET_MASK, DHCP_OPT_ROUTER, DHCP_OPT_DNS };
+    /* Client Identifier (Hardware Type = 1 [Ethernet] + MAC) */
+    if (chaddr_bytes && mac_l > 0 && mac_l <= 64) {
+        uint8_t cid_hdr[3] = { DHCP_OPT_CLIENT_ID, (uint8_t)(1 + mac_l), 1 };
+        dyn_buf_append(&discover_pkt.options, cid_hdr, 3);
+        dyn_buf_append(&discover_pkt.options, chaddr_bytes, mac_l);
+    }
+
+    /* Maximum DHCP Message Size (self-expanding dynamically via dhcp_get_max_message_size()) */
+    uint16_t cur_max_size = dhcp_get_max_message_size();
+    uint8_t opt_max_size[4] = {
+        DHCP_OPT_MAX_MSG_SIZE, 2,
+        (uint8_t)(cur_max_size >> 8),
+        (uint8_t)(cur_max_size & 0xFF)
+    };
+    dyn_buf_append(&discover_pkt.options, opt_max_size, sizeof(opt_max_size));
+
+    /* Host Name ("ipo-os") */
+    const char hostname[] = "ipo-os";
+    uint8_t host_hdr[2] = { DHCP_OPT_HOSTNAME, (uint8_t)(sizeof(hostname) - 1) };
+    dyn_buf_append(&discover_pkt.options, host_hdr, 2);
+    dyn_buf_append(&discover_pkt.options, hostname, sizeof(hostname) - 1);
+
+    /* Parameter Request List */
+    uint8_t opt_params[] = {
+        DHCP_OPT_PARAM_REQUEST, 5,
+        DHCP_OPT_SUBNET_MASK,
+        DHCP_OPT_ROUTER,
+        DHCP_OPT_DNS,
+        DHCP_OPT_DOMAIN_NAME,
+        DHCP_OPT_BROADCAST_ADDR
+    };
     dyn_buf_append(&discover_pkt.options, opt_params, sizeof(opt_params));
 
     uint8_t opt_end = DHCP_OPT_END;
@@ -307,7 +366,11 @@ bool dhcp_request_lease(uint32_t timeout_ms) {
     s_dhcp_state = DHCP_STATE_DISCOVER_SENT;
     udp_send(IP4_ADDR_BROADCAST, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, discover_wire.data, (uint16_t)discover_wire.size);
 
-    /* Wait for DHCP Offer */
+    /* Wait for DHCP Offer with exponential backoff */
+    static const uint32_t retry_intervals_ms[] = { 1000, 2000, 3000, 4000 };
+    size_t retry_idx = 0;
+    size_t max_retries = sizeof(retry_intervals_ms) / sizeof(retry_intervals_ms[0]);
+
     uint32_t start_ms = timer_millis();
     uint32_t last_send_ms = start_ms;
 
@@ -316,9 +379,11 @@ bool dhcp_request_lease(uint32_t timeout_ms) {
         if (s_dhcp_state == DHCP_STATE_OFFER_RECEIVED) {
             break;
         }
-        if (timer_millis() - last_send_ms >= 500) {
+        uint32_t current_interval = (retry_idx < max_retries) ? retry_intervals_ms[retry_idx] : 4000;
+        if (timer_millis() - last_send_ms >= current_interval) {
             udp_send(IP4_ADDR_BROADCAST, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, discover_wire.data, (uint16_t)discover_wire.size);
             last_send_ms = timer_millis();
+            if (retry_idx < max_retries) retry_idx++;
         }
         io_wait();
     }
@@ -336,12 +401,25 @@ bool dhcp_request_lease(uint32_t timeout_ms) {
     dhcp_packet_init(&request_pkt);
     request_pkt.op = DHCP_OP_BOOTREQUEST;
     request_pkt.htype = DHCP_HTYPE_ETHERNET;
-    request_pkt.hlen = DHCP_HLEN_ETHERNET;
+    request_pkt.hlen = (uint8_t)(mac_get_len(&netif->mac) <= 16 ? mac_get_len(&netif->mac) : 6);
     request_pkt.hops = 0;
     request_pkt.xid = htonl(s_dhcp_xid);
     request_pkt.secs = 0;
     request_pkt.flags = htons(0x8000);
-    dyn_buf_append(&request_pkt.chaddr, netif->mac.mac, 6);
+    const uint8_t *req_chaddr = mac_get_bytes(&netif->mac);
+    size_t req_mac_l = mac_get_len(&netif->mac);
+    if (req_chaddr && req_mac_l > 0) {
+        size_t chaddr_copy = req_mac_l <= 16 ? req_mac_l : 16;
+        dyn_buf_append(&request_pkt.chaddr, req_chaddr, chaddr_copy);
+    } else {
+        size_t zlen = req_mac_l ? req_mac_l : 6;
+        uint8_t *zero_mac = (uint8_t *)kmalloc(zlen);
+        if (zero_mac) {
+            memset(zero_mac, 0, zlen);
+            dyn_buf_append(&request_pkt.chaddr, zero_mac, zlen <= 16 ? zlen : 16);
+            kfree(zero_mac);
+        }
+    }
     request_pkt.magic_cookie = htonl(DHCP_MAGIC_COOKIE);
 
     uint8_t req_msg_type[3] = { DHCP_OPT_MESSAGE_TYPE, 1, DHCP_REQUEST };
@@ -367,8 +445,22 @@ bool dhcp_request_lease(uint32_t timeout_ms) {
         dyn_buf_append(&request_pkt.options, srv_id, sizeof(srv_id));
     }
 
-    uint8_t req_params[5] = { DHCP_OPT_PARAM_REQUEST, 3, DHCP_OPT_SUBNET_MASK, DHCP_OPT_ROUTER, DHCP_OPT_DNS };
-    dyn_buf_append(&request_pkt.options, req_params, sizeof(req_params));
+    /* Client Identifier (Hardware Type = 1 [Ethernet] + MAC) */
+    if (req_chaddr && req_mac_l > 0 && req_mac_l <= 64) {
+        uint8_t req_cid_hdr[3] = { DHCP_OPT_CLIENT_ID, (uint8_t)(1 + req_mac_l), 1 };
+        dyn_buf_append(&request_pkt.options, req_cid_hdr, 3);
+        dyn_buf_append(&request_pkt.options, req_chaddr, req_mac_l);
+    }
+
+    /* Maximum DHCP Message Size */
+    dyn_buf_append(&request_pkt.options, opt_max_size, sizeof(opt_max_size));
+
+    /* Host Name */
+    dyn_buf_append(&request_pkt.options, host_hdr, 2);
+    dyn_buf_append(&request_pkt.options, hostname, sizeof(hostname) - 1);
+
+    /* Parameter Request List */
+    dyn_buf_append(&request_pkt.options, opt_params, sizeof(opt_params));
 
     uint8_t req_end = DHCP_OPT_END;
     dyn_buf_append(&request_pkt.options, &req_end, 1);
@@ -381,7 +473,8 @@ bool dhcp_request_lease(uint32_t timeout_ms) {
     s_dhcp_state = DHCP_STATE_REQUEST_SENT;
     udp_send(IP4_ADDR_BROADCAST, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, request_wire.data, (uint16_t)request_wire.size);
 
-    /* Wait for DHCP ACK */
+    /* Wait for DHCP ACK with exponential backoff */
+    retry_idx = 0;
     start_ms = timer_millis();
     last_send_ms = start_ms;
 
@@ -390,9 +483,11 @@ bool dhcp_request_lease(uint32_t timeout_ms) {
         if (s_dhcp_ack_received) {
             break;
         }
-        if (timer_millis() - last_send_ms >= 500) {
+        uint32_t current_interval = (retry_idx < max_retries) ? retry_intervals_ms[retry_idx] : 4000;
+        if (timer_millis() - last_send_ms >= current_interval) {
             udp_send(IP4_ADDR_BROADCAST, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, request_wire.data, (uint16_t)request_wire.size);
             last_send_ms = timer_millis();
+            if (retry_idx < max_retries) retry_idx++;
         }
         io_wait();
     }
@@ -418,7 +513,7 @@ bool dhcp_request_lease(uint32_t timeout_ms) {
     ip_to_str(s_offered_gateway, gw_s, sizeof(gw_s));
     ip_to_str(s_offered_dns, dns_s, sizeof(dns_s));
 
-    serial_printf("[dhcp] Lease acquired: IP=%s, Mask=%s, Gateway=%s, DNS=%s\n",
+    printf("[dhcp] Lease acquired: IP=%s, Mask=%s, Gateway=%s, DNS=%s\n",
                   ip_s, mask_s, gw_s, dns_s);
 
     s_dhcp_state = DHCP_STATE_IDLE;

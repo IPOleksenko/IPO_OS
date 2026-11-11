@@ -116,7 +116,9 @@ static void terminal_cwd_init(void) {
 #define SCROLL_HISTORY_CLEAR_THRESHOLD (SCROLL_HISTORY_SIZE * 3 / 4)
 #define SCROLL_HISTORY_KEEP_SIZE (SCROLL_HISTORY_SIZE / 2)
 static uint16_t (*terminal_top_buffer)[VGA_WIDTH] = NULL;
+static size_t terminal_top_cap = 0;
 static uint16_t (*terminal_bottom_buffer)[VGA_WIDTH] = NULL;
+static size_t terminal_bottom_cap = 0;
 
 /* Scroll state */
 static int top_buffer_count = 0;
@@ -124,8 +126,12 @@ static int bottom_buffer_count = 0;
 
 static inline void init_scroll_buffer(uint16_t (*buf)[VGA_WIDTH]) {
     if (!buf) return;
+    size_t lines = terminal_top_cap ? terminal_top_cap : 128;
+    if (buf == terminal_bottom_buffer && terminal_bottom_cap) {
+        lines = terminal_bottom_cap;
+    }
     uint16_t blank = vga_entry(' ', VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-    for (size_t i = 0; i < SCROLL_HISTORY_SIZE * VGA_WIDTH; i++) {
+    for (size_t i = 0; i < lines * VGA_WIDTH; i++) {
         ((uint16_t *)buf)[i] = blank;
     }
 }
@@ -138,7 +144,8 @@ static inline uint16_t (*active_top_buffer(void))[VGA_WIDTH] {
         }
     }
     if (!terminal_top_buffer) {
-        terminal_top_buffer = (uint16_t (*)[VGA_WIDTH])kmalloc(SCROLL_HISTORY_SIZE * VGA_WIDTH * sizeof(uint16_t));
+        terminal_top_cap = 128;
+        terminal_top_buffer = (uint16_t (*)[VGA_WIDTH])kmalloc(terminal_top_cap * VGA_WIDTH * sizeof(uint16_t));
         if (terminal_top_buffer) {
             init_scroll_buffer(terminal_top_buffer);
         }
@@ -164,7 +171,8 @@ static inline uint16_t (*active_bottom_buffer(void))[VGA_WIDTH] {
         }
     }
     if (!terminal_bottom_buffer) {
-        terminal_bottom_buffer = (uint16_t (*)[VGA_WIDTH])kmalloc(SCROLL_HISTORY_SIZE * VGA_WIDTH * sizeof(uint16_t));
+        terminal_bottom_cap = 128;
+        terminal_bottom_buffer = (uint16_t (*)[VGA_WIDTH])kmalloc(terminal_bottom_cap * VGA_WIDTH * sizeof(uint16_t));
         if (terminal_bottom_buffer) {
             init_scroll_buffer(terminal_bottom_buffer);
         }
@@ -253,7 +261,7 @@ void terminal_render_language_bar(void) {
 
     const char *lang_name = dynamic_keymap_get_name();
     if (lang_name == NULL || lang_name[0] == '\0') {
-        lang_name = "Unknown";
+        lang_name = default_keymap_name;
     }
     size_t len = strlen(lang_name);
 
@@ -650,14 +658,21 @@ static void save_top_line(uint16_t row) {
         return;
     }
 
-    if (*top_cnt >= SCROLL_HISTORY_SIZE) {
-        trim_top_buffer();
+    if (!(process_is_batch_active() && process_get_separate_windows())) {
+        if ((size_t)(*top_cnt) >= terminal_top_cap) {
+            size_t new_cap = (terminal_top_cap == 0) ? 128 : (terminal_top_cap * 2);
+            uint16_t (*new_buf)[VGA_WIDTH] = (uint16_t (*)[VGA_WIDTH])krealloc(
+                terminal_top_buffer, new_cap * VGA_WIDTH * sizeof(uint16_t));
+            if (new_buf) {
+                terminal_top_buffer = new_buf;
+                terminal_top_cap = new_cap;
+                top_buf = new_buf;
+            }
+        }
     }
 
-    if (*top_cnt < SCROLL_HISTORY_SIZE) {
-        read_line_from_vga(row, top_buf[*top_cnt]);
-        (*top_cnt)++;
-    }
+    read_line_from_vga(row, top_buf[*top_cnt]);
+    (*top_cnt)++;
 }
 
 /* Scroll down - restore next line from history if available */
@@ -803,7 +818,7 @@ int terminal_set_cwd(const char *path) {
     if (!path || !*path) return -1;
     char *target = fs_make_absolute_path(path, NULL);
     if (!target) return -1;
-    uint32_t ino;
+    uint64_t ino;
     struct ipo_inode st;
     if (path_resolve(target, &ino) < 0 || !ipo_fs_stat(target, &st) || (st.mode & IPO_INODE_TYPE_DIR) == 0) {
         kfree(target);
@@ -961,7 +976,7 @@ static void builtin_help(void) {
     printf("  [Hardware Resources & Infrastructure]\n");
     printf("    hardware [overview | list | cpu | memory | pci | storage | network | usb | refresh | info <id> | status]\n");
     printf("      - Inspect hardware resources scanned directly from hardware buses & tables:\n");
-    printf("          overview (default) : Summary of CPU, RAM, PCI, ATA storage, network, and device registry.\n");
+    printf("          overview (default): Summary of CPU, memory, PCI devices, ATA/IDE storage, network interfaces, and device registry statistics.\n");
     printf("          list               : Table of all discovered hardware & ACPI devices with IDs and resources.\n");
     printf("          cpu                : CPU vendor/brand/features, logical cores table, and SMP status.\n");
     printf("          memory             : BIOS E820 physical memory map and managed memory pools.\n");
@@ -974,8 +989,7 @@ static void builtin_help(void) {
     printf("          status             : System hardware health and device count breakdown by state and type.\n");
     printf("    storage [list | status | usage | check | create [uuid] [dev] | add <dev> | recover | save]\n");
     printf("      - Manage multi-disk storage pool, block devices, partitions, superblocks, and WAL journal:\n");
-    printf("          list (default)     : Show storage pool status and scan all physical block devices & partitions.\n");
-    printf("          status             : Show unified storage pool state, superblock LBAs, WAL journal, and members.\n");
+    printf("          list (default)     : Show storage pool configuration, member disks, transaction journal statistics, physical block devices, and partition tables.\n");    printf("          status             : Show unified storage pool state, superblock LBAs, WAL journal, and members.\n");
     printf("          usage              : Show volume space usage, active filesystem stats, and member drive breakdown.\n");
     printf("          check              : Verify sector 0, primary/backup superblock CRCs, partitions, and WAL journal.\n");
     printf("          create [uuid] [dev]: Create a persistent storage pool with optional UUID on target block device.\n");
@@ -985,9 +999,9 @@ static void builtin_help(void) {
     printf("\n");
     printf("  [Disk & Memory Info]\n");
     printf("    df\n");
-    printf("      - Show storage pool capacity: total, used, free blocks, inodes, drives.\n");
+    printf("      - Show storage pool, block size, blocks, space, inodes, and partition information.\n");
     printf("    free\n");
-    printf("      - Show kernel heap stats: total, used, free, block count, overhead.\n");
+    printf("      - Show kernel heap start, total, used, available, allocated, freed, free space, overhead, and block statistics.\n");
     printf("    keymap [list | on <id/name> | off <id/name> | rm <id/name>]\n");
     printf("      - Manage keyboard layouts: list registered layouts, enable (on), disable (off), or remove (rm).\n");
     printf("    return [on | off]\n");
@@ -1236,7 +1250,7 @@ static void builtin_ls(int argc, char **argv) {
     }
     if (!target) { printf("ls: out of memory\n"); return; }
 
-    uint32_t ino;
+    uint64_t ino;
     if (path_resolve(target, &ino) < 0) {
         printf("ls: cannot access '%s': No such file or directory\n", target);
         kfree(target);
@@ -1260,14 +1274,15 @@ static void builtin_ls(int argc, char **argv) {
         struct ipo_dir_entry hdr;
         if (inode_read_bytes(&din, &hdr, sizeof(hdr), offset) != (int)sizeof(hdr)) break;
         if (hdr.rec_len < sizeof(hdr)) break;
-        if (hdr.inode != 0) {
+        uint64_t entry_ino = dir_entry_get_inode(&hdr);
+        if (entry_ino != 0) {
             char *name = (char *)kmalloc(hdr.name_len + 1);
             if (name) {
                 if (inode_read_bytes(&din, name, hdr.name_len, offset + sizeof(hdr)) == (int)hdr.name_len) {
                     name[hdr.name_len] = '\0';
                     struct ipo_inode ein;
                     uint32_t fsize = 0;
-                    if (read_inode(hdr.inode, &ein)) {
+                    if (read_inode(entry_ino, &ein)) {
                         fsize = (uint32_t)ein.size;
                     }
                     if (hdr.type == IPO_INODE_TYPE_DIR) {
@@ -1548,7 +1563,7 @@ static void builtin_stat(int argc, char **argv) {
         char *target = fs_make_absolute_path(argv[a], NULL);
         if (!target) continue;
 
-        uint32_t inode_num = 0;
+        uint64_t inode_num = 0;
         if (path_resolve(target, &inode_num) < 0) {
             printf("stat: cannot resolve '%s'\n", argv[a]);
             kfree(target);
@@ -1557,14 +1572,15 @@ static void builtin_stat(int argc, char **argv) {
 
         struct ipo_inode st;
         if (!read_inode(inode_num, &st)) {
-            printf("stat: cannot read inode %u\n", inode_num);
+            printf("stat: cannot read inode %llu\n", inode_num);
             kfree(target);
             continue;
         }
 
         printf("  Path:      %s\n", target);
+        printf("  Inode:     %llu\n", inode_num);
         printf("  Protected: %s\n", (st.mode & IPO_INODE_FLAG_PROTECTED) ? "Yes" : "No");
-        printf("  Size:      %u bytes\n", st.size);
+        printf("  Size:      %u bytes\n", (uint32_t)st.size);
         printf("  Links:     %u\n", st.links_count);
         kfree(target);
     }
@@ -1622,91 +1638,31 @@ static void builtin_reinstall_fs(void) {
         return;
     }
 
-    printf("=== Reinstalling Filesystem (IPO_FS) ===\n");
-    printf("WARNING: This will completely erase all data on the filesystem!\n");
-    printf("System directories (/applications, /autorun) will be re-initialized.\n\n");
+    printf("=== Reinstalling Filesystem ===\n");
 
     /* 1. Kill all running processes */
-    printf("[1/5] Terminating all processes...\n");
+    printf("[1/4] Terminating all processes...\n");
     process_kill_all();
 
-    /* 2. Close all open file descriptors */
-    printf("[2/5] Closing all file descriptors...\n");
-    if (fds) {
-        for (uint32_t i = 0; i < fds_capacity; i++) {
-            if (fds[i].used && i >= 3) {
-                fds[i].used = 0;
-                fds[i].inode = 0;
-                fds[i].offset = 0;
-                fds[i].flags = 0;
-            }
-        }
-    }
+    /* 2. Reset in-memory filesystem state and file descriptors */
+    printf("[2/4] Resetting filesystem state...\n");
+    ipo_fs_reset_state();
 
-    /* 3. Compute format parameters (same logic as kernel boot ensure_fs_mounted) */
-    printf("[3/5] Computing filesystem parameters...\n");
+    /* 3. Completely wipe connected storage devices (protecting boot disk) */
+    printf("[3/4] Wiping storage devices...\n");
+    ipo_fs_wipe_storage();
 
-    uint64_t pool_capacity = ata_get_pool_capacity();
-    if (pool_capacity == 0) {
-        printf("reinstall: disk not detected\n");
-        return;
-    }
-    if (pool_capacity < 10) {
-        printf("reinstall: disk too small for filesystem (< 5 KiB)\n");
+    /* 4. Format fresh filesystem and mount */
+    printf("[4/4] Formatting & mounting fresh filesystem...\n");
+    if (!ipo_fs_install()) {
+        printf("reinstall_fs: installation FAILED\n");
+        printf("WARNING: Filesystem is unmounted. Reboot recommended.\n");
         return;
     }
 
-    /* Use the current fs_start_lba if the filesystem was already mounted,
-       otherwise fall back to the adaptive partition offset logic. */
-    uint64_t start_lba = fs_start_lba;
-    uint64_t available_sectors = pool_capacity;
-
-    if (start_lba > 0 && start_lba < pool_capacity) {
-        available_sectors = pool_capacity - start_lba;
-    } else {
-        /* Use the standard offset only when the pool has room for it plus
-         * at least 10 sectors; otherwise use LBA 0. */
-        start_lba = 0;
-        if (pool_capacity > 2048 + 10) {
-            start_lba = 2048;
-            available_sectors = pool_capacity - 2048;
-        }
-    }
-
-    uint64_t total_blocks = available_sectors;
-    uint64_t total_inodes = total_blocks / 16;
-    if (total_inodes == 0) total_inodes = 1;
-
-    printf("  Storage Pool : %u sectors\n", (uint32_t)pool_capacity);
-    printf("  Start LBA    : %u\n", (uint32_t)start_lba);
-    printf("  Total Blocks : %u\n", (uint32_t)total_blocks);
-    printf("  Total Inodes : %u\n", (uint32_t)total_inodes);
-
-    /* 4. Unmount, format, remount */
-    printf("[4/5] Formatting filesystem...\n");
-    fs_mounted = false;
-
-    if (!ipo_fs_format(start_lba, total_blocks, total_inodes)) {
-        printf("reinstall_fs: ipo_fs_format FAILED\n");
-        printf("WARNING: Filesystem is now unmounted. Reboot recommended.\n");
-        return;
-    }
-
-    if (!ipo_fs_mount(start_lba)) {
-        printf("reinstall_fs: ipo_fs_mount FAILED after format\n");
-        printf("WARNING: Filesystem formatted but not mounted. Reboot recommended.\n");
-        return;
-    }
-
-    /* 5. Reset terminal state */
-    printf("[5/5] Resetting terminal state...\n");
     terminal_cwd_set("/");
 
     printf("\n=== Filesystem Reinstallation Complete ===\n");
-    printf("Fresh IPO_FS successfully reinstalled at LBA %u.\n", (uint32_t)start_lba);
-    printf("  %u blocks, %u inodes available.\n",
-           (uint32_t)total_blocks, (uint32_t)total_inodes);
-    printf("Note: /applications and /autorun have been recreated.\n");
 }
 
 static void builtin_ps(void) {
@@ -1755,14 +1711,17 @@ static void fs_count_blocks(uint32_t *out_used, uint32_t *out_total) {
 }
 
 /* ---------------------------------------------------------------
- * Helper: count used/total inodes by scanning the inode bitmap
+ * Helper: count used/total inodes by querying filesystem stats
  * --------------------------------------------------------------- */
 static void fs_count_inodes(uint32_t *out_used, uint32_t *out_total) {
-    *out_total = (uint32_t)sb.inode_count;
-    *out_used  = 0;
-    if (!fs_mounted || sb.inode_count == 0) return;
-
-    *out_used = bitmap_count_set(sb.inode_bitmap_start, sb.inode_count);
+    uint64_t total = 0, used = 0, free_ino = 0, dyn_chunks = 0;
+    if (ipo_fs_get_inode_stats(&total, &used, &free_ino, &dyn_chunks)) {
+        *out_total = (uint32_t)total;
+        *out_used  = (uint32_t)used;
+    } else {
+        *out_total = 0;
+        *out_used  = 0;
+    }
 }
 
 static void builtin_df(void) {
@@ -1774,8 +1733,8 @@ static void builtin_df(void) {
     uint32_t blk_used, blk_total;
     fs_count_blocks(&blk_used, &blk_total);
 
-    uint32_t ino_used, ino_total;
-    fs_count_inodes(&ino_used, &ino_total);
+    uint64_t total_ino = 0, used_ino = 0, free_ino = 0, dyn_chunks = 0;
+    ipo_fs_get_inode_stats(&total_ino, &used_ino, &free_ino, &dyn_chunks);
 
     uint32_t blk_free = (blk_total >= blk_used) ? blk_total - blk_used : 0;
 
@@ -1790,15 +1749,19 @@ static void builtin_df(void) {
 
     printf("Storage Pool : %u physical ATA drive(s), %u sectors pool capacity\n",
            dev_cnt, (uint32_t)pool_cap);
-    printf("Filesystem   : IPO_FS\n");
     printf("Block size   : %u bytes\n", bs);
     printf("Blocks       : %u total, %u used, %u free\n",
            blk_total, blk_used, blk_free);
     printf("Space        : %u KiB total, %u KiB used, %u KiB free  (%u%% used)\n",
            total_kb, used_kb, free_kb, used_pct);
-    printf("Inodes       : %u total, %u used, %u free\n",
-           ino_total, ino_used,
-           (ino_total >= ino_used) ? ino_total - ino_used : 0);
+    printf("Inodes       : %llu total, %llu used, %llu free",
+           total_ino, used_ino, free_ino);
+    if (dyn_chunks > 0) {
+        printf("  (Dynamic: %llu chunks, %llu inodes)\n",
+               dyn_chunks, sb.dynamic_inodes_count);
+    } else {
+        printf("\n");
+    }
     printf("Partition    : Start LBA %u, Total %u blocks (%u KiB)\n",
            (uint32_t)fs_start_lba, (uint32_t)sb.fs_size_blocks, (uint32_t)((sb.fs_size_blocks * bs) / 1024));
 }
@@ -1871,7 +1834,7 @@ static void builtin_meminfo(void) {
                       ? (st.heap_used * 100u) / st.heap_total : 0;
 
     printf("=== Memory (Kernel Heap) ===\n");
-    printf("Heap start : 0x%x\n", 0x1000000);
+    printf("Heap start : 0x%x\n", (uint32_t)KMALLOC_HEAP_START);
     printf("Heap total : %u KiB  (%u MiB)\n",
            (uint32_t)(st.heap_total / 1024),
            (uint32_t)(st.heap_total / 1024 / 1024));
@@ -2165,9 +2128,9 @@ static void builtin_ifconfig(int argc, char **argv) {
     printf("eth0: flags=<%s> mtu 1500\n", netif->link_up ? "UP,RUNNING" : "DOWN");
     printf("      inet %s  netmask %s\n", ip_str ? ip_str : "Unknown", mask_str ? mask_str : "Unknown");
     printf("      gateway %s  dns %s\n", gw_str ? gw_str : "Unknown", dns_str ? dns_str : "Unknown");
-    printf("      ether %02x:%02x:%02x:%02x:%02x:%02x\n",
-           netif->mac.mac[0], netif->mac.mac[1], netif->mac.mac[2],
-           netif->mac.mac[3], netif->mac.mac[4], netif->mac.mac[5]);
+    char *mac_buf = mac_format_dyn(&netif->mac);
+    printf("      ether %s\n", (mac_buf && mac_buf[0]) ? mac_buf : "00:00:00:00:00:00");
+    if (mac_buf) kfree(mac_buf);
 
     if (ip_str) kfree(ip_str);
     if (mask_str) kfree(mask_str);
@@ -2424,11 +2387,17 @@ static void builtin_hardware(int argc, char **argv) {
                 }
             }
 
-            if (p->vendor_id == RTL8139_VENDOR_ID && p->device_id == RTL8139_DEVICE_ID && rtl8139_is_present()) {
-                const uint8_t *m = rtl8139_get_mac();
-                if (m) {
-                    printf("     MAC:       %02x:%02x:%02x:%02x:%02x:%02x\n",
-                           m[0], m[1], m[2], m[3], m[4], m[5]);
+            if (rtl8139_is_present() && p->vendor_id == rtl8139_get_vendor_id() && p->device_id == rtl8139_get_device_id()) {
+                size_t m_len = 0;
+                const uint8_t *m = rtl8139_get_mac(&m_len);
+                if (m && m_len > 0) {
+                    mac_addr_t tmp_mac;
+                    mac_init(&tmp_mac);
+                    mac_set(&tmp_mac, m, m_len);
+                    char *m_str = mac_format_dyn(&tmp_mac);
+                    printf("     MAC:       %s\n", m_str ? m_str : "Unknown");
+                    if (m_str) kfree(m_str);
+                    mac_free(&tmp_mac);
                 } else {
                     printf("     MAC:       Unknown\n");
                 }
@@ -3137,7 +3106,6 @@ void terminal_poll_serial_commands(void) {
 
                 int exec = try_execute_command(s_serial_cmd_buf);
                 if (exec == 0) {
-                    serial_printf("Command not found: %s\n", s_serial_cmd_buf);
                     if (!wm_session_active()) {
                         printf("Command not found: %s\n", s_serial_cmd_buf);
                     }

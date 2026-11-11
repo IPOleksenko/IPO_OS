@@ -75,10 +75,13 @@ void vga_init_font_cache(void);
 
 typedef struct {
     uint32_t codepoint;    /* Unicode codepoint (e.g. 0x0410, 0x4E2D, 0x03B1) */
-    uint8_t  bitmap[16];   /* 8x16 1-bit font bitmap */
+    uint8_t  width;        /* Glyph width in pixels */
+    uint8_t  height;       /* Glyph height in pixels */
+    const uint8_t *bitmap; /* 1-bit font bitmap of variable length */
 } dynamic_glyph_def_t;
 
 void vga_load_font(uint8_t start_code, uint32_t count, const uint8_t *glyphs);
+int vga_font_load(const char *path);
 int vga_load_cyrillic_font(const char *path);
 int vga_font_load_database(const char *path);
 void vga_font_clear_registry(void);

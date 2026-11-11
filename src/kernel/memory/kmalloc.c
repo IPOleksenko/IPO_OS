@@ -1,4 +1,5 @@
 #include <memory/kmalloc.h>
+#include <memory/memory_map.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
@@ -6,10 +7,35 @@
 
 static spinlock_t s_kmalloc_lock = {0};
 
-#define KMALLOC_HEAP_START  (0x1000000)  // 16 MiB kernel heap start
-#define KMALLOC_HEAP_SIZE   (0x4000000)  // 64 MiB kernel heap
 #define KMALLOC_MAGIC       (0xDEADBEEF)
 #define KMALLOC_FREED_MAGIC (0xDEADC0DE)
+
+size_t kmalloc_get_heap_capacity(void) {
+    uint32_t magic = *(volatile uint32_t *)E820_MAGIC_ADDR;
+    uint32_t raw_count = *(volatile uint32_t *)E820_COUNT_ADDR;
+    uint32_t ptr_val = *(volatile uint32_t *)E820_PTR_ADDR;
+    uint64_t total_ram = 0;
+
+    if (magic == E820_MAGIC_VAL && raw_count > 0 && ptr_val != 0) {
+        const e820_entry_t *entries = (const e820_entry_t *)(uintptr_t)ptr_val;
+        for (uint32_t i = 0; i < raw_count; i++) {
+            if (entries[i].type == E820_TYPE_USABLE) {
+                total_ram += entries[i].length;
+            }
+        }
+    } else {
+        total_ram = *(volatile uint32_t *)E820_RAM_LOW_ADDR;
+    }
+
+    if (total_ram > KMALLOC_HEAP_START) {
+        uint64_t avail = total_ram - KMALLOC_HEAP_START;
+        if ((uint64_t)KMALLOC_HEAP_START + avail > 0xE0000000ull) {
+            avail = 0xE0000000ull - KMALLOC_HEAP_START;
+        }
+        return (size_t)avail;
+    }
+    return 0x4000000u; // fallback 64 MiB
+}
 
 typedef struct {
     size_t size;           // Total size including this header

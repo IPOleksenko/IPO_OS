@@ -1,9 +1,11 @@
 #include <kernel/process.h>
 #include <kernel/async.h>
+#include <kernel/ipc.h>
 #include <kernel/terminal.h>
 #include <system/state.h>
 #include <file_system/ipo_fs.h>
 #include <memory/kmalloc.h>
+#include <memory/address_space.h>
 #include <memory/memory_map.h>
 #include <driver/input/keymap/keymap.h>
 #include <driver/input/keymap/dynamic_keymap.h>
@@ -35,7 +37,88 @@ static process_return_value_t last_return_val;
 static process_return_value_t *last_batch_return_vals = NULL;
 static int last_batch_return_vals_cap = 0;
 static process_t *current_process = NULL;
+
+uintptr_t process_current_context_token(void) {
+    return current_process ? (uintptr_t)current_process : (uintptr_t)1u;
+}
 static process_t *process_list = NULL;
+
+bool process_update_memory_mappings(process_t *proc, uint32_t address,
+                                    uint32_t length, bool allocated) {
+    if (!proc || !length || (address & 0xFFFu) || (length & 0xFFFu) ||
+        (uint64_t)address + length > 0x100000000ULL)
+        return false;
+
+    for (process_t *other = process_list; other; other = other->next) {
+        if (other == proc || !other->address_space) continue;
+        if (!address_space_set_identity_range(other->address_space, address,
+                                              length, !allocated)) {
+            for (process_t *restore = process_list; restore; restore = restore->next) {
+                if (restore != proc && restore->address_space) {
+                    (void)address_space_set_identity_range(
+                        restore->address_space, address, length, true);
+                }
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool process_address_space_initialize(process_t *proc) {
+    if (!proc || !proc->address_space) return false;
+    for (process_t *other = process_list; other; other = other->next) {
+        if (other == proc) continue;
+        if (other->user_heap_limit > other->user_heap_base) {
+            uint32_t start = other->user_heap_base & ~0xFFFu;
+            uint64_t end =
+                ((uint64_t)other->user_heap_limit + 0xFFFu) & ~0xFFFULL;
+            if (end > UINT32_MAX ||
+                (end > start &&
+                 !address_space_set_identity_range(
+                     proc->address_space, start,
+                     (uint32_t)end - start, false)))
+                return false;
+        }
+        if (other->binary_base && other->binary_size &&
+            (uint32_t)(uintptr_t)other->binary_base != PROCESS_HEAP_START) {
+            address_space_set_identity_range(
+                proc->address_space,
+                (uint32_t)(uintptr_t)other->binary_base,
+                other->binary_size, false);
+        }
+    }
+
+    if (proc->binary_base && proc->binary_size) {
+        for (uint32_t off = 0; off < proc->binary_size; off += 4096) {
+            if (!address_space_map(proc->address_space,
+                                  PROCESS_HEAP_START + off,
+                                  (uint32_t)(uintptr_t)proc->binary_base + off,
+                                  ADDRESS_SPACE_PAGE_PRESENT |
+                                  ADDRESS_SPACE_PAGE_WRITABLE |
+                                  ADDRESS_SPACE_PAGE_USER)) {
+                return false;
+            }
+        }
+        if ((uint32_t)(uintptr_t)proc->binary_base != PROCESS_HEAP_START) {
+            for (process_t *other = process_list; other; other = other->next) {
+                if (other != proc && other->address_space) {
+                    address_space_set_identity_range(
+                        other->address_space,
+                        (uint32_t)(uintptr_t)proc->binary_base,
+                        proc->binary_size, false);
+                }
+            }
+        }
+        if (!address_space_range_mapped(
+                proc->address_space,
+                PROCESS_HEAP_START,
+                proc->binary_size, true))
+            return false;
+    }
+    serial_printf("[paging] pid=%u private image mapping verified\n", proc->pid);
+    return true;
+}
 
 void process_return_val_init(process_return_value_t *val) {
     if (!val) return;
@@ -270,14 +353,104 @@ void process_yield_kernel(void) {
         return;
     }
 
+    if (!current_process->is_running) {
+        ipc_process_terminated(current_process->pid);
+    }
+
     process_t *fg = process_get_foreground();
     if (current_process != fg && !wm_session_active()) {
         io_wait();
     }
 
     in_process_context = false;
-    process_switch_context(&current_process->stack_ptr, scheduler_esp);
+    if (current_process->current_thread) {
+        process_switch_context(&current_process->current_thread->context_esp,
+                               scheduler_esp);
+    } else {
+        process_switch_context(&current_process->stack_ptr, scheduler_esp);
+    }
     in_process_context = true;
+}
+
+void process_ipc_set_waiting(process_t *proc, uint32_t endpoint_id, uint8_t wait_kind) {
+    if (!proc || !batch_active || !proc->is_running) return;
+    if (proc->current_thread && in_process_context) {
+        process_thread_t *thread = proc->current_thread;
+        thread->ipc_wait_endpoint = endpoint_id;
+        thread->ipc_wait_kind = wait_kind;
+        thread->ipc_wait_cancelled = false;
+        thread->ipc_waiting = true;
+        thread->state = PROCESS_THREAD_BLOCKED;
+        return;
+    }
+    proc->ipc_wait_endpoint = endpoint_id;
+    proc->ipc_wait_kind = wait_kind;
+    proc->ipc_wait_cancelled = false;
+    proc->ipc_waiting = true;
+}
+
+void process_ipc_wake_waiters(uint32_t endpoint_id, uint8_t wait_kind) {
+    if (!batch_active || !batch_procs) return;
+    for (int i = 0; i < batch_proc_count; i++) {
+        process_t *proc = batch_procs[i];
+        if (!proc) continue;
+        if (proc->ipc_waiting && proc->ipc_wait_endpoint == endpoint_id &&
+            (wait_kind == 0u || proc->ipc_wait_kind == wait_kind)) {
+            proc->ipc_waiting = false;
+            proc->ipc_wait_cancelled = false;
+            proc->ipc_wait_endpoint = 0u;
+            proc->ipc_wait_kind = 0u;
+        }
+        for (process_thread_t *thread = proc->threads; thread;
+             thread = thread->next) {
+            if (!thread->ipc_waiting ||
+                thread->ipc_wait_endpoint != endpoint_id ||
+                (wait_kind != 0u && thread->ipc_wait_kind != wait_kind))
+                continue;
+            thread->ipc_waiting = false;
+            thread->ipc_wait_cancelled = false;
+            thread->ipc_wait_endpoint = 0u;
+            thread->ipc_wait_kind = 0u;
+            if (thread->state == PROCESS_THREAD_BLOCKED)
+                thread->state = PROCESS_THREAD_RUNNABLE;
+        }
+    }
+}
+
+void process_ipc_cancel_batch_waiters(void) {
+    if (!batch_active || !batch_procs) return;
+    for (int i = 0; i < batch_proc_count; i++) {
+        process_t *proc = batch_procs[i];
+        if (!proc || !proc->is_running) continue;
+        if (proc->ipc_waiting) {
+            proc->ipc_waiting = false;
+            proc->ipc_wait_cancelled = true;
+            proc->ipc_wait_endpoint = 0u;
+            proc->ipc_wait_kind = 0u;
+        }
+        for (process_thread_t *thread = proc->threads; thread;
+             thread = thread->next) {
+            if (!thread->ipc_waiting) continue;
+            thread->ipc_waiting = false;
+            thread->ipc_wait_cancelled = true;
+            thread->ipc_wait_endpoint = 0u;
+            thread->ipc_wait_kind = 0u;
+            if (thread->state == PROCESS_THREAD_BLOCKED)
+                thread->state = PROCESS_THREAD_RUNNABLE;
+        }
+    }
+}
+
+bool process_ipc_consume_wait_cancelled(void) {
+    process_t *proc = current_process;
+    if (!proc) return false;
+    if (proc->current_thread && proc->current_thread->ipc_wait_cancelled) {
+        proc->current_thread->ipc_wait_cancelled = false;
+        return true;
+    }
+    if (!proc->ipc_wait_cancelled) return false;
+    proc->ipc_wait_cancelled = false;
+    return true;
 }
 
 bool process_is_active_or_has_windows(process_t *p) {
@@ -592,17 +765,19 @@ void process_init_text_screen(process_t *proc) {
     if (!proc->text_vram_backup) return;
 
     if (!proc->scroll_top_buffer) {
-        proc->scroll_top_buffer = (uint16_t *)kmalloc(TERMINAL_SCROLL_HISTORY_SIZE * 80 * sizeof(uint16_t));
+        proc->scroll_top_capacity = 128;
+        proc->scroll_top_buffer = (uint16_t *)kmalloc(proc->scroll_top_capacity * 80 * sizeof(uint16_t));
         if (proc->scroll_top_buffer) {
-            for (int i = 0; i < TERMINAL_SCROLL_HISTORY_SIZE * 80; i++) {
+            for (int i = 0; i < proc->scroll_top_capacity * 80; i++) {
                 proc->scroll_top_buffer[i] = 0x0720;
             }
         }
     }
     if (!proc->scroll_bottom_buffer) {
-        proc->scroll_bottom_buffer = (uint16_t *)kmalloc(TERMINAL_SCROLL_HISTORY_SIZE * 80 * sizeof(uint16_t));
+        proc->scroll_bottom_capacity = 128;
+        proc->scroll_bottom_buffer = (uint16_t *)kmalloc(proc->scroll_bottom_capacity * 80 * sizeof(uint16_t));
         if (proc->scroll_bottom_buffer) {
-            for (int i = 0; i < TERMINAL_SCROLL_HISTORY_SIZE * 80; i++) {
+            for (int i = 0; i < proc->scroll_bottom_capacity * 80; i++) {
                 proc->scroll_bottom_buffer[i] = 0x0720;
             }
         }
@@ -639,15 +814,15 @@ void process_workspace_auto_scroll(process_t *proc) {
     uint16_t terminal_rows = VGA_HEIGHT - top_row;
     uint16_t last_line_start = (top_row + terminal_rows - 1) * VGA_WIDTH;
 
-    if (proc->scroll_top_buffer) {
-        if (proc->scroll_top_count >= TERMINAL_SCROLL_HISTORY_SIZE) {
-            int keep = TERMINAL_SCROLL_HISTORY_SIZE / 2;
-            int remove = proc->scroll_top_count - keep;
-            memmove(&proc->scroll_top_buffer[0],
-                    &proc->scroll_top_buffer[remove * 80],
-                    (size_t)keep * 80 * sizeof(uint16_t));
-            proc->scroll_top_count = keep;
+    if (proc->scroll_top_count >= proc->scroll_top_capacity) {
+        int new_cap = (proc->scroll_top_capacity == 0) ? 128 : (proc->scroll_top_capacity * 2);
+        uint16_t *new_buf = (uint16_t *)krealloc(proc->scroll_top_buffer, (size_t)new_cap * 80 * sizeof(uint16_t));
+        if (new_buf) {
+            proc->scroll_top_buffer = new_buf;
+            proc->scroll_top_capacity = new_cap;
         }
+    }
+    if (proc->scroll_top_buffer && proc->scroll_top_count < proc->scroll_top_capacity) {
         memcpy(&proc->scroll_top_buffer[proc->scroll_top_count * 80],
                &proc->text_vram_backup[top_row * 80],
                80 * sizeof(uint16_t));
@@ -2192,8 +2367,8 @@ static void process_trampoline(void) {
                     kfree(hex_str);
                 }
             } else {
-                /* Check if scalar return is a Cyrillic character constant in UTF-8 (e.g. 'ы' = 0xD18B = 53643) */
-                if ((ret_eax & 0xFF00) == 0xD000 || (ret_eax & 0xFF00) == 0xD100) {
+                /* Check if scalar return is a 2-byte UTF-8 character constant */
+                if (((ret_eax >> 8) & 0xE0) == 0xC0 && (ret_eax & 0xC0) == 0x80) {
                     char c_str[5];
                     c_str[0] = '\'';
                     c_str[1] = (char)((ret_eax >> 8) & 0xFF);
@@ -2260,6 +2435,7 @@ static void process_trampoline(void) {
         struct_buf = NULL;
     }
 
+    process_thread_main_exit(proc);
     proc->is_running = 0;
     if (!process_get_separate_windows() ||
         (proc->is_wm_app && !wm_has_windows_for_pid(proc->pid)) ||
@@ -2350,17 +2526,6 @@ static void log_process_heap_state(const char *stage) {
                  stage, used, total, used_pct, remaining);
 }
 
-/* =========================================================================
- * Process Isolated Heap Management
- *
- * Each process is allocated an independent, strictly isolated physical memory
- * region for its heap (used by sbrk/malloc).
- * - No hardcoded maximum slot limit: slot count scales dynamically with RAM.
- * - Dynamic slot discovery: finds the first free, non-overlapping range.
- * - Dynamic heap expansion: expands limit if contiguous physical RAM is free.
- * - Automatic recycling: memory is immediately reclaimed on process exit.
- * ========================================================================= */
-
 bool process_heap_init(process_t *proc) {
     if (!proc) return false;
 
@@ -2368,8 +2533,8 @@ bool process_heap_init(process_t *proc) {
     uint32_t heap_start = USER_HEAP_START;
 
     if (total_ram > 0 && total_ram <= heap_start) {
-        /* On low-RAM systems (<= 128 MiB), start heap at 80 MiB (above kmalloc) */
-        heap_start = 0x05000000u;
+        /* On low-RAM systems (<= 256 MiB), start heap at 128 MiB (above kmalloc) */
+        heap_start = 0x08000000u;
     }
 
     uint32_t stride = USER_HEAP_PROCESS_STRIDE; /* 256 MiB default */
@@ -2442,7 +2607,7 @@ bool process_heap_can_expand(process_t *proc, uint32_t new_limit) {
         return true;
     }
     uint64_t total_ram = get_process_heap_capacity();
-    if (total_ram > 0 && new_limit > (uint32_t)total_ram) {
+    if (total_ram > 0 && (uint64_t)new_limit > total_ram) {
         return false;
     }
     uint32_t check_base = proc->user_heap_limit;
@@ -2450,8 +2615,9 @@ bool process_heap_can_expand(process_t *proc, uint32_t new_limit) {
 
     process_t *curr = process_list;
     while (curr) {
-        if (curr != proc && curr->user_heap_limit > curr->user_heap_base) {
-            if (check_base < curr->user_heap_limit && check_limit > curr->user_heap_base) {
+        if (curr != proc && curr->user_heap_base > 0) {
+            uint32_t curr_end = curr->user_heap_limit;
+            if (check_base < curr_end && check_limit > curr->user_heap_base) {
                 return false;
             }
         }
@@ -2608,8 +2774,6 @@ static void *allocate_process_memory(process_t *proc, uint32_t size, uint32_t pr
         return NULL;
     }
 
-    uint64_t heap_capacity = get_process_heap_capacity();
-    
     // First, try to find a free block that fits
     for (int i = 0; i < block_count; i++) {
         if (allocated_blocks[i].pid == 0 && allocated_blocks[i].size >= size) {
@@ -2637,14 +2801,17 @@ static void *allocate_process_memory(process_t *proc, uint32_t size, uint32_t pr
         }
     }
     
-    // No suitable free block found, allocate at the end
-    if (global_process_heap_used + size > heap_capacity) {
-        serial_printf("Process heap exhausted: need %llu, have %llu\n",
-                     global_process_heap_used + size, heap_capacity);
+    uint32_t base = PROCESS_HEAP_START + (uint32_t)global_process_heap_used;
+    uint64_t total_ram = get_process_heap_capacity();
+
+    /* Dynamically allocate as much space as the application needs,
+     * bounded only by physical RAM available on the machine. */
+    if (total_ram > 0 && ((uint64_t)base + size) > total_ram) {
+        serial_printf("[process] Physical RAM exhausted: requested base 0x%x + size %u exceeds total RAM %llu bytes\n",
+                     base, size, total_ram);
         return NULL;
     }
 
-    uint32_t base = PROCESS_HEAP_START + (uint32_t)global_process_heap_used;
     void *addr = (void *)base;
 
     // Track this allocation
@@ -2735,6 +2902,32 @@ static void process_release_execution_memory(process_t *proc) {
     if (currently_mapped_app == proc) {
         currently_mapped_app = NULL;
     }
+    if (proc->binary_base && proc->binary_size &&
+        !process_update_memory_mappings(
+            proc, (uint32_t)(uintptr_t)proc->binary_base,
+            proc->binary_size, false)) {
+        serial_printf("[process] failed to restore freed binary mapping for pid=%u\n",
+                      proc->pid);
+    }
+    if (proc->user_heap_limit > proc->user_heap_base) {
+        uint32_t start = proc->user_heap_base & ~0xFFFu;
+        uint32_t end = (proc->user_heap_limit + 0xFFFu) & ~0xFFFu;
+        if (end > start &&
+            !process_update_memory_mappings(proc, start, end - start, false)) {
+            serial_printf("[process] failed to restore freed heap mapping for pid=%u\n",
+                          proc->pid);
+        }
+    }
+    if (proc->address_space) {
+        if (!address_space_activate_kernel() ||
+            !address_space_destroy(proc->address_space)) {
+            serial_printf("[process] failed to release address space for pid=%u\n",
+                          proc->pid);
+        } else {
+            proc->address_space = NULL;
+        }
+    }
+    process_thread_cleanup(proc);
     if (proc->binary_storage) {
         kfree(proc->binary_storage);
         proc->binary_storage = NULL;
@@ -2825,12 +3018,12 @@ int process_adjust_stack_size(process_t *proc, int32_t delta) {
 
     if (delta > 0) {
         uint32_t grow = (uint32_t)delta;
-        uint64_t heap_capacity = get_process_heap_capacity();
-        uint64_t new_used = (uint64_t)global_process_heap_used + grow;
+        uint32_t base = PROCESS_HEAP_START + (uint32_t)global_process_heap_used;
+        uint64_t total_ram = get_process_heap_capacity();
 
-        if (new_used > heap_capacity) {
-            serial_printf("[process] stack grow rejected: need %llu, have %llu\n",
-                         new_used, heap_capacity);
+        if (total_ram > 0 && ((uint64_t)base + grow) > total_ram) {
+            serial_printf("[process] stack grow rejected: physical RAM exhausted (need %llu, have %llu)\n",
+                         (uint64_t)base + grow, total_ram);
             return -1;
         }
 
@@ -2957,6 +3150,7 @@ static int __attribute__((unused)) load_binary_file(const char *path, void **dat
  */
 void process_cleanup(process_t *proc) {
     if (!proc) return;
+    ipc_process_terminated(proc->pid);
     
     serial_printf("Cleaning up process %d\n", proc->pid);
     if (process_is_batch_active()) {
@@ -2969,6 +3163,33 @@ void process_cleanup(process_t *proc) {
     if (proc->async_task_count > 0) {
         proc->is_running = 0;
         return;
+    }
+    process_thread_cleanup(proc);
+
+    if (proc->binary_base && proc->binary_size &&
+        !process_update_memory_mappings(
+            proc, (uint32_t)(uintptr_t)proc->binary_base,
+            proc->binary_size, false)) {
+        serial_printf("[process] failed to restore cleaned binary mapping for pid=%u\n",
+                      proc->pid);
+    }
+    if (proc->user_heap_limit > proc->user_heap_base) {
+        uint32_t start = proc->user_heap_base & ~0xFFFu;
+        uint32_t end = (proc->user_heap_limit + 0xFFFu) & ~0xFFFu;
+        if (end > start &&
+            !process_update_memory_mappings(proc, start, end - start, false)) {
+            serial_printf("[process] failed to restore cleaned heap mapping for pid=%u\n",
+                          proc->pid);
+        }
+    }
+    if (proc->address_space) {
+        if (!address_space_activate_kernel() ||
+            !address_space_destroy(proc->address_space)) {
+            serial_printf("[process] failed to release address space for pid=%u\n",
+                          proc->pid);
+        } else {
+            proc->address_space = NULL;
+        }
     }
     
     if (currently_mapped_app == proc) {
@@ -3104,7 +3325,9 @@ void process_emergency_crash_exit(void) {
         async_stop_tasks_by_owner(proc);
         proc->async_task_count = 0;
 
+        process_thread_main_exit(proc);
         proc->is_running = 0;
+        ipc_process_terminated(proc->pid);
         proc->completed_and_acknowledged = true;
         proc->exit_code = 139;
         last_exit_code = 139;
@@ -3299,30 +3522,23 @@ static int exec_load(process_t *proc, struct ipo_inode *stat) {
         return -1;
     }
 
-    uint8_t *file_data = (uint8_t *)kmalloc((uint32_t)stat->size);
-    if (!file_data) {
-        serial_printf("[exec_load] Failed to allocate temporary buffer for '%s'\n", proc->name ? proc->name : "unknown");
-        return -1;
-    }
-
-    int read_bytes = inode_read_bytes(stat, file_data, (uint32_t)stat->size, 0);
-    if (read_bytes < 0 || (uint32_t)read_bytes < (uint32_t)stat->size) {
-        kfree(file_data);
-        return -1;
-    }
-
     /* Standard Bare-Metal Executable Loader */
     uint32_t total_memsz = ((uint32_t)stat->size + 4095u) & ~4095u;
     void *mem = allocate_process_memory(proc, total_memsz, PROT_READ | PROT_WRITE | PROT_EXEC);
     if (!mem) {
-        kfree(file_data);
         serial_printf("[exec_load] Failed to allocate %u bytes of process memory for '%s'\n",
                       total_memsz, proc->name ? proc->name : "unknown");
         return -1;
     }
     memset(mem, 0, total_memsz);
-    memcpy(mem, file_data, (size_t)stat->size);
-    kfree(file_data);
+
+    int read_bytes = inode_read_bytes(stat, mem, (uint32_t)stat->size, 0);
+    if (read_bytes < 0 || (uint32_t)read_bytes < (uint32_t)stat->size) {
+        free_process_memory(proc, mem, total_memsz);
+        serial_printf("[exec_load] Failed to read '%s' from inode (%d < %u)\n",
+                      proc->name ? proc->name : "unknown", read_bytes, (uint32_t)stat->size);
+        return -1;
+    }
 
     proc->demand_loading = false;
     proc->demand_loaded_bytes = stat->size;
@@ -3331,7 +3547,7 @@ static int exec_load(process_t *proc, struct ipo_inode *stat) {
 
     proc->binary_base = mem;
     proc->binary_size = total_memsz;
-    proc->entry_point = (uint32_t)(uintptr_t)mem;
+    proc->entry_point = PROCESS_HEAP_START;
     proc->data_offset = 0;
     proc->data_size = total_memsz;
     proc->code_mapped = true;
@@ -3526,6 +3742,27 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
     sp[-5] = 0;       // edi
     sp[-6] = 0x02;    // eflags (reserved bit 1=1, IF=0)
     proc->stack_ptr = (uint32_t)&sp[-6];
+    if (!process_thread_init(proc)) {
+        printf("Failed to initialize main thread\n");
+        process_set_last_exit_code(126);
+        process_cleanup(proc);
+        return NULL;
+    }
+    proc->address_space = address_space_create();
+    if (!proc->address_space) {
+        printf("Failed to create address space for process\n");
+        process_set_last_exit_code(126);
+        process_cleanup(proc);
+        return NULL;
+    }
+    if (!process_address_space_initialize(proc)) {
+        printf("Failed to isolate process memory mappings\n");
+        process_set_last_exit_code(126);
+        process_cleanup(proc);
+        return NULL;
+    }
+    serial_printf("[paging] pid=%u address_space=%p\n", proc->pid,
+                  (void *)proc->address_space);
  
     serial_printf("Process %d ready: entry=0x%x, argc=%d\n",
            proc->pid, proc->entry_point, proc->argc);
@@ -3635,6 +3872,8 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
     }
 
     process_t *old_process = current_process;
+    address_space_t *old_address_space =
+        old_process ? old_process->address_space : NULL;
     process_t **old_batch_procs = batch_procs;
     int old_batch_proc_count = batch_proc_count;
     int old_batch_current_idx = batch_current_idx;
@@ -3950,7 +4189,8 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
         for (int step = 0; step < count; step++) {
             int idx = (batch_current_idx + step) % count;
             process_t *p = procs[idx];
-            if (p && p->is_running) {
+            if (p && p->is_running && !p->signal_stopped && !p->ipc_waiting &&
+                process_thread_has_runnable(p)) {
                 if (p->waiting_for_input && p != fg && !wm_session_active() && fg && fg->is_running) {
                     continue;
                 }
@@ -3962,7 +4202,8 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
         if (found == -1) {
             if (fg && fg->is_running) {
                 for (int i = 0; i < count; i++) {
-                    if (procs[i] == fg) {
+                    if (procs[i] == fg && !fg->signal_stopped &&
+                        !fg->ipc_waiting && process_thread_has_runnable(fg)) {
                         found = i;
                         break;
                     }
@@ -3971,7 +4212,10 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
             }
             if (found == -1) {
                 for (int i = 0; i < count; i++) {
-                    if (procs[i] && procs[i]->is_running) {
+                    if (procs[i] && procs[i]->is_running &&
+                        !procs[i]->signal_stopped &&
+                        !procs[i]->ipc_waiting &&
+                        process_thread_has_runnable(procs[i])) {
                         found = i;
                         break;
                     }
@@ -3982,6 +4226,7 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
                     current_process = fg;
                     process_sync_shared_context();
                 }
+                process_ipc_cancel_batch_waiters();
                 io_wait();
                 continue;
             }
@@ -3989,6 +4234,19 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
 
         batch_current_idx = (found + 1) % count;
         current_process = procs[found];
+        process_thread_t *selected_thread =
+            process_thread_pick_next(current_process);
+        if (!selected_thread) {
+            in_process_context = false;
+            continue;
+        }
+        if (!current_process->address_space ||
+            !address_space_activate(current_process->address_space)) {
+            serial_printf("[process] cannot activate address space for pid=%u\n",
+                          current_process->pid);
+            current_process->is_running = 0u;
+            continue;
+        }
         process_sync_shared_context();
 
         // Map process binary to 0x800000
@@ -3996,10 +4254,16 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
 
         in_process_context = true;
         // Switch to process!
-        process_switch_context(&scheduler_esp, current_process->stack_ptr);
+        process_switch_context(&scheduler_esp, selected_thread->context_esp);
         in_process_context = false;
+        if (old_address_space) {
+            (void)address_space_activate(old_address_space);
+        } else {
+            (void)address_space_activate_kernel();
+        }
         // Process yields back here
         if (current_process && !current_process->is_running) {
+            ipc_process_terminated(current_process->pid);
             process_release_execution_memory(current_process);
         }
     }
@@ -4008,6 +4272,11 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
         process_map_app(old_process);
     } else {
         process_map_app(NULL);
+    }
+    if (old_address_space) {
+        (void)address_space_activate(old_address_space);
+    } else {
+        (void)address_space_activate_kernel();
     }
     batch_active = old_batch_active;
     batch_separate_windows = old_batch_separate_windows;

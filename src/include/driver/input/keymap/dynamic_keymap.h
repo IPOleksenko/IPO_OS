@@ -69,8 +69,8 @@
  */
 typedef struct {
     uint8_t scancode;          /* Key scancode */
-    char normal[8];            /* Normal output string (supports UTF-8 / multi-byte) */
-    char shift[8];             /* Shift output string (supports UTF-8 / multi-byte) */
+    const char *normal;        /* Normal output string (supports arbitrary length) */
+    const char *shift;         /* Shift output string (supports arbitrary length) */
 } keymap_entry_t;
 
 #include <vga.h>
@@ -120,7 +120,7 @@ void dynamic_keymap_set_default_symbol(const char *symbol);
 const char* dynamic_keymap_get_default_symbol(void);
 
 /**
- * Cycle to next layout in the storage (English -> Russian -> Chinese -> ...).
+ * Cycle to next layout in the storage.
  */
 void dynamic_keymap_cycle_next(void);
 void dynamic_keymap_cycle_next_local(void);
@@ -176,7 +176,7 @@ bool dynamic_keymap_is_slot_enabled(uint32_t index);
 const char* dynamic_keymap_get_slot_name(uint32_t index);
 
 /**
- * Reset back to default system keymap (English QWERTY).
+ * Reset back to default system keymap.
  */
 void dynamic_keymap_reset(void);
 

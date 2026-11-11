@@ -10,7 +10,7 @@
 #include <stdio.h>
 
 _Static_assert(sizeof(storage_pool_raw_member_t) == 48, "storage_pool_raw_member_t must be exactly 48 bytes");
-_Static_assert(sizeof(storage_pool_raw_sb_t) == 68, "storage_pool_raw_sb_t header must be exactly 68 bytes");
+_Static_assert(sizeof(storage_pool_raw_sb_t) == 64, "storage_pool_raw_sb_t header must be exactly 64 bytes");
 _Static_assert(sizeof(storage_raw_disk_tx_entry_t) == 64, "storage_raw_disk_tx_entry_t must be exactly 64 bytes");
 
 #define STORAGE_ENTRIES_PER_SECTOR (512 / sizeof(storage_raw_disk_tx_entry_t))
@@ -19,6 +19,10 @@ _Static_assert(sizeof(storage_raw_disk_tx_entry_t) == 64, "storage_raw_disk_tx_e
 static storage_pool_t s_storage_pool;
 static spinlock_t     s_pool_lock = {0};
 static uint32_t       s_next_tx_id = 1;
+
+static inline uint32_t storage_pool_primary_member_capacity(void) {
+    return (512u - sizeof(storage_pool_raw_sb_t) - 60u) / sizeof(storage_pool_raw_member_t);
+}
 
 static int storage_pool_set_pool_uuid(const uint8_t *uuid, size_t len) {
     if (!uuid || len == 0) return 0;
@@ -173,27 +177,37 @@ static bool disk_journal_write_entry(uint32_t slot, const storage_disk_tx_entry_
     return true;
 }
 
-/* Save persistent metadata (Primary SB and Backup SB) - Unlocked */
+/* Save persistent metadata (Primary SB, Backup SB, and Extended Members) - Unlocked */
 static int storage_pool_save_metadata_unlocked(void) {
     if (!s_storage_pool.initialized || s_storage_pool.member_count == 0) return -1;
-    if (s_storage_pool.member_count > STORAGE_POOL_MAX_MEMBERS) {
-        serial_printf("[storage_pool] Cannot save metadata: on-disk format supports at most %u members.\n",
-                      STORAGE_POOL_MAX_MEMBERS);
-        return -1;
-    }
 
     s_storage_pool.generation++;
     uint64_t sb_lba = s_storage_pool.sb_lba ? s_storage_pool.sb_lba : STORAGE_POOL_PRIMARY_SB_LBA;
     uint64_t backup_sb_lba = s_storage_pool.backup_sb_lba ? s_storage_pool.backup_sb_lba : STORAGE_POOL_BACKUP_SB_LBA;
 
-    for (uint32_t m = 0; m < s_storage_pool.member_count; m++) {
+    uint32_t total_members = s_storage_pool.member_count;
+    uint32_t inline_cap = storage_pool_primary_member_capacity();
+    uint32_t ext_sectors = 0;
+    storage_pool_ext_header_t ext_hdr;
+    memset(&ext_hdr, 0, sizeof(ext_hdr));
+
+    if (total_members > inline_cap) {
+        uint32_t ext_members_count = total_members - inline_cap;
+        ext_sectors = (ext_members_count + STORAGE_POOL_MEMBERS_PER_EXT_SEC - 1) / STORAGE_POOL_MEMBERS_PER_EXT_SEC;
+        ext_hdr.ext_magic = STORAGE_POOL_EXT_MAGIC;
+        ext_hdr.total_members = total_members;
+        ext_hdr.ext_lba = STORAGE_POOL_EXT_MEMBERS_LBA;
+        ext_hdr.ext_sectors = ext_sectors;
+        ext_hdr.backup_ext_lba = STORAGE_POOL_BACKUP_EXT_LBA;
+    }
+
+    for (uint32_t m = 0; m < total_members; m++) {
         pool_member_t *mem = &s_storage_pool.members[m];
         if (!mem->online || !mem->bdev) continue;
 
         storage_pool_disk_sb_t sb;
         storage_pool_disk_sb_init(&sb);
         sb.magic = STORAGE_POOL_MAGIC;
-        sb.version = STORAGE_POOL_SB_VERSION;
         if (s_storage_pool.pool_uuid && s_storage_pool.pool_uuid_len > 0) {
             storage_pool_disk_sb_set_pool_uuid(&sb, s_storage_pool.pool_uuid, s_storage_pool.pool_uuid_len);
         }
@@ -201,14 +215,20 @@ static int storage_pool_save_metadata_unlocked(void) {
             storage_pool_disk_sb_set_local_member_uuid(&sb, mem->uuid, mem->uuid_len);
         }
         sb.member_index = m;
-        sb.member_count = s_storage_pool.member_count;
+        sb.member_count = total_members;
         sb.total_capacity_sectors = s_storage_pool.total_capacity_sectors;
         sb.chunk_size_sectors = s_storage_pool.chunk_size_sectors;
         sb.generation = s_storage_pool.generation;
         sb.state = (uint32_t)s_storage_pool.state;
         sb.recovery_count = s_storage_pool.recovery_count;
 
-        for (uint32_t i = 0; i < s_storage_pool.member_count; i++) {
+        if (ext_sectors > 0) {
+            storage_pool_disk_sb_set_reserved(&sb, (const uint8_t *)&ext_hdr, sizeof(ext_hdr));
+        }
+
+        /* Inline descriptors fitting in the primary superblock sector */
+        uint32_t inline_limit = total_members < inline_cap ? total_members : inline_cap;
+        for (uint32_t i = 0; i < inline_limit; i++) {
             pool_member_t *mi = &s_storage_pool.members[i];
             storage_pool_disk_member_t dm;
             storage_pool_disk_member_init(&dm);
@@ -232,6 +252,9 @@ static int storage_pool_save_metadata_unlocked(void) {
         storage_pool_disk_sb_to_raw(&sb, raw_sb);
         storage_pool_disk_sb_free(&sb);
 
+        /* Ensure total member_count is preserved in raw superblock */
+        raw_sb->member_count = total_members;
+
         /* Calculate CRC32 of first 508 bytes */
         uint32_t crc = partition_crc32(raw_sb_buf, 508);
         *(uint32_t *)(raw_sb_buf + 508) = crc;
@@ -246,6 +269,46 @@ static int storage_pool_save_metadata_unlocked(void) {
         if (!block_dev_write(mem->bdev, backup_sb_lba, 1, raw_sb_buf)) {
             serial_printf("[storage_pool] Failed to write Backup SB to '%s' LBA %llu\n",
                           mem->bdev_name ? mem->bdev_name : "unknown", backup_sb_lba);
+        }
+
+        /* Write Extended Member Sectors if member_count > primary sector capacity */
+        if (ext_sectors > 0) {
+            for (uint32_t s = 0; s < ext_sectors; s++) {
+                storage_pool_ext_sector_t ext_sec;
+                memset(&ext_sec, 0, sizeof(ext_sec));
+                ext_sec.magic = STORAGE_POOL_EXT_MAGIC;
+                ext_sec.sector_index = s;
+                ext_sec.start_member_index = inline_cap + s * STORAGE_POOL_MEMBERS_PER_EXT_SEC;
+                uint32_t rem = total_members - ext_sec.start_member_index;
+                uint32_t in_sec = rem < STORAGE_POOL_MEMBERS_PER_EXT_SEC ? rem : STORAGE_POOL_MEMBERS_PER_EXT_SEC;
+                ext_sec.member_count = in_sec;
+                ext_sec.next_lba = (s + 1 < ext_sectors) ? (STORAGE_POOL_EXT_MEMBERS_LBA + s + 1) : 0;
+
+                for (uint32_t j = 0; j < in_sec; j++) {
+                    uint32_t m_idx = ext_sec.start_member_index + j;
+                    pool_member_t *pmi = &s_storage_pool.members[m_idx];
+                    storage_pool_disk_member_t dm;
+                    storage_pool_disk_member_init(&dm);
+                    if (pmi->uuid && pmi->uuid_len > 0) {
+                        storage_pool_disk_member_set_uuid(&dm, pmi->uuid, pmi->uuid_len);
+                    }
+                    dm.member_index = (uint8_t)m_idx;
+                    dm.flags = pmi->online ? 0x01 : 0x02;
+                    if (pmi->bdev_name) {
+                        storage_pool_disk_member_set_bdev_name(&dm, pmi->bdev_name);
+                    }
+                    dm.start_pool_lba = pmi->start_pool_lba;
+                    dm.capacity_sectors = pmi->capacity_sectors;
+                    storage_pool_disk_member_to_raw(&dm, &ext_sec.members[j]);
+                    storage_pool_disk_member_free(&dm);
+                }
+
+                uint32_t sec_crc = partition_crc32(&ext_sec, 508);
+                ext_sec.crc32 = sec_crc;
+
+                block_dev_write(mem->bdev, STORAGE_POOL_EXT_MEMBERS_LBA + s, 1, &ext_sec);
+                block_dev_write(mem->bdev, STORAGE_POOL_BACKUP_EXT_LBA - s, 1, &ext_sec);
+            }
         }
 
         block_dev_flush(mem->bdev);
@@ -293,14 +356,11 @@ static int storage_pool_load_metadata_unlocked(void) {
         if (curr->total_sectors > curr_backup_lba) {
             /* Check Primary Superblock */
             if (block_dev_read(curr, curr_sb_lba, 1, raw_buf)) {
-                if (raw->magic == STORAGE_POOL_MAGIC && raw->version == STORAGE_POOL_SB_VERSION) {
+                if (raw->magic == STORAGE_POOL_MAGIC) {
                     uint32_t calc_crc = partition_crc32(raw_buf, 508);
                     uint32_t stored_crc = *(uint32_t *)(raw_buf + 508);
-                    if (calc_crc == stored_crc && raw->member_count <= STORAGE_POOL_MAX_MEMBERS) {
+                    if (calc_crc == stored_crc) {
                         sb_ok = true;
-                    } else if (raw->member_count > STORAGE_POOL_MAX_MEMBERS) {
-                        serial_printf("[storage_pool] '%s': Primary SB member count %u exceeds format limit %u\n",
-                                      curr->name, raw->member_count, STORAGE_POOL_MAX_MEMBERS);
                     } else {
                         serial_printf("[storage_pool] '%s': Primary SB (LBA %llu) CRC mismatch\n",
                                       curr->name, curr_sb_lba);
@@ -313,11 +373,10 @@ static int storage_pool_load_metadata_unlocked(void) {
                 uint8_t backup_buf[512];
                 storage_pool_raw_sb_t *backup_raw = (storage_pool_raw_sb_t *)backup_buf;
                 if (block_dev_read(curr, curr_backup_lba, 1, backup_buf)) {
-                    if (backup_raw->magic == STORAGE_POOL_MAGIC && backup_raw->version == STORAGE_POOL_SB_VERSION) {
+                    if (backup_raw->magic == STORAGE_POOL_MAGIC) {
                         uint32_t b_crc = partition_crc32(backup_buf, 508);
                         uint32_t stored_b_crc = *(uint32_t *)(backup_buf + 508);
-                        if (b_crc == stored_b_crc &&
-                            backup_raw->member_count <= STORAGE_POOL_MAX_MEMBERS) {
+                        if (b_crc == stored_b_crc) {
                             serial_printf("[storage_pool] '%s': Primary SB corrupted. Recovered from Backup SB (LBA %llu)!\n",
                                           curr->name, curr_backup_lba);
                             memcpy(raw_buf, backup_buf, 512);
@@ -327,9 +386,6 @@ static int storage_pool_load_metadata_unlocked(void) {
                             /* Repair corrupted Primary Superblock */
                             block_dev_write(curr, curr_sb_lba, 1, raw_buf);
                             block_dev_flush(curr);
-                        } else if (backup_raw->member_count > STORAGE_POOL_MAX_MEMBERS) {
-                            serial_printf("[storage_pool] '%s': Backup SB member count %u exceeds format limit %u\n",
-                                          curr->name, backup_raw->member_count, STORAGE_POOL_MAX_MEMBERS);
                         }
                     }
                 }
@@ -354,9 +410,55 @@ static int storage_pool_load_metadata_unlocked(void) {
         curr = curr->next;
     }
 
-    if (!found_sb) {
+    if (!found_sb || best_sb.member_count == 0 || best_sb.total_capacity_sectors == 0) {
         storage_pool_disk_sb_free(&best_sb);
         return -2; /* No valid superblocks found */
+    }
+
+    /* If the superblock specifies more members than fit in the primary sector,
+     * load extended member descriptors from extended sectors. */
+    uint32_t inline_cap = storage_pool_primary_member_capacity();
+    if (best_sb.member_count > inline_cap && best_sb.reserved &&
+        best_sb.reserved_len >= sizeof(storage_pool_ext_header_t)) {
+        const storage_pool_ext_header_t *ext_hdr = (const storage_pool_ext_header_t *)best_sb.reserved;
+        if (ext_hdr->ext_magic == STORAGE_POOL_EXT_MAGIC) {
+            uint32_t ext_sec_count = ext_hdr->ext_sectors;
+            for (uint32_t s = 0; s < ext_sec_count; s++) {
+                storage_pool_ext_sector_t ext_sec;
+                bool ext_ok = false;
+                uint64_t prim_lba = ext_hdr->ext_lba ? (ext_hdr->ext_lba + s) : (STORAGE_POOL_EXT_MEMBERS_LBA + s);
+                if (sb_host_dev && block_dev_read(sb_host_dev, prim_lba, 1, &ext_sec)) {
+                    if (ext_sec.magic == STORAGE_POOL_EXT_MAGIC &&
+                        partition_crc32(&ext_sec, 508) == ext_sec.crc32) {
+                        ext_ok = true;
+                    }
+                }
+                if (!ext_ok && sb_host_dev) {
+                    uint64_t bak_lba = ext_hdr->backup_ext_lba ? (ext_hdr->backup_ext_lba - s) : (STORAGE_POOL_BACKUP_EXT_LBA - s);
+                    if (block_dev_read(sb_host_dev, bak_lba, 1, &ext_sec)) {
+                        if (ext_sec.magic == STORAGE_POOL_EXT_MAGIC &&
+                            partition_crc32(&ext_sec, 508) == ext_sec.crc32) {
+                            ext_ok = true;
+                            /* Repair primary extended sector */
+                            block_dev_write(sb_host_dev, prim_lba, 1, &ext_sec);
+                            block_dev_flush(sb_host_dev);
+                        }
+                    }
+                }
+                if (ext_ok) {
+                    for (uint32_t j = 0; j < ext_sec.member_count; j++) {
+                        storage_pool_disk_member_t dm;
+                        storage_pool_disk_member_init(&dm);
+                        storage_pool_disk_member_from_raw(&dm, &ext_sec.members[j]);
+                        storage_pool_disk_sb_add_member(&best_sb, &dm);
+                        storage_pool_disk_member_free(&dm);
+                    }
+                } else {
+                    serial_printf("[storage_pool] WARNING: Failed to read extended member sector %u (LBA %llu)\n",
+                                  s, prim_lba);
+                }
+            }
+        }
     }
 
     /* Clean up any old allocated state to prevent memory leaks */
@@ -364,7 +466,6 @@ static int storage_pool_load_metadata_unlocked(void) {
 
     /* Restore storage pool state from loaded superblock */
     s_storage_pool.magic = best_sb.magic;
-    s_storage_pool.version = best_sb.version;
     storage_pool_set_pool_uuid(best_sb.pool_uuid, best_sb.pool_uuid_len);
     s_storage_pool.total_capacity_sectors = best_sb.total_capacity_sectors;
     s_storage_pool.chunk_size_sectors = best_sb.chunk_size_sectors;
@@ -562,15 +663,53 @@ int storage_pool_create_ex(const char *pool_uuid, const char *bdev_name) {
         }
     }
     if (!target_bdev) {
+        /* Check if any dedicated data block device already has an existing IPO_FS filesystem */
         block_device_t *bdev = block_dev_get_list();
         while (bdev) {
-            if ((bdev->flags & BLOCK_DEV_BOOTABLE) && bdev->total_sectors >= 2048 + 10) {
+            if (!(bdev->flags & BLOCK_DEV_BOOTABLE) && bdev->total_sectors >= 2048 + 10) {
+                uint8_t chk[512];
+                if (block_dev_read(bdev, 2048, 1, chk) && memcmp(chk, "IPO_FS", 6) == 0) {
+                    target_bdev = bdev;
+                    break;
+                }
+                if (block_dev_read(bdev, 0, 1, chk) && memcmp(chk, "IPO_FS", 6) == 0) {
+                    target_bdev = bdev;
+                    break;
+                }
+            }
+            bdev = bdev->next;
+        }
+    }
+    if (!target_bdev) {
+        /* Check if bootable block device has an existing IPO_FS filesystem */
+        block_device_t *bdev = block_dev_get_list();
+        while (bdev) {
+            if (bdev->total_sectors >= 2048 + 10) {
+                uint8_t chk[512];
+                if (block_dev_read(bdev, 2048, 1, chk) && memcmp(chk, "IPO_FS", 6) == 0) {
+                    target_bdev = bdev;
+                    break;
+                }
+                if (block_dev_read(bdev, 0, 1, chk) && memcmp(chk, "IPO_FS", 6) == 0) {
+                    target_bdev = bdev;
+                    break;
+                }
+            }
+            bdev = bdev->next;
+        }
+    }
+    /* Prefer dedicated data storage devices (non-bootable devices with sufficient capacity) */
+    if (!target_bdev) {
+        block_device_t *bdev = block_dev_get_list();
+        while (bdev) {
+            if (!(bdev->flags & BLOCK_DEV_BOOTABLE) && bdev->total_sectors >= 2048 + 10) {
                 target_bdev = bdev;
                 break;
             }
             bdev = bdev->next;
         }
     }
+    /* Fallback to bootable device if it is the only device */
     if (!target_bdev) {
         block_device_t *bdev = block_dev_get_list();
         while (bdev) {
@@ -603,7 +742,6 @@ int storage_pool_create_ex(const char *pool_uuid, const char *bdev_name) {
     }
     memset(s_storage_pool.members, 0, s_storage_pool.member_capacity * sizeof(pool_member_t));
     s_storage_pool.magic = STORAGE_POOL_MAGIC;
-    s_storage_pool.version = STORAGE_POOL_SB_VERSION;
     s_storage_pool.chunk_size_sectors = 2048; /* 1 MiB extents */
     s_storage_pool.generation = 1;
     s_storage_pool.recovery_count = 0;
@@ -784,13 +922,6 @@ int storage_pool_add_device(block_device_t *bdev) {
             spin_unlock(&s_pool_lock);
             return 0;
         }
-    }
-
-    if (s_storage_pool.member_count >= STORAGE_POOL_MAX_MEMBERS) {
-        spin_unlock(&s_pool_lock);
-        serial_printf("[storage_pool] Cannot attach '%s': on-disk format supports at most %u members.\n",
-                      bdev->name ? bdev->name : "unknown", STORAGE_POOL_MAX_MEMBERS);
-        return -3;
     }
 
     if (s_storage_pool.member_count >= s_storage_pool.member_capacity) {
@@ -1063,7 +1194,7 @@ int storage_pool_check(void) {
         if (block_dev_read(mem->bdev, sb_lba, 1, psb_buf)) {
             uint32_t c_crc = partition_crc32(psb_buf, 508);
             uint32_t stored_crc = *(uint32_t *)(psb_buf + 508);
-            if (psb->magic == STORAGE_POOL_MAGIC && psb->version == STORAGE_POOL_SB_VERSION && c_crc == stored_crc) {
+            if (psb->magic == STORAGE_POOL_MAGIC && c_crc == stored_crc) {
                 printf("    Primary SB:    LBA %llu Verified (OK, Gen %u, CRC 0x%08X)\n",
                        sb_lba, psb->generation, stored_crc);
             } else {
@@ -1082,7 +1213,7 @@ int storage_pool_check(void) {
         if (block_dev_read(mem->bdev, backup_sb_lba, 1, bsb_buf)) {
             uint32_t b_crc = partition_crc32(bsb_buf, 508);
             uint32_t stored_b_crc = *(uint32_t *)(bsb_buf + 508);
-            if (bsb->magic == STORAGE_POOL_MAGIC && bsb->version == STORAGE_POOL_SB_VERSION && b_crc == stored_b_crc) {
+            if (bsb->magic == STORAGE_POOL_MAGIC && b_crc == stored_b_crc) {
                 printf("    Backup SB:     LBA %llu Verified (OK, Gen %u, CRC 0x%08X)\n",
                        backup_sb_lba, bsb->generation, stored_b_crc);
             } else {
@@ -1323,9 +1454,9 @@ void storage_pool_disk_member_from_raw(storage_pool_disk_member_t *m, const stor
     storage_pool_disk_member_set_uuid(m, raw->uuid, 16);
     m->member_index = raw->member_index;
     m->flags = raw->flags;
-    char name_buf[15];
-    memcpy(name_buf, raw->bdev_name, 14);
-    name_buf[14] = '\0';
+    char name_buf[sizeof(raw->bdev_name) + 1];
+    memcpy(name_buf, raw->bdev_name, sizeof(raw->bdev_name));
+    name_buf[sizeof(raw->bdev_name)] = '\0';
     storage_pool_disk_member_set_bdev_name(m, name_buf);
     m->start_pool_lba = raw->start_pool_lba;
     m->capacity_sectors = raw->capacity_sectors;
@@ -1508,7 +1639,6 @@ int storage_pool_disk_sb_set_reserved(storage_pool_disk_sb_t *sb, const uint8_t 
 
 int storage_pool_disk_sb_add_member(storage_pool_disk_sb_t *sb, const storage_pool_disk_member_t *m) {
     if (!sb || !m) return -1;
-    if (sb->members_count >= STORAGE_POOL_MAX_MEMBERS) return -1;
     if (sb->members_count >= sb->members_cap) {
         size_t nc = sb->members_cap ? sb->members_cap * 2 : 4;
         storage_pool_disk_member_t *nm = (storage_pool_disk_member_t *)krealloc(sb->members, nc * sizeof(*nm));
@@ -1524,9 +1654,8 @@ int storage_pool_disk_sb_add_member(storage_pool_disk_sb_t *sb, const storage_po
 }
 
 void storage_pool_disk_sb_from_raw(storage_pool_disk_sb_t *sb, const storage_pool_raw_sb_t *raw) {
-    if (!sb || !raw || raw->member_count > STORAGE_POOL_MAX_MEMBERS) return;
+    if (!sb || !raw) return;
     sb->magic = raw->magic;
-    sb->version = raw->version;
     storage_pool_disk_sb_set_pool_uuid(sb, raw->pool_uuid, sizeof(raw->pool_uuid));
     storage_pool_disk_sb_set_local_member_uuid(sb, raw->local_member_uuid, sizeof(raw->local_member_uuid));
     sb->member_index = raw->member_index;
@@ -1541,8 +1670,10 @@ void storage_pool_disk_sb_from_raw(storage_pool_disk_sb_t *sb, const storage_poo
     storage_pool_disk_sb_set_reserved(sb, sec + 456, 52);
     sb->crc32 = *(const uint32_t *)(sec + 508);
 
-    /* Load the member descriptors that fit in this superblock version. */
-    for (uint32_t i = 0; i < raw->member_count; i++) {
+    /* Load the inline member descriptors that fit in this superblock sector. */
+    uint32_t inline_cap = storage_pool_primary_member_capacity();
+    uint32_t inline_count = raw->member_count > inline_cap ? inline_cap : raw->member_count;
+    for (uint32_t i = 0; i < inline_count; i++) {
         storage_pool_disk_member_t dm;
         storage_pool_disk_member_init(&dm);
         storage_pool_disk_member_from_raw(&dm, &raw->members[i]);
@@ -1552,11 +1683,10 @@ void storage_pool_disk_sb_from_raw(storage_pool_disk_sb_t *sb, const storage_poo
 }
 
 void storage_pool_disk_sb_to_raw(const storage_pool_disk_sb_t *sb, storage_pool_raw_sb_t *raw) {
-    if (!sb || !raw || sb->members_count > STORAGE_POOL_MAX_MEMBERS) return;
+    if (!sb || !raw) return;
     uint8_t *sec = (uint8_t *)raw;
     memset(sec, 0, 512);
     raw->magic = sb->magic;
-    raw->version = sb->version;
     if (sb->pool_uuid) memcpy(raw->pool_uuid, sb->pool_uuid, sb->pool_uuid_len < 16 ? sb->pool_uuid_len : 16);
     if (sb->local_member_uuid)
         memcpy(raw->local_member_uuid, sb->local_member_uuid,
@@ -1568,8 +1698,10 @@ void storage_pool_disk_sb_to_raw(const storage_pool_disk_sb_t *sb, storage_pool_
     raw->generation = sb->generation;
     raw->state = sb->state;
 
-    /* Serialize the member descriptors supported by the fixed sector layout. */
-    for (size_t i = 0; i < sb->members_count; i++) {
+    /* Serialize the inline member descriptors supported by the 512B sector layout. */
+    uint32_t inline_cap = storage_pool_primary_member_capacity();
+    size_t inline_count = sb->members_count > inline_cap ? inline_cap : sb->members_count;
+    for (size_t i = 0; i < inline_count; i++) {
         storage_pool_disk_member_to_raw(&sb->members[i], &raw->members[i]);
     }
 

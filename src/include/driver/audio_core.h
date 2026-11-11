@@ -53,8 +53,15 @@ void            audio_stream_set_volume(audio_stream_t *stream, float volume);
 void            audio_stream_seek(audio_stream_t *stream, double progress_fraction);
 double          audio_stream_get_progress(audio_stream_t *stream);
 
+/* Continuous background DMA replenishment and mixing */
+void            audio_poll(void);
+
 /* Resamples, mixes all active streams and outputs audio to hardware */
 void            audio_tick(void);
+
+/* Audio engine diagnostic metrics */
+uint32_t        audio_get_refill_count(void);
+bool            audio_is_running(void);
 
 /* Stops Sound Blaster 16 DMA output immediately */
 void            sb16_stop(void);

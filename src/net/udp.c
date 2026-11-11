@@ -3,6 +3,7 @@
 #include <net/ipv4.h>
 #include <string.h>
 #include <memory/kmalloc.h>
+#include <stdio.h>
 
 void udp_init(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
@@ -13,6 +14,14 @@ void udp_init(void) {
 
 bool udp_bind(uint16_t port, udp_callback_t callback) {
     net_shared_ctx_t *ctx = net_get_shared_context();
+    if (ctx->udp_table_capacity == 0 || !ctx->udp_table) {
+        size_t init_cap = 16;
+        udp_socket_t *init_tbl = (udp_socket_t *)kmalloc(init_cap * sizeof(udp_socket_t));
+        if (!init_tbl) return false;
+        memset(init_tbl, 0, init_cap * sizeof(udp_socket_t));
+        ctx->udp_table = init_tbl;
+        ctx->udp_table_capacity = init_cap;
+    }
 
     for (size_t i = 0; i < ctx->udp_table_capacity; i++) {
         if (ctx->udp_table[i].in_use && ctx->udp_table[i].port == port) {
@@ -109,8 +118,8 @@ void udp_receive(ip4_addr_t src_ip, const void *data, uint16_t len) {
         dns_process_response_packet(payload, payload_len);
     }
 
-    /* Central DHCP response capture if to client port 68 from server port 67 */
-    if (dst_port == 68 && src_port == 67) {
+    /* Central DHCP response capture if to client port 68 (RFC 2131) */
+    if (dst_port == 68) {
         dhcp_process_packet(payload, payload_len);
     }
 

@@ -171,7 +171,7 @@ void wm_buf_draw_rect(uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, int 
 /**
  * Draw a single VGA font slot (0..255) at 6x8 into the buffer.
  * For printable ASCII (0x20..0x7E) the fast built-in wm_font is used.
- * For any other slot (Cyrillic, CJK, etc.) the 8x16 glyph from the VGA
+ * For any other slot (extended Unicode, non-ASCII, etc.) the 8x16 glyph from the VGA
  * font cache is downscaled to 6x8 by sampling every other row and the
  * six most significant columns.
  */
@@ -665,11 +665,17 @@ bool wm_resize(wm_window_t *win, uint16_t nw, uint16_t nh) {
     uint16_t old_w = win->w;
     uint16_t old_h = win->h;
 
-    /* Dynamic fast fixed-point 16.16 2D scaling of framebuffer using static scratch: ZERO HEAP CHURN */
+    /* Dynamic fast fixed-point 16.16 2D scaling of framebuffer using self-expanding scratch buffer */
     if (win->framebuf_owned && win->framebuf && old_w > 0 && old_h > 0) {
-        static uint8_t scale_scratch[VGA_GFX_SIZE];
+        static uint8_t *scale_scratch = NULL;
+        static size_t scale_scratch_cap = 0;
         size_t cur_sz = (size_t)old_w * old_h;
-        if (cur_sz > VGA_GFX_SIZE) cur_sz = VGA_GFX_SIZE;
+        if (cur_sz > scale_scratch_cap) {
+            uint8_t *new_scratch = (uint8_t *)krealloc(scale_scratch, cur_sz);
+            if (!new_scratch) return false;
+            scale_scratch = new_scratch;
+            scale_scratch_cap = cur_sz;
+        }
         memcpy(scale_scratch, win->framebuf, cur_sz);
 
         uint32_t step_y = ((uint32_t)old_h << 16) / nh;
@@ -1068,91 +1074,6 @@ static int taskbar_scroll_offset = 0;
 static uint32_t wm_lang_offset = 0;
 static uint32_t wm_lang_last_tick = 0;
 
-static const char *wm_cyrillic_transliteration(uint32_t codepoint) {
-    static const char *const russian[] = {
-        "A", "B", "V", "G", "D", "E", "Zh", "Z",
-        "I", "Y", "K", "L", "M", "N", "O", "P",
-        "R", "S", "T", "U", "F", "Kh", "Ts", "Ch",
-        "Sh", "Shch", "", "Y", "", "E", "Yu", "Ya"
-    };
-    static const char *const russian_lower[] = {
-        "a", "b", "v", "g", "d", "e", "zh", "z",
-        "i", "y", "k", "l", "m", "n", "o", "p",
-        "r", "s", "t", "u", "f", "kh", "ts", "ch",
-        "sh", "shch", "", "y", "", "e", "yu", "ya"
-    };
-    if (codepoint >= 0x0410 && codepoint <= 0x042F) {
-        return russian[codepoint - 0x0410];
-    }
-    if (codepoint >= 0x0430 && codepoint <= 0x044F) {
-        return russian_lower[codepoint - 0x0430];
-    }
-    switch (codepoint) {
-        case 0x0401: return "Yo";
-        case 0x0451: return "yo";
-        case 0x0404: return "Ye";
-        case 0x0454: return "ye";
-        case 0x0406: return "I";
-        case 0x0456: return "i";
-        case 0x0407: return "Yi";
-        case 0x0457: return "yi";
-        case 0x0490: return "G";
-        case 0x0491: return "g";
-        default: return "?";
-    }
-}
-
-static uint32_t wm_utf8_codepoint(const char *text, size_t bytes) {
-    const unsigned char *s = (const unsigned char *)text;
-    if (bytes == 2) return ((uint32_t)(s[0] & 0x1Fu) << 6) | (s[1] & 0x3Fu);
-    if (bytes == 3) return ((uint32_t)(s[0] & 0x0Fu) << 12) |
-                              ((uint32_t)(s[1] & 0x3Fu) << 6) | (s[2] & 0x3Fu);
-    if (bytes == 4) return ((uint32_t)(s[0] & 0x07u) << 18) |
-                              ((uint32_t)(s[1] & 0x3Fu) << 12) |
-                              ((uint32_t)(s[2] & 0x3Fu) << 6) | (s[3] & 0x3Fu);
-    return s[0];
-}
-
-static bool wm_language_name_has_missing_glyphs(const char *name) {
-    size_t length = strlen(name);
-    for (size_t pos = 0; pos < length;) {
-        size_t bytes = 0;
-        uint8_t glyph = utf8_to_vga_glyph(&name[pos], length - pos, &bytes);
-        if (bytes == 0) {
-            pos++;
-            continue;
-        }
-        if ((unsigned char)name[pos] >= 0x80u && glyph == '?') return true;
-        pos += bytes;
-    }
-    return false;
-}
-
-static void wm_language_name_to_ascii(const char *name, char *out, size_t out_size) {
-    size_t length = strlen(name);
-    size_t pos = 0;
-    size_t used = 0;
-    while (pos < length && used + 1 < out_size) {
-        size_t bytes = 0;
-        utf8_to_vga_glyph(&name[pos], length - pos, &bytes);
-        if (bytes == 0) {
-            pos++;
-            continue;
-        }
-        if ((unsigned char)name[pos] < 0x80u) {
-            out[used++] = name[pos++];
-            continue;
-        }
-        const char *replacement = wm_cyrillic_transliteration(
-            wm_utf8_codepoint(&name[pos], bytes));
-        while (*replacement && used + 1 < out_size) {
-            out[used++] = *replacement++;
-        }
-        pos += bytes;
-    }
-    out[used] = '\0';
-}
-
 static void wm_draw_close_button(uint8_t *bb, int x, int y, int w, int h, bool pressed) {
     bool is_wm = wm_session_active();
     uint8_t clr_face      = is_wm ? WIN_CLR_FACE : 7;
@@ -1309,12 +1230,7 @@ static void draw_taskbar(uint8_t *bb) {
     draw_3d_box(bb, 195, TASKBAR_Y + 2, 85, 10, true);
     const char *lang_name = dynamic_keymap_get_name();
     if (!lang_name || lang_name[0] == '\0') {
-        lang_name = "English (US)";
-    }
-    char fallback_name[96];
-    if (wm_language_name_has_missing_glyphs(lang_name)) {
-        wm_language_name_to_ascii(lang_name, fallback_name, sizeof(fallback_name));
-        lang_name = fallback_name;
+        lang_name = default_keymap_name;
     }
     size_t lang_byte_len = strlen(lang_name);
     int vis_chars = 13; /* (85 - 4) / 6 = 13 character cells */
@@ -1982,10 +1898,29 @@ void wm_compositor_tick(void) {
         drag_win = NULL;
     }
 
-    /* Keep invalidation state current, but redraw every compositor tick. */
+    static int32_t last_rendered_mx = -1;
+    static int32_t last_rendered_my = -1;
+    static uint32_t last_rendered_time = 0;
+    bool any_dirty = false;
     for (wm_window_t *w = wm_head; w; w = w->next) {
-        w->dirty = false;
+        if (w->dirty) {
+            any_dirty = true;
+            w->dirty = false;
+        }
     }
+
+    uint32_t now = timer_millis();
+    bool mouse_moved = (ms.x != last_rendered_mx || ms.y != last_rendered_my ||
+                        left_pressed || left_released || right_pressed);
+    bool time_to_update_clock = (now - last_rendered_time >= 500u);
+
+    if (!any_dirty && !mouse_moved && !time_to_update_clock && drag_mode == DRAG_NONE) {
+        return;
+    }
+
+    last_rendered_mx = ms.x;
+    last_rendered_my = ms.y;
+    last_rendered_time = now;
 
     if (!vga_is_graphics_mode()) {
         return;
@@ -2112,14 +2047,15 @@ void wm_raw_gfx_overlay_tick(void) {
     uint8_t *vram = (uint8_t *)0xA0000;
 
     static int prev_cx = -1, prev_cy = -1;
-    static uint8_t saved_under[64];
+    static uint8_t *saved_under = NULL;
+    static size_t saved_under_cap = 0;
     static bool has_saved = false;
 
     bool show_cursor = !(overlay_flags & VGA_OVERLAY_HIDE_CURSOR);
     bool show_button = !(overlay_flags & VGA_OVERLAY_HIDE_BUTTON);
 
     /* Restore pixels under the previous cursor position */
-    if (has_saved && prev_cx >= 0 && prev_cy >= 0) {
+    if (has_saved && saved_under && prev_cx >= 0 && prev_cy >= 0) {
         for (int row = 0; row < 8; row++) {
             int py = prev_cy + row;
             if (py < 0 || py >= VGA_GFX_HEIGHT) continue;
@@ -2149,18 +2085,26 @@ void wm_raw_gfx_overlay_tick(void) {
     if (show_cursor) {
         prev_cx = (int)ms.x;
         prev_cy = (int)ms.y;
+        size_t needed = 8 * 8;
+        if (saved_under_cap < needed) {
+            uint8_t *new_buf = (uint8_t *)krealloc(saved_under, needed);
+            if (new_buf) {
+                saved_under = new_buf;
+                saved_under_cap = needed;
+            }
+        }
         for (int row = 0; row < 8; row++) {
             int py = prev_cy + row;
             for (int col = 0; col < 8; col++) {
                 int px = prev_cx + col;
                 if (px >= 0 && px < VGA_GFX_WIDTH && py >= 0 && py < VGA_GFX_HEIGHT) {
-                    saved_under[row * 8 + col] = vram[py * VGA_GFX_WIDTH + px];
+                    if (saved_under) saved_under[row * 8 + col] = vram[py * VGA_GFX_WIDTH + px];
                 } else {
-                    saved_under[row * 8 + col] = 0;
+                    if (saved_under) saved_under[row * 8 + col] = 0;
                 }
             }
         }
-        has_saved = true;
+        has_saved = (saved_under != NULL);
         draw_cursor(vram, prev_cx, prev_cy);
     }
 }

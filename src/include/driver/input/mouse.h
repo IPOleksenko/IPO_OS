@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #define MOUSE_BTN_LEFT   0x01
 #define MOUSE_BTN_RIGHT  0x02
@@ -25,7 +26,8 @@ typedef struct {
     bool has_wheel;        /* True if scroll wheel is enabled */
     uint8_t dev_id;        /* PS/2 device ID (0x00, 0x03, 0x04) */
     uint8_t packet_size;   /* Packet size in bytes (3 or 4) */
-    uint8_t raw_packet[4]; /* Most recent raw packet bytes */
+    uint8_t *raw_packet;   /* Most recent raw packet bytes (dynamically allocated) */
+    size_t raw_packet_len; /* Dynamic length of raw packet */
     uint32_t buttons;      /* Bitmask of pressed buttons */
     uint32_t event_count;  /* Total number of mouse packets processed */
 } mouse_state_t;

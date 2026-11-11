@@ -112,6 +112,20 @@ static void net_free_configured_buffers(net_shared_ctx_t *ctx) {
     kfree(ctx->dns_queue);
     kfree(ctx->icmp_queue);
     kfree(ctx->loop_slots);
+    if (ctx->rx_buffer) {
+        kfree(ctx->rx_buffer);
+        ctx->rx_buffer = NULL;
+    }
+    if (ctx->tx_buffers) {
+        for (size_t i = 0; i < ctx->tx_buffers_count; i++) {
+            if (ctx->tx_buffers[i]) {
+                kfree(ctx->tx_buffers[i]);
+            }
+        }
+        kfree(ctx->tx_buffers);
+        ctx->tx_buffers = NULL;
+        ctx->tx_buffers_count = 0;
+    }
     ctx->arp_table = NULL;
     ctx->udp_table = NULL;
     ctx->dns_queue = NULL;
@@ -126,53 +140,57 @@ static void *net_allocate_array(size_t count, size_t element_size) {
     return kmalloc(count * element_size);
 }
 
-bool net_init(const net_config_t *config) {
-    if (!config) {
-        return false;
-    }
-
+bool net_init(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
     if (ctx->magic == NET_SHARED_MAGIC) {
         if (ctx->rtl_dev.initialized) {
             ctx->default_if.link_up = true;
         }
-        return ctx->icmp_queue_capacity >= config->icmp_queue_capacity &&
-               ctx->arp_table_capacity >= config->arp_table_capacity &&
-               ctx->udp_table_capacity >= config->udp_sockets_capacity &&
-               ctx->dns_queue_capacity >= config->dns_queue_capacity &&
-               ctx->loopback_queue_capacity >= config->loopback_queue_capacity;
+        return true;
     }
 
-    if (ctx->magic != NET_SHARED_MAGIC) {
-        memset(ctx, 0, sizeof(net_shared_ctx_t));
-        ctx->icmp_queue = net_allocate_array(config->icmp_queue_capacity, sizeof(*ctx->icmp_queue));
-        ctx->arp_table = net_allocate_array(config->arp_table_capacity, sizeof(*ctx->arp_table));
-        ctx->udp_table = net_allocate_array(config->udp_sockets_capacity, sizeof(*ctx->udp_table));
-        ctx->dns_queue = net_allocate_array(config->dns_queue_capacity, sizeof(*ctx->dns_queue));
-        ctx->loop_slots = net_allocate_array(config->loopback_queue_capacity, sizeof(*ctx->loop_slots));
-        if ((config->icmp_queue_capacity > 0 && !ctx->icmp_queue) ||
-            (config->arp_table_capacity > 0 && !ctx->arp_table) ||
-            (config->udp_sockets_capacity > 0 && !ctx->udp_table) ||
-            (config->dns_queue_capacity > 0 && !ctx->dns_queue) ||
-            (config->loopback_queue_capacity > 0 && !ctx->loop_slots)) {
-            net_free_configured_buffers(ctx);
-            return false;
-        }
-        ctx->icmp_queue_capacity = config->icmp_queue_capacity;
-        ctx->arp_table_capacity = config->arp_table_capacity;
-        ctx->udp_table_capacity = config->udp_sockets_capacity;
-        ctx->dns_queue_capacity = config->dns_queue_capacity;
-        ctx->loopback_queue_capacity = config->loopback_queue_capacity;
-        if (ctx->dns_queue_capacity > 0 && ctx->dns_queue) {
-            memset(ctx->dns_queue, 0, ctx->dns_queue_capacity * sizeof(*ctx->dns_queue));
-        }
-        ctx->magic = NET_SHARED_MAGIC;
-        memset(&ctx->default_if.mac, 0, sizeof(ctx->default_if.mac));
-        ctx->default_if.ip = 0;
-        ctx->default_if.netmask = 0;
-        ctx->default_if.gateway = 0;
-        ctx->default_if.dns = 0;
-        ctx->default_if.link_up = false;
+    size_t icmp_cap = 16;
+    size_t arp_cap  = 16;
+    size_t udp_cap  = 16;
+    size_t dns_cap  = 16;
+    size_t loop_cap = 16;
+
+    memset(ctx, 0, sizeof(net_shared_ctx_t));
+    ctx->icmp_queue = net_allocate_array(icmp_cap, sizeof(*ctx->icmp_queue));
+    ctx->arp_table  = net_allocate_array(arp_cap,  sizeof(*ctx->arp_table));
+    ctx->udp_table  = net_allocate_array(udp_cap,  sizeof(*ctx->udp_table));
+    ctx->dns_queue  = net_allocate_array(dns_cap,  sizeof(*ctx->dns_queue));
+    ctx->loop_slots = net_allocate_array(loop_cap, sizeof(*ctx->loop_slots));
+
+    if (!ctx->icmp_queue || !ctx->arp_table || !ctx->udp_table ||
+        !ctx->dns_queue  || !ctx->loop_slots) {
+        net_free_configured_buffers(ctx);
+        return false;
+    }
+
+    ctx->icmp_queue_capacity = icmp_cap;
+    ctx->arp_table_capacity  = arp_cap;
+    ctx->udp_table_capacity  = udp_cap;
+    ctx->dns_queue_capacity  = dns_cap;
+    ctx->loopback_queue_capacity = loop_cap;
+
+    for (size_t i = 0; i < ctx->icmp_queue_capacity; i++) {
+        ctx->icmp_queue[i].id = 0xFFFF;
+        ctx->icmp_queue[i].seq = 0xFFFF;
+    }
+    memset(ctx->arp_table, 0, ctx->arp_table_capacity * sizeof(*ctx->arp_table));
+    memset(ctx->udp_table, 0, ctx->udp_table_capacity * sizeof(*ctx->udp_table));
+    memset(ctx->dns_queue, 0, ctx->dns_queue_capacity * sizeof(*ctx->dns_queue));
+    memset(ctx->loop_slots, 0, ctx->loopback_queue_capacity * sizeof(*ctx->loop_slots));
+
+    ctx->magic = NET_SHARED_MAGIC;
+    ctx->loopback_ip = IP4_ADDR(127, 0, 0, 1);
+    mac_init(&ctx->default_if.mac);
+    ctx->default_if.ip = 0;
+    ctx->default_if.netmask = 0;
+    ctx->default_if.gateway = 0;
+    ctx->default_if.dns = 0;
+    ctx->default_if.link_up = false;
 
         loopback_init();
         arp_init();
@@ -181,29 +199,41 @@ bool net_init(const net_config_t *config) {
         tcp_init();
         socket_subsystem_init();
         if (rtl8139_init()) {
-            const uint8_t *mac = rtl8139_get_mac();
-            memcpy(ctx->default_if.mac.mac, mac, 6);
+            size_t hw_mac_len = 0;
+            const uint8_t *mac = rtl8139_get_mac(&hw_mac_len);
+            mac_set(&ctx->default_if.mac, mac, hw_mac_len);
             ctx->default_if.link_up = true;
-            serial_printf("[net] RTL8139 init SUCCESS, MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-                          (unsigned int)mac[0], (unsigned int)mac[1], (unsigned int)mac[2],
-                          (unsigned int)mac[3], (unsigned int)mac[4], (unsigned int)mac[5]);
+            char *mac_str = mac_format_dyn(&ctx->default_if.mac);
+            printf("[net] RTL8139 init SUCCESS, MAC: %s\n", mac_str ? mac_str : "unknown");
+            if (mac_str) kfree(mac_str);
 
             /* Dynamic configuration via DHCP */
-            serial_printf("[net] Discovering network configuration via DHCP...\n");
-            if (dhcp_request_lease(3000)) {
-                serial_printf("[net] Dynamic network configuration established via DHCP.\n");
+            printf("[net] Discovering network configuration via DHCP...\n");
+            if (dhcp_request_lease(10000)) {
+                printf("[net] Dynamic network configuration established via DHCP.\n");
             } else {
-                serial_printf("[net] DHCP not responding, falling back to static 192.168.7.2/24\n");
-                ctx->default_if.ip = IP4_ADDR(192, 168, 7, 2);
-                ctx->default_if.netmask = IP4_ADDR(255, 255, 255, 0);
-                ctx->default_if.gateway = IP4_ADDR(192, 168, 7, 1);
-                ctx->default_if.dns = IP4_ADDR(192, 168, 7, 3);
+                const uint8_t *hw_mac = mac_get_bytes(&ctx->default_if.mac);
+                size_t mac_l = mac_get_len(&ctx->default_if.mac);
+                uint8_t b3 = (hw_mac && mac_l >= 2) ? hw_mac[mac_l - 2] : 1;
+                uint8_t b4 = (hw_mac && mac_l >= 1) ? hw_mac[mac_l - 1] : 2;
+                if (b3 == 0) b3 = 1;
+                if (b3 == 255) b3 = 254;
+                if (b4 == 0) b4 = 1;
+                if (b4 == 255) b4 = 254;
+
+                ctx->default_if.ip = IP4_ADDR(169, 254, b3, b4);
+                ctx->default_if.netmask = IP4_ADDR(255, 255, 0, 0);
+                ctx->default_if.gateway = 0;
+                ctx->default_if.dns = 0;
+
+                char ip_s[32];
+                ip_to_str(ctx->default_if.ip, ip_s, sizeof(ip_s));
+                printf("[net] DHCP not detected, auto-configured Link-Local IP from hardware MAC: %s/16\n", ip_s);
             }
         } else {
             ctx->default_if.link_up = false;
-            serial_printf("[net] RTL8139 init FAILED, link is down\n");
+            printf("[net] RTL8139 init FAILED, link is down\n");
         }
-    }
 
     return true;
 }

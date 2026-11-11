@@ -6,12 +6,21 @@
 #include <memory/kmalloc.h>
 #include <ioport.h>
 #include <syscall.h>
+#include <stdio.h>
 
 #define ARP_ENTRY_TIMEOUT_MS 60000u
 
-static const mac_addr_t broadcast_mac = {
-    {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
-};
+static mac_addr_t broadcast_mac;
+static bool broadcast_mac_inited = false;
+
+static const mac_addr_t *get_broadcast_mac(void) {
+    if (!broadcast_mac_inited) {
+        mac_init(&broadcast_mac);
+        mac_set_broadcast(&broadcast_mac);
+        broadcast_mac_inited = true;
+    }
+    return &broadcast_mac;
+}
 
 static void arp_cache_prune(void) {
     uint32_t now = timer_millis();
@@ -35,7 +44,7 @@ static void arp_cache_insert(ip4_addr_t ip, const mac_addr_t *mac) {
     /* 1. Update existing entry if present */
     for (size_t i = 0; i < ctx->arp_table_capacity; i++) {
         if (ctx->arp_table[i].in_use && ctx->arp_table[i].ip == ip) {
-            memcpy(&ctx->arp_table[i].mac, mac, sizeof(mac_addr_t));
+            mac_copy(&ctx->arp_table[i].mac, mac);
             ctx->arp_table[i].last_seen_ms = now;
             return;
         }
@@ -79,7 +88,7 @@ static void arp_cache_insert(ip4_addr_t ip, const mac_addr_t *mac) {
     }
 
     ctx->arp_table[slot].ip = ip;
-    memcpy(&ctx->arp_table[slot].mac, mac, sizeof(mac_addr_t));
+    mac_copy(&ctx->arp_table[slot].mac, mac);
     ctx->arp_table[slot].last_seen_ms = now;
     ctx->arp_table[slot].in_use = true;
 }
@@ -91,7 +100,7 @@ static bool arp_cache_lookup(ip4_addr_t ip, mac_addr_t *out_mac) {
     for (size_t i = 0; i < ctx->arp_table_capacity; i++) {
         if (ctx->arp_table[i].in_use && ctx->arp_table[i].ip == ip) {
             if (out_mac) {
-                memcpy(out_mac, &ctx->arp_table[i].mac, sizeof(mac_addr_t));
+                mac_copy(out_mac, &ctx->arp_table[i].mac);
             }
             return true;
         }
@@ -106,22 +115,179 @@ void arp_init(void) {
     }
 }
 
+void arp_packet_init(arp_packet_t *pkt) {
+    if (!pkt) return;
+    memset(pkt, 0, sizeof(*pkt));
+    mac_init(&pkt->sender_mac);
+    mac_init(&pkt->target_mac);
+}
+
+void arp_packet_free(arp_packet_t *pkt) {
+    if (!pkt) return;
+    mac_free(&pkt->sender_mac);
+    mac_free(&pkt->target_mac);
+    memset(pkt, 0, sizeof(*pkt));
+}
+
+bool arp_packet_parse(arp_packet_t *pkt, const void *data, size_t len) {
+    if (!pkt || !data || len < 8) return false;
+    arp_packet_init(pkt);
+
+    const uint8_t *raw = (const uint8_t *)data;
+    pkt->hw_type    = (uint16_t)((raw[0] << 8) | raw[1]);
+    pkt->proto_type = (uint16_t)((raw[2] << 8) | raw[3]);
+    pkt->hw_len     = raw[4];
+    pkt->proto_len  = raw[5];
+    pkt->opcode     = (uint16_t)((raw[6] << 8) | raw[7]);
+
+    size_t needed = 8 + (pkt->hw_len * 2) + (pkt->proto_len * 2);
+    if (len < needed) {
+        arp_packet_free(pkt);
+        return false;
+    }
+
+    size_t off = 8;
+    mac_set(&pkt->sender_mac, raw + off, pkt->hw_len);
+    off += pkt->hw_len;
+
+    if (pkt->proto_len == 4) {
+        uint32_t s_ip;
+        memcpy(&s_ip, raw + off, 4);
+        pkt->sender_ip = ntohl(s_ip);
+    }
+    off += pkt->proto_len;
+
+    mac_set(&pkt->target_mac, raw + off, pkt->hw_len);
+    off += pkt->hw_len;
+
+    if (pkt->proto_len == 4) {
+        uint32_t t_ip;
+        memcpy(&t_ip, raw + off, 4);
+        pkt->target_ip = ntohl(t_ip);
+    }
+
+    return true;
+}
+
+size_t arp_packet_serialize(const arp_packet_t *pkt, void *buf, size_t buf_size) {
+    if (!pkt || !buf) return 0;
+    uint8_t hw_len = pkt->hw_len ? pkt->hw_len : (uint8_t)mac_get_len(&pkt->sender_mac);
+    if (hw_len == 0) hw_len = 6;
+    uint8_t proto_len = pkt->proto_len ? pkt->proto_len : 4;
+    size_t needed = 8 + (size_t)hw_len * 2 + (size_t)proto_len * 2;
+    if (buf_size < needed) return 0;
+
+    uint8_t *raw = (uint8_t *)buf;
+    raw[0] = (uint8_t)(pkt->hw_type >> 8);
+    raw[1] = (uint8_t)(pkt->hw_type & 0xFF);
+    raw[2] = (uint8_t)(pkt->proto_type >> 8);
+    raw[3] = (uint8_t)(pkt->proto_type & 0xFF);
+    raw[4] = hw_len;
+    raw[5] = proto_len;
+    raw[6] = (uint8_t)(pkt->opcode >> 8);
+    raw[7] = (uint8_t)(pkt->opcode & 0xFF);
+
+    size_t off = 8;
+    const uint8_t *s_mac = mac_get_bytes(&pkt->sender_mac);
+    size_t s_len = mac_get_len(&pkt->sender_mac);
+    for (size_t i = 0; i < hw_len; i++) {
+        raw[off + i] = (s_mac && i < s_len) ? s_mac[i] : 0;
+    }
+    off += hw_len;
+
+    uint32_t s_ip = htonl(pkt->sender_ip);
+    memcpy(raw + off, &s_ip, proto_len <= 4 ? proto_len : 4);
+    off += proto_len;
+
+    const uint8_t *t_mac = mac_get_bytes(&pkt->target_mac);
+    size_t t_len = mac_get_len(&pkt->target_mac);
+    for (size_t i = 0; i < hw_len; i++) {
+        raw[off + i] = (t_mac && i < t_len) ? t_mac[i] : 0;
+    }
+    off += hw_len;
+
+    uint32_t t_ip = htonl(pkt->target_ip);
+    memcpy(raw + off, &t_ip, proto_len <= 4 ? proto_len : 4);
+    off += proto_len;
+
+    return off;
+}
+
+size_t arp_packet_calc_size(const arp_packet_t *pkt) {
+    if (!pkt) return 0;
+    uint8_t hw_len = pkt->hw_len ? pkt->hw_len : (uint8_t)mac_get_len(&pkt->sender_mac);
+    if (hw_len == 0) hw_len = (uint8_t)mac_get_len(&pkt->target_mac);
+    if (hw_len == 0) hw_len = 6;
+    uint8_t proto_len = pkt->proto_len ? pkt->proto_len : 4;
+    return 8 + (size_t)hw_len * 2 + (size_t)proto_len * 2;
+}
+
+size_t arp_packet_serialize_dynamic(const arp_packet_t *pkt, uint8_t **out_raw) {
+    if (!pkt || !out_raw) return 0;
+    *out_raw = NULL;
+
+    size_t needed = arp_packet_calc_size(pkt);
+    size_t raw_cap = (needed > 0) ? needed : 28;
+
+    uint8_t *raw = (uint8_t *)kmalloc(raw_cap);
+    if (!raw) return 0;
+
+    size_t len = arp_packet_serialize(pkt, raw, raw_cap);
+    while (len == 0 && raw_cap < 65536) {
+        size_t new_cap = raw_cap * 2;
+        uint8_t *new_raw = (uint8_t *)krealloc(raw, new_cap);
+        if (!new_raw) {
+            kfree(raw);
+            return 0;
+        }
+        raw = new_raw;
+        raw_cap = new_cap;
+        len = arp_packet_serialize(pkt, raw, raw_cap);
+    }
+
+    if (len == 0) {
+        kfree(raw);
+        return 0;
+    }
+
+    *out_raw = raw;
+    return len;
+}
+
 void arp_send_request(ip4_addr_t target_ip) {
     net_if_t *netif = net_get_interface();
     if (!netif) return;
 
     arp_packet_t pkt;
-    pkt.hw_type = htons(1);
-    pkt.proto_type = htons(0x0800);
-    pkt.hw_len = 6;
+    arp_packet_init(&pkt);
+    pkt.hw_type = 1;
+    pkt.proto_type = 0x0800;
+    size_t mac_l = mac_get_len(&netif->mac);
+    pkt.hw_len = (uint8_t)(mac_l ? mac_l : 6);
     pkt.proto_len = 4;
-    pkt.opcode = htons(ARP_OP_REQUEST);
-    memcpy(&pkt.sender_mac, &netif->mac, sizeof(mac_addr_t));
-    pkt.sender_ip = htonl(netif->ip);
-    memset(&pkt.target_mac, 0, sizeof(mac_addr_t));
-    pkt.target_ip = htonl(target_ip);
+    pkt.opcode = ARP_OP_REQUEST;
+    mac_copy(&pkt.sender_mac, &netif->mac);
+    pkt.sender_ip = netif->ip;
 
-    eth_send(&broadcast_mac, ETHERTYPE_ARP, &pkt, sizeof(pkt));
+    /* Dynamically allocate zero MAC buffer of exact hardware length */
+    uint8_t *zero_mac = (uint8_t *)kmalloc(pkt.hw_len);
+    if (zero_mac) {
+        memset(zero_mac, 0, pkt.hw_len);
+        mac_set(&pkt.target_mac, zero_mac, pkt.hw_len);
+        kfree(zero_mac);
+    }
+    pkt.target_ip = target_ip;
+
+    /* Self-expanding dynamic serialization buffer via kmalloc */
+    uint8_t *raw = NULL;
+    size_t len = arp_packet_serialize_dynamic(&pkt, &raw);
+    if (raw && len > 0) {
+        eth_send(get_broadcast_mac(), ETHERTYPE_ARP, raw, (uint16_t)len);
+    }
+    if (raw) {
+        kfree(raw);
+    }
+    arp_packet_free(&pkt);
 }
 
 void arp_send_gratuitous(void) {
@@ -129,75 +295,119 @@ void arp_send_gratuitous(void) {
     if (!netif || netif->ip == 0) return;
 
     arp_packet_t pkt;
-    pkt.hw_type = htons(1);
-    pkt.proto_type = htons(0x0800);
-    pkt.hw_len = 6;
+    arp_packet_init(&pkt);
+    pkt.hw_type = 1;
+    pkt.proto_type = 0x0800;
+    size_t mac_l = mac_get_len(&netif->mac);
+    pkt.hw_len = (uint8_t)(mac_l ? mac_l : 6);
     pkt.proto_len = 4;
-    pkt.opcode = htons(ARP_OP_REQUEST);
-    memcpy(&pkt.sender_mac, &netif->mac, sizeof(mac_addr_t));
-    pkt.sender_ip = htonl(netif->ip);
-    memset(&pkt.target_mac, 0xFF, sizeof(mac_addr_t));
-    pkt.target_ip = htonl(netif->ip);
+    pkt.opcode = ARP_OP_REQUEST;
+    mac_copy(&pkt.sender_mac, &netif->mac);
+    pkt.sender_ip = netif->ip;
+    mac_copy(&pkt.target_mac, get_broadcast_mac());
+    pkt.target_ip = netif->ip;
 
-    eth_send(&broadcast_mac, ETHERTYPE_ARP, &pkt, sizeof(pkt));
+    /* Self-expanding dynamic serialization buffer via kmalloc */
+    uint8_t *raw = NULL;
+    size_t len = arp_packet_serialize_dynamic(&pkt, &raw);
+    if (raw && len > 0) {
+        eth_send(get_broadcast_mac(), ETHERTYPE_ARP, raw, (uint16_t)len);
+    }
+    if (raw) {
+        kfree(raw);
+    }
+    arp_packet_free(&pkt);
 }
 
 void arp_receive(const void *data, uint16_t len) {
-    if (!data || len < sizeof(arp_packet_t)) return;
+    if (!data || len < 8) return;
 
-    const arp_packet_t *pkt = (const arp_packet_t *)data;
+    arp_packet_t pkt;
+    if (!arp_packet_parse(&pkt, data, len)) {
+        return;
+    }
 
-    if (ntohs(pkt->hw_type) != 1 || ntohs(pkt->proto_type) != 0x0800) {
+    if (pkt.hw_type != 1 || pkt.proto_type != 0x0800) {
+        arp_packet_free(&pkt);
         return;
     }
     net_if_t *netif = net_get_interface();
-    if (!netif) return;
+    if (!netif) {
+        arp_packet_free(&pkt);
+        return;
+    }
 
-    ip4_addr_t sender_ip = ntohl(pkt->sender_ip);
-    ip4_addr_t target_ip = ntohl(pkt->target_ip);
-    uint16_t opcode = ntohs(pkt->opcode);
+    ip4_addr_t sender_ip = pkt.sender_ip;
+    ip4_addr_t target_ip = pkt.target_ip;
+    uint16_t opcode = pkt.opcode;
 
-    /* Update cache with sender info */
-    arp_cache_insert(sender_ip, &pkt->sender_mac);
+    /* Update cache with sender info (supports arbitrary length MAC via dynamic mac_addr_t) */
+    arp_cache_insert(sender_ip, &pkt.sender_mac);
 
     /* If it's a request for our IP, reply */
     if (opcode == ARP_OP_REQUEST && target_ip == netif->ip) {
         arp_packet_t reply;
-        reply.hw_type = htons(1);
-        reply.proto_type = htons(0x0800);
-        reply.hw_len = 6;
+        arp_packet_init(&reply);
+        reply.hw_type = 1;
+        reply.proto_type = 0x0800;
+        size_t mac_l = mac_get_len(&netif->mac);
+        reply.hw_len = pkt.hw_len ? pkt.hw_len : (uint8_t)(mac_l ? mac_l : 6);
         reply.proto_len = 4;
-        reply.opcode = htons(ARP_OP_REPLY);
-        memcpy(&reply.sender_mac, &netif->mac, sizeof(mac_addr_t));
-        reply.sender_ip = htonl(netif->ip);
-        memcpy(&reply.target_mac, &pkt->sender_mac, sizeof(mac_addr_t));
-        reply.target_ip = htonl(sender_ip);
+        reply.opcode = ARP_OP_REPLY;
+        mac_copy(&reply.sender_mac, &netif->mac);
+        reply.sender_ip = netif->ip;
+        mac_copy(&reply.target_mac, &pkt.sender_mac);
+        reply.target_ip = sender_ip;
 
-        eth_send(&pkt->sender_mac, ETHERTYPE_ARP, &reply, sizeof(reply));
+        /* Self-expanding dynamic serialization buffer via kmalloc */
+        uint8_t *raw = NULL;
+        size_t r_len = arp_packet_serialize_dynamic(&reply, &raw);
+        if (raw && r_len > 0) {
+            eth_send(&pkt.sender_mac, ETHERTYPE_ARP, raw, (uint16_t)r_len);
+        }
+        if (raw) {
+            kfree(raw);
+        }
+        arp_packet_free(&reply);
     }
+    arp_packet_free(&pkt);
 }
 
-bool arp_resolve(ip4_addr_t target_ip, mac_addr_t *out_mac, uint32_t timeout_ms) {
+bool arp_resolve_ex(ip4_addr_t target_ip, mac_addr_t *out_mac, uint32_t timeout_ms,
+                    uint32_t max_retries, uint32_t retry_interval_ms) {
     if (arp_cache_lookup(target_ip, out_mac)) {
         return true;
     }
+
+    if (retry_interval_ms == 0) retry_interval_ms = 250;
+    if (timeout_ms == 0) timeout_ms = 1000;
 
     arp_send_request(target_ip);
 
     uint32_t start = timer_millis();
     uint32_t last_req = start;
+    uint32_t retries_sent = 0;
+
     while (timer_millis() - start < timeout_ms) {
         net_poll();
         if (arp_cache_lookup(target_ip, out_mac)) {
             return true;
         }
-        if (timer_millis() - last_req >= 250) {
+        if (timer_millis() - last_req >= retry_interval_ms) {
+            if (max_retries > 0 && retries_sent >= max_retries) {
+                break;
+            }
             arp_send_request(target_ip);
             last_req = timer_millis();
+            retries_sent++;
         }
         ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
         io_wait();
     }
 
     return false;
+}
+
+bool arp_resolve(ip4_addr_t target_ip, mac_addr_t *out_mac, uint32_t timeout_ms) {
+    return arp_resolve_ex(target_ip, out_mac, timeout_ms, 0, 250);
 }

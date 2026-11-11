@@ -13,7 +13,6 @@
 #define DHCP_OP_BOOTREPLY   2
 
 #define DHCP_HTYPE_ETHERNET 1
-#define DHCP_HLEN_ETHERNET  6
 
 #define DHCP_MAGIC_COOKIE   0x63825363u
 
@@ -22,14 +21,24 @@
 #define DHCP_OPT_SUBNET_MASK      1
 #define DHCP_OPT_ROUTER           3
 #define DHCP_OPT_DNS              6
+#define DHCP_OPT_HOSTNAME         12
+#define DHCP_OPT_DOMAIN_NAME      15
+#define DHCP_OPT_BROADCAST_ADDR   28
 #define DHCP_OPT_REQUESTED_IP     50
 #define DHCP_OPT_LEASE_TIME       51
 #define DHCP_OPT_MESSAGE_TYPE     53
 #define DHCP_OPT_SERVER_ID        54
 #define DHCP_OPT_PARAM_REQUEST    55
+#define DHCP_OPT_MAX_MSG_SIZE     57
+#define DHCP_DEFAULT_MAX_MSG_SIZE 1500
+
+/* Self-expanding DHCP maximum message size configuration */
+uint16_t dhcp_get_max_message_size(void);
+void     dhcp_set_max_message_size(uint16_t max_size);
+#define DHCP_OPT_CLIENT_ID        61
 #define DHCP_OPT_END              255
 
-/* DHCP Message Types (Option 53) */
+/* DHCP Message Types */
 #define DHCP_DISCOVER 1
 #define DHCP_OFFER    2
 #define DHCP_REQUEST  3

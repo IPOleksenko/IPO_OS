@@ -6,16 +6,21 @@
 #include <stddef.h>
 #include <driver/storage/block_dev.h>
 
-#define STORAGE_POOL_MAGIC          0x504F4F4C /* 'POOL' */
-#define STORAGE_POOL_SB_VERSION     2
-#define STORAGE_POOL_MAX_MEMBERS    8
+#define STORAGE_POOL_MAGIC               0x504F4F4C /* 'POOL' */
 
-/* Storage pool metadata occupies LBA 2030..2039, in the MBR gap before FS_START_LBA (2048).
+/* Storage pool metadata occupies LBA 2030..2039, and extended members occupy 2040..2047
+ * in the MBR gap before FS_START_LBA (2048).
  * The kernel image is loaded from LBA 1 and its sector count depends on the build. */
 #define STORAGE_POOL_PRIMARY_SB_LBA      2030
 #define STORAGE_POOL_JOURNAL_LBA         2031
 #define STORAGE_POOL_JOURNAL_SECTORS     8
 #define STORAGE_POOL_BACKUP_SB_LBA       2039
+#define STORAGE_POOL_EXT_MEMBERS_LBA     2040
+#define STORAGE_POOL_EXT_MEMBERS_SECTORS 7
+#define STORAGE_POOL_BACKUP_EXT_LBA      2047
+
+#define STORAGE_POOL_EXT_MAGIC           0x58544D42 /* 'XTMB' */
+#define STORAGE_POOL_MEMBERS_PER_EXT_SEC 10
 
 /* Default Primary Superblock LBA */
 #define STORAGE_POOL_SB_LBA              STORAGE_POOL_PRIMARY_SB_LBA
@@ -52,6 +57,30 @@ typedef struct __attribute__((packed)) {
     uint64_t capacity_sectors;        /* 8 bytes: Member capacity in sectors */
 } storage_pool_raw_member_t;
 
+/* Packed On-Disk Extended Member Sector (512 bytes)
+ * Stores up to 10 additional members beyond the 8 inline members in the primary superblock. */
+typedef struct __attribute__((packed)) {
+    uint32_t magic;                    /* 4 bytes: STORAGE_POOL_EXT_MAGIC */
+    uint32_t sector_index;             /* 4 bytes: 0, 1, ... */
+    uint32_t start_member_index;       /* 4 bytes: Starting index in pool (e.g. 8, 18...) */
+    uint32_t member_count;             /* 4 bytes: Number of members in this sector (<= 10) */
+    uint64_t next_lba;                 /* 8 bytes: Next sector LBA, or 0 if last */
+    uint32_t reserved;                 /* 4 bytes: Reserved padding */
+    storage_pool_raw_member_t members[10]; /* 10 * 48 = 480 bytes */
+    uint32_t crc32;                    /* 4 bytes at offset 508: CRC32 of bytes 0..507 */
+} storage_pool_ext_sector_t;
+
+/* Packed On-Disk Extended Superblock Header (52 bytes)
+ * Fits in reserved[52] at offset 456 of the 512-byte raw superblock. */
+typedef struct __attribute__((packed)) {
+    uint32_t ext_magic;                /* 4 bytes: STORAGE_POOL_EXT_MAGIC (0x58544D42) */
+    uint32_t total_members;            /* 4 bytes: Total member count in pool */
+    uint32_t ext_lba;                  /* 4 bytes: First extended sector LBA (e.g. 2040) */
+    uint32_t ext_sectors;              /* 4 bytes: Total extended sectors count */
+    uint32_t backup_ext_lba;           /* 4 bytes: Backup extended sectors LBA (e.g. 2047) */
+    uint32_t reserved[8];              /* 32 bytes: Reserved */
+} storage_pool_ext_header_t;
+
 /* Dynamically allocated in-memory member descriptor. */
 typedef struct {
     uint8_t  *uuid;                   /* Member UUID */
@@ -75,11 +104,10 @@ int  storage_pool_disk_member_copy(storage_pool_disk_member_t *dst, const storag
 void storage_pool_disk_member_from_raw(storage_pool_disk_member_t *m, const storage_pool_raw_member_t *raw);
 void storage_pool_disk_member_to_raw(const storage_pool_disk_member_t *m, storage_pool_raw_member_t *raw);
 
-/* Packed 512-byte on-disk superblock. Eight 48-byte member descriptors fit
- * between the 68-byte header and the fixed recovery/reserved fields. */
+/* Packed 512-byte on-disk superblock. Member descriptors fit
+ * between the header and the fixed recovery/reserved fields. */
 typedef struct __attribute__((packed)) {
     uint32_t magic;                    /* 4 bytes: 0x504F4F4C */
-    uint32_t version;                  /* 4 bytes: 2 */
     uint8_t  pool_uuid[16];            /* 16 bytes: Pool UUID */
     uint8_t  local_member_uuid[16];    /* 16 bytes: Local member UUID */
     uint32_t member_index;             /* 4 bytes: Local member index */
@@ -88,13 +116,12 @@ typedef struct __attribute__((packed)) {
     uint32_t chunk_size_sectors;       /* 4 bytes: Extent chunk size */
     uint32_t generation;               /* 4 bytes: Generation counter */
     uint32_t state;                    /* 4 bytes: storage_pool_state_t */
-    storage_pool_raw_member_t members[]; /* Up to STORAGE_POOL_MAX_MEMBERS descriptors */
+    storage_pool_raw_member_t members[]; /* Inline descriptors fitting in the 512B sector */
 } storage_pool_raw_sb_t;
 
 /* Dynamic in-memory descriptor; its serialized member count is format-limited. */
 typedef struct {
     uint32_t magic;
-    uint32_t version;
     uint8_t  *pool_uuid;
     size_t   pool_uuid_len;
     size_t   pool_uuid_cap;
@@ -218,7 +245,6 @@ int  pool_member_set_uuid(pool_member_t *m, const uint8_t *uuid, size_t len);
 /* In-Memory Storage Pool Runtime State (self-expanding, no fixed array limits) */
 typedef struct {
     uint32_t             magic;
-    uint32_t             version;
     uint8_t              *pool_uuid;
     size_t               pool_uuid_len;
     size_t               pool_uuid_cap;

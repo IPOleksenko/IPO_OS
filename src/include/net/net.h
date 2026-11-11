@@ -10,13 +10,42 @@ typedef uint32_t ip4_addr_t;
 #define IP4_ADDR(a, b, c, d) \
     (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | ((uint32_t)(c) << 8) | (uint32_t)(d))
 
-#define IP4_ADDR_LOOPBACK   IP4_ADDR(127, 0, 0, 1)
-#define IP4_ADDR_ANY        IP4_ADDR(0, 0, 0, 0)
-#define IP4_ADDR_BROADCAST  IP4_ADDR(255, 255, 255, 255)
+/* Special IPv4 addresses */
+#define IP4_ADDR_ANY        ((ip4_addr_t)0)
+#define IP4_ADDR_BROADCAST  ((ip4_addr_t)0xFFFFFFFFu)
 
+/* Dynamic network/interface-derived IPv4 address query functions */
+ip4_addr_t net_get_any_ip(void);
+ip4_addr_t net_get_loopback_ip(void);
+void       net_set_loopback_ip(ip4_addr_t ip);
+ip4_addr_t net_get_broadcast_ip(const void *iface_ptr);
+
+#define IP4_ADDR_LOOPBACK   (net_get_loopback_ip())
+
+/* Dynamic unbounded MAC address structure:
+ * Supports arbitrary hardware address lengths (standard 6-byte Ethernet,
+ * 8-byte EUI-64, 20-byte InfiniBand, or arbitrary 999+ byte custom/cryptographic identifiers).
+ */
 typedef struct {
-    uint8_t mac[6];
-} __attribute__((packed)) mac_addr_t;
+    uint8_t *bytes;       /* Dynamically allocated buffer */
+    size_t   len;         /* Actual length of MAC in bytes */
+    size_t   capacity;    /* Allocated capacity of bytes buffer */
+} mac_addr_t;
+
+/* Dynamic MAC address lifecycle & manipulation */
+void mac_init(mac_addr_t *mac);
+void mac_free(mac_addr_t *mac);
+bool mac_set(mac_addr_t *mac, const void *data, size_t len);
+bool mac_copy(mac_addr_t *dst, const mac_addr_t *src);
+bool mac_equal(const mac_addr_t *a, const mac_addr_t *b);
+const uint8_t *mac_get_bytes(const mac_addr_t *mac);
+size_t mac_get_len(const mac_addr_t *mac);
+uint8_t mac_get_byte(const mac_addr_t *mac, size_t index);
+void mac_set_broadcast(mac_addr_t *mac);
+bool mac_is_broadcast(const mac_addr_t *mac);
+bool mac_set_hex(mac_addr_t *mac, const char *hex_str);
+int  mac_format(const mac_addr_t *mac, char *out_buf, size_t out_cap);
+char *mac_format_dyn(const mac_addr_t *mac);
 
 typedef struct {
     mac_addr_t mac;
@@ -27,13 +56,7 @@ typedef struct {
     bool        link_up;
 } net_if_t;
 
-typedef struct {
-    size_t icmp_queue_capacity;
-    size_t arp_table_capacity;
-    size_t udp_sockets_capacity;
-    size_t dns_queue_capacity;
-    size_t loopback_queue_capacity;
-} net_config_t;
+bool net_set_mac(net_if_t *iface, const void *data, size_t len);
 
 /* Byte order helpers */
 #ifndef _BYTEORDER_HELPERS_DEFINED
@@ -64,7 +87,7 @@ char *ip_to_str_dyn(ip4_addr_t ip);
 bool str_to_ip(const char *str, ip4_addr_t *out_ip);
 
 /* Net initialization and polling */
-bool net_init(const net_config_t *config);
+bool net_init(void);
 void net_poll(void);
 net_if_t *net_get_interface(void);
 void net_set_ip(ip4_addr_t ip, ip4_addr_t netmask, ip4_addr_t gateway, ip4_addr_t dns);

@@ -8,6 +8,8 @@ static spinlock_t serial_printf_lock = {0};
  * Formatted print to serial port
  */
 int serial_printf(const char *format, ...) {
+    uint32_t flags;
+    __asm__ volatile("pushfl; popl %0; cli" : "=r"(flags) : : "memory");
     spin_lock(&serial_printf_lock);
 
     va_list args;
@@ -296,6 +298,7 @@ int serial_printf(const char *format, ...) {
 
     va_end(args);
     spin_unlock(&serial_printf_lock);
+    __asm__ volatile("pushl %0; popfl" : : "r"(flags) : "memory", "cc");
     return count;
 }
 

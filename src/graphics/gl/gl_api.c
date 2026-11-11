@@ -26,7 +26,7 @@ static void evaluate_vertex_lighting(GLContext *ctx, gl_vertex_t *v) {
         if (len > 0.0f) { nx /= len; ny /= len; nz /= len; }
     }
 
-    for (int i = 0; i < 8; i++) {
+    for (size_t i = 0; i < ctx->lights_count; i++) {
         gl_light_t *l = &ctx->lights[i];
         if (!l->enabled) continue;
 

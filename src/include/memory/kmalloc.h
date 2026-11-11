@@ -4,6 +4,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define KMALLOC_HEAP_START  (0x4000000u)  // 64 MiB kernel heap start
+size_t kmalloc_get_heap_capacity(void);
+#define KMALLOC_HEAP_SIZE   (kmalloc_get_heap_capacity())
+
 void* kmalloc(size_t size);
 
 void* krealloc(void* ptr, size_t size);

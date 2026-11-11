@@ -14,13 +14,20 @@ void loopback_init(void) {
 }
 
 int loopback_send(const void *packet, uint16_t len) {
-    if (!packet || len == 0 || len > sizeof(((loopback_slot_t *)0)->data)) {
+    if (!packet || len == 0) {
         return -1;
     }
 
     net_shared_ctx_t *ctx = net_get_shared_context();
-    if (ctx->loopback_queue_capacity == 0) {
-        return -1;
+    if (ctx->loopback_queue_capacity == 0 || !ctx->loop_slots) {
+        size_t init_cap = 16;
+        loopback_slot_t *init_slots = (loopback_slot_t *)kmalloc(init_cap * sizeof(loopback_slot_t));
+        if (!init_slots) return -1;
+        memset(init_slots, 0, init_cap * sizeof(loopback_slot_t));
+        ctx->loop_slots = init_slots;
+        ctx->loopback_queue_capacity = init_cap;
+        ctx->loop_head_idx = 0;
+        ctx->loop_tail_idx = 0;
     }
 
     if (ctx->loop_slots[ctx->loop_tail_idx].valid) {
@@ -49,6 +56,15 @@ int loopback_send(const void *packet, uint16_t len) {
 
     size_t next_tail = (ctx->loop_tail_idx + 1) % ctx->loopback_queue_capacity;
     size_t idx = ctx->loop_tail_idx;
+
+    /* Auto-expand packet buffer dynamically via krealloc */
+    if (len > ctx->loop_slots[idx].capacity || !ctx->loop_slots[idx].data) {
+        uint8_t *new_buf = (uint8_t *)krealloc(ctx->loop_slots[idx].data, len);
+        if (!new_buf) return -1;
+        ctx->loop_slots[idx].data = new_buf;
+        ctx->loop_slots[idx].capacity = len;
+    }
+
     memcpy(ctx->loop_slots[idx].data, packet, len);
     ctx->loop_slots[idx].len = len;
     ctx->loop_slots[idx].valid = true;
@@ -66,7 +82,7 @@ void loopback_poll(void) {
     while (ctx->loop_slots[ctx->loop_head_idx].valid) {
         size_t idx = ctx->loop_head_idx;
         uint16_t len = ctx->loop_slots[idx].len;
-        if (len > 0) {
+        if (len > 0 && ctx->loop_slots[idx].data) {
             ip4_receive(ctx->loop_slots[idx].data, len);
         }
         ctx->loop_slots[idx].valid = false;
@@ -79,7 +95,7 @@ bool loopback_get_info(uint16_t *mtu, size_t *queue_capacity) {
     if (!ctx || ctx->magic != NET_SHARED_MAGIC || ctx->loopback_queue_capacity == 0) {
         return false;
     }
-    if (mtu) *mtu = (uint16_t)sizeof(((loopback_slot_t *)0)->data);
+    if (mtu) *mtu = 65535;
     if (queue_capacity) *queue_capacity = ctx->loopback_queue_capacity;
     return true;
 }

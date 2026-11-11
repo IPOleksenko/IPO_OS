@@ -998,42 +998,54 @@ static void vga_gfx_present(const uint8_t *buf,
         }
 
         if (scale_to_display) {
-            for (int y = 0; y < height; y++) {
-                int source_y = (int)(((uint64_t)y * (uint32_t)source_height) /
-                                     (uint32_t)height);
-                uint8_t *dst = framebuffer + (size_t)y * (size_t)width;
-                const uint8_t *src = buf + (size_t)source_y * (size_t)source_width;
-                for (int x = 0; x < width; x++) {
-                    int source_x = (int)(((uint64_t)x * (uint32_t)source_width) /
-                                         (uint32_t)width);
-                    dst[x] = src[source_x];
+            if (source_width == width && source_height == height) {
+                memcpy(framebuffer, buf, (size_t)width * height);
+            } else {
+                int *lut_x = (int *)kmalloc(sizeof(int) * width);
+                if (lut_x) {
+                    for (int x = 0; x < width; x++) {
+                        lut_x[x] = (int)(((uint64_t)x * (uint32_t)source_width) / (uint32_t)width);
+                    }
+                    for (int y = 0; y < height; y++) {
+                        int source_y = (int)(((uint64_t)y * (uint32_t)source_height) / (uint32_t)height);
+                        uint8_t *dst = framebuffer + (size_t)y * (size_t)width;
+                        const uint8_t *src = buf + (size_t)source_y * (size_t)source_width;
+                        for (int x = 0; x < width; x++) {
+                            dst[x] = src[lut_x[x]];
+                        }
+                    }
+                    kfree(lut_x);
                 }
             }
         } else {
-            int copy_width = width < source_width ? width : source_width;
-            int copy_height = height < source_height ? height : source_height;
-            int source_x = (source_width - copy_width) / 2;
-            int source_y = (source_height - copy_height) / 2;
-            int target_x = (width - copy_width) / 2;
-            int target_y = (height - copy_height) / 2;
-            for (int y = 0; y < target_y; y++) {
-                memset(framebuffer + (size_t)y * (size_t)width, 0, (size_t)width);
-            }
-            for (int y = 0; y < copy_height; y++) {
-                uint8_t *dst = framebuffer + (size_t)(target_y + y) * (size_t)width;
-                if (target_x > 0) {
-                    memset(dst, 0, (size_t)target_x);
+            if (source_width == width && source_height == height) {
+                memcpy(framebuffer, buf, (size_t)width * height);
+            } else {
+                int copy_width = width < source_width ? width : source_width;
+                int copy_height = height < source_height ? height : source_height;
+                int source_x = (source_width - copy_width) / 2;
+                int source_y = (source_height - copy_height) / 2;
+                int target_x = (width - copy_width) / 2;
+                int target_y = (height - copy_height) / 2;
+                for (int y = 0; y < target_y; y++) {
+                    memset(framebuffer + (size_t)y * (size_t)width, 0, (size_t)width);
                 }
-                memcpy(dst + target_x,
-                       buf + (size_t)(source_y + y) * (size_t)source_width + source_x,
-                       (size_t)copy_width);
-                if (target_x + copy_width < width) {
-                    memset(dst + target_x + copy_width, 0,
-                           (size_t)(width - target_x - copy_width));
+                for (int y = 0; y < copy_height; y++) {
+                    uint8_t *dst = framebuffer + (size_t)(target_y + y) * (size_t)width;
+                    if (target_x > 0) {
+                        memset(dst, 0, (size_t)target_x);
+                    }
+                    memcpy(dst + target_x,
+                           buf + (size_t)(source_y + y) * (size_t)source_width + source_x,
+                           (size_t)copy_width);
+                    if (target_x + copy_width < width) {
+                        memset(dst + target_x + copy_width, 0,
+                               (size_t)(width - target_x - copy_width));
+                    }
                 }
-            }
-            for (int y = target_y + copy_height; y < height; y++) {
-                memset(framebuffer + (size_t)y * (size_t)width, 0, (size_t)width);
+                for (int y = target_y + copy_height; y < height; y++) {
+                    memset(framebuffer + (size_t)y * (size_t)width, 0, (size_t)width);
+                }
             }
         }
         process_yield();
@@ -1043,35 +1055,45 @@ static void vga_gfx_present(const uint8_t *buf,
 
     volatile uint8_t *vram = (volatile uint8_t *)VGA_VRAM_ADDR;
     if (scale_to_display) {
-        for (int y = 0; y < VGA_GFX_HEIGHT; y++) {
-            int source_y = (int)(((uint64_t)y * (uint32_t)source_height) /
-                                 VGA_GFX_HEIGHT);
+        if (source_width == VGA_GFX_WIDTH && source_height == VGA_GFX_HEIGHT) {
+            memcpy((void *)vram, buf, VGA_GFX_SIZE);
+        } else {
+            int lut_x[VGA_GFX_WIDTH];
             for (int x = 0; x < VGA_GFX_WIDTH; x++) {
-                int source_x = (int)(((uint64_t)x * (uint32_t)source_width) /
-                                     VGA_GFX_WIDTH);
-                vram[y * VGA_GFX_WIDTH + x] =
-                    buf[(size_t)source_y * (size_t)source_width + source_x];
+                lut_x[x] = (int)(((uint64_t)x * (uint32_t)source_width) / VGA_GFX_WIDTH);
+            }
+            for (int y = 0; y < VGA_GFX_HEIGHT; y++) {
+                int source_y = (int)(((uint64_t)y * (uint32_t)source_height) / VGA_GFX_HEIGHT);
+                volatile uint8_t *dst = vram + y * VGA_GFX_WIDTH;
+                const uint8_t *src = buf + (size_t)source_y * (size_t)source_width;
+                for (int x = 0; x < VGA_GFX_WIDTH; x++) {
+                    dst[x] = src[lut_x[x]];
+                }
             }
         }
     } else {
-        int copy_width = source_width < VGA_GFX_WIDTH ? source_width : VGA_GFX_WIDTH;
-        int copy_height = source_height < VGA_GFX_HEIGHT ? source_height : VGA_GFX_HEIGHT;
-        int source_x = (source_width - copy_width) / 2;
-        int source_y = (source_height - copy_height) / 2;
-        int target_x = (VGA_GFX_WIDTH - copy_width) / 2;
-        int target_y = (VGA_GFX_HEIGHT - copy_height) / 2;
-        for (int y = 0; y < target_y; y++) {
-            memset((void *)(vram + (size_t)y * VGA_GFX_WIDTH), 0, VGA_GFX_WIDTH);
-        }
-        for (int y = 0; y < copy_height; y++) {
-            memset((void *)(vram + (size_t)(target_y + y) * VGA_GFX_WIDTH),
-                   0, VGA_GFX_WIDTH);
-            memcpy((void *)(vram + (size_t)(target_y + y) * VGA_GFX_WIDTH + target_x),
-                   buf + (size_t)(source_y + y) * (size_t)source_width + source_x,
-                   (size_t)copy_width);
-        }
-        for (int y = target_y + copy_height; y < VGA_GFX_HEIGHT; y++) {
-            memset((void *)(vram + (size_t)y * VGA_GFX_WIDTH), 0, VGA_GFX_WIDTH);
+        if (source_width == VGA_GFX_WIDTH && source_height == VGA_GFX_HEIGHT) {
+            memcpy((void *)vram, buf, VGA_GFX_SIZE);
+        } else {
+            int copy_width = source_width < VGA_GFX_WIDTH ? source_width : VGA_GFX_WIDTH;
+            int copy_height = source_height < VGA_GFX_HEIGHT ? source_height : VGA_GFX_HEIGHT;
+            int source_x = (source_width - copy_width) / 2;
+            int source_y = (source_height - copy_height) / 2;
+            int target_x = (VGA_GFX_WIDTH - copy_width) / 2;
+            int target_y = (VGA_GFX_HEIGHT - copy_height) / 2;
+            for (int y = 0; y < target_y; y++) {
+                memset((void *)(vram + (size_t)y * VGA_GFX_WIDTH), 0, VGA_GFX_WIDTH);
+            }
+            for (int y = 0; y < copy_height; y++) {
+                memset((void *)(vram + (size_t)(target_y + y) * VGA_GFX_WIDTH),
+                       0, VGA_GFX_WIDTH);
+                memcpy((void *)(vram + (size_t)(target_y + y) * VGA_GFX_WIDTH + target_x),
+                       buf + (size_t)(source_y + y) * (size_t)source_width + source_x,
+                       (size_t)copy_width);
+            }
+            for (int y = target_y + copy_height; y < VGA_GFX_HEIGHT; y++) {
+                memset((void *)(vram + (size_t)y * VGA_GFX_WIDTH), 0, VGA_GFX_WIDTH);
+            }
         }
     }
     process_yield();

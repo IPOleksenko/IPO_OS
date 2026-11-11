@@ -5,9 +5,11 @@
 #include <stdbool.h>
 #include <file_system/ipo_fs.h>
 
+typedef struct address_space address_space_t;
+
 // Dynamic memory allocation for processes
-#define PROCESS_HEAP_START       0x00800000   // Start of process heap area
-#define USER_HEAP_START          0x08000000u  // Start of isolated user process heaps (128 MiB)
+#define PROCESS_HEAP_START       0x00800000u  // Start of process heap area (8 MiB)
+#define USER_HEAP_START          0x10000000u  // Start of isolated user process heaps (256 MiB)
 #define USER_HEAP_PROCESS_STRIDE 0x10000000u  // Dynamic stride between process heaps (256 MiB)
 
 // Protection flags
@@ -53,6 +55,8 @@ typedef struct {
 } process_return_value_t;
 
 // Process structure
+typedef struct process_thread process_thread_t;
+
 typedef struct process {
     uint32_t pid;
     
@@ -70,6 +74,10 @@ typedef struct process {
     uint32_t stack_ptr;     // Current stack pointer
     uint32_t stack_start;   // Start of the stack region
     uint32_t stack_size;    // Stack size
+    process_thread_t *threads;
+    process_thread_t *current_thread;
+    uint32_t next_thread_id;
+    address_space_t *address_space;
     
     // Arguments
     int argc;               // Number of arguments
@@ -82,6 +90,17 @@ typedef struct process {
     bool return_val_explicit; // True if process explicitly set custom return value
     uint8_t is_running;     // Running flag
     bool waiting_for_input; // Blocked waiting for user input
+    bool ipc_waiting;
+    bool ipc_wait_cancelled;
+    uint32_t ipc_wait_endpoint;
+    uint8_t ipc_wait_kind;
+    uint64_t signal_pending;
+    uint64_t signal_mask;
+    uintptr_t *signal_handlers;
+    uint64_t *signal_action_masks;
+    uint32_t signal_action_capacity;
+    bool signal_stopped;
+    bool signal_delivering;
     bool wants_graphics;    // Process requested VGA graphics mode (Mode 13h)
     uint32_t gfx_overlay_flags; // Flags for raw VGA overlay (VGA_OVERLAY_HIDE_BUTTON, etc.)
     bool is_wm_app;         // Process created a Window Manager window
@@ -107,7 +126,9 @@ typedef struct process {
     bool completed_and_acknowledged; // Process completed execution and was acknowledged / closed
 
     uint16_t *scroll_top_buffer;    // Workspace top scrollback buffer
+    int scroll_top_capacity;        // Allocated capacity in lines
     uint16_t *scroll_bottom_buffer; // Workspace bottom scrollback buffer
+    int scroll_bottom_capacity;     // Allocated capacity in lines
     int scroll_top_count;           // Number of scrolled top lines
     int scroll_bottom_count;        // Number of scrolled bottom lines
     int window_id;                  // Workspace / window group ID in batch mode
@@ -124,6 +145,37 @@ typedef struct process {
     // Links
     struct process *next;   // For process list
 } process_t;
+
+typedef enum {
+    PROCESS_THREAD_RUNNABLE = 0,
+    PROCESS_THREAD_BLOCKED,
+    PROCESS_THREAD_EXITED
+} process_thread_state_t;
+
+struct process_thread {
+    uint32_t id;
+    uint32_t context_esp;
+    void *stack_base;
+    uint32_t stack_size;
+    void *(*entry)(void *);
+    void *argument;
+    void *result;
+    process_thread_state_t state;
+    bool is_main;
+    bool join_claimed;
+    process_thread_t *joiner;
+    process_thread_t *wait_next;
+    bool ipc_waiting;
+    bool ipc_wait_cancelled;
+    uint32_t ipc_wait_endpoint;
+    uint8_t ipc_wait_kind;
+    uint64_t signal_mask;
+    uint32_t signal_altstack_base;
+    uint32_t signal_altstack_size;
+    uint32_t signal_altstack_flags;
+    bool signal_altstack_active;
+    process_thread_t *next;
+};
 
 #define PROCESS_SHARED_ADDR  0x00001000u
 #define PROCESS_SHARED_MAGIC 0x50524F43u
@@ -144,6 +196,7 @@ static inline process_shared_ctx_t *process_get_shared_context(void) {
 
 bool process_is_active_or_has_windows(process_t *p);
 void process_workspace_auto_scroll(process_t *proc);
+uintptr_t process_current_context_token(void);
 
 // Entry point signature with arguments
 typedef int (*process_entry_t)(int argc, char **argv);
@@ -176,10 +229,26 @@ void process_list_print(void);
 int process_kill_by_pid(uint32_t pid);
 int process_kill_all(void);
 bool process_is_alive(uint32_t pid); /* true while PID is in the process list */
+uint32_t process_signal_syscall_handler(uint32_t num, uint32_t argc,
+                                        uint32_t *argv);
+void process_signal_deliver_pending(void);
 
-/* Cooperative multitasking */
+/* Cooperative and timer-preemptive thread scheduling */
 void process_yield(void);
 void process_yield_kernel(void);
+bool process_thread_init(process_t *proc);
+bool process_thread_has_runnable(process_t *proc);
+process_thread_t *process_thread_pick_next(process_t *proc);
+void process_thread_cleanup(process_t *proc);
+bool process_update_memory_mappings(process_t *proc, uint32_t address,
+                                    uint32_t length, bool allocated);
+void process_thread_main_exit(process_t *proc);
+uint32_t process_thread_syscall_handler(uint32_t num, uint32_t argc,
+                                        uint32_t *argv);
+void process_ipc_set_waiting(process_t *proc, uint32_t endpoint_id, uint8_t wait_kind);
+void process_ipc_wake_waiters(uint32_t endpoint_id, uint8_t wait_kind);
+void process_ipc_cancel_batch_waiters(void);
+bool process_ipc_consume_wait_cancelled(void);
 process_t *process_spawn(const char *path, int argc, char **argv);
 int process_run_batch(process_t **procs, int count);
 int process_run_batch_ex(process_t **procs, int count, bool separate_windows);

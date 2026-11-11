@@ -2,6 +2,8 @@
 #include <driver/input/keyboard.h>
 #include <ioport.h>
 #include <stdio.h>
+#include <string.h>
+#include <memory/kmalloc.h>
 #include <kernel/driver.h>
 #include <wm.h>
 #include <vga_gfx.h>
@@ -36,11 +38,22 @@ static mouse_state_t current_mouse_state = {
 static int64_t cumulative_motion_x;
 static int64_t cumulative_motion_y;
 static uint8_t mouse_cycle = 0;
-static uint8_t mouse_packet[4] = {0, 0, 0, 0};
+static uint8_t *mouse_packet = NULL;
+static size_t mouse_packet_cap = 0;
 static uint8_t mouse_packet_size = 3;
 static uint8_t mouse_device_id = 0;
 static bool mouse_has_wheel = false;
 static bool mouse_initialized = false;
+
+static void mouse_packet_ensure_capacity(size_t needed) {
+    if (needed < mouse_packet_cap && mouse_packet != NULL) return;
+    size_t new_cap = (mouse_packet_cap == 0) ? 8 : (mouse_packet_cap * 2);
+    while (new_cap <= needed) new_cap *= 2;
+    uint8_t *new_buf = (uint8_t *)krealloc(mouse_packet, new_cap);
+    if (!new_buf) return;
+    mouse_packet = new_buf;
+    mouse_packet_cap = new_cap;
+}
 
 static void mouse_wait_write(void) {
     for (int timeout = 0; timeout < 100000; timeout++) {
@@ -251,11 +264,23 @@ static void mouse_process_packet(void) {
     current_mouse_state.has_wheel = mouse_has_wheel;
     current_mouse_state.dev_id = mouse_device_id;
     current_mouse_state.packet_size = mouse_packet_size;
-    for (int k = 0; k < 4; k++) current_mouse_state.raw_packet[k] = mouse_packet[k];
+    if (!current_mouse_state.raw_packet || current_mouse_state.raw_packet_len < mouse_packet_size) {
+        uint8_t *r = (uint8_t *)krealloc(current_mouse_state.raw_packet, mouse_packet_size);
+        if (r) {
+            current_mouse_state.raw_packet = r;
+            current_mouse_state.raw_packet_len = mouse_packet_size;
+        }
+    }
+    if (current_mouse_state.raw_packet && mouse_packet) {
+        memcpy(current_mouse_state.raw_packet, mouse_packet, mouse_packet_size);
+    }
     current_mouse_state.event_count++;
 }
 
 void mouse_handle_byte(uint8_t data) {
+    mouse_packet_ensure_capacity(mouse_cycle + 1);
+    if (!mouse_packet) return;
+
     if (mouse_cycle == 0) {
         // Bit 3 of byte 0 must be 1, and bits 6 & 7 (overflow) must be 0 in valid PS/2 packets
         if ((data & 0x08) == 0 || (data & 0xC0) != 0) {

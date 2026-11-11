@@ -9,6 +9,7 @@ SECTIONS
     {
         *(.text*)
     }
+    _kernel_text_end = .;
 
     .rodata :
     {
@@ -23,6 +24,9 @@ SECTIONS
         *(.data*)
     }
 
+    . = 0x100000;
+    _kernel_bss_start = .;
+
     .bss :
     {
         *(COMMON)
@@ -36,3 +40,4 @@ SECTIONS
         *(.comment*)
     }
 }
+

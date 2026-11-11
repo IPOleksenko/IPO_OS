@@ -792,7 +792,7 @@ void ap_main(uint32_t cpu_id) {
     /* 2. Enable Local APIC on this core */
     smp_lapic_enable();
 
-    /* Mask LINT0 and LINT1 so legacy 8259 PIC IRQs never hit this AP */
+    /* Mask LINT0 and LINT1 so 8259 PIC IRQs never hit this AP */
     volatile uint32_t *lint0 = (volatile uint32_t *)(lapic_base_addr + LAPIC_LINT0_REG);
     volatile uint32_t *lint1 = (volatile uint32_t *)(lapic_base_addr + LAPIC_LINT1_REG);
     *lint0 = 0x00010000u;

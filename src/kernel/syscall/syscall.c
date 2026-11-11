@@ -3,6 +3,7 @@
 #include <string.h>
 #include <file_system/ipo_fs.h>
 #include <kernel/process.h>
+#include <kernel/ipc.h>
 #include <memory/kmalloc.h>
 #include <kernel/terminal.h>
 #include <driver/input/keyboard.h>
@@ -402,9 +403,8 @@ static uint32_t syscall_builtin_fs_create(uint32_t num,
         return IPO_SYSCALL_ENOSYS;
     }
 
-    return (uint32_t)ipo_fs_create(
-        (const char *)(uintptr_t)argv[0],
-        (uint8_t)argv[1]);
+    return (uint32_t)ipo_fs_create((const char *)(uintptr_t)argv[0],
+                                   (uint8_t)argv[1]);
 }
 
 static uint32_t syscall_builtin_fs_open(uint32_t num,
@@ -579,16 +579,16 @@ static uint32_t syscall_builtin_fs_statvfs(uint32_t num,
     uint32_t total = (sb.fs_size_blocks > data_start)
                      ? (uint32_t)(sb.fs_size_blocks - data_start) : 0;
     uint32_t used = total ? bitmap_count_set(sb.block_bitmap_start, total) : 0;
-    uint32_t ino_total = (uint32_t)sb.inode_count;
-    uint32_t ino_used = ino_total ? bitmap_count_set(sb.inode_bitmap_start, ino_total) : 0;
+    uint64_t ino_total = 0, ino_used = 0, ino_free = 0, dyn_chunks = 0;
+    ipo_fs_get_inode_stats(&ino_total, &ino_used, &ino_free, &dyn_chunks);
 
     out[0] = sb.block_size;                 /* f_bsize */
     out[1] = sb.block_size;                 /* f_frsize */
     out[2] = total;                         /* f_blocks */
     out[3] = total > used ? total - used : 0; /* f_bfree */
     out[4] = out[3];                        /* f_bavail */
-    out[5] = ino_total;                     /* f_files */
-    out[6] = ino_total > ino_used ? ino_total - ino_used : 0; /* f_ffree */
+    out[5] = (uint32_t)ino_total;           /* f_files */
+    out[6] = (uint32_t)ino_free;            /* f_ffree */
     return 0u;
 }
 
@@ -839,7 +839,7 @@ static uint32_t syscall_builtin_font_load(uint32_t num,
                                           uint32_t *argv) {
     (void)num;
     const char *path = (argc >= 1u && argv != NULL) ? (const char *)(uintptr_t)argv[0] : NULL;
-    int res = vga_load_cyrillic_font(path);
+    int res = vga_font_load_database(path);
     return (res == 0) ? IPO_SYSCALL_OK : IPO_SYSCALL_ENOSYS;
 }
 
@@ -942,7 +942,7 @@ static uint32_t syscall_builtin_keymap_get_name(uint32_t num,
     if (argc >= 2u && argv != NULL && argv[0] != 0 && argv[1] > 0) {
         char *user_buf = (char *)(uintptr_t)argv[0];
         uint32_t max_len = argv[1];
-        strncpy(user_buf, name ? name : "English", max_len - 1);
+        strncpy(user_buf, name ? name : default_keymap_name, max_len - 1);
         user_buf[max_len - 1] = '\0';
         return 0;
     }
@@ -1730,13 +1730,35 @@ static uint32_t syscall_builtin_sbrk(uint32_t num, uint32_t argc, uint32_t *argv
             return prev;
         }
         if (inc > 0) {
+            if ((uint32_t)inc > USER_HEAP_PROCESS_STRIDE ||
+                (uint32_t)inc > UINT32_MAX - proc->user_heap_break) {
+                return (uint32_t)-1;
+            }
             uint32_t needed = proc->user_heap_break + (uint32_t)inc;
             if (needed > proc->user_heap_limit) {
-                /* Dynamically expand process heap limit if contiguous physical RAM is free */
                 if (process_heap_can_expand(proc, needed)) {
-                    uint32_t aligned_limit = (needed + 0x0000FFFFu) & ~0x0000FFFFu;
+                    uint64_t aligned = ((uint64_t)needed + 0xFFFFu) & ~0xFFFFULL;
+                    uint32_t aligned_limit = aligned <= UINT32_MAX
+                        ? (uint32_t)aligned : needed;
                     if (!process_heap_can_expand(proc, aligned_limit)) {
                         aligned_limit = needed;
+                        if (!process_heap_can_expand(proc, aligned_limit)) {
+                            return (uint32_t)-1;
+                        }
+                    }
+                    uint32_t mapped_start =
+                        proc->user_heap_limit & ~0xFFFu;
+                    uint64_t mapped_end =
+                        ((uint64_t)aligned_limit + 0xFFFu) & ~0xFFFULL;
+                    if (mapped_end > UINT32_MAX) {
+                        return (uint32_t)-1;
+                    }
+                    if (mapped_end > mapped_start &&
+                        !process_update_memory_mappings(
+                            proc, mapped_start,
+                            (uint32_t)mapped_end - mapped_start,
+                            true)) {
+                        return (uint32_t)-1;
                     }
                     proc->user_heap_limit = aligned_limit;
                     serial_printf("[process] Dynamic on-demand heap expanded for pid=%u: limit=0x%x (+%u KiB, total=%u MiB)\n",
@@ -1753,13 +1775,34 @@ static uint32_t syscall_builtin_sbrk(uint32_t num, uint32_t argc, uint32_t *argv
             proc->user_heap_break = needed;
             return prev;
         } else {
-            uint32_t dec = (uint32_t)(-inc);
-            if (proc->user_heap_break - dec < proc->user_heap_base) {
+            uint32_t dec = 0u - (uint32_t)inc;
+            if (dec > proc->user_heap_break - proc->user_heap_base) {
                 return (uint32_t)-1;
             }
-            proc->user_heap_break -= dec;
-            /* Reclaim physical memory immediately when break decreases */
-            proc->user_heap_limit = (proc->user_heap_break + 0x0000FFFFu) & ~0x0000FFFFu;
+            uint32_t new_break = proc->user_heap_break - dec;
+            uint64_t aligned_limit =
+                ((uint64_t)new_break + 0xFFFFu) & ~0xFFFFULL;
+            if (aligned_limit > UINT32_MAX) {
+                return (uint32_t)-1;
+            }
+            uint32_t new_limit = (uint32_t)aligned_limit;
+            if (new_limit < proc->user_heap_limit) {
+                uint32_t mapped_start = new_limit & ~0xFFFu;
+                uint64_t mapped_end =
+                    ((uint64_t)proc->user_heap_limit + 0xFFFu) & ~0xFFFULL;
+                if (mapped_end > UINT32_MAX) {
+                    return (uint32_t)-1;
+                }
+                if (mapped_end > mapped_start &&
+                    !process_update_memory_mappings(
+                        proc, mapped_start,
+                        (uint32_t)mapped_end - mapped_start,
+                        false)) {
+                    return (uint32_t)-1;
+                }
+            }
+            proc->user_heap_break = new_break;
+            proc->user_heap_limit = new_limit;
             return prev;
         }
     }
@@ -1777,8 +1820,8 @@ static uint32_t syscall_builtin_sbrk(uint32_t num, uint32_t argc, uint32_t *argv
         user_heap_break += (uint32_t)inc;
         return prev;
     } else {
-        uint32_t dec = (uint32_t)(-inc);
-        if (user_heap_break - dec < USER_HEAP_START) {
+        uint32_t dec = 0u - (uint32_t)inc;
+        if (dec > user_heap_break - USER_HEAP_START) {
             return (uint32_t)-1;
         }
         user_heap_break -= dec;
@@ -1832,19 +1875,20 @@ static uint32_t syscall_builtin_net_dns_resolve(uint32_t num, uint32_t argc, uin
     if (argc < 3u || !argv || !argv[0] || !argv[1]) {
         return 0u;
     }
-    char hostname[256];
     const char *user_hostname = (const char *)(uintptr_t)argv[0];
-    size_t i = 0;
-    for (; i < sizeof(hostname) - 1u && user_hostname[i] != '\0'; i++) {
-        hostname[i] = user_hostname[i];
-    }
-    if (i == sizeof(hostname) - 1u && user_hostname[i] != '\0') {
-        return 0u;
-    }
-    hostname[i] = '\0';
+    size_t host_len = strlen(user_hostname);
+    char *hostname = (char *)kmalloc(host_len + 1u);
+    if (!hostname) return 0u;
+    memcpy(hostname, user_hostname, host_len + 1u);
+
+    uint32_t timeout_ms = argv[2];
+    uint32_t max_retries = (argc >= 4u) ? argv[3] : 0u;
+    uint32_t retry_interval_ms = (argc >= 5u) ? argv[4] : 0u;
 
     ip4_addr_t resolved_ip;
-    if (!dns_resolve(hostname, &resolved_ip, argv[2])) {
+    bool ok = dns_resolve_ex(hostname, &resolved_ip, timeout_ms, max_retries, retry_interval_ms);
+    kfree(hostname);
+    if (!ok) {
         return 0u;
     }
     *(ip4_addr_t *)(uintptr_t)argv[1] = resolved_ip;
@@ -2006,12 +2050,9 @@ static uint32_t syscall_builtin_net_get_interface(uint32_t num, uint32_t argc, u
 
 static uint32_t syscall_builtin_net_init(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num;
-    if (argc < 1u || !argv || !argv[0]) {
-        return 0u;
-    }
-    net_config_t config;
-    memcpy(&config, (const void *)(uintptr_t)argv[0], sizeof(config));
-    return net_init(&config) ? 1u : 0u;
+    (void)argc;
+    (void)argv;
+    return net_init() ? 1u : 0u;
 }
 
 static uint32_t syscall_builtin_net_set_ip(uint32_t num, uint32_t argc, uint32_t *argv) {
@@ -2636,6 +2677,9 @@ void syscall_load_idt(void) {
 
 void syscall_init(void) {
     memset(ipo_idt_table, 0, sizeof(ipo_idt_table));
+    if (!ipc_init()) {
+        serial_printf("[syscall] IPC subsystem unavailable\n");
+    }
 
 
     ipo_register_syscall(
@@ -2805,6 +2849,48 @@ void syscall_init(void) {
                          syscall_builtin_net_get_interface);
     ipo_register_syscall(IPO_SYSCALL_NET_INIT, syscall_builtin_net_init);
     ipo_register_syscall(IPO_SYSCALL_NET_SET_IP, syscall_builtin_net_set_ip);
+    ipo_register_syscall(IPO_SYSCALL_IPC_CREATE, ipc_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_IPC_OPEN, ipc_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_IPC_CLOSE, ipc_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_IPC_DESTROY, ipc_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_IPC_SEND, ipc_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_IPC_RECEIVE, ipc_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_IPC_PIPE_CREATE, ipc_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_IPC_PIPE_OPEN, ipc_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_IPC_PIPE_CLOSE, ipc_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_IPC_PIPE_DESTROY, ipc_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_IPC_PIPE_READ, ipc_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_IPC_PIPE_WRITE, ipc_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_IPC_NOTIFY_SEND, ipc_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_IPC_NOTIFY_WAIT, ipc_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_SHM_CREATE,
+                         ipc_shared_memory_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_SHM_OPEN,
+                         ipc_shared_memory_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_SHM_ATTACH,
+                         ipc_shared_memory_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_SHM_DETACH,
+                         ipc_shared_memory_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_SHM_DESTROY,
+                         ipc_shared_memory_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_SIGACTION,
+                         process_signal_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_SIGPROCMASK,
+                         process_signal_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_KILL,
+                         process_signal_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_SIGALTSTACK,
+                         process_signal_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_THREAD_CREATE,
+                         process_thread_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_THREAD_EXIT,
+                         process_thread_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_THREAD_JOIN,
+                         process_thread_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_THREAD_SELF,
+                         process_thread_syscall_handler);
+    ipo_register_syscall(IPO_SYSCALL_THREAD_SYNC,
+                         process_thread_syscall_handler);
 
     ipo_register_syscall(
         IPO_SYSCALL_FREE,
@@ -3095,7 +3181,7 @@ void syscall_init(void) {
     printf("[syscall] System call dispatch table initialized (IDT vector 0x80 registered).\n");
 }
 
-uint32_t syscall_dispatch(uint32_t num,
+uint64_t syscall_dispatch(uint32_t num,
                           uint32_t argc,
                           uint32_t *argv)
 {
@@ -3108,7 +3194,21 @@ uint32_t syscall_dispatch(uint32_t num,
         return IPO_SYSCALL_ENOSYS;
     }
 
-    return fn(num, argc, argv);
+    uint64_t result;
+    if (num == IPO_SYSCALL_FS_CREATE) {
+        if (argc < 2u || argv == NULL) {
+            result = (uint64_t)(int64_t)-1;
+        } else {
+            result = (uint64_t)ipo_fs_create(
+                (const char *)(uintptr_t)argv[0], (uint8_t)argv[1]);
+        }
+    } else {
+        result = fn(num, argc, argv);
+    }
+    process_signal_deliver_pending();
+    if (curr && !curr->is_running && process_in_process_context())
+        process_yield_kernel();
+    return result;
 }
 
 int ipo_syscall(uint32_t num,

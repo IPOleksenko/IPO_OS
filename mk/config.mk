@@ -141,7 +141,7 @@ else ifneq ($(FIRMWARE),)
   QEMU_BIOS_FLAGS := -bios $(FIRMWARE)
 endif
 
-CPU ?= pentium3
+CPU ?= pentium3,+rdrand
 
 QEMU_FLAGS := 	-M pc -cpu $(CPU) -m 2048 \
 				$(QEMU_BIOS_FLAGS) \

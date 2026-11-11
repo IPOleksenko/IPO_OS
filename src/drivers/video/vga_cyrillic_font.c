@@ -807,11 +807,15 @@ void vga_font_reapply_active(void) {
     }
 }
 
-int vga_load_cyrillic_font(const char *path) {
+int vga_font_load(const char *path) {
     if (path == NULL || path[0] == '\0') {
         return -1;
     }
     return vga_font_load_database(path);
+}
+
+int vga_load_cyrillic_font(const char *path) {
+    return vga_font_load(path);
 }
 
 uint8_t utf8_to_vga_glyph(const char *str, size_t str_len, size_t *out_bytes) {

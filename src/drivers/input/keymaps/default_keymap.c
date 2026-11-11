@@ -1,11 +1,11 @@
 /**
- * Default System Keyboard Layout: English (US)
+ * Default System Keyboard Layout
  * Registered as standard dynamic keymap entries with full scancode dictionary.
  */
 
 #include <driver/input/keymap/dynamic_keymap.h>
 
-const char default_keymap_name[] = "English (US)";
+const char default_keymap_name[] = "English";
 
 const keymap_entry_t default_keymap_entries[] = {
     { KEY_ESC,        "\x1B", "\x1B" },

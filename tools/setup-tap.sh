@@ -83,4 +83,30 @@ fi
 echo "[TAP] ✓ Interface ${TAP_DEV} is UP and active."
 echo "[TAP] Host IP           : ${HOST_IP}"
 echo "[TAP] Guest (IPO_OS) IP : ${GUEST_IP}"
+
+# Start local DHCP server on TAP interface if dnsmasq is available
+if command -v dnsmasq >/dev/null 2>&1; then
+    PID_FILE="/tmp/dnsmasq_${TAP_DEV}.pid"
+    if [ -f "${PID_FILE}" ] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+        echo "[TAP] DHCP server (dnsmasq) already running on ${TAP_DEV}."
+    else
+        echo "[TAP] Starting local DHCP server (dnsmasq) on ${TAP_DEV}..."
+        sudo dnsmasq \
+            --interface="${TAP_DEV}" \
+            --bind-interfaces \
+            --port=0 \
+            --dhcp-range="${GUEST_IP},${GUEST_IP},255.255.255.0,12h" \
+            --dhcp-option=3,"${HOST_IP}" \
+            --dhcp-option=6,8.8.8.8,1.1.1.1 \
+            --conf-file=/dev/null \
+            --pid-file="${PID_FILE}" 2>/dev/null || true
+    fi
+    if [ -f "${PID_FILE}" ] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+        echo "[TAP] ✓ DHCP server active on ${TAP_DEV} (offering IP ${GUEST_IP}, Gateway ${HOST_IP}, DNS 8.8.8.8,1.1.1.1)."
+    else
+        echo "[TAP] Warning: DHCP server could not be started on ${TAP_DEV}."
+    fi
+fi
+
+
 echo "[TAP] Guest IP: ${GUEST_IP}; ports require a listening service and permitted network/firewall rules."

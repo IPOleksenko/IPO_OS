@@ -8,6 +8,9 @@
 #define PCI_CONFIG_ADDRESS  0x0CF8
 #define PCI_CONFIG_DATA     0x0CFC
 
+#define PCI_CLASS_NETWORK       0x02
+#define PCI_SUBCLASS_ETHERNET   0x00
+
 typedef struct {
     uint8_t  bus;
     uint8_t  slot;
@@ -43,6 +46,7 @@ void     pci_write_word(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset,
 void     pci_write_byte(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint8_t val);
 
 bool pci_find_device(uint16_t vendor_id, uint16_t device_id, pci_device_t *out_dev);
+bool pci_find_class(uint8_t class_code, uint8_t subclass, pci_device_t *out_dev);
 void pci_enable_bus_mastering(const pci_device_t *dev);
 
 /* Full PCI Bus Scanning */

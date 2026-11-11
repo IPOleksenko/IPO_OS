@@ -349,7 +349,11 @@ static void ata_register_block_devices(void) {
         bdev.name = (char *)hw_name;
         bdev.total_sectors = d->capacity_sectors;
         bdev.sector_size = d->sector_size;
-        bdev.flags = (i == 0) ? BLOCK_DEV_BOOTABLE : 0;
+
+        uint8_t boot_sec[512];
+        bool has_mbr = (ata_read_drive_sectors(i, 0, 1, boot_sec) &&
+                        boot_sec[510] == 0x55 && boot_sec[511] == 0xAA);
+        bdev.flags = (i == 0 || has_mbr) ? BLOCK_DEV_BOOTABLE : 0;
         bdev.ops = &s_ata_bdev_ops;
         bdev.priv_data = (void *)(uintptr_t)i;
         block_dev_register(&bdev);

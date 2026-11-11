@@ -1,10 +1,3 @@
-/**
- * Dynamic Keymap & Layout Repository
- *
- * Stores registered keyboard layouts and allows cycling between them
- * (e.g. English -> Russian -> Chinese -> English) via Ctrl + Shift.
- */
-
 #include <driver/input/keymap/dynamic_keymap.h>
 #include <driver/input/keymap/keymap.h>
 #include <kernel/terminal.h>
@@ -44,11 +37,11 @@ static void register_slot_fonts(keymap_slot_t *slot) {
         return;
     }
     for (uint32_t i = 0; i < slot->count; i++) {
-        if (slot->entries[i].normal[0] != '\0') {
+        if (slot->entries[i].normal != NULL && slot->entries[i].normal[0] != '\0') {
             size_t b = 0;
             utf8_to_vga_glyph(slot->entries[i].normal, strlen(slot->entries[i].normal), &b);
         }
-        if (slot->entries[i].shift[0] != '\0') {
+        if (slot->entries[i].shift != NULL && slot->entries[i].shift[0] != '\0') {
             size_t b = 0;
             utf8_to_vga_glyph(slot->entries[i].shift, strlen(slot->entries[i].shift), &b);
         }
@@ -65,7 +58,7 @@ static void init_storage_if_needed(void) {
         memset(keymap_storage, 0, sizeof(keymap_slot_t) * keymap_storage_capacity);
     }
 
-    /* Slot 0 is always default English */
+    /* Slot 0 is default system layout */
     keymap_storage[0].name = (char *)default_keymap_name;
     keymap_storage[0].entries = (keymap_entry_t *)default_keymap_entries;
     keymap_storage[0].count = default_keymap_entries_count;
@@ -79,6 +72,14 @@ static void init_storage_if_needed(void) {
 
 static void free_slot_entries(keymap_slot_t *slot) {
     if (slot->entries != NULL && slot->is_custom) {
+        for (uint32_t i = 0; i < slot->count; i++) {
+            if (slot->entries[i].normal && slot->entries[i].normal[0] != '\0') {
+                kfree((void *)slot->entries[i].normal);
+            }
+            if (slot->entries[i].shift && slot->entries[i].shift[0] != '\0') {
+                kfree((void *)slot->entries[i].shift);
+            }
+        }
         kfree(slot->entries);
         slot->entries = NULL;
     }
@@ -89,7 +90,7 @@ int dynamic_keymap_set(const char *name, const keymap_entry_t *entries, uint32_t
     init_storage_if_needed();
 
     if (name == NULL) {
-        /* Reset to English (Slot 0) */
+        /* Reset to default layout (Slot 0) */
         active_storage_index = 0;
         register_slot_fonts(&keymap_storage[0]);
         terminal_render_language_bar();
@@ -145,7 +146,33 @@ int dynamic_keymap_set(const char *name, const keymap_entry_t *entries, uint32_t
         }
 
         keymap_storage[slot].count = count;
-        memcpy(keymap_storage[slot].entries, entries, sizeof(keymap_entry_t) * count);
+        for (uint32_t i = 0; i < count; i++) {
+            keymap_storage[slot].entries[i].scancode = entries[i].scancode;
+            if (entries[i].normal != NULL && entries[i].normal[0] != '\0') {
+                size_t nlen = strlen(entries[i].normal);
+                char *nstr = (char *)kmalloc(nlen + 1u);
+                if (nstr) {
+                    memcpy(nstr, entries[i].normal, nlen + 1u);
+                    keymap_storage[slot].entries[i].normal = nstr;
+                } else {
+                    keymap_storage[slot].entries[i].normal = "";
+                }
+            } else {
+                keymap_storage[slot].entries[i].normal = "";
+            }
+            if (entries[i].shift != NULL && entries[i].shift[0] != '\0') {
+                size_t slen = strlen(entries[i].shift);
+                char *sstr = (char *)kmalloc(slen + 1u);
+                if (sstr) {
+                    memcpy(sstr, entries[i].shift, slen + 1u);
+                    keymap_storage[slot].entries[i].shift = sstr;
+                } else {
+                    keymap_storage[slot].entries[i].shift = "";
+                }
+            } else {
+                keymap_storage[slot].entries[i].shift = "";
+            }
+        }
     } else {
         keymap_storage[slot].entries = NULL;
         keymap_storage[slot].count = 0;
@@ -467,7 +494,7 @@ const char* dynamic_keymap_get_default_symbol(void) {
 
 void dynamic_keymap_reset(void) {
     init_storage_if_needed();
-    active_storage_index = 0; /* Return to English */
+    active_storage_index = 0; /* Return to default layout */
     apply_active_font();
     terminal_render_language_bar();
 }

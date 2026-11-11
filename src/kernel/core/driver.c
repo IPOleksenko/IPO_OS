@@ -190,7 +190,7 @@ uint32_t driver_count_user(void) {
 
 void driver_print_list(void) {
     if (driver_head == NULL) {
-        printf("  No dynamic drivers currently loaded.\n");
+        printf("  No drivers currently loaded.\n");
         return;
     }
 

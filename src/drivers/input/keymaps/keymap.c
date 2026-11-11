@@ -62,8 +62,12 @@ uint8_t keyboard_get_modifiers(void) {
 }
 
 char* get_keymap(void) {
-    static char s_kernel_keymap[256];
-    memset(s_kernel_keymap, 0, sizeof(s_kernel_keymap));
+    static char *s_kernel_keymap = NULL;
+    if (!s_kernel_keymap) {
+        s_kernel_keymap = (char *)kmalloc(256);
+        if (!s_kernel_keymap) return NULL;
+    }
+    memset(s_kernel_keymap, 0, 256);
     for (uint32_t sc = 0; sc < 256; sc++) {
         const char *s = dynamic_keymap_translate((uint8_t)sc, shift_mode);
         if (s != NULL && s[0] != '\0') {

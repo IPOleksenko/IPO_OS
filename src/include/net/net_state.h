@@ -35,17 +35,22 @@ typedef struct {
 } dns_reply_entry_t;
 
 typedef struct {
-    uint8_t data[1536];
+    uint8_t *data;
+    size_t   capacity;
     uint16_t len;
-    bool valid;
+    bool     valid;
 } loopback_slot_t;
 
 typedef struct {
     uint32_t magic;
     net_if_t default_if;
     rtl8139_dev_t rtl_dev;
-    uint8_t rx_buffer[RTL8139_RX_BUFFER_SIZE] __attribute__((aligned(4)));
-    uint8_t tx_buffers[4][RTL8139_TX_BUFFER_SIZE] __attribute__((aligned(4)));
+    uint8_t *rx_buffer;
+    size_t   rx_buffer_size;
+    uint8_t **tx_buffers;
+    size_t   tx_buffers_count;
+    size_t   tx_buffer_size;
+    ip4_addr_t loopback_ip;
     struct arp_entry *arp_cache;
     struct udp_socket *udp_sockets;
     arp_entry_t *arp_table;

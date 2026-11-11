@@ -24,12 +24,16 @@ void glLighti(GLenum light, GLenum pname, GLint param) {
 void glLightfv(GLenum light, GLenum pname, const GLfloat *params) {
     GLContext *ctx = gl_get_current_context();
     if (!ctx || !params) return;
-    if (light < GL_LIGHT0 || light > GL_LIGHT7) {
+    if (light < GL_LIGHT0) {
         ctx->error_flag = GL_INVALID_ENUM;
         return;
     }
 
-    gl_light_t *l = &ctx->lights[light - GL_LIGHT0];
+    gl_light_t *l = gl_get_or_create_light(ctx, (size_t)(light - GL_LIGHT0));
+    if (!l) {
+        ctx->error_flag = GL_OUT_OF_MEMORY;
+        return;
+    }
     switch (pname) {
         case GL_AMBIENT:               memcpy(l->ambient, params, 4 * sizeof(GLfloat)); break;
         case GL_DIFFUSE:               memcpy(l->diffuse, params, 4 * sizeof(GLfloat)); break;

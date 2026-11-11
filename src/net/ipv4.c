@@ -54,8 +54,10 @@ int ip4_send(ip4_addr_t dst_ip, uint8_t protocol, uint8_t ttl, const void *paylo
     }
 
     mac_addr_t next_hop_mac;
-    if (dst_ip == IP4_ADDR_BROADCAST || dst_ip == 0xFFFFFFFFu) {
-        memset(&next_hop_mac, 0xFF, sizeof(mac_addr_t));
+    mac_init(&next_hop_mac);
+    ip4_addr_t bcast = net_get_broadcast_ip(netif);
+    if (dst_ip == IP4_ADDR_BROADCAST || dst_ip == 0xFFFFFFFFu || dst_ip == bcast) {
+        mac_set_broadcast(&next_hop_mac);
     } else {
         /* Determine next hop */
         ip4_addr_t next_hop;
@@ -65,10 +67,18 @@ int ip4_send(ip4_addr_t dst_ip, uint8_t protocol, uint8_t ttl, const void *paylo
             next_hop = netif->gateway;
         }
 
+        if (next_hop == 0) {
+            mac_free(&next_hop_mac);
+            kfree(tx_buf);
+            return -3; // No route to host (gateway not set)
+        }
+
         if (!arp_resolve(next_hop, &next_hop_mac, 1000)) {
+            mac_free(&next_hop_mac);
             kfree(tx_buf);
             return -2; // ARP resolution failed
         }
+
     }
 
     /* Build IPv4 packet */
@@ -90,6 +100,7 @@ int ip4_send(ip4_addr_t dst_ip, uint8_t protocol, uint8_t ttl, const void *paylo
     }
 
     int ret = eth_send(&next_hop_mac, ETHERTYPE_IPV4, tx_buf, total_len);
+    mac_free(&next_hop_mac);
     kfree(tx_buf);
     return ret;
 }
@@ -124,9 +135,10 @@ void ip4_receive(const void *packet, uint16_t len) {
     net_if_t *netif = net_get_interface();
     ip4_addr_t dst_ip = ntohl(hdr->dst_ip);
     ip4_addr_t src_ip = ntohl(hdr->src_ip);
+    ip4_addr_t bcast = net_get_broadcast_ip(netif);
 
     /* Accept if destined to our IP, broadcast, loopback, or if interface IP is not yet set (during DHCP) */
-    if (netif && netif->ip != 0 && dst_ip != netif->ip && dst_ip != IP4_ADDR_BROADCAST && dst_ip != 0xFFFFFFFFu && (dst_ip >> 24) != 127) {
+    if (netif && netif->ip != 0 && dst_ip != netif->ip && dst_ip != IP4_ADDR_BROADCAST && dst_ip != 0xFFFFFFFFu && dst_ip != bcast && (dst_ip >> 24) != 127) {
         return;
     }
 

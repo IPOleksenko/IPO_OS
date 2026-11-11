@@ -49,7 +49,7 @@ int kmod_init(void) {
     s_kmod_head = NULL;
     s_next_kmod_id = 1;
     s_kmod_initialized = true;
-    printf("[kmod] Dynamic Driver Subsystem initialized (ABI %04x, %u kernel symbols exported).\n",
+    printf("[kmod] Driver Subsystem initialized (ABI %04x, %u kernel symbols exported).\n",
                   KMOD_ABI_VERSION, &s_kernel_syms_count ? (uint32_t)s_kernel_syms_count : 0);
     return 0;
 }
@@ -402,7 +402,7 @@ void kmod_print_list(void) {
     spin_lock(&s_kmod_lock);
     kmod_t *curr = s_kmod_head;
     if (!curr) {
-        printf("  No dynamic modules loaded.\n");
+        printf("  No modules loaded.\n");
         spin_unlock(&s_kmod_lock);
         return;
     }

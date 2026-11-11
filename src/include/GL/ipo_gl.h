@@ -155,7 +155,9 @@ typedef struct GLContext {
     /* Lighting & Shading */
     GLboolean    lighting_enabled;
     GLenum       shade_model;
-    gl_light_t   lights[8];
+    gl_light_t  *lights;
+    size_t       lights_count;
+    size_t       lights_capacity;
     gl_material_t front_material;
     gl_material_t back_material;
     GLboolean    color_material_enabled;
@@ -233,6 +235,7 @@ bool       gl_resize_context(GLContext *ctx, int new_w, int new_h);
 void       gl_make_current(GLContext *ctx);
 GLContext *gl_get_current_context(void);
 void       gl_swap_buffers(GLContext *ctx, void *win);
+gl_light_t *gl_get_or_create_light(GLContext *ctx, size_t index);
 
 /* Internal Rasterizer and Pipeline Hooks */
 void gl_matrix_init_stack(gl_matrix_stack_t *stack);

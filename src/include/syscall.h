@@ -92,6 +92,7 @@
 #define IPO_SYSCALL_NET_GET_INTERFACE 0x109Du
 #define IPO_SYSCALL_NET_INIT        0x109Eu
 #define IPO_SYSCALL_NET_SET_IP      0x109Fu
+#define IPO_SYSCALL_NET_SET_MAC     0x10A0u
 
 #define IPO_SYSCALL_FREE         0x1047u
 
@@ -230,6 +231,37 @@
 #define IPO_SYSCALL_BINFMT_UNREGISTER 0x10E1u
 #define IPO_SYSCALL_BINFMT_LIST       0x10E2u
 
+#define IPO_SYSCALL_IPC_CREATE        0x10F0u
+#define IPO_SYSCALL_IPC_OPEN          0x10F1u
+#define IPO_SYSCALL_IPC_CLOSE         0x10F2u
+#define IPO_SYSCALL_IPC_DESTROY       0x10F3u
+#define IPO_SYSCALL_IPC_SEND          0x10F4u
+#define IPO_SYSCALL_IPC_RECEIVE       0x10F5u
+#define IPO_SYSCALL_IPC_PIPE_CREATE   0x10F6u
+#define IPO_SYSCALL_IPC_PIPE_OPEN     0x10F7u
+#define IPO_SYSCALL_IPC_PIPE_CLOSE    0x10F8u
+#define IPO_SYSCALL_IPC_PIPE_DESTROY  0x10F9u
+#define IPO_SYSCALL_IPC_PIPE_READ     0x10FAu
+#define IPO_SYSCALL_IPC_PIPE_WRITE    0x10FBu
+#define IPO_SYSCALL_IPC_NOTIFY_SEND   0x10FCu
+#define IPO_SYSCALL_IPC_NOTIFY_WAIT   0x10FDu
+
+#define IPO_SYSCALL_SHM_CREATE        0x1100u
+#define IPO_SYSCALL_SHM_OPEN          0x1101u
+#define IPO_SYSCALL_SHM_ATTACH        0x1102u
+#define IPO_SYSCALL_SHM_DETACH        0x1103u
+#define IPO_SYSCALL_SHM_DESTROY       0x1104u
+
+#define IPO_SYSCALL_SIGACTION         0x1110u
+#define IPO_SYSCALL_SIGPROCMASK       0x1111u
+#define IPO_SYSCALL_KILL              0x1112u
+#define IPO_SYSCALL_SIGALTSTACK       0x1113u
+#define IPO_SYSCALL_THREAD_CREATE     0x1120u
+#define IPO_SYSCALL_THREAD_EXIT       0x1121u
+#define IPO_SYSCALL_THREAD_JOIN       0x1122u
+#define IPO_SYSCALL_THREAD_SELF       0x1123u
+#define IPO_SYSCALL_THREAD_SYNC       0x1130u
+
 #define IPO_SYSCALL_EXIT         0xFFFFu
 
 typedef uint32_t (*ipo_syscall_handler_t)(uint32_t, uint32_t, uint32_t *);
@@ -239,6 +271,21 @@ void syscall_init(void);
 void ipo_register_syscall(uint32_t num, ipo_syscall_handler_t handler);
 
 int ipo_syscall(uint32_t num, uint32_t argc, uint32_t *argv);
+
+static inline uint64_t ipo_syscall64(uint32_t num, uint32_t argc,
+                                     uint32_t *argv) {
+    uint32_t low;
+    uint32_t high;
+    __asm__ volatile(
+        "int $0x80"
+        : "=a"(low), "=d"(high)
+        : "a"(num),
+          "b"(argc),
+          "c"(argv)
+        : "memory"
+    );
+    return ((uint64_t)high << 32) | low;
+}
 
 static inline int ipo_exec(const char *path, int argc, char **argv) {
     uint32_t args[3];
@@ -369,11 +416,11 @@ static inline int ipo_read(int fd, void *buf, uint32_t count, uint32_t offset) {
     return ipo_syscall(IPO_SYSCALL_FS_READ, 4u, args);
 }
 
-static inline int ipo_create(const char *path, uint8_t type) {
+static inline int64_t ipo_create(const char *path, uint8_t type) {
     uint32_t args[2];
     args[0] = (uint32_t)(uintptr_t)path;
     args[1] = (uint32_t)type;
-    return ipo_syscall(IPO_SYSCALL_FS_CREATE, 2u, args);
+    return (int64_t)ipo_syscall64(IPO_SYSCALL_FS_CREATE, 2u, args);
 }
 
 static inline int ipo_write(int fd, const void *buf, uint32_t count, uint32_t offset) {
@@ -617,4 +664,4 @@ static inline int ipo_binfmt_list(void) {
 
 void syscall_reset_user_heap(void);
 
-#endif
+#endif

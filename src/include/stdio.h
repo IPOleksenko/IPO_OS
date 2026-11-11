@@ -19,6 +19,11 @@ bool putchar_is_locked(void);
 void putchar_unlock(void);
 
 /**
+ * Initialize COM1 serial port (38400 baud, 8N1)
+ */
+void serial_init(void);
+
+/**
  * Low-level serial output (COM1)
  * @param c Character to output
  */

@@ -95,27 +95,24 @@ void memory_map_init(void) {
                 total_usable_ram += len;
 
                 /* Filter usable memory for dynamic allocator:
-                 * Skip conventional low memory (< 1 MiB) and kernel static reserved space (1-16 MiB).
-                 * Only register usable regions above 16 MiB (0x1000000) for general dynamic allocation.
-                 * The first 64 MiB (0x1000000 - 0x5000000) is reserved for the kernel kmalloc heap,
-                 * so regions[0].used is initialized to 64 MiB to prevent collision with kmalloc. */
-                if (base >= 0x1000000ull && base < 0xFFFFFFFFull) {
+                 * Skip conventional low memory (< 1 MiB), kernel static reserved space (1-8 MiB),
+                 * process binary execution space (8-64 MiB), and kernel kmalloc heap (64-128 MiB).
+                 * Only register usable regions above 128 MiB (0x08000000) for general dynamic allocation. */
+                if (base >= 0x08000000ull && base < 0xFFFFFFFFull) {
                     uint64_t usable_len = len;
                     if (base + usable_len > 0xFFFFFFFFull) {
                         usable_len = 0xFFFFFFFFull - base;
                     }
 
-                    uint32_t used = (base == 0x1000000ull && usable_len > 0x4000000ull) ? 0x4000000u : 0;
-                    memory_map_add_region((uint32_t)base, (uint32_t)usable_len, used, true);
-                } else if (base < 0x1000000ull && (base + len) > 0x1000000ull) {
-                    uint32_t start = 0x1000000u;
-                    uint64_t usable_len = (base + len) - 0x1000000ull;
+                    memory_map_add_region((uint32_t)base, (uint32_t)usable_len, 0, true);
+                } else if (base < 0x08000000ull && (base + len) > 0x08000000ull) {
+                    uint32_t start = 0x08000000u;
+                    uint64_t usable_len = (base + len) - 0x08000000ull;
                     if ((uint64_t)start + usable_len > 0xFFFFFFFFull) {
                         usable_len = 0xFFFFFFFFull - (uint64_t)start;
                     }
 
-                    uint32_t used = (usable_len > 0x4000000ull) ? 0x4000000u : 0;
-                    memory_map_add_region(start, (uint32_t)usable_len, used, true);
+                    memory_map_add_region(start, (uint32_t)usable_len, 0, true);
                 }
             }
         }
@@ -124,10 +121,9 @@ void memory_map_init(void) {
         printf("[mem] Fallback memory detection: %u bytes\n", fallback_ram);
         total_usable_ram = fallback_ram;
 
-        if (total_usable_ram > 0x1000000ull) {
-            uint32_t sz = (uint32_t)(total_usable_ram - 0x1000000ull);
-            uint32_t used = (sz > 0x1000000u) ? 0x1000000u : 0;
-            memory_map_add_region(0x1000000u, sz, used, true);
+        if (total_usable_ram > 0x08000000ull) {
+            uint32_t sz = (uint32_t)(total_usable_ram - 0x08000000ull);
+            memory_map_add_region(0x08000000u, sz, 0, true);
         }
     }
 
@@ -201,8 +197,8 @@ bool memory_map_is_valid_ram(uint32_t addr, uint32_t len) {
         }
     }
 
-    /* Check if in low conventional RAM (e.g. process heap or kernel text) */
-    if (req_start >= 0x10000 && req_end <= 0x1000000) {
+    /* Check if in low conventional RAM */
+    if (req_start >= 0x10000 && req_end <= 0x08000000) {
         return true;
     }
 

@@ -110,10 +110,16 @@ GLContext *gl_create_context(int width, int height, void *win) {
     ctx->front_material.specular[2] = 0.0f; ctx->front_material.specular[3] = 1.0f;
     ctx->front_material.shininess = 0.0f;
 
-    /* Light 0 default position */
-    ctx->lights[0].diffuse[0] = 1.0f; ctx->lights[0].diffuse[1] = 1.0f;
-    ctx->lights[0].diffuse[2] = 1.0f; ctx->lights[0].diffuse[3] = 1.0f;
-    ctx->lights[0].position[2] = 1.0f;
+    /* Lights dynamic initialization */
+    ctx->lights_capacity = 8;
+    ctx->lights_count = 8;
+    ctx->lights = kmalloc(ctx->lights_capacity * sizeof(gl_light_t));
+    if (ctx->lights) {
+        memset(ctx->lights, 0, ctx->lights_capacity * sizeof(gl_light_t));
+        ctx->lights[0].diffuse[0] = 1.0f; ctx->lights[0].diffuse[1] = 1.0f;
+        ctx->lights[0].diffuse[2] = 1.0f; ctx->lights[0].diffuse[3] = 1.0f;
+        ctx->lights[0].position[2] = 1.0f;
+    }
 
     /* Polygon mode */
     ctx->polygon_mode      = GL_FILL;
@@ -161,6 +167,7 @@ void gl_destroy_context(GLContext *ctx) {
     if (ctx->color_buffer)   kfree(ctx->color_buffer);
     if (ctx->z_buffer)       kfree(ctx->z_buffer);
     if (ctx->stencil_buffer) kfree(ctx->stencil_buffer);
+    if (ctx->lights)         kfree(ctx->lights);
 
     gl_matrix_free_stack(&ctx->modelview_stack);
     gl_matrix_free_stack(&ctx->projection_stack);
@@ -349,6 +356,23 @@ void glScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
     ctx->scissor_h = height;
 }
 
+gl_light_t *gl_get_or_create_light(GLContext *ctx, size_t index) {
+    if (!ctx) return NULL;
+    if (index >= ctx->lights_capacity) {
+        size_t new_cap = (ctx->lights_capacity == 0) ? 8 : (ctx->lights_capacity * 2);
+        while (new_cap <= index) new_cap *= 2;
+        gl_light_t *new_lights = (gl_light_t *)krealloc(ctx->lights, new_cap * sizeof(gl_light_t));
+        if (!new_lights) return NULL;
+        memset(new_lights + ctx->lights_capacity, 0, (new_cap - ctx->lights_capacity) * sizeof(gl_light_t));
+        ctx->lights = new_lights;
+        ctx->lights_capacity = new_cap;
+    }
+    if (index >= ctx->lights_count) {
+        ctx->lights_count = index + 1;
+    }
+    return &ctx->lights[index];
+}
+
 void glEnable(GLenum cap) {
     GLContext *ctx = gl_get_current_context();
     if (!ctx) return;
@@ -367,8 +391,10 @@ void glEnable(GLenum cap) {
         case GL_COLOR_MATERIAL: ctx->color_material_enabled = GL_TRUE; break;
         case GL_NORMALIZE:      ctx->normalize_normals    = GL_TRUE; break;
         default:
-            if (cap >= GL_LIGHT0 && cap <= GL_LIGHT7) {
-                ctx->lights[cap - GL_LIGHT0].enabled = GL_TRUE;
+            if (cap >= GL_LIGHT0) {
+                size_t l_idx = (size_t)(cap - GL_LIGHT0);
+                gl_light_t *l = gl_get_or_create_light(ctx, l_idx);
+                if (l) l->enabled = GL_TRUE;
             } else {
                 ctx->error_flag = GL_INVALID_ENUM;
             }
@@ -394,8 +420,10 @@ void glDisable(GLenum cap) {
         case GL_COLOR_MATERIAL: ctx->color_material_enabled = GL_FALSE; break;
         case GL_NORMALIZE:      ctx->normalize_normals    = GL_FALSE; break;
         default:
-            if (cap >= GL_LIGHT0 && cap <= GL_LIGHT7) {
-                ctx->lights[cap - GL_LIGHT0].enabled = GL_FALSE;
+            if (cap >= GL_LIGHT0) {
+                size_t l_idx = (size_t)(cap - GL_LIGHT0);
+                gl_light_t *l = gl_get_or_create_light(ctx, l_idx);
+                if (l) l->enabled = GL_FALSE;
             } else {
                 ctx->error_flag = GL_INVALID_ENUM;
             }
@@ -419,8 +447,11 @@ GLboolean glIsEnabled(GLenum cap) {
         case GL_TEXTURE_2D:     return ctx->texture_2d_enabled;
         case GL_TEXTURE_3D:     return ctx->texture_3d_enabled;
         default:
-            if (cap >= GL_LIGHT0 && cap <= GL_LIGHT7) {
-                return ctx->lights[cap - GL_LIGHT0].enabled;
+            if (cap >= GL_LIGHT0) {
+                size_t l_idx = (size_t)(cap - GL_LIGHT0);
+                if (l_idx < ctx->lights_count && ctx->lights) {
+                    return ctx->lights[l_idx].enabled;
+                }
             }
             return GL_FALSE;
     }
