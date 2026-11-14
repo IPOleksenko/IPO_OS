@@ -2,13 +2,9 @@
 #include <vga_gfx.h>
 #include <ioport.h>
 
-/* Bayer 4x4 Dithering Matrix (values 0..15 scaled to bias RGB components) */
-static const int8_t bayer4x4[4][4] = {
-    { -8,  0, -6,  2 },
-    {  4, -4,  6, -2 },
-    { -5,  3, -7,  1 },
-    {  7, -1,  5, -3 }
-};
+/* Bayer 4x4 Dithering Matrix (packed 4x4 signed biases without fixed array) */
+static const int8_t * const bayer4x4_flat =
+    (const int8_t *)"\xf8\x00\xfa\x02\x04\xfc\x06\xfe\xfb\x03\xf9\x01\x07\xff\x05\xfd";
 
 static bool g_palette_initialized = false;
 
@@ -53,7 +49,7 @@ void gl_quantize_argb_to_palette_strided(const uint32_t *src, int src_stride,
     }
 
     for (int y = 0; y < h; y++) {
-        const int8_t *drow = bayer4x4[y & 3];
+        const int8_t *drow = bayer4x4_flat + ((y & 3) * 4);
         const uint32_t *srow = src + y * src_stride;
         uint8_t *drow_dst = dst + y * dst_stride;
 

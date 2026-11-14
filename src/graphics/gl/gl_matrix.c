@@ -5,11 +5,13 @@
 #include <memory/kmalloc.h>
 #include <string.h>
 
-#define MAT_IDENTITY { \
-    1.0f, 0.0f, 0.0f, 0.0f, \
-    0.0f, 1.0f, 0.0f, 0.0f, \
-    0.0f, 0.0f, 1.0f, 0.0f, \
-    0.0f, 0.0f, 0.0f, 1.0f  \
+static void gl_mat_set_identity(GLfloat *m) {
+    if (!m) return;
+    memset(m, 0, 16u * sizeof(GLfloat));
+    m[0] = 1.0f;
+    m[5] = 1.0f;
+    m[10] = 1.0f;
+    m[15] = 1.0f;
 }
 
 void gl_matrix_init_stack(gl_matrix_stack_t *stack) {
@@ -17,8 +19,7 @@ void gl_matrix_init_stack(gl_matrix_stack_t *stack) {
     stack->data = kmalloc((size_t)stack->capacity * 16 * sizeof(GLfloat));
     stack->top = 0;
     if (stack->data) {
-        GLfloat id[16] = MAT_IDENTITY;
-        memcpy(stack->data, id, 16 * sizeof(GLfloat));
+        gl_mat_set_identity(stack->data);
     }
 }
 
@@ -32,6 +33,7 @@ void gl_matrix_free_stack(gl_matrix_stack_t *stack) {
 }
 
 void gl_matrix_push(gl_matrix_stack_t *stack) {
+    if (!stack || !stack->data) return;
     if (stack->top + 1 >= stack->capacity) {
         int new_cap = stack->capacity * 2;
         GLfloat *new_data = krealloc(stack->data, (size_t)new_cap * 16 * sizeof(GLfloat));
@@ -57,6 +59,7 @@ GLfloat *gl_matrix_current(gl_matrix_stack_t *stack) {
 }
 
 void gl_matrix_mult(GLfloat *dst, const GLfloat *a, const GLfloat *b) {
+    if (!dst || !a || !b) return;
     GLfloat res[16];
     for (int r = 0; r < 4; r++) {
         for (int c = 0; c < 4; c++) {
@@ -93,15 +96,15 @@ void glLoadIdentity(void) {
     GLContext *ctx = gl_get_current_context();
     gl_matrix_stack_t *st = get_current_stack(ctx);
     if (!st) return;
-    GLfloat id[16] = MAT_IDENTITY;
-    memcpy(gl_matrix_current(st), id, 16 * sizeof(GLfloat));
+    gl_mat_set_identity(gl_matrix_current(st));
 }
 
 void glLoadMatrixf(const GLfloat *m) {
     GLContext *ctx = gl_get_current_context();
     gl_matrix_stack_t *st = get_current_stack(ctx);
     if (!st || !m) return;
-    memcpy(gl_matrix_current(st), m, 16 * sizeof(GLfloat));
+    GLfloat *curr = gl_matrix_current(st);
+    if (curr) memcpy(curr, m, 16 * sizeof(GLfloat));
 }
 
 void glMultMatrixf(const GLfloat *m) {
@@ -109,13 +112,18 @@ void glMultMatrixf(const GLfloat *m) {
     gl_matrix_stack_t *st = get_current_stack(ctx);
     if (!st || !m) return;
     GLfloat *curr = gl_matrix_current(st);
-    gl_matrix_mult(curr, curr, m);
+    if (curr) gl_matrix_mult(curr, curr, m);
 }
 
 void glPushMatrix(void) {
     GLContext *ctx = gl_get_current_context();
     gl_matrix_stack_t *st = get_current_stack(ctx);
-    if (st) gl_matrix_push(st);
+    if (!st) return;
+    int prev_top = st->top;
+    gl_matrix_push(st);
+    if (st->top == prev_top && ctx && ctx->error_flag == GL_NO_ERROR) {
+        ctx->error_flag = GL_STACK_OVERFLOW;
+    }
 }
 
 void glPopMatrix(void) {
@@ -131,7 +139,8 @@ void glPopMatrix(void) {
 }
 
 void glTranslatef(GLfloat x, GLfloat y, GLfloat z) {
-    GLfloat m[16] = MAT_IDENTITY;
+    GLfloat m[16];
+    gl_mat_set_identity(m);
     m[12] = x;
     m[13] = y;
     m[14] = z;
@@ -139,7 +148,8 @@ void glTranslatef(GLfloat x, GLfloat y, GLfloat z) {
 }
 
 void glScalef(GLfloat x, GLfloat y, GLfloat z) {
-    GLfloat m[16] = MAT_IDENTITY;
+    GLfloat m[16];
+    gl_mat_set_identity(m);
     m[0]  = x;
     m[5]  = y;
     m[10] = z;
@@ -181,9 +191,14 @@ void glRotatef(GLfloat angle, GLfloat x, GLfloat y, GLfloat z) {
 }
 
 void glFrustum(GLdouble left, GLdouble right, GLdouble bottom, GLdouble top, GLdouble nearVal, GLdouble farVal) {
-    if (nearVal <= 0.0 || farVal <= 0.0 || left == right || bottom == top || nearVal == farVal) return;
+    if (nearVal <= 0.0 || farVal <= 0.0 || left == right || bottom == top || nearVal == farVal) {
+        GLContext *ctx = gl_get_current_context();
+        if (ctx) ctx->error_flag = GL_INVALID_VALUE;
+        return;
+    }
 
-    GLfloat m[16] = {0};
+    GLfloat m[16];
+    memset(m, 0, sizeof(m));
     m[0] = (GLfloat)((2.0 * nearVal) / (right - left));
     m[5] = (GLfloat)((2.0 * nearVal) / (top - bottom));
     m[8] = (GLfloat)((right + left) / (right - left));
@@ -196,9 +211,14 @@ void glFrustum(GLdouble left, GLdouble right, GLdouble bottom, GLdouble top, GLd
 }
 
 void glOrtho(GLdouble left, GLdouble right, GLdouble bottom, GLdouble top, GLdouble nearVal, GLdouble farVal) {
-    if (left == right || bottom == top || nearVal == farVal) return;
+    if (left == right || bottom == top || nearVal == farVal) {
+        GLContext *ctx = gl_get_current_context();
+        if (ctx) ctx->error_flag = GL_INVALID_VALUE;
+        return;
+    }
 
-    GLfloat m[16] = {0};
+    GLfloat m[16];
+    memset(m, 0, sizeof(m));
     m[0]  = (GLfloat)(2.0 / (right - left));
     m[5]  = (GLfloat)(2.0 / (top - bottom));
     m[10] = (GLfloat)(-2.0 / (farVal - nearVal));
@@ -221,32 +241,32 @@ void gluPerspective(GLdouble fovy, GLdouble aspect, GLdouble zNear, GLdouble zFa
 void gluLookAt(GLdouble eyex, GLdouble eyey, GLdouble eyez,
                GLdouble centerx, GLdouble centery, GLdouble centerz,
                GLdouble upx, GLdouble upy, GLdouble upz) {
-    GLfloat forward[3], side[3], up[3];
-    forward[0] = (GLfloat)(centerx - eyex);
-    forward[1] = (GLfloat)(centery - eyey);
-    forward[2] = (GLfloat)(centerz - eyez);
+    GLfloat fx = (GLfloat)(centerx - eyex);
+    GLfloat fy = (GLfloat)(centery - eyey);
+    GLfloat fz = (GLfloat)(centerz - eyez);
 
-    GLfloat fnorm = gl_sqrtf(forward[0]*forward[0] + forward[1]*forward[1] + forward[2]*forward[2]);
-    if (fnorm > 0.0f) { forward[0] /= fnorm; forward[1] /= fnorm; forward[2] /= fnorm; }
+    GLfloat fnorm = gl_sqrtf(fx * fx + fy * fy + fz * fz);
+    if (fnorm > 0.0f) { fx /= fnorm; fy /= fnorm; fz /= fnorm; }
 
-    up[0] = (GLfloat)upx; up[1] = (GLfloat)upy; up[2] = (GLfloat)upz;
+    GLfloat ux = (GLfloat)upx, uy = (GLfloat)upy, uz = (GLfloat)upz;
 
     /* side = forward x up */
-    side[0] = forward[1] * up[2] - forward[2] * up[1];
-    side[1] = forward[2] * up[0] - forward[0] * up[2];
-    side[2] = forward[0] * up[1] - forward[1] * up[0];
-    GLfloat snorm = gl_sqrtf(side[0]*side[0] + side[1]*side[1] + side[2]*side[2]);
-    if (snorm > 0.0f) { side[0] /= snorm; side[1] /= snorm; side[2] /= snorm; }
+    GLfloat sx = fy * uz - fz * uy;
+    GLfloat sy = fz * ux - fx * uz;
+    GLfloat sz = fx * uy - fy * ux;
+    GLfloat snorm = gl_sqrtf(sx * sx + sy * sy + sz * sz);
+    if (snorm > 0.0f) { sx /= snorm; sy /= snorm; sz /= snorm; }
 
     /* up = side x forward */
-    up[0] = side[1] * forward[2] - side[2] * forward[1];
-    up[1] = side[2] * forward[0] - side[0] * forward[2];
-    up[2] = side[0] * forward[1] - side[1] * forward[0];
+    ux = sy * fz - sz * fy;
+    uy = sz * fx - sx * fz;
+    uz = sx * fy - sy * fx;
 
-    GLfloat m[16] = MAT_IDENTITY;
-    m[0] = side[0];    m[4] = side[1];    m[8]  = side[2];
-    m[1] = up[0];      m[5] = up[1];      m[9]  = up[2];
-    m[2] = -forward[0];m[6] = -forward[1];m[10] = -forward[2];
+    GLfloat m[16];
+    gl_mat_set_identity(m);
+    m[0] = sx;   m[4] = sy;   m[8]  = sz;
+    m[1] = ux;   m[5] = uy;   m[9]  = uz;
+    m[2] = -fx;  m[6] = -fy;  m[10] = -fz;
 
     glMultMatrixf(m);
     glTranslatef((GLfloat)-eyex, (GLfloat)-eyey, (GLfloat)-eyez);

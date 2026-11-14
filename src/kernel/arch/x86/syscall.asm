@@ -5,6 +5,11 @@ global syscall_isr_entry
 extern syscall_dispatch
 
 syscall_isr_entry:
+    cld
+    push ds
+    push es
+    push fs
+    push gs
     push ebx
     push ecx
     push edx
@@ -18,6 +23,14 @@ syscall_isr_entry:
     push dword ecx
     push dword ebx
     push dword eax
+
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov ax, 0x18
+    mov gs, ax
+
     call syscall_dispatch
     add esp, 24
 
@@ -27,9 +40,50 @@ syscall_isr_entry:
     pop edx
     pop ecx
     pop ebx
+    pop gs
+    pop fs
+    pop es
+    pop ds
     iretd
 
 extern cpu_exception_handler
+extern cpu_page_fault_task_handler
+extern cpu_double_fault_task_handler
+
+global page_fault_task_entry
+page_fault_task_entry:
+    cli
+    cld
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov ax, 0x18
+    mov gs, ax
+    mov ebp, esp        ; ebp points to hardware error_code
+    and esp, 0xFFFFFFF0 ; align stack for C ABI
+    sub esp, 12
+    push dword [ebp]    ; pass error_code
+    call cpu_page_fault_task_handler
+    lea esp, [ebp + 4]  ; discard hardware error_code
+    iretd
+    jmp page_fault_task_entry
+
+global double_fault_task_entry
+double_fault_task_entry:
+    cli
+    cld
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov ax, 0x18
+    mov gs, ax
+    and esp, 0xFFFFFFF0
+    call cpu_double_fault_task_handler
+.double_fault_halt:
+    hlt
+    jmp .double_fault_halt
 
 %macro ISR_NOERR 1
 global isr_%1
@@ -67,7 +121,7 @@ ISR_ERR   17
 ISR_NOERR 18
 ISR_NOERR 19
 ISR_NOERR 20
-ISR_NOERR 21
+ISR_ERR   21
 ISR_NOERR 22
 ISR_NOERR 23
 ISR_NOERR 24
@@ -75,7 +129,7 @@ ISR_NOERR 25
 ISR_NOERR 26
 ISR_NOERR 27
 ISR_NOERR 28
-ISR_NOERR 29
+ISR_ERR   29
 ISR_ERR   30
 ISR_NOERR 31
 
@@ -88,20 +142,31 @@ isr_common:
     push ebp
     push esi
     push edi
+    mov ebx, esp
+    push ds
+    push es
+    push fs
+    push gs
     mov ax, 0x10
     mov ds, ax
     mov es, ax
     mov fs, ax
     mov ax, 0x18
     mov gs, ax
-    mov ebx, esp
+    mov ebp, esp
     cmp esp, 0x10000
     jae .stack_ok
     mov esp, exception_stack_top
 .stack_ok:
+    and esp, 0xFFFFFFF0
+    sub esp, 12
     push ebx
     call cpu_exception_handler
-    mov esp, ebx
+    mov esp, ebp
+    pop gs
+    pop fs
+    pop es
+    pop ds
     pop edi
     pop esi
     pop ebp
@@ -113,8 +178,9 @@ isr_common:
     iretd
 
 extern timer_irq_handler
-global irq0_isr
-irq0_isr:
+extern irq_common_dispatch
+
+irq_common:
     cld
     push eax
     push ecx
@@ -133,13 +199,26 @@ irq0_isr:
     mov fs, ax
     mov ax, 0x18
     mov gs, ax
-    sub esp, 108
+    mov eax, [esp + 44]
+    mov ebx, esp
+    and esp, 0xFFFFFFF0
+    sub esp, 112
     fnsave [esp]
+    mov esi, esp
+    test eax, eax
+    jnz .dispatch_irq
     mov al, 0x20
     out 0x20, al
     call timer_irq_handler
+    jmp .restore
+.dispatch_irq:
+    sub esp, 12
+    push eax
+    call irq_common_dispatch
+.restore:
+    mov esp, esi
     frstor [esp]
-    add esp, 108
+    mov esp, ebx
     pop gs
     pop fs
     pop es
@@ -151,24 +230,34 @@ irq0_isr:
     pop edx
     pop ecx
     pop eax
+    add esp, 4
     iretd
 
-global irq_ignore_master
-irq_ignore_master:
-    push eax
-    mov al, 0x20
-    out 0x20, al
-    pop eax
-    iretd
+global irq0_isr
+irq0_isr:
+    push dword 0
+    jmp irq_common
 
-global irq_ignore_slave
-irq_ignore_slave:
-    push eax
-    mov al, 0x20
-    out 0xA0, al
-    out 0x20, al
-    pop eax
-    iretd
+%macro IRQ_STUB 1
+global irq_stub_%1
+irq_stub_%1:
+    push dword %1
+    jmp irq_common
+%endmacro
+
+%assign irq_n 1
+%rep 15
+    IRQ_STUB irq_n
+%assign irq_n irq_n+1
+%endrep
+
+global irq_stub_table
+irq_stub_table:
+%assign irq_n 1
+%rep 15
+    dd irq_stub_%+irq_n
+%assign irq_n irq_n+1
+%endrep
 
 global isr_stub_table
 isr_stub_table:

@@ -109,7 +109,7 @@ static bool ipc_shm_map_locked(ipc_shm_region_t *region, process_t *proc,
                      IPC_SHM_PAGE_SIZE;
     uint32_t virtual_address = region->virtual_base;
     uint32_t physical_address = (uint32_t)(uintptr_t)region->memory;
-    uint32_t flags = ADDRESS_SPACE_PAGE_USER;
+    uint32_t flags = ADDRESS_SPACE_PAGE_PRESENT | ADDRESS_SPACE_PAGE_USER;
     if ((rights & IPO_SHM_RIGHT_WRITE) != 0u) {
         flags |= ADDRESS_SPACE_PAGE_WRITABLE;
     }
@@ -288,7 +288,8 @@ static int ipc_shm_open(const char *user_name, uint32_t rights) {
         spin_unlock(&ipc_shm_lock);
         return IPO_IPC_ERR_NOT_FOUND;
     }
-    if ((rights & region->public_rights) != rights) {
+    if (proc->pid != region->owner_pid &&
+        (rights & region->public_rights) != rights) {
         spin_unlock(&ipc_shm_lock);
         return IPO_IPC_ERR_PERMISSION;
     }
@@ -471,42 +472,33 @@ bool ipc_shared_memory_user_range(uint32_t pid, const void *ptr,
     return false;
 }
 
-static bool ipc_shm_copy_args(uint32_t argc, uint32_t *argv,
-                              uint32_t required, uint32_t *out) {
-    if (argc < required ||
-        !ipc_user_range(argv, required * sizeof(uint32_t)))
-        return false;
-    memcpy(out, argv, required * sizeof(uint32_t));
-    return true;
-}
-
 uint32_t ipc_shared_memory_syscall_handler(uint32_t num, uint32_t argc,
                                            uint32_t *argv) {
     if (!ipc_shm_ready) return (uint32_t)IPO_IPC_ERR_NO_SPACE;
     uint32_t args[3] = {0};
     switch (num) {
         case IPO_SYSCALL_SHM_CREATE:
-            if (!ipc_shm_copy_args(argc, argv, 3u, args))
+            if (!ipc_copy_syscall_args(argc, argv, 3u, args))
                 return (uint32_t)IPO_IPC_ERR_INVALID;
             return (uint32_t)ipc_shm_create(
                 (const char *)(uintptr_t)args[0], args[1], args[2]);
         case IPO_SYSCALL_SHM_OPEN:
-            if (!ipc_shm_copy_args(argc, argv, 2u, args))
+            if (!ipc_copy_syscall_args(argc, argv, 2u, args))
                 return (uint32_t)IPO_IPC_ERR_INVALID;
             return (uint32_t)ipc_shm_open(
                 (const char *)(uintptr_t)args[0], args[1]);
         case IPO_SYSCALL_SHM_ATTACH:
-            if (!ipc_shm_copy_args(argc, argv, 3u, args))
+            if (!ipc_copy_syscall_args(argc, argv, 3u, args))
                 return (uint32_t)IPO_IPC_ERR_INVALID;
             return (uint32_t)ipc_shm_attach(
                 args[0], (void **)(uintptr_t)args[1],
                 (uint32_t *)(uintptr_t)args[2]);
         case IPO_SYSCALL_SHM_DETACH:
-            if (!ipc_shm_copy_args(argc, argv, 1u, args))
+            if (!ipc_copy_syscall_args(argc, argv, 1u, args))
                 return (uint32_t)IPO_IPC_ERR_INVALID;
             return (uint32_t)ipc_shm_detach(args[0]);
         case IPO_SYSCALL_SHM_DESTROY:
-            if (!ipc_shm_copy_args(argc, argv, 1u, args))
+            if (!ipc_copy_syscall_args(argc, argv, 1u, args))
                 return (uint32_t)IPO_IPC_ERR_INVALID;
             return (uint32_t)ipc_shm_destroy(args[0]);
         default:

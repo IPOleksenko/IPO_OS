@@ -160,95 +160,6 @@ void print_padded(const char *s, int width) {
     }
 }
 
-char *str_trim(char *str) {
-    if (!str) return NULL;
-    char *start = str;
-    while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n') {
-        start++;
-    }
-    if (*start == '\0') {
-        str[0] = '\0';
-        return str;
-    }
-    char *end = start + strlen(start) - 1;
-    while (end > start && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) {
-        *end = '\0';
-        end--;
-    }
-    if (start != str) {
-        memmove(str, start, strlen(start) + 1);
-    }
-    return str;
-}
-
-int parse_int(const char *str, int *out_val) {
-    if (!str) return -1;
-    while (*str == ' ' || *str == '\t') str++;
-    if (!*str) return -1;
-
-    int sign = 1;
-    if (*str == '-') {
-        sign = -1;
-        str++;
-    } else if (*str == '+') {
-        str++;
-    }
-    if (!(*str >= '0' && *str <= '9')) return -1;
-
-    int val = 0;
-    while (*str >= '0' && *str <= '9') {
-        val = val * 10 + (*str - '0');
-        str++;
-    }
-    if (out_val) *out_val = val * sign;
-    return 0;
-}
-
-int parse_uint(const char *str, uint32_t *out_val) {
-    if (!str) return -1;
-    while (*str == ' ' || *str == '\t') str++;
-    if (!*str) return -1;
-
-    if (*str == '0' && (*(str + 1) == 'x' || *(str + 1) == 'X')) {
-        return parse_hex(str, out_val);
-    }
-
-    if (!(*str >= '0' && *str <= '9')) return -1;
-    uint32_t val = 0;
-    while (*str >= '0' && *str <= '9') {
-        val = val * 10u + (uint32_t)(*str - '0');
-        str++;
-    }
-    if (out_val) *out_val = val;
-    return 0;
-}
-
-int parse_hex(const char *str, uint32_t *out_val) {
-    if (!str) return -1;
-    while (*str == ' ' || *str == '\t') str++;
-    if (*str == '0' && (*(str + 1) == 'x' || *(str + 1) == 'X')) {
-        str += 2;
-    }
-    if (!*str) return -1;
-
-    uint32_t val = 0;
-    int digits = 0;
-    while (*str) {
-        char c = *str;
-        uint32_t d;
-        if (c >= '0' && c <= '9') d = (uint32_t)(c - '0');
-        else if (c >= 'a' && c <= 'f') d = (uint32_t)(c - 'a' + 10);
-        else if (c >= 'A' && c <= 'F') d = (uint32_t)(c - 'A' + 10);
-        else break;
-        val = (val << 4) | d;
-        digits++;
-        str++;
-    }
-    if (digits == 0) return -1;
-    if (out_val) *out_val = val;
-    return 0;
-}
-
 int format_size(uint64_t bytes, char *buf, size_t buf_size) {
     if (!buf || buf_size == 0) return 0;
     if (bytes >= (1024ull * 1024ull * 1024ull)) {
@@ -272,6 +183,42 @@ char *format_size_dynamic(uint64_t bytes) {
     if (!buf) return NULL;
     format_size(bytes, buf, sz);
     return buf;
+}
+
+static bool cmdline_push_char(char **buf, size_t *cap, size_t *pos, char ch) {
+    if (*pos + 1 >= *cap) {
+        size_t new_cap = *cap * 2;
+        char *ext = (char *)krealloc(*buf, new_cap);
+        if (!ext) {
+            return false;
+        }
+        *buf = ext;
+        *cap = new_cap;
+    }
+    (*buf)[(*pos)++] = ch;
+    return true;
+}
+
+static bool cmdline_push_arg(char ***argv, int *cap, int *argc, const char *buf, size_t len) {
+    char *copy = (char *)kmalloc(len + 1);
+    if (!copy) {
+        return false;
+    }
+    memcpy(copy, buf, len);
+    copy[len] = '\0';
+
+    if (*argc + 1 >= *cap) {
+        int new_cap = *cap * 2;
+        char **new_argv = (char **)krealloc(*argv, (size_t)new_cap * sizeof(char *));
+        if (!new_argv) {
+            kfree(copy);
+            return false;
+        }
+        *argv = new_argv;
+        *cap = new_cap;
+    }
+    (*argv)[(*argc)++] = copy;
+    return true;
 }
 
 int cmdline_split(const char *cmdline, int *out_argc, char ***out_argv) {
@@ -304,22 +251,12 @@ int cmdline_split(const char *cmdline, int *out_argc, char ***out_argv) {
         if (in_quote) {
             if (c == in_quote) {
                 in_quote = '\0';
-            } else if (c == '\\' && (*(p + 1) == in_quote || *(p + 1) == '\\')) {
-                p++;
-                c = *p;
-                if (arg_pos + 1 >= arg_cap) {
-                    size_t new_cap = arg_cap * 2;
-                    char *ext = (char *)kmalloc(new_cap);
-                    if (ext) { memcpy(ext, arg_buf, arg_pos); kfree(arg_buf); arg_buf = ext; arg_cap = new_cap; }
-                }
-                arg_buf[arg_pos++] = c;
             } else {
-                if (arg_pos + 1 >= arg_cap) {
-                    size_t new_cap = arg_cap * 2;
-                    char *ext = (char *)kmalloc(new_cap);
-                    if (ext) { memcpy(ext, arg_buf, arg_pos); kfree(arg_buf); arg_buf = ext; arg_cap = new_cap; }
+                if (c == '\\' && (*(p + 1) == in_quote || *(p + 1) == '\\')) {
+                    p++;
+                    c = *p;
                 }
-                arg_buf[arg_pos++] = c;
+                if (!cmdline_push_char(&arg_buf, &arg_cap, &arg_pos, c)) goto fail;
             }
             p++;
             in_arg = true;
@@ -335,16 +272,12 @@ int cmdline_split(const char *cmdline, int *out_argc, char ***out_argv) {
 
         if (c == '\\' && *(p + 1) != '\0') {
             char next = *(p + 1);
-            if (next == ' ' || next == '\t' || next == '"' || next == '\'' || next == '\\' || next == '&' || next == ';' || next == '|' || next == '>' || next == '<') {
+            if (next == ' ' || next == '\t' || next == '"' || next == '\'' || next == '\\' ||
+                next == '&' || next == ';' || next == '|' || next == '>' || next == '<') {
                 p++;
                 c = *p;
             }
-            if (arg_pos + 1 >= arg_cap) {
-                size_t new_cap = arg_cap * 2;
-                char *ext = (char *)kmalloc(new_cap);
-                if (ext) { memcpy(ext, arg_buf, arg_pos); kfree(arg_buf); arg_buf = ext; arg_cap = new_cap; }
-            }
-            arg_buf[arg_pos++] = c;
+            if (!cmdline_push_char(&arg_buf, &arg_cap, &arg_pos, c)) goto fail;
             p++;
             in_arg = true;
             continue;
@@ -352,22 +285,7 @@ int cmdline_split(const char *cmdline, int *out_argc, char ***out_argv) {
 
         if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
             if (in_arg) {
-                arg_buf[arg_pos] = '\0';
-                char *copy = (char *)kmalloc(arg_pos + 1);
-                if (copy) {
-                    memcpy(copy, arg_buf, arg_pos + 1);
-                    if (argc + 1 >= argv_cap) {
-                        int new_cap = argv_cap * 2;
-                        char **new_argv = (char **)kmalloc((size_t)new_cap * sizeof(char *));
-                        if (new_argv) {
-                            memcpy(new_argv, argv, (size_t)argc * sizeof(char *));
-                            kfree(argv);
-                            argv = new_argv;
-                            argv_cap = new_cap;
-                        }
-                    }
-                    argv[argc++] = copy;
-                }
+                if (!cmdline_push_arg(&argv, &argv_cap, &argc, arg_buf, arg_pos)) goto fail;
                 arg_pos = 0;
                 in_arg = false;
             }
@@ -375,33 +293,13 @@ int cmdline_split(const char *cmdline, int *out_argc, char ***out_argv) {
             continue;
         }
 
-        if (arg_pos + 1 >= arg_cap) {
-            size_t new_cap = arg_cap * 2;
-            char *ext = (char *)kmalloc(new_cap);
-            if (ext) { memcpy(ext, arg_buf, arg_pos); kfree(arg_buf); arg_buf = ext; arg_cap = new_cap; }
-        }
-        arg_buf[arg_pos++] = c;
+        if (!cmdline_push_char(&arg_buf, &arg_cap, &arg_pos, c)) goto fail;
         p++;
         in_arg = true;
     }
 
     if (in_arg) {
-        arg_buf[arg_pos] = '\0';
-        char *copy = (char *)kmalloc(arg_pos + 1);
-        if (copy) {
-            memcpy(copy, arg_buf, arg_pos + 1);
-            if (argc + 1 >= argv_cap) {
-                int new_cap = argv_cap * 2;
-                char **new_argv = (char **)kmalloc((size_t)new_cap * sizeof(char *));
-                if (new_argv) {
-                    memcpy(new_argv, argv, (size_t)argc * sizeof(char *));
-                    kfree(argv);
-                    argv = new_argv;
-                    argv_cap = new_cap;
-                }
-            }
-            argv[argc++] = copy;
-        }
+        if (!cmdline_push_arg(&argv, &argv_cap, &argc, arg_buf, arg_pos)) goto fail;
     }
 
     kfree(arg_buf);
@@ -410,6 +308,11 @@ int cmdline_split(const char *cmdline, int *out_argc, char ***out_argv) {
     if (out_argc) *out_argc = argc;
     if (out_argv) *out_argv = argv;
     return argc;
+
+fail:
+    kfree(arg_buf);
+    cmdline_free_args(argc, argv);
+    return -1;
 }
 
 void cmdline_free_args(int argc, char **argv) {

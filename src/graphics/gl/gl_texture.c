@@ -17,19 +17,40 @@ static gl_texture_t *get_or_create_texture(GLContext *ctx, GLuint id) {
     gl_texture_t *t = get_texture(ctx, id);
     if (t) return t;
 
-    /* Expand texture registry array without limits */
-    if (ctx->texture_count >= ctx->texture_capacity) {
-        int new_cap = ctx->texture_capacity ? ctx->texture_capacity * 2 : 16;
-        gl_texture_t **new_arr = krealloc(ctx->textures, (size_t)new_cap * sizeof(gl_texture_t *));
-        if (!new_arr) return NULL;
-        ctx->textures = new_arr;
-        ctx->texture_capacity = new_cap;
+    int free_idx = -1;
+    for (int i = 0; i < ctx->texture_count; i++) {
+        if (!ctx->textures[i] || !ctx->textures[i]->in_use) {
+            free_idx = i;
+            break;
+        }
     }
 
-    t = kmalloc(sizeof(gl_texture_t));
-    if (!t) return NULL;
-    memset(t, 0, sizeof(gl_texture_t));
+    if (free_idx >= 0 && ctx->textures[free_idx]) {
+        t = ctx->textures[free_idx];
+        if (t->pixels) {
+            kfree(t->pixels);
+        }
+    } else {
+        if (free_idx < 0 && ctx->texture_count >= ctx->texture_capacity) {
+            int new_cap = ctx->texture_capacity ? ctx->texture_capacity * 2 : 16;
+            gl_texture_t **new_arr = krealloc(
+                ctx->textures, (size_t)new_cap * sizeof(gl_texture_t *));
+            if (!new_arr) return NULL;
+            memset(new_arr + ctx->texture_capacity, 0,
+                   (size_t)(new_cap - ctx->texture_capacity) * sizeof(gl_texture_t *));
+            ctx->textures = new_arr;
+            ctx->texture_capacity = new_cap;
+        }
 
+        t = kmalloc(sizeof(gl_texture_t));
+        if (!t) return NULL;
+        if (free_idx < 0) {
+            free_idx = ctx->texture_count++;
+        }
+        ctx->textures[free_idx] = t;
+    }
+
+    memset(t, 0, sizeof(gl_texture_t));
     t->id         = id;
     t->target     = GL_TEXTURE_2D;
     t->min_filter = GL_NEAREST;
@@ -38,19 +59,28 @@ static gl_texture_t *get_or_create_texture(GLContext *ctx, GLuint id) {
     t->wrap_t     = GL_REPEAT;
     t->wrap_r     = GL_REPEAT;
     t->in_use     = true;
-
-    ctx->textures[ctx->texture_count++] = t;
     return t;
 }
 
 void glGenTextures(GLsizei n, GLuint *textures) {
     GLContext *ctx = gl_get_current_context();
-    if (!ctx || !textures || n <= 0) return;
+    if (!ctx) return;
+    if (n < 0) {
+        ctx->error_flag = GL_INVALID_VALUE;
+        return;
+    }
+    if (!textures || n == 0) return;
 
     static GLuint next_id = 1;
     for (GLsizei i = 0; i < n; i++) {
+        while (next_id == 0 || get_texture(ctx, next_id)) {
+            next_id++;
+        }
         GLuint id = next_id++;
-        get_or_create_texture(ctx, id);
+        if (!get_or_create_texture(ctx, id)) {
+            ctx->error_flag = GL_OUT_OF_MEMORY;
+            return;
+        }
         textures[i] = id;
     }
 }
@@ -59,22 +89,33 @@ void glBindTexture(GLenum target, GLuint texture) {
     GLContext *ctx = gl_get_current_context();
     if (!ctx) return;
 
-    if (texture != 0) {
-        get_or_create_texture(ctx, texture);
+    if (texture != 0 && !get_or_create_texture(ctx, texture)) {
+        ctx->error_flag = GL_OUT_OF_MEMORY;
+        return;
     }
 
-    if (target == GL_TEXTURE_2D) {
+    if (target == GL_TEXTURE_2D || target == GL_TEXTURE_1D) {
         ctx->current_texture_2d = texture;
     } else if (target == GL_TEXTURE_3D) {
         ctx->current_texture_3d = texture;
+    } else {
+        ctx->error_flag = GL_INVALID_ENUM;
     }
 }
 
 void glDeleteTextures(GLsizei n, const GLuint *textures) {
     GLContext *ctx = gl_get_current_context();
-    if (!ctx || !textures || n <= 0) return;
+    if (!ctx) return;
+    if (n < 0) {
+        ctx->error_flag = GL_INVALID_VALUE;
+        return;
+    }
+    if (!textures || n == 0) return;
 
     for (GLsizei i = 0; i < n; i++) {
+        if (textures[i] == 0) continue;
+        if (ctx->current_texture_2d == textures[i]) ctx->current_texture_2d = 0;
+        if (ctx->current_texture_3d == textures[i]) ctx->current_texture_3d = 0;
         gl_texture_t *t = get_texture(ctx, textures[i]);
         if (t) {
             t->in_use = false;
@@ -168,18 +209,32 @@ static uint32_t unpack_pixel(const void *src, GLenum format, GLenum type, size_t
 void glTexImage2D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid *pixels) {
     (void)level; (void)internalformat; (void)border;
     GLContext *ctx = gl_get_current_context();
-    if (!ctx || width <= 0 || height <= 0) return;
-
-    gl_texture_t *t = get_or_create_texture(ctx, ctx->current_texture_2d);
-    if (!t) return;
+    if (!ctx) return;
+    if (width <= 0 || height <= 0 || (size_t)width > SIZE_MAX / (size_t)height) {
+        ctx->error_flag = GL_INVALID_VALUE;
+        return;
+    }
 
     size_t num_pixels = (size_t)width * (size_t)height;
-    if (t->pixels) {
-        kfree(t->pixels);
+    if (num_pixels > SIZE_MAX / sizeof(uint32_t)) {
+        ctx->error_flag = GL_OUT_OF_MEMORY;
+        return;
     }
-    t->pixels = kmalloc(num_pixels * sizeof(uint32_t));
-    if (!t->pixels) return;
 
+    gl_texture_t *t = get_or_create_texture(ctx, ctx->current_texture_2d);
+    if (!t) {
+        ctx->error_flag = GL_OUT_OF_MEMORY;
+        return;
+    }
+
+    uint32_t *new_pixels = kmalloc(num_pixels * sizeof(uint32_t));
+    if (!new_pixels) {
+        ctx->error_flag = GL_OUT_OF_MEMORY;
+        return;
+    }
+
+    if (t->pixels) kfree(t->pixels);
+    t->pixels = new_pixels;
     t->target = target;
     t->width  = width;
     t->height = height;
@@ -203,18 +258,34 @@ void glTexImage1D(GLenum target, GLint level, GLint internalformat, GLsizei widt
 void glTexImage3D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type, const GLvoid *pixels) {
     (void)level; (void)internalformat; (void)border;
     GLContext *ctx = gl_get_current_context();
-    if (!ctx || width <= 0 || height <= 0 || depth <= 0) return;
-
-    gl_texture_t *t = get_or_create_texture(ctx, ctx->current_texture_3d);
-    if (!t) return;
+    if (!ctx) return;
+    if (width <= 0 || height <= 0 || depth <= 0 ||
+        (size_t)width > SIZE_MAX / (size_t)height ||
+        (size_t)width * (size_t)height > SIZE_MAX / (size_t)depth) {
+        ctx->error_flag = GL_INVALID_VALUE;
+        return;
+    }
 
     size_t num_pixels = (size_t)width * (size_t)height * (size_t)depth;
-    if (t->pixels) {
-        kfree(t->pixels);
+    if (num_pixels > SIZE_MAX / sizeof(uint32_t)) {
+        ctx->error_flag = GL_OUT_OF_MEMORY;
+        return;
     }
-    t->pixels = kmalloc(num_pixels * sizeof(uint32_t));
-    if (!t->pixels) return;
 
+    gl_texture_t *t = get_or_create_texture(ctx, ctx->current_texture_3d);
+    if (!t) {
+        ctx->error_flag = GL_OUT_OF_MEMORY;
+        return;
+    }
+
+    uint32_t *new_pixels = kmalloc(num_pixels * sizeof(uint32_t));
+    if (!new_pixels) {
+        ctx->error_flag = GL_OUT_OF_MEMORY;
+        return;
+    }
+
+    if (t->pixels) kfree(t->pixels);
+    t->pixels = new_pixels;
     t->target = target;
     t->width  = width;
     t->height = height;
@@ -285,15 +356,31 @@ void glCopyTexImage2D(GLenum target, GLint level, GLenum internalformat, GLint x
     (void)level; (void)internalformat; (void)border;
     GLContext *ctx = gl_get_current_context();
     if (!ctx || !ctx->color_buffer) return;
-
-    gl_texture_t *t = get_or_create_texture(ctx, ctx->current_texture_2d);
-    if (!t) return;
+    if (width <= 0 || height <= 0 || (size_t)width > SIZE_MAX / (size_t)height) {
+        ctx->error_flag = GL_INVALID_VALUE;
+        return;
+    }
 
     size_t num = (size_t)width * (size_t)height;
-    if (t->pixels) kfree(t->pixels);
-    t->pixels = kmalloc(num * sizeof(uint32_t));
-    if (!t->pixels) return;
+    if (num > SIZE_MAX / sizeof(uint32_t)) {
+        ctx->error_flag = GL_OUT_OF_MEMORY;
+        return;
+    }
 
+    gl_texture_t *t = get_or_create_texture(ctx, ctx->current_texture_2d);
+    if (!t) {
+        ctx->error_flag = GL_OUT_OF_MEMORY;
+        return;
+    }
+
+    uint32_t *new_pixels = kmalloc(num * sizeof(uint32_t));
+    if (!new_pixels) {
+        ctx->error_flag = GL_OUT_OF_MEMORY;
+        return;
+    }
+
+    if (t->pixels) kfree(t->pixels);
+    t->pixels = new_pixels;
     t->target = target;
     t->width  = width;
     t->height = height;

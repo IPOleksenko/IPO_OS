@@ -54,17 +54,6 @@ int kmod_init(void) {
     return 0;
 }
 
-/* Duplicate a (possibly non-terminated) fixed-width header field into a dynamic string */
-static char *kmod_dup_field(const char *src, size_t max) {
-    size_t n = 0;
-    while (n < max && src[n]) n++;
-    char *d = (char *)kmalloc(n + 1);
-    if (!d) return NULL;
-    memcpy(d, src, n);
-    d[n] = 0;
-    return d;
-}
-
 static void kmod_free_strings(kmod_t *m) {
     if (m->name) kfree(m->name);
     if (m->author) kfree(m->author);
@@ -83,65 +72,86 @@ int kmod_load_buffer(const void *buf, size_t size, kmod_t **out_mod) {
     kmod_header_from_raw(&dyn_hdr, raw_hdr);
     const kmod_header_t *hdr = &dyn_hdr;
 
-    /* Validate Magic */
+    int rc = -1;
+    uint8_t *image = NULL;
+    kmod_t *mod = NULL;
+    kmod_sym_t *syms = NULL;
+
+    if (!hdr->name || !hdr->author || !hdr->version || !hdr->description) {
+        rc = -6;
+        goto fail;
+    }
+
     if (hdr->magic != KMOD_MAGIC) {
         serial_printf("[kmod] Invalid magic: 0x%08x (expected 0x%08x)\n", hdr->magic, KMOD_MAGIC);
-        return -2;
+        rc = -2;
+        goto fail;
     }
 
-    /* Validate ABI Version */
     if (hdr->abi_version != KMOD_ABI_VERSION) {
         serial_printf("[kmod] ABI mismatch: 0x%04x (expected 0x%04x)\n", hdr->abi_version, KMOD_ABI_VERSION);
-        return -3;
+        rc = -3;
+        goto fail;
     }
 
-    /* Validate Payload Checksum */
     size_t payload_len = size - sizeof(kmod_raw_header_t);
     if (payload_len > 0 && hdr->checksum != 0) {
         uint32_t calc_crc = partition_crc32((const uint8_t *)buf + sizeof(kmod_raw_header_t), payload_len);
         if (calc_crc != hdr->checksum) {
             serial_printf("[kmod] Payload checksum mismatch: calc 0x%08x vs hdr 0x%08x\n",
                           calc_crc, hdr->checksum);
-            return -4;
+            rc = -4;
+            goto fail;
         }
     }
 
-    /* Check if already loaded by name */
     if (kmod_find_by_name(hdr->name) != NULL) {
         serial_printf("[kmod] Module '%s' is already loaded.\n", hdr->name);
-        return -5;
+        rc = -5;
+        goto fail;
     }
 
-    /* Allocate memory for code and data image */
-    size_t image_sz = hdr->text_size + hdr->data_size + hdr->bss_size;
-    if (image_sz == 0) image_sz = 64;
+    uint64_t raw_image_sz = (uint64_t)hdr->text_size + hdr->data_size + hdr->bss_size;
+    if (raw_image_sz > 16u * 1024u * 1024u) {
+        rc = -6;
+        goto fail;
+    }
+    size_t image_sz = (raw_image_sz == 0u) ? 64u : (size_t)raw_image_sz;
 
-    uint8_t *image = (uint8_t *)kmalloc(image_sz);
+    image = (uint8_t *)kmalloc(image_sz);
     if (!image) {
         serial_printf("[kmod] Failed to allocate %u bytes for module image.\n", image_sz);
-        return -6;
+        rc = -6;
+        goto fail;
     }
     memset(image, 0, image_sz);
 
-    /* Copy payload into allocated image */
     const uint8_t *payload = (const uint8_t *)buf + sizeof(kmod_raw_header_t);
-    size_t copy_bytes = (payload_len < (hdr->text_size + hdr->data_size)) ?
-                         payload_len : (hdr->text_size + hdr->data_size);
+    uint64_t text_data_sz = (uint64_t)hdr->text_size + hdr->data_size;
+    size_t copy_bytes = (payload_len < text_data_sz) ? payload_len : (size_t)text_data_sz;
     if (copy_bytes > 0) {
         memcpy(image, payload, copy_bytes);
     }
 
-    /* Process relocations if present */
-    if (hdr->reloc_count > 0 && hdr->reloc_offset < size) {
-        const kmod_reloc_t   *relocs   = (const kmod_reloc_t *)((const uint8_t *)buf + hdr->reloc_offset);
-        const kmod_raw_sym_t *raw_syms = (const kmod_raw_sym_t *)((const uint8_t *)buf + hdr->sym_tab_offset);
+    if (hdr->reloc_count > 0) {
+        if (hdr->reloc_offset >= size ||
+            (size - hdr->reloc_offset) / sizeof(kmod_reloc_t) < hdr->reloc_count) {
+            rc = -7;
+            goto fail;
+        }
+        const kmod_reloc_t *relocs = (const kmod_reloc_t *)((const uint8_t *)buf + hdr->reloc_offset);
 
-        kmod_sym_t *syms = NULL;
-        if (hdr->sym_tab_count > 0 && hdr->sym_tab_offset < size) {
+        if (hdr->sym_tab_count > 0) {
+            if (hdr->sym_tab_offset >= size ||
+                (size - hdr->sym_tab_offset) / sizeof(kmod_raw_sym_t) < hdr->sym_tab_count) {
+                rc = -7;
+                goto fail;
+            }
+            const kmod_raw_sym_t *raw_syms = (const kmod_raw_sym_t *)((const uint8_t *)buf + hdr->sym_tab_offset);
             syms = (kmod_sym_t *)kmalloc(hdr->sym_tab_count * sizeof(kmod_sym_t));
             if (!syms) {
-                kfree(image);
-                return -7;
+                rc = -7;
+                goto fail;
             }
             for (uint32_t s = 0; s < hdr->sym_tab_count; s++) {
                 kmod_sym_init(&syms[s]);
@@ -152,8 +162,11 @@ int kmod_load_buffer(const void *buf, size_t size, kmod_t **out_mod) {
         bool reloc_ok = true;
         for (uint32_t r = 0; r < hdr->reloc_count; r++) {
             const kmod_reloc_t *rel = &relocs[r];
-            if (rel->offset + 4 > image_sz) continue;
-            if (rel->sym_index >= hdr->sym_tab_count || !syms) continue;
+            if (rel->offset > image_sz || image_sz - rel->offset < 4u ||
+                rel->sym_index >= hdr->sym_tab_count || !syms) {
+                reloc_ok = false;
+                break;
+            }
 
             const char *sym_name = syms[rel->sym_index].name;
             void *target_addr = kmod_resolve_symbol(sym_name);
@@ -166,9 +179,12 @@ int kmod_load_buffer(const void *buf, size_t size, kmod_t **out_mod) {
 
             uint32_t *patch_loc = (uint32_t *)(image + rel->offset);
             if (rel->type == KMOD_RELOC_ABS32) {
-                *patch_loc += (uint32_t)target_addr;
+                *patch_loc += (uint32_t)(uintptr_t)target_addr;
             } else if (rel->type == KMOD_RELOC_REL32) {
-                *patch_loc += (uint32_t)target_addr - ((uint32_t)patch_loc + 4);
+                *patch_loc += (uint32_t)(uintptr_t)target_addr - ((uint32_t)(uintptr_t)patch_loc + 4u);
+            } else {
+                reloc_ok = false;
+                break;
             }
         }
 
@@ -177,33 +193,27 @@ int kmod_load_buffer(const void *buf, size_t size, kmod_t **out_mod) {
                 kmod_sym_free(&syms[s]);
             }
             kfree(syms);
+            syms = NULL;
         }
 
         if (!reloc_ok) {
-            kfree(image);
-            return -7;
+            rc = -7;
+            goto fail;
         }
     }
 
-    /* Allocate runtime descriptor */
-    kmod_t *mod = (kmod_t *)kmalloc(sizeof(kmod_t));
+    mod = (kmod_t *)kmalloc(sizeof(kmod_t));
     if (!mod) {
-        kfree(image);
-        return -8;
+        rc = -8;
+        goto fail;
     }
     memset(mod, 0, sizeof(kmod_t));
 
     mod->id = s_next_kmod_id++;
-    mod->name = kmod_dup_field(hdr->name, strlen(hdr->name));
-    mod->author = kmod_dup_field(hdr->author, strlen(hdr->author));
-    mod->version = kmod_dup_field(hdr->version, strlen(hdr->version));
-    mod->description = kmod_dup_field(hdr->description, strlen(hdr->description));
-    if (!mod->name || !mod->author || !mod->version || !mod->description) {
-        kmod_free_strings(mod);
-        kfree(image);
-        kfree(mod);
-        return -8;
-    }
+    mod->name = dyn_hdr.name; dyn_hdr.name = NULL;
+    mod->author = dyn_hdr.author; dyn_hdr.author = NULL;
+    mod->version = dyn_hdr.version; dyn_hdr.version = NULL;
+    mod->description = dyn_hdr.description; dyn_hdr.description = NULL;
     mod->abi_version = hdr->abi_version;
     mod->flags = KMOD_FLAG_LOADED;
     mod->image_base = image;
@@ -216,30 +226,26 @@ int kmod_load_buffer(const void *buf, size_t size, kmod_t **out_mod) {
         mod->cleanup = (int (*)(void))(image + hdr->cleanup_offset);
     }
 
-    /* Call module init() callback */
     if (mod->init != NULL) {
         int init_ret = mod->init();
         if (init_ret < 0) {
             serial_printf("[kmod] Module '%s' init() failed with code %d\n", mod->name, init_ret);
-            kfree(image);
-            kmod_free_strings(mod);
-            kfree(mod);
-            kmod_header_free(&dyn_hdr);
-            return init_ret;
+            rc = init_ret;
+            goto fail;
         }
     }
 
     mod->flags |= KMOD_FLAG_ACTIVE;
 
-    /* Register with core driver subsystem */
-    driver_t drv;
-    memset(&drv, 0, sizeof(drv));
-    drv.name = mod->name;
-    drv.description = mod->description;
-    drv.flags = DRIVER_FLAG_KERNEL | DRIVER_FLAG_ACTIVE;
-    driver_register(&drv);
+    if (driver_find(mod->name) == NULL) {
+        driver_t drv;
+        memset(&drv, 0, sizeof(drv));
+        drv.name = mod->name;
+        drv.description = mod->description;
+        drv.flags = DRIVER_FLAG_ACTIVE;
+        driver_register(&drv);
+    }
 
-    /* Insert into module list */
     spin_lock(&s_kmod_lock);
     mod->next = s_kmod_head;
     s_kmod_head = mod;
@@ -251,6 +257,15 @@ int kmod_load_buffer(const void *buf, size_t size, kmod_t **out_mod) {
     kmod_header_free(&dyn_hdr);
     if (out_mod) *out_mod = mod;
     return 0;
+
+fail:
+    if (mod) {
+        kmod_free_strings(mod);
+        kfree(mod);
+    }
+    if (image) kfree(image);
+    kmod_header_free(&dyn_hdr);
+    return rc;
 }
 
 int kmod_load_file(const char *path, kmod_t **out_mod) {
@@ -315,13 +330,12 @@ int kmod_unload(uint32_t id) {
             }
             spin_unlock(&s_kmod_lock);
 
-            /* Call cleanup() callback */
+            /* Call cleanup() callback before removing the module driver */
             if (curr->cleanup != NULL) {
                 curr->cleanup();
             }
 
-            /* Unregister from core driver registry */
-            driver_unregister(curr->name);
+            driver_unregister_force(curr->name);
 
             serial_printf("[kmod] Unloaded module '%s' (id=%u)\n", curr->name, curr->id);
 
@@ -377,10 +391,6 @@ kmod_t *kmod_find_by_name(const char *name) {
     return NULL;
 }
 
-const kmod_t *kmod_get_list(void) {
-    return s_kmod_head;
-}
-
 uint32_t kmod_count(void) {
     spin_lock(&s_kmod_lock);
     uint32_t cnt = 0;
@@ -424,19 +434,20 @@ void kmod_print_list(void) {
     spin_unlock(&s_kmod_lock);
 }
 
-int kmod_device_firmware_probe(const void *rom_data, size_t rom_size, const char *dev_name) {
-    if (!rom_data || rom_size < sizeof(kmod_raw_header_t)) return -1;
-
-    const uint8_t *p = (const uint8_t *)rom_data;
-    for (size_t off = 0; off + sizeof(kmod_raw_header_t) <= rom_size; off += 16) {
-        uint32_t magic = *(const uint32_t *)(p + off);
-        if (magic == KMOD_MAGIC) {
-            serial_printf("[kmod] Detected device firmware driver in ROM at offset 0x%x for '%s'\n",
-                          off, dev_name ? dev_name : "unknown");
-            kmod_t *mod = NULL;
-            return kmod_load_buffer(p + off, rom_size - off, &mod);
-        }
+static int kmod_str_set_bounded(char **dst, size_t *len, size_t *cap,
+                                const char *src, size_t max_len) {
+    if (!src) src = "";
+    size_t slen = 0;
+    while (slen < max_len && src[slen] != '\0') slen++;
+    if (slen + 1u > *cap || !*dst) {
+        char *nb = (char *)krealloc(*dst, slen + 1u);
+        if (!nb) return -1;
+        *dst = nb;
+        *cap = slen + 1u;
     }
+    if (slen > 0u) memcpy(*dst, src, slen);
+    (*dst)[slen] = '\0';
+    *len = slen;
     return 0;
 }
 
@@ -458,49 +469,22 @@ void kmod_sym_free(kmod_sym_t *sym) {
 
 int kmod_sym_set_name(kmod_sym_t *sym, const char *name) {
     if (!sym) return -1;
-    if (sym->name) {
-        kfree(sym->name);
-        sym->name = NULL;
+    if (!name) {
+        if (sym->name) {
+            kfree(sym->name);
+            sym->name = NULL;
+        }
+        sym->name_len = 0;
+        sym->name_cap = 0;
+        return 0;
     }
-    sym->name_len = 0;
-    sym->name_cap = 0;
-    if (!name) return 0;
-
-    size_t len = strlen(name);
-    size_t cap = len + 1;
-    char *buf = (char *)kmalloc(cap);
-    if (!buf) return -1;
-    memcpy(buf, name, len);
-    buf[len] = '\0';
-    sym->name = buf;
-    sym->name_len = len;
-    sym->name_cap = cap;
-    return 0;
-}
-
-int kmod_sym_copy(kmod_sym_t *dst, const kmod_sym_t *src) {
-    if (!dst) return -1;
-    kmod_sym_free(dst);
-    if (!src) return 0;
-    kmod_sym_set_name(dst, src->name);
-    dst->address = src->address;
-    return 0;
+    return kmod_str_set_bounded(&sym->name, &sym->name_len, &sym->name_cap, name, strlen(name));
 }
 
 void kmod_sym_from_raw(kmod_sym_t *dst, const kmod_raw_sym_t *raw) {
     if (!dst || !raw) return;
-    char name_buf[33];
-    memset(name_buf, 0, sizeof(name_buf));
-    strncpy(name_buf, raw->name, 32);
-    kmod_sym_set_name(dst, name_buf);
+    kmod_str_set_bounded(&dst->name, &dst->name_len, &dst->name_cap, raw->name, sizeof(raw->name));
     dst->address = raw->address;
-}
-
-void kmod_sym_to_raw(const kmod_sym_t *src, kmod_raw_sym_t *raw) {
-    if (!src || !raw) return;
-    memset(raw, 0, sizeof(*raw));
-    if (src->name) strncpy(raw->name, src->name, 31);
-    raw->address = src->address;
 }
 
 void kmod_header_init(kmod_header_t *h) {
@@ -516,52 +500,24 @@ void kmod_header_free(kmod_header_t *h) {
     memset(h, 0, sizeof(*h));
 }
 
-static int kmod_hdr_str_set(char **dst, size_t *len, size_t *cap, const char *src) {
-    if (!src) src = "";
-    size_t slen = strlen(src);
-    if (slen + 1 > *cap || !*dst) {
-        char *nb = (char *)krealloc(*dst, slen + 1);
-        if (!nb) return -1;
-        *dst = nb;
-        *cap = slen + 1;
-    }
-    memcpy(*dst, src, slen + 1);
-    *len = slen;
-    return 0;
-}
-
 int kmod_header_set_name(kmod_header_t *h, const char *name) {
     if (!h) return -1;
-    return kmod_hdr_str_set(&h->name, &h->name_len, &h->name_cap, name);
+    return kmod_str_set_bounded(&h->name, &h->name_len, &h->name_cap, name, name ? strlen(name) : 0u);
 }
 
 int kmod_header_set_author(kmod_header_t *h, const char *author) {
     if (!h) return -1;
-    return kmod_hdr_str_set(&h->author, &h->author_len, &h->author_cap, author);
+    return kmod_str_set_bounded(&h->author, &h->author_len, &h->author_cap, author, author ? strlen(author) : 0u);
 }
 
 int kmod_header_set_version(kmod_header_t *h, const char *version) {
     if (!h) return -1;
-    return kmod_hdr_str_set(&h->version, &h->version_len, &h->version_cap, version);
+    return kmod_str_set_bounded(&h->version, &h->version_len, &h->version_cap, version, version ? strlen(version) : 0u);
 }
 
 int kmod_header_set_description(kmod_header_t *h, const char *desc) {
     if (!h) return -1;
-    return kmod_hdr_str_set(&h->description, &h->description_len, &h->description_cap, desc);
-}
-
-static void kmod_raw_str_copy(int (*setter)(kmod_header_t *, const char *),
-                              kmod_header_t *dst,
-                              const char *raw_str,
-                              size_t max_len) {
-    size_t len = 0;
-    while (len < max_len && raw_str[len] != '\0') len++;
-    char *tmp = (char *)kmalloc(len + 1u);
-    if (!tmp) return;
-    memcpy(tmp, raw_str, len);
-    tmp[len] = '\0';
-    setter(dst, tmp);
-    kfree(tmp);
+    return kmod_str_set_bounded(&h->description, &h->description_len, &h->description_cap, desc, desc ? strlen(desc) : 0u);
 }
 
 void kmod_header_from_raw(kmod_header_t *dst, const kmod_raw_header_t *raw) {
@@ -570,10 +526,10 @@ void kmod_header_from_raw(kmod_header_t *dst, const kmod_raw_header_t *raw) {
     dst->abi_version = raw->abi_version;
     dst->flags = raw->flags;
 
-    kmod_raw_str_copy(kmod_header_set_name, dst, raw->name, sizeof(raw->name));
-    kmod_raw_str_copy(kmod_header_set_author, dst, raw->author, sizeof(raw->author));
-    kmod_raw_str_copy(kmod_header_set_version, dst, raw->version, sizeof(raw->version));
-    kmod_raw_str_copy(kmod_header_set_description, dst, raw->description, sizeof(raw->description));
+    kmod_str_set_bounded(&dst->name, &dst->name_len, &dst->name_cap, raw->name, sizeof(raw->name));
+    kmod_str_set_bounded(&dst->author, &dst->author_len, &dst->author_cap, raw->author, sizeof(raw->author));
+    kmod_str_set_bounded(&dst->version, &dst->version_len, &dst->version_cap, raw->version, sizeof(raw->version));
+    kmod_str_set_bounded(&dst->description, &dst->description_len, &dst->description_cap, raw->description, sizeof(raw->description));
 
     dst->init_offset = raw->init_offset;
     dst->cleanup_offset = raw->cleanup_offset;
@@ -585,26 +541,4 @@ void kmod_header_from_raw(kmod_header_t *dst, const kmod_raw_header_t *raw) {
     dst->reloc_offset = raw->reloc_offset;
     dst->reloc_count = raw->reloc_count;
     dst->checksum = raw->checksum;
-}
-
-void kmod_header_to_raw(const kmod_header_t *src, kmod_raw_header_t *raw) {
-    if (!src || !raw) return;
-    memset(raw, 0, sizeof(*raw));
-    raw->magic = src->magic;
-    raw->abi_version = src->abi_version;
-    raw->flags = src->flags;
-    if (src->name) strncpy(raw->name, src->name, 31);
-    if (src->author) strncpy(raw->author, src->author, 31);
-    if (src->version) strncpy(raw->version, src->version, 15);
-    if (src->description) strncpy(raw->description, src->description, 63);
-    raw->init_offset = src->init_offset;
-    raw->cleanup_offset = src->cleanup_offset;
-    raw->text_size = src->text_size;
-    raw->data_size = src->data_size;
-    raw->bss_size = src->bss_size;
-    raw->sym_tab_offset = src->sym_tab_offset;
-    raw->sym_tab_count = src->sym_tab_count;
-    raw->reloc_offset = src->reloc_offset;
-    raw->reloc_count = src->reloc_count;
-    raw->checksum = src->checksum;
 }

@@ -5,14 +5,34 @@
 #include <net/udp.h>
 #include <net/loopback.h>
 #include <net/tcp.h>
+#include <driver/net/rtl8139.h>
 #include <string.h>
-
+#include <stdio.h>
 #include <memory/kmalloc.h>
 
 static uint16_t ip_ident_counter = 1;
 
+static void build_ip4_header(ip4_header_t *hdr, uint16_t total_len,
+                             uint8_t protocol, uint8_t ttl,
+                             ip4_addr_t src_ip, ip4_addr_t dst_ip) {
+    hdr->ihl_version = 0x45;
+    hdr->tos = 0;
+    hdr->total_len = htons(total_len);
+    hdr->id = htons(ip_ident_counter++);
+    hdr->flags_frag = 0;
+    hdr->ttl = ttl ? ttl : 64;
+    hdr->protocol = protocol;
+    hdr->checksum = 0;
+    hdr->src_ip = htonl(src_ip);
+    hdr->dst_ip = htonl(dst_ip);
+    hdr->checksum = net_checksum(hdr, sizeof(ip4_header_t));
+}
+
 int ip4_send(ip4_addr_t dst_ip, uint8_t protocol, uint8_t ttl, const void *payload, uint16_t len) {
     if (!payload && len > 0) {
+        return -1;
+    }
+    if ((size_t)len > 65535u - sizeof(ip4_header_t)) {
         return -1;
     }
 
@@ -27,19 +47,8 @@ int ip4_send(ip4_addr_t dst_ip, uint8_t protocol, uint8_t ttl, const void *paylo
 
     /* Check for loopback destination 127.0.0.0/8 */
     if ((dst_ip >> 24) == 127) {
-        ip4_header_t *hdr = (ip4_header_t *)tx_buf;
-        hdr->ihl_version = 0x45;
-        hdr->tos = 0;
-        hdr->total_len = htons(total_len);
-        hdr->id = htons(ip_ident_counter++);
-        hdr->flags_frag = 0;
-        hdr->ttl = ttl ? ttl : 64;
-        hdr->protocol = protocol;
-        hdr->checksum = 0;
-        hdr->src_ip = htonl(IP4_ADDR_LOOPBACK);
-        hdr->dst_ip = htonl(dst_ip);
-        hdr->checksum = net_checksum(hdr, sizeof(ip4_header_t));
-
+        build_ip4_header((ip4_header_t *)tx_buf, total_len, protocol, ttl,
+                         IP4_ADDR_LOOPBACK, dst_ip);
         if (payload && len > 0) {
             memcpy(tx_buf + sizeof(ip4_header_t), payload, len);
         }
@@ -82,18 +91,8 @@ int ip4_send(ip4_addr_t dst_ip, uint8_t protocol, uint8_t ttl, const void *paylo
     }
 
     /* Build IPv4 packet */
-    ip4_header_t *hdr = (ip4_header_t *)tx_buf;
-    hdr->ihl_version = 0x45;
-    hdr->tos = 0;
-    hdr->total_len = htons(total_len);
-    hdr->id = htons(ip_ident_counter++);
-    hdr->flags_frag = 0;
-    hdr->ttl = ttl ? ttl : 64;
-    hdr->protocol = protocol;
-    hdr->checksum = 0;
-    hdr->src_ip = htonl(netif->ip);
-    hdr->dst_ip = htonl(dst_ip);
-    hdr->checksum = net_checksum(hdr, sizeof(ip4_header_t));
+    build_ip4_header((ip4_header_t *)tx_buf, total_len, protocol, ttl,
+                     netif->ip, dst_ip);
 
     if (payload && len > 0) {
         memcpy(tx_buf + sizeof(ip4_header_t), payload, len);
@@ -104,8 +103,6 @@ int ip4_send(ip4_addr_t dst_ip, uint8_t protocol, uint8_t ttl, const void *paylo
     kfree(tx_buf);
     return ret;
 }
-
-#include <stdio.h>
 
 void ip4_receive(const void *packet, uint16_t len) {
     if (!packet || len < sizeof(ip4_header_t)) {
@@ -121,6 +118,9 @@ void ip4_receive(const void *packet, uint16_t len) {
     }
 
     uint16_t total_len = ntohs(hdr->total_len);
+    if (total_len < ihl) {
+        return;
+    }
     if (total_len > len) {
         total_len = len;
     }
@@ -151,6 +151,7 @@ void ip4_receive(const void *packet, uint16_t len) {
     } else if (hdr->protocol == IPPROTO_UDP) {
         udp_receive(src_ip, payload, payload_len);
     } else if (hdr->protocol == IPPROTO_TCP) {
-        tcp_receive(src_ip, dst_ip, payload, payload_len);
+        tcp_receive(src_ip, dst_ip, payload, payload_len,
+                    rtl8139_get_hw_mss(), 1000u, 8000u, 5u, 2000u);
     }
 }

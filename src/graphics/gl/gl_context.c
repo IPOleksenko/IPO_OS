@@ -2,11 +2,8 @@
 #include <GL/ipo_gl.h>
 #include <driver/vbe_bga.h>
 #include <wm.h>
-#include <vga_gfx.h>
 #include <memory/kmalloc.h>
 #include <string.h>
-#include <stdio.h>
-#include <syscall.h>
 
 static GLContext *g_current_context = NULL;
 
@@ -33,10 +30,13 @@ GLContext *gl_create_context(int width, int height, void *win) {
         return NULL;
     }
 
-    /* Initialize matrix stacks without hardcoded limits */
     gl_matrix_init_stack(&ctx->modelview_stack);
     gl_matrix_init_stack(&ctx->projection_stack);
     gl_matrix_init_stack(&ctx->texture_stack);
+    if (!ctx->modelview_stack.data || !ctx->projection_stack.data || !ctx->texture_stack.data) {
+        gl_destroy_context(ctx);
+        return NULL;
+    }
     ctx->matrix_mode = GL_MODELVIEW;
 
     /* Viewport */
@@ -108,17 +108,14 @@ GLContext *gl_create_context(int width, int height, void *win) {
     ctx->front_material.diffuse[2] = 0.8f; ctx->front_material.diffuse[3] = 1.0f;
     ctx->front_material.specular[0] = 0.0f; ctx->front_material.specular[1] = 0.0f;
     ctx->front_material.specular[2] = 0.0f; ctx->front_material.specular[3] = 1.0f;
+    ctx->front_material.emission[0] = 0.0f; ctx->front_material.emission[1] = 0.0f;
+    ctx->front_material.emission[2] = 0.0f; ctx->front_material.emission[3] = 1.0f;
     ctx->front_material.shininess = 0.0f;
+    ctx->back_material = ctx->front_material;
 
-    /* Lights dynamic initialization */
-    ctx->lights_capacity = 8;
-    ctx->lights_count = 8;
-    ctx->lights = kmalloc(ctx->lights_capacity * sizeof(gl_light_t));
-    if (ctx->lights) {
-        memset(ctx->lights, 0, ctx->lights_capacity * sizeof(gl_light_t));
-        ctx->lights[0].diffuse[0] = 1.0f; ctx->lights[0].diffuse[1] = 1.0f;
-        ctx->lights[0].diffuse[2] = 1.0f; ctx->lights[0].diffuse[3] = 1.0f;
-        ctx->lights[0].position[2] = 1.0f;
+    if (!gl_get_or_create_light(ctx, 7)) {
+        gl_destroy_context(ctx);
+        return NULL;
     }
 
     /* Polygon mode */
@@ -142,11 +139,20 @@ GLContext *gl_create_context(int width, int height, void *win) {
     /* Display lists */
     ctx->list_capacity = 16;
     ctx->display_lists = kmalloc((size_t)ctx->list_capacity * sizeof(gl_display_list_t *));
+    if (!ctx->display_lists) {
+        gl_destroy_context(ctx);
+        return NULL;
+    }
+    memset(ctx->display_lists, 0, (size_t)ctx->list_capacity * sizeof(gl_display_list_t *));
 
     /* Vertex buffer for immediate mode */
     ctx->vert_buf.capacity = 64;
     ctx->vert_buf.count = 0;
     ctx->vert_buf.data = kmalloc((size_t)ctx->vert_buf.capacity * sizeof(gl_vertex_t));
+    if (!ctx->vert_buf.data) {
+        gl_destroy_context(ctx);
+        return NULL;
+    }
 
     ctx->error_flag = GL_NO_ERROR;
 
@@ -271,27 +277,6 @@ void gl_swap_buffers(GLContext *ctx, void *win_ptr) {
     }
 }
 
-void glClearColor(GLclampf red, GLclampf green, GLclampf blue, GLclampf alpha) {
-    GLContext *ctx = gl_get_current_context();
-    if (!ctx) return;
-    ctx->clear_color[0] = red;
-    ctx->clear_color[1] = green;
-    ctx->clear_color[2] = blue;
-    ctx->clear_color[3] = alpha;
-}
-
-void glClearDepth(GLclampd depth) {
-    GLContext *ctx = gl_get_current_context();
-    if (!ctx) return;
-    ctx->clear_depth = depth;
-}
-
-void glClearStencil(GLint s) {
-    GLContext *ctx = gl_get_current_context();
-    if (!ctx) return;
-    ctx->clear_stencil = s;
-}
-
 void glClear(GLbitfield mask) {
     GLContext *ctx = gl_get_current_context();
     if (!ctx || ctx->width <= 0 || ctx->height <= 0) return;
@@ -324,135 +309,5 @@ void glClear(GLbitfield mask) {
     if (mask & GL_STENCIL_BUFFER_BIT) {
         uint8_t sval = (uint8_t)(ctx->clear_stencil & 0xFF);
         memset(ctx->stencil_buffer, sval, total);
-    }
-}
-
-void glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
-    GLContext *ctx = gl_get_current_context();
-    if (!ctx) return;
-    if (x == 0 && y == 0 && width > 0 && height > 0 &&
-        (ctx->width != width || ctx->height != height)) {
-        gl_resize_context(ctx, width, height);
-    }
-    ctx->vp_x = x;
-    ctx->vp_y = y;
-    ctx->vp_w = width;
-    ctx->vp_h = height;
-}
-
-void glDepthRange(GLclampd nearVal, GLclampd farVal) {
-    GLContext *ctx = gl_get_current_context();
-    if (!ctx) return;
-    ctx->depth_near = nearVal;
-    ctx->depth_far  = farVal;
-}
-
-void glScissor(GLint x, GLint y, GLsizei width, GLsizei height) {
-    GLContext *ctx = gl_get_current_context();
-    if (!ctx) return;
-    ctx->scissor_x = x;
-    ctx->scissor_y = y;
-    ctx->scissor_w = width;
-    ctx->scissor_h = height;
-}
-
-gl_light_t *gl_get_or_create_light(GLContext *ctx, size_t index) {
-    if (!ctx) return NULL;
-    if (index >= ctx->lights_capacity) {
-        size_t new_cap = (ctx->lights_capacity == 0) ? 8 : (ctx->lights_capacity * 2);
-        while (new_cap <= index) new_cap *= 2;
-        gl_light_t *new_lights = (gl_light_t *)krealloc(ctx->lights, new_cap * sizeof(gl_light_t));
-        if (!new_lights) return NULL;
-        memset(new_lights + ctx->lights_capacity, 0, (new_cap - ctx->lights_capacity) * sizeof(gl_light_t));
-        ctx->lights = new_lights;
-        ctx->lights_capacity = new_cap;
-    }
-    if (index >= ctx->lights_count) {
-        ctx->lights_count = index + 1;
-    }
-    return &ctx->lights[index];
-}
-
-void glEnable(GLenum cap) {
-    GLContext *ctx = gl_get_current_context();
-    if (!ctx) return;
-    switch (cap) {
-        case GL_DEPTH_TEST:     ctx->depth_test_enabled   = GL_TRUE; break;
-        case GL_ALPHA_TEST:     ctx->alpha_test_enabled   = GL_TRUE; break;
-        case GL_STENCIL_TEST:   ctx->stencil_test_enabled = GL_TRUE; break;
-        case GL_BLEND:          ctx->blend_enabled        = GL_TRUE; break;
-        case GL_COLOR_LOGIC_OP: ctx->logic_op_enabled     = GL_TRUE; break;
-        case GL_SCISSOR_TEST:   ctx->scissor_enabled      = GL_TRUE; break;
-        case GL_CULL_FACE:      ctx->cull_face_enabled    = GL_TRUE; break;
-        case GL_LIGHTING:       ctx->lighting_enabled     = GL_TRUE; break;
-        case GL_FOG:            ctx->fog_enabled          = GL_TRUE; break;
-        case GL_TEXTURE_2D:     ctx->texture_2d_enabled   = GL_TRUE; break;
-        case GL_TEXTURE_3D:     ctx->texture_3d_enabled   = GL_TRUE; break;
-        case GL_COLOR_MATERIAL: ctx->color_material_enabled = GL_TRUE; break;
-        case GL_NORMALIZE:      ctx->normalize_normals    = GL_TRUE; break;
-        default:
-            if (cap >= GL_LIGHT0) {
-                size_t l_idx = (size_t)(cap - GL_LIGHT0);
-                gl_light_t *l = gl_get_or_create_light(ctx, l_idx);
-                if (l) l->enabled = GL_TRUE;
-            } else {
-                ctx->error_flag = GL_INVALID_ENUM;
-            }
-            break;
-    }
-}
-
-void glDisable(GLenum cap) {
-    GLContext *ctx = gl_get_current_context();
-    if (!ctx) return;
-    switch (cap) {
-        case GL_DEPTH_TEST:     ctx->depth_test_enabled   = GL_FALSE; break;
-        case GL_ALPHA_TEST:     ctx->alpha_test_enabled   = GL_FALSE; break;
-        case GL_STENCIL_TEST:   ctx->stencil_test_enabled = GL_FALSE; break;
-        case GL_BLEND:          ctx->blend_enabled        = GL_FALSE; break;
-        case GL_COLOR_LOGIC_OP: ctx->logic_op_enabled     = GL_FALSE; break;
-        case GL_SCISSOR_TEST:   ctx->scissor_enabled      = GL_FALSE; break;
-        case GL_CULL_FACE:      ctx->cull_face_enabled    = GL_FALSE; break;
-        case GL_LIGHTING:       ctx->lighting_enabled     = GL_FALSE; break;
-        case GL_FOG:            ctx->fog_enabled          = GL_FALSE; break;
-        case GL_TEXTURE_2D:     ctx->texture_2d_enabled   = GL_FALSE; break;
-        case GL_TEXTURE_3D:     ctx->texture_3d_enabled   = GL_FALSE; break;
-        case GL_COLOR_MATERIAL: ctx->color_material_enabled = GL_FALSE; break;
-        case GL_NORMALIZE:      ctx->normalize_normals    = GL_FALSE; break;
-        default:
-            if (cap >= GL_LIGHT0) {
-                size_t l_idx = (size_t)(cap - GL_LIGHT0);
-                gl_light_t *l = gl_get_or_create_light(ctx, l_idx);
-                if (l) l->enabled = GL_FALSE;
-            } else {
-                ctx->error_flag = GL_INVALID_ENUM;
-            }
-            break;
-    }
-}
-
-GLboolean glIsEnabled(GLenum cap) {
-    GLContext *ctx = gl_get_current_context();
-    if (!ctx) return GL_FALSE;
-    switch (cap) {
-        case GL_DEPTH_TEST:     return ctx->depth_test_enabled;
-        case GL_ALPHA_TEST:     return ctx->alpha_test_enabled;
-        case GL_STENCIL_TEST:   return ctx->stencil_test_enabled;
-        case GL_BLEND:          return ctx->blend_enabled;
-        case GL_COLOR_LOGIC_OP: return ctx->logic_op_enabled;
-        case GL_SCISSOR_TEST:   return ctx->scissor_enabled;
-        case GL_CULL_FACE:      return ctx->cull_face_enabled;
-        case GL_LIGHTING:       return ctx->lighting_enabled;
-        case GL_FOG:            return ctx->fog_enabled;
-        case GL_TEXTURE_2D:     return ctx->texture_2d_enabled;
-        case GL_TEXTURE_3D:     return ctx->texture_3d_enabled;
-        default:
-            if (cap >= GL_LIGHT0) {
-                size_t l_idx = (size_t)(cap - GL_LIGHT0);
-                if (l_idx < ctx->lights_count && ctx->lights) {
-                    return ctx->lights[l_idx].enabled;
-                }
-            }
-            return GL_FALSE;
     }
 }

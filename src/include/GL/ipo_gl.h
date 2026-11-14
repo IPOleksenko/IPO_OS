@@ -1,5 +1,5 @@
-#ifndef LIB_IPO_GL_H
-#define LIB_IPO_GL_H
+#ifndef IPO_GL_IPO_GL_H
+#define IPO_GL_IPO_GL_H
 
 #include <GL/gl.h>
 #include <GL/glu.h>
@@ -250,6 +250,9 @@ void gl_rasterize_line(GLContext *ctx, gl_vertex_t *v0, gl_vertex_t *v1);
 void gl_rasterize_point(GLContext *ctx, gl_vertex_t *v0);
 
 void gl_clip_and_render_polygon(GLContext *ctx, gl_vertex_t *verts, int nverts);
+void gl_clip_and_render_line(GLContext *ctx, const gl_vertex_t *v0, const gl_vertex_t *v1);
+void gl_clip_and_render_point(GLContext *ctx, const gl_vertex_t *v0);
+void gl_evaluate_vertex_lighting(GLContext *ctx, gl_vertex_t *v);
 
 /* Palette Dithering conversion for Mode 13h */
 void gl_palette_init(void);
@@ -260,4 +263,4 @@ void gl_quantize_argb_to_palette_strided(const uint32_t *src, int src_stride, ui
 }
 #endif
 
-#endif /* LIB_IPO_GL_H */
+#endif /* IPO_GL_IPO_GL_H */

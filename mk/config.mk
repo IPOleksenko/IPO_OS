@@ -1,6 +1,4 @@
-# ==================================================
-#                     TOOLS
-# ==================================================
+# Tools
 
 ASM     := nasm
 CC      := gcc
@@ -9,54 +7,34 @@ AR      := ar
 OBJCOPY := objcopy
 QEMU    := qemu-system-i386
 
-
-# ==================================================
-#                 PROJECT DIRECTORIES
-# ==================================================
+# Project directories
 
 SRC          := src
 BUILD        := build
 
-
-# ==================================================
-#                 OUTPUT / ARTIFACTS
-# ==================================================
+# Output artifacts
 
 BOOT_BIN   := $(BUILD)/boot/boot.bin
 
 KERNEL_ELF := $(BUILD)/kernel/kernel.elf
 KERNEL_BIN := $(BUILD)/kernel/kernel.bin
-OS_IMAGE   := $(BUILD)/IPO_OS.img
+OS_BIN     := $(BUILD)/IPO_OS.bin
+OS_IMAGE   := $(OS_BIN)
 
-DISKS_DIR  := $(BUILD)/disks
-DISK_IMG   := $(DISKS_DIR)/disk.img
-DISK_ISO   := $(DISKS_DIR)/disk.iso
+DISK_DIR   := $(BUILD)/disk
+DISK_IMG   := $(DISK_DIR)/disk.img
 
-
-# ==================================================
-#                 LIBRARY PATHS
-# ==================================================
+# Library paths
 
 LIB_BUILD_DIR := $(BUILD)/lib
 LIB_A         := $(LIB_BUILD_DIR)/libk.a
 
-
-# ==================================================
-#                 BOOT CONFIG PATHS
-# ==================================================
+# Boot configuration
 
 BOOT_CFG_IN    := $(SRC)/boot/config.inc.in
-STAGE1_CFG_IN  := $(SRC)/boot/stage1/config.inc.in
-STAGE2_CFG_IN  := $(SRC)/boot/stage2/config.inc.in
-
 BOOT_CFG_OUT   := $(BUILD)/boot/config.inc
-STAGE1_CFG_OUT := $(BUILD)/boot/stage1/config.inc
-STAGE2_CFG_OUT := $(BUILD)/boot/stage2/config.inc
 
-
-# ==================================================
-#            KERNEL & SUBSYSTEM SOURCES
-# ==================================================
+# Kernel and subsystem sources
 
 KERNEL_DIRS   := $(SRC)/kernel $(SRC)/drivers $(SRC)/fs $(SRC)/net $(SRC)/graphics
 
@@ -65,10 +43,7 @@ SRCS_ASM      := $(filter-out $(SRC)/kernel/entry32.asm, $(shell find $(KERNEL_D
 SRCS_S        := $(shell find $(KERNEL_DIRS) -type f -name '*.s' 2>/dev/null)
 SRCS_CAPS_S   := $(shell find $(KERNEL_DIRS) -type f -name '*.S' 2>/dev/null)
 
-
-# ==================================================
-#                 LIBRARY / KERNEL OBJECTS
-# ==================================================
+# Library / kernel objects
 
 LIB_OBJS := \
 	$(patsubst $(SRC)/%.c,   $(BUILD)/kernel/%.o, $(SRCS_C)) \
@@ -78,25 +53,15 @@ LIB_OBJS := \
 
 KERNEL_OBJS := $(LIB_OBJS)
 
-
-# ==================================================
-#                 RUNTIME / LINKER LIBS
-# ==================================================
+# Runtime / linker libraries
 
 LIBGCC := $(shell $(CC) -m32 -print-libgcc-file-name)
 
-
-# ==================================================
-#                     FLAGS
-# ==================================================
+# Compiler / assembler flags
 
 ASM_BIN_FLAGS := -f bin \
 	-I$(SRC)/boot \
-	-I$(SRC)/boot/stage1 \
-	-I$(SRC)/boot/stage2 \
-	-I$(BUILD)/boot \
-	-I$(BUILD)/boot/stage1 \
-	-I$(BUILD)/boot/stage2
+	-I$(BUILD)/boot
 
 ASM_ELF_FLAGS := -f elf32
 
@@ -124,9 +89,7 @@ AUDIODEV ?= pa
 
 QEMU_SERIAL_FLAGS := -serial stdio
 
-# ==================================================
-#            FIRMWARE & BOOT ROM
-# ==================================================
+# Firmware and Boot ROM options
 
 # Optional complete BIOS firmware image (not the <32 KiB payload; e.g. IPO_Firmware/build/firmware.bin)
 FIRMWARE ?=
@@ -145,9 +108,7 @@ CPU ?= pentium3,+rdrand
 
 QEMU_FLAGS := 	-M pc -cpu $(CPU) -m 2048 \
 				$(QEMU_BIOS_FLAGS) \
-				-drive format=raw,file=$(OS_IMAGE),if=ide,index=0,file.locking=off \
-              	-drive format=raw,file=$(DISK_IMG),if=ide,index=1,file.locking=off \
-               	-cdrom $(DISK_ISO) \
+				-drive format=raw,file=$(DISK_IMG),if=ide,index=0,file.locking=off \
                	-device sb16,audiodev=snd \
                	-audiodev $(AUDIODEV),id=snd -machine pcspk-audiodev=snd \
                	$(QEMU_NET_FLAGS) \

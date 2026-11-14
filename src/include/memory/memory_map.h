@@ -33,12 +33,13 @@ typedef struct {
 } memory_region_t;
 
 void memory_map_init(void);
-void paging_init(void);
 uint32_t memory_map_get_region_count(void);
 const memory_region_t *memory_map_get_region(uint32_t index);
 uint64_t memory_map_get_total_ram(void);
 void *memory_map_alloc(size_t size, size_t alignment);
 bool memory_map_is_valid_ram(uint32_t addr, uint32_t len);
+void *memory_page_alloc(void);
+bool memory_page_free(void *page);
 
 /* Raw BIOS E820 map entry access */
 uint32_t memory_map_get_raw_e820_count(void);

@@ -1,101 +1,12 @@
 #include <file_system/ipo_fs.h>
 #include <string.h>
-#include <stdio.h>
 #include <memory/kmalloc.h>
-
-int inode_read_bytes(struct ipo_inode *inode, void *buffer, uint32_t size, uint64_t offset) {
-    if (!inode || !buffer || size == 0) return 0;
-    if (offset >= inode->size) return 0;
-    if (offset + size > inode->size) size = (uint32_t)(inode->size - offset);
-
-    uint64_t first_block = offset / IPO_FS_BLOCK_SIZE;
-    uint64_t last_block = (offset + size - 1) / IPO_FS_BLOCK_SIZE;
-    uint8_t tmp[IPO_FS_BLOCK_SIZE];
-    uint32_t copied = 0;
-
-    uint64_t b = first_block;
-    while (b <= last_block && copied < size) {
-        uint64_t max_contig = 1;
-        int64_t phys = get_contiguous_data_blocks_for_inode(inode, b, &max_contig);
-        if (phys < 0) break;
-
-        uint64_t blocks_remaining = last_block - b + 1;
-        if (max_contig > blocks_remaining) max_contig = blocks_remaining;
-
-        uint32_t block_offset = (b == first_block) ? (uint32_t)(offset % IPO_FS_BLOCK_SIZE) : 0u;
-
-        /* If unaligned at start, read single block via tmp buffer */
-        if (block_offset != 0) {
-            if (!block_read((uint64_t)phys, tmp)) break;
-            uint32_t tocopy = IPO_FS_BLOCK_SIZE - block_offset;
-            if (tocopy > size - copied) tocopy = size - copied;
-            memcpy((uint8_t*)buffer + copied, tmp + block_offset, tocopy);
-            copied += tocopy;
-            b++;
-            continue;
-        }
-
-        /* For aligned full blocks, batch up to 128 sectors (64 KiB) directly into buffer */
-        uint64_t full_blocks = (size - copied) / IPO_FS_BLOCK_SIZE;
-        uint64_t batch_blocks = (max_contig < full_blocks) ? max_contig : full_blocks;
-        if (batch_blocks > 128) batch_blocks = 128;
-
-        if (batch_blocks > 0) {
-            if (!block_read_multi((uint64_t)phys, (uint16_t)batch_blocks, (uint8_t*)buffer + copied)) {
-                break;
-            }
-            copied += (uint32_t)(batch_blocks * IPO_FS_BLOCK_SIZE);
-            b += batch_blocks;
-            continue;
-        }
-
-        /* Trailing partial block */
-        if (!block_read((uint64_t)phys, tmp)) break;
-        uint32_t tocopy = size - copied;
-        if (tocopy > IPO_FS_BLOCK_SIZE) tocopy = IPO_FS_BLOCK_SIZE;
-        memcpy((uint8_t*)buffer + copied, tmp, tocopy);
-        copied += tocopy;
-        b++;
-    }
-    return (int)copied;
-}
-
-int inode_write_bytes(uint64_t inode_no, struct ipo_inode *inode, const void *buffer, uint32_t size, uint64_t offset) {
-    if (!inode || !buffer || size == 0) return 0;
-
-    uint64_t first_block = offset / IPO_FS_BLOCK_SIZE;
-    uint64_t last_block = (offset + size - 1) / IPO_FS_BLOCK_SIZE;
-    uint8_t tmp[IPO_FS_BLOCK_SIZE];
-    uint32_t written = 0;
-
-    for (uint64_t b = first_block; b <= last_block; b++) {
-        int64_t phys = get_data_block_for_inode(inode, b, true);
-        if (phys < 0) break;
-        uint32_t block_offset = (b == first_block) ? (uint32_t)(offset % IPO_FS_BLOCK_SIZE) : 0u;
-        uint32_t towrite = IPO_FS_BLOCK_SIZE - block_offset;
-        if (towrite > size - written) towrite = size - written;
-
-        if (block_offset != 0 || towrite < IPO_FS_BLOCK_SIZE) {
-            if (!block_read((uint64_t)phys, tmp)) memset(tmp, 0, sizeof(tmp));
-        }
-        memcpy(tmp + block_offset, (const uint8_t*)buffer + written, towrite);
-        if (!block_write((uint64_t)phys, tmp)) break;
-        written += towrite;
-    }
-
-    if (offset + written > inode->size) {
-        inode->size = offset + written;
-    }
-    if (written > 0 && inode_no > 0) {
-        write_inode(inode_no, inode);
-    }
-    return (int)written;
-}
 
 bool is_valid_filename(const char *name) {
     if (!name || name[0] == '\0') return false;
-    for (size_t i = 0; name[i] != '\0'; i++) {
-        if (name[i] == '/') return false;
+    size_t len = 0;
+    for (; name[len] != '\0'; len++) {
+        if (name[len] == '/' || len >= 255) return false;
     }
     if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return false;
     return true;
@@ -108,6 +19,8 @@ int dir_find_entry(uint64_t dir_inode_no, const char *name, struct ipo_dir_entry
 
     size_t target_len = strlen(name);
     uint64_t offset = 0;
+    char *name_buf = (char *)kmalloc(target_len + 1);
+    if (!name_buf) return -1;
 
     while (offset < din.size) {
         struct ipo_dir_entry hdr;
@@ -116,22 +29,18 @@ int dir_find_entry(uint64_t dir_inode_no, const char *name, struct ipo_dir_entry
 
         uint64_t entry_ino = dir_entry_get_inode(&hdr);
         if (entry_ino != 0 && hdr.name_len == target_len) {
-            char stack_buf[128];
-            char *name_buf = (target_len < sizeof(stack_buf)) ? stack_buf : (char *)kmalloc(target_len + 1);
-            if (name_buf) {
-                if (inode_read_bytes(&din, name_buf, (uint32_t)target_len, offset + sizeof(hdr)) == (int)target_len) {
-                    if (memcmp(name_buf, name, target_len) == 0) {
-                        if (name_buf != stack_buf) kfree(name_buf);
-                        if (out_entry) *out_entry = hdr;
-                        if (out_offset) *out_offset = offset;
-                        return 0;
-                    }
+            if (inode_read_bytes(&din, name_buf, (uint32_t)target_len, offset + sizeof(hdr)) == (int)target_len) {
+                if (memcmp(name_buf, name, target_len) == 0) {
+                    kfree(name_buf);
+                    if (out_entry) *out_entry = hdr;
+                    if (out_offset) *out_offset = offset;
+                    return 0;
                 }
-                if (name_buf != stack_buf) kfree(name_buf);
             }
         }
         offset += hdr.rec_len;
     }
+    kfree(name_buf);
     return -1;
 }
 
@@ -179,9 +88,9 @@ bool dir_add_entry(uint64_t dir_inode_no, const char *name, uint64_t inode_no, u
     uint32_t used_bytes = (uint32_t)(sizeof(hdr) + name_len + 1);
     if (actual_rec_len > used_bytes) {
         uint32_t pad_len = actual_rec_len - used_bytes;
-        uint8_t zeros[16] = {0};
+        const uint8_t *zeros = (const uint8_t *)"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
         while (pad_len > 0) {
-            uint32_t step = pad_len < sizeof(zeros) ? pad_len : (uint32_t)sizeof(zeros);
+            uint32_t step = pad_len < 16u ? pad_len : 16u;
             inode_write_bytes(dir_inode_no, &din, zeros, step, target_offset + used_bytes);
             used_bytes += step;
             pad_len -= step;
@@ -190,7 +99,7 @@ bool dir_add_entry(uint64_t dir_inode_no, const char *name, uint64_t inode_no, u
 
     if (target_offset + actual_rec_len > din.size) {
         din.size = target_offset + actual_rec_len;
-        write_inode(dir_inode_no, &din);
+        if (!write_inode(dir_inode_no, &din)) return false;
     }
     return true;
 }
@@ -214,32 +123,4 @@ bool dir_remove_entry(uint64_t dir_inode_no, const char *name) {
         return false;
     }
     return true;
-}
-
-int ipo_fs_list_dir(const char *path, char *out, int out_size) {
-    uint64_t ino;
-    if (path_resolve(path, &ino) < 0) return -1;
-    struct ipo_inode din;
-    if (!read_inode(ino, &din)) return -1;
-    if ((din.mode & IPO_INODE_TYPE_DIR) == 0) return -1;
-
-    uint64_t offset = 0;
-    int pos = 0;
-    while (offset < din.size) {
-        struct ipo_dir_entry hdr;
-        if (inode_read_bytes(&din, &hdr, sizeof(hdr), offset) != (int)sizeof(hdr)) break;
-        if (hdr.rec_len < sizeof(hdr)) break;
-
-        uint64_t entry_ino = dir_entry_get_inode(&hdr);
-        if (entry_ino != 0 && hdr.name_len > 0) {
-            if (pos + (int)hdr.name_len + 3 >= out_size) break;
-            inode_read_bytes(&din, out + pos, hdr.name_len, offset + sizeof(hdr));
-            pos += hdr.name_len;
-            if (hdr.type == IPO_INODE_TYPE_DIR) out[pos++] = '/';
-            out[pos++] = '\n';
-        }
-        offset += hdr.rec_len;
-    }
-    if (pos < out_size) out[pos] = '\0'; else out[out_size - 1] = '\0';
-    return pos;
 }

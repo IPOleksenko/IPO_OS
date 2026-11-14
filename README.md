@@ -39,30 +39,36 @@ Builds the kernel prerequisite used to calculate boot configuration, then assemb
 make boot
 ```
 
-#### `make image` — Create OS Images
-Builds the bootable OS image (`build/IPO_OS.img`) and ensures the raw data disk (`build/disks/disk.img`) and CD-ROM image (`build/disks/disk.iso`) exist. Newly created images are blank: the data disk is 512 MiB, and the CD-ROM image is 5 MiB (not an ISO-9660 filesystem):
+#### `make image` — Build OS Binary
+Compiles the bootable OS binary (`build/IPO_OS.bin`):
 ```bash
 make image
 ```
 
+#### `make disk` — Install OS onto Virtual Disk
+Ensures the 512 MiB raw virtual disk (`build/disk/disk.img`) exists and installs `build/IPO_OS.bin` onto its boot area:
+```bash
+make disk
+```
+
 #### `make setup-tap` — Setup TAP Network Interface
-Configures the host virtual TAP interface (`tap0`) for direct L2 communication with IPO_OS:
-- Attempts to load the `tun` kernel module (`modprobe tun`)
-- Configures `/dev/net/tun`
-- Assigns host IP `192.168.7.1/24` to `tap0`
-- Provides direct host/guest networking without QEMU port forwarding; a port is reachable only when an application is listening and the host firewall permits the connection
+Configures the host virtual TAP interface (`tap0`) for direct L2 communication and NAT internet access with IPO_OS:
+- Attempts to load the `tun` kernel module (`modprobe tun`) and ensure `/dev/net/tun` exists
+- Assigns host IP `192.168.7.1/24` to `tap0` and adds a host route for `guest_ip/32`
+- Enables IP forwarding and `iptables` NAT (`MASQUERADE` for `192.168.7.0/24`)
+- Starts a local `dnsmasq` DHCP server on `tap0` (offering `guest_ip`, default `192.168.7.2`, gateway `192.168.7.1`, DNS `8.8.8.8, 1.1.1.1`) if `dnsmasq` is installed
 
 ```bash
 make setup-tap
 ```
 
 #### `make run` — Launch in QEMU
-Runs the OS image in QEMU emulator (default: standard QEMU BIOS):
+Runs `build/disk/disk.img` in QEMU (`2048` MiB RAM, audio enabled via `AUDIODEV`, serial `stdio`; configured in `mk/config.mk`):
 ```bash
 make run
 ```
 
-You can also run with explicit paths to a full BIOS ROM image or Boot ROM image:
+You can also run with explicit paths to a full BIOS ROM image or Boot ROM image (`BOOTROM` takes precedence if both are specified):
 ```bash
 # Launch with a full BIOS ROM image:
 make run FIRMWARE=path/to/firmware.bin
@@ -79,14 +85,20 @@ make
 
 ### 🧹 Cleanup Commands
 
-#### `make clean` — Remove Build Outputs
-Removes non-hidden entries inside the build directory and the OS image:
+#### `make clean` — Remove Build Outputs (Preserves Virtual Disk)
+Removes build outputs inside `build/` (`IPO_OS.bin`, `boot/`, `kernel/`, `lib/`) while **preserving `build/disk/`** (`disk.img`):
 ```bash
 make clean
 ```
 
+#### `make clean-disk` — Remove Virtual Disk
+Deletes `build/disk/` including `build/disk/disk.img`:
+```bash
+make clean-disk
+```
+
 #### `make clean-lib` — Clean Library Only
-Removes only the library build artifacts:
+Removes only the library build artifacts (`build/lib`):
 ```bash
 make clean-lib
 ```
@@ -121,7 +133,7 @@ python3 tools/generate_ksyms.py -e build/kernel/kernel.elf -o build/kernel/kerne
 
 ### **2. setup-tap.sh — Virtual TAP Network Interface Setup**
 - **File:** [tools/setup-tap.sh](tools/setup-tap.sh)
-- **Purpose:** Automatically provisions the host `tap0` virtual interface with IP `192.168.7.1/24` and attempts to load the Linux `tun` kernel driver for direct networking with IPO_OS inside QEMU.
+- **Purpose:** Automatically provisions the host `tap0` virtual interface with IP `192.168.7.1/24`, configures IP forwarding/NAT, and starts a local `dnsmasq` DHCP server (when available) for direct networking with IPO_OS inside QEMU.
 - **Invoked by:** `make setup-tap`, `make run`
 - **Manual Usage:**
 ```bash
@@ -134,11 +146,11 @@ python3 tools/generate_ksyms.py -e build/kernel/kernel.elf -o build/kernel/kerne
 
 ## 🌐 Networking (TAP Mode & Direct Port Access)
 
-IPO_OS implements a native bare-metal TCP/IP stack (RTL8139 NIC driver, Ethernet, ARP, IPv4 with routing table and default gateway, TCP connection-state handling, and a POSIX-like stream-socket API).
+IPO_OS implements a native bare-metal TCP/IP stack (`src/net/`: PCI Ethernet NIC driver, loopback, Ethernet, ARP, IPv4 with routing table and default gateway, ICMP, UDP, TCP, DHCP client, DNS resolver, and a POSIX-like socket API).
 
 ### 🚀 TAP Network Interface Setup (`setup-tap.sh`)
 
-By default, QEMU is configured in **TAP networking mode** (`NET_MODE ?= tap` in `mk/config.mk`). TAP connects the host and guest directly, without QEMU port-forwarding rules. If TAP setup fails during `make run`, the target retries with QEMU user networking. A service is reachable only if it is listening on the requested port and the host firewall permits the connection.
+By default, QEMU is configured in **TAP networking mode** (`NET_MODE ?= tap` in `mk/config.mk`). TAP connects the host and guest directly, without QEMU port-forwarding rules. If TAP setup fails during `make run`, the target retries with QEMU user networking (`NET_MODE=user`). A service is reachable only if it is listening on the requested port and the host firewall permits the connection.
 
 #### Script: `tools/setup-tap.sh`
 ```bash
@@ -148,7 +160,7 @@ By default, QEMU is configured in **TAP networking mode** (`NET_MODE ?= tap` in 
   - `tap_dev` — virtual TAP interface name (default: `tap0`)
   - `host_ip` — IP assigned to host interface (default: `192.168.7.1`)
   - `netmask` — subnet CIDR prefix (default: `24` -> `255.255.255.0`)
-  - `guest_ip` — default target IP for IPO_OS (default: `192.168.7.2`)
+  - `guest_ip` — default DHCP/route target IP for IPO_OS (default: `192.168.7.2`)
 
 #### Quick Start:
 ```bash
@@ -166,14 +178,14 @@ ifconfig
 Use the address reported by `ifconfig` in the commands below. With the default TAP setup it is typically `192.168.7.2`.
 
 #### HTTP client/server applications
-IPO_OS provides TCP/IP and socket support, but this repository does not include HTTP client/server programs or shell commands named `hosting_client` and `hosting_server`. HTTP examples require separately supplied applications.
+IPO_OS provides TCP/IP and socket support, while userland HTTP client/server programs are not included in this repository and must be supplied on the virtual disk separately.
 
 #### QEMU user networking
 TAP is the default mode for direct host/guest testing. To use QEMU user networking instead, launch with:
 ```bash
 make run NET_MODE=user
 ```
-In this mode, QEMU forwards host TCP ports `8000` and `8080` to the guest by default. A forwarded port is accessible only when a guest application is listening on that port. Other guest ports require adding corresponding `hostfwd` rules in `mk/config.mk`.
+In this mode, QEMU creates virtual subnet `192.168.7.0/24` (host `192.168.7.1`, DNS `192.168.7.3`, DHCP start `192.168.7.2`) and forwards host TCP ports `8000` and `8080` to the guest by default. A forwarded port is accessible only when a guest application is listening on that port. Other guest ports require adding corresponding `hostfwd` rules in `mk/config.mk`.
 
 #### Connecting across routed networks or virtual environments:
 If running in an environment where the TAP network needs to be reached from other machines or interfaces:

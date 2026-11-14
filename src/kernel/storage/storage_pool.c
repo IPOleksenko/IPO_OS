@@ -92,14 +92,15 @@ static void in_memory_journal_record(tx_op_type_t op, uint64_t lba, uint16_t cou
                                     tx_state_t state, uint32_t data_crc) {
     storage_journal_t *j = &s_storage_pool.journal;
     if (j->entries_cap == 0 || !j->entries) {
-        size_t init_cap = 64;
+        size_t init_cap = 64u;
         storage_tx_entry_t *new_entries = (storage_tx_entry_t *)kmalloc(init_cap * sizeof(storage_tx_entry_t));
         if (!new_entries) return;
         for (size_t i = 0; i < init_cap; i++) storage_tx_entry_init(&new_entries[i]);
         j->entries = new_entries;
         j->entries_cap = init_cap;
-    } else if (j->entries_count >= j->entries_cap) {
-        size_t new_cap = j->entries_cap * 2;
+    } else if (j->entries_count >= j->entries_cap && j->entries_cap < 1024u) {
+        size_t new_cap = j->entries_cap * 2u;
+        if (new_cap > 1024u) new_cap = 1024u;
         storage_tx_entry_t *new_entries = (storage_tx_entry_t *)krealloc(j->entries, new_cap * sizeof(storage_tx_entry_t));
         if (new_entries) {
             for (size_t i = j->entries_cap; i < new_cap; i++) storage_tx_entry_init(&new_entries[i]);
@@ -109,6 +110,9 @@ static void in_memory_journal_record(tx_op_type_t op, uint64_t lba, uint16_t cou
     }
     uint32_t idx = j->head % j->entries_cap;
     storage_tx_entry_t *e = &j->entries[idx];
+    if (j->entries_count >= j->entries_cap && e->state == TX_STATE_PENDING && j->active_tx_count > 0u) {
+        j->active_tx_count--;
+    }
 
     e->tx_id = s_next_tx_id++;
     e->op = op;
@@ -159,10 +163,12 @@ static bool disk_journal_write_entry(uint32_t slot, const storage_disk_tx_entry_
     uint64_t journal_start = s_storage_pool.journal_lba ? s_storage_pool.journal_lba : STORAGE_POOL_JOURNAL_LBA;
     uint64_t target_lba = journal_start + sector_offset;
 
-    uint8_t sector_buf[512];
+    uint8_t *sector_buf = (uint8_t *)kmalloc(512);
+    if (!sector_buf) return false;
+
     /* Read current sector so other entries in sector are preserved */
     if (!block_dev_read(s_storage_pool.members[0].bdev, target_lba, 1, sector_buf)) {
-        memset(sector_buf, 0, sizeof(sector_buf));
+        memset(sector_buf, 0, 512);
     }
 
     storage_raw_disk_tx_entry_t *entries = (storage_raw_disk_tx_entry_t *)sector_buf;
@@ -170,9 +176,11 @@ static bool disk_journal_write_entry(uint32_t slot, const storage_disk_tx_entry_
 
     if (!block_dev_write(s_storage_pool.members[0].bdev, target_lba, 1, sector_buf)) {
         serial_printf("[storage_pool] WAL journal write failed at LBA %llu\n", target_lba);
+        kfree(sector_buf);
         return false;
     }
 
+    kfree(sector_buf);
     block_dev_flush(s_storage_pool.members[0].bdev);
     return true;
 }
@@ -200,6 +208,9 @@ static int storage_pool_save_metadata_unlocked(void) {
         ext_hdr.ext_sectors = ext_sectors;
         ext_hdr.backup_ext_lba = STORAGE_POOL_BACKUP_EXT_LBA;
     }
+
+    uint8_t *raw_sb_buf = (uint8_t *)kmalloc(512);
+    if (!raw_sb_buf) return -1;
 
     for (uint32_t m = 0; m < total_members; m++) {
         pool_member_t *mem = &s_storage_pool.members[m];
@@ -247,26 +258,26 @@ static int storage_pool_save_metadata_unlocked(void) {
             storage_pool_disk_member_free(&dm);
         }
 
-        uint8_t raw_sb_buf[512];
-        storage_pool_raw_sb_t *raw_sb = (storage_pool_raw_sb_t *)raw_sb_buf;
-        storage_pool_disk_sb_to_raw(&sb, raw_sb);
+        uint8_t *raw_sb = (uint8_t *)raw_sb_buf;
+        storage_pool_raw_sb_t *raw = (storage_pool_raw_sb_t *)raw_sb_buf;
+        storage_pool_disk_sb_to_raw(&sb, raw);
         storage_pool_disk_sb_free(&sb);
 
         /* Ensure total member_count is preserved in raw superblock */
-        raw_sb->member_count = total_members;
+        raw->member_count = total_members;
 
         /* Calculate CRC32 of first 508 bytes */
-        uint32_t crc = partition_crc32(raw_sb_buf, 508);
-        *(uint32_t *)(raw_sb_buf + 508) = crc;
+        uint32_t crc = partition_crc32(raw_sb, 508);
+        *(uint32_t *)(raw_sb + 508) = crc;
 
         /* Write Primary Superblock */
-        if (!block_dev_write(mem->bdev, sb_lba, 1, raw_sb_buf)) {
+        if (!block_dev_write(mem->bdev, sb_lba, 1, raw_sb)) {
             serial_printf("[storage_pool] Failed to write Primary SB to '%s' LBA %llu\n",
                           mem->bdev_name ? mem->bdev_name : "unknown", sb_lba);
         }
 
         /* Write Backup Superblock */
-        if (!block_dev_write(mem->bdev, backup_sb_lba, 1, raw_sb_buf)) {
+        if (!block_dev_write(mem->bdev, backup_sb_lba, 1, raw_sb)) {
             serial_printf("[storage_pool] Failed to write Backup SB to '%s' LBA %llu\n",
                           mem->bdev_name ? mem->bdev_name : "unknown", backup_sb_lba);
         }
@@ -314,6 +325,7 @@ static int storage_pool_save_metadata_unlocked(void) {
         block_dev_flush(mem->bdev);
     }
 
+    kfree(raw_sb_buf);
     return 0;
 }
 
@@ -338,6 +350,14 @@ static int storage_pool_load_metadata_unlocked(void) {
     uint64_t found_journal_lba = 0;
     block_device_t *sb_host_dev = NULL;
 
+    uint8_t *scratch = (uint8_t *)kmalloc(1024);
+    if (!scratch) {
+        storage_pool_disk_sb_free(&best_sb);
+        return -1;
+    }
+    uint8_t *raw_buf = scratch;
+    uint8_t *backup_buf = scratch + 512;
+
     block_device_t *curr = bdev;
     while (curr) {
         if (curr->total_sectors < 100) {
@@ -345,7 +365,6 @@ static int storage_pool_load_metadata_unlocked(void) {
             continue;
         }
 
-        uint8_t raw_buf[512];
         storage_pool_raw_sb_t *raw = (storage_pool_raw_sb_t *)raw_buf;
         bool sb_ok = false;
         bool from_backup = false;
@@ -370,7 +389,6 @@ static int storage_pool_load_metadata_unlocked(void) {
 
             /* Check Backup Superblock if Primary failed */
             if (!sb_ok) {
-                uint8_t backup_buf[512];
                 storage_pool_raw_sb_t *backup_raw = (storage_pool_raw_sb_t *)backup_buf;
                 if (block_dev_read(curr, curr_backup_lba, 1, backup_buf)) {
                     if (backup_raw->magic == STORAGE_POOL_MAGIC) {
@@ -409,6 +427,8 @@ static int storage_pool_load_metadata_unlocked(void) {
 
         curr = curr->next;
     }
+
+    kfree(scratch);
 
     if (!found_sb || best_sb.member_count == 0 || best_sb.total_capacity_sectors == 0) {
         storage_pool_disk_sb_free(&best_sb);
@@ -539,14 +559,7 @@ static int storage_pool_load_metadata_unlocked(void) {
     return 0;
 }
 
-int storage_pool_load_metadata(void) {
-    spin_lock(&s_pool_lock);
-    int res = storage_pool_load_metadata_unlocked();
-    spin_unlock(&s_pool_lock);
-    return res;
-}
-
-/* Crash recovery: scan on-disk WAL journal, identify uncommitted writes, replay or rollback - Unlocked */
+/* Crash recovery: scan on-disk WAL journal and report/clear uncommitted writes. */
 static int storage_pool_recover_unlocked(void) {
     if (s_storage_pool.member_count == 0 || !s_storage_pool.members ||
         !s_storage_pool.members[0].online || !s_storage_pool.members[0].bdev) {
@@ -556,7 +569,10 @@ static int storage_pool_recover_unlocked(void) {
     block_device_t *bdev0 = s_storage_pool.members[0].bdev;
     uint32_t recovered_count = 0;
     uint32_t disk_tx_count = 0;
-    uint8_t sector_buf[512];
+    uint8_t *scratch = (uint8_t *)kmalloc(1024);
+    if (!scratch) return -1;
+    uint8_t *sector_buf = scratch;
+    uint8_t *check_buf = scratch + 512;
 
     uint64_t journal_start = s_storage_pool.journal_lba ? s_storage_pool.journal_lba : STORAGE_POOL_JOURNAL_LBA;
 
@@ -598,7 +614,6 @@ static int storage_pool_recover_unlocked(void) {
                 /* Verify whether data on media matches transaction data CRC using unlocked read */
                 bool data_intact = false;
                 if (tx->count == 1 && s_storage_pool.state != STORAGE_POOL_STATE_CORRUPT) {
-                    uint8_t check_buf[512];
                     if (storage_pool_read_unlocked(tx->lba, 1, check_buf)) {
                         uint32_t disk_crc = partition_crc32(check_buf, 512);
                         if (disk_crc == tx->data_crc) {
@@ -626,6 +641,8 @@ static int storage_pool_recover_unlocked(void) {
             block_dev_flush(bdev0);
         }
     }
+
+    kfree(scratch);
 
     if (s_storage_pool.journal.total_tx_count < disk_tx_count) {
         s_storage_pool.journal.total_tx_count = disk_tx_count;
@@ -662,58 +679,34 @@ int storage_pool_create_ex(const char *pool_uuid, const char *bdev_name) {
             return -2;
         }
     }
-    if (!target_bdev) {
-        /* Check if any dedicated data block device already has an existing IPO_FS filesystem */
-        block_device_t *bdev = block_dev_get_list();
-        while (bdev) {
-            if (!(bdev->flags & BLOCK_DEV_BOOTABLE) && bdev->total_sectors >= 2048 + 10) {
-                uint8_t chk[512];
-                if (block_dev_read(bdev, 2048, 1, chk) && memcmp(chk, "IPO_FS", 6) == 0) {
-                    target_bdev = bdev;
-                    break;
-                }
-                if (block_dev_read(bdev, 0, 1, chk) && memcmp(chk, "IPO_FS", 6) == 0) {
-                    target_bdev = bdev;
-                    break;
-                }
-            }
-            bdev = bdev->next;
-        }
+    uint8_t *sec_buf = (uint8_t *)kmalloc(512);
+    if (!sec_buf) {
+        spin_unlock(&s_pool_lock);
+        return -1;
     }
     if (!target_bdev) {
-        /* Check if bootable block device has an existing IPO_FS filesystem */
-        block_device_t *bdev = block_dev_get_list();
-        while (bdev) {
-            if (bdev->total_sectors >= 2048 + 10) {
-                uint8_t chk[512];
-                if (block_dev_read(bdev, 2048, 1, chk) && memcmp(chk, "IPO_FS", 6) == 0) {
-                    target_bdev = bdev;
-                    break;
+        /* Prefer non-bootable devices with existing IPO_FS filesystem, then bootable */
+        for (int pass = 0; pass < 2 && !target_bdev; pass++) {
+            block_device_t *bdev = block_dev_get_list();
+            while (bdev) {
+                bool eligible = (pass == 1) || !(bdev->flags & BLOCK_DEV_BOOTABLE);
+                if (eligible && bdev->total_sectors >= 2048 + 10) {
+                    if ((block_dev_read(bdev, 2048, 1, sec_buf) && memcmp(sec_buf, "IPO_FS", 6) == 0) ||
+                        (block_dev_read(bdev, 0, 1, sec_buf) && memcmp(sec_buf, "IPO_FS", 6) == 0)) {
+                        target_bdev = bdev;
+                        break;
+                    }
                 }
-                if (block_dev_read(bdev, 0, 1, chk) && memcmp(chk, "IPO_FS", 6) == 0) {
-                    target_bdev = bdev;
-                    break;
-                }
+                bdev = bdev->next;
             }
-            bdev = bdev->next;
         }
     }
-    /* Prefer dedicated data storage devices (non-bootable devices with sufficient capacity) */
-    if (!target_bdev) {
+    /* Prefer dedicated data storage devices, then bootable fallback */
+    for (int pass = 0; pass < 2 && !target_bdev; pass++) {
         block_device_t *bdev = block_dev_get_list();
         while (bdev) {
-            if (!(bdev->flags & BLOCK_DEV_BOOTABLE) && bdev->total_sectors >= 2048 + 10) {
-                target_bdev = bdev;
-                break;
-            }
-            bdev = bdev->next;
-        }
-    }
-    /* Fallback to bootable device if it is the only device */
-    if (!target_bdev) {
-        block_device_t *bdev = block_dev_get_list();
-        while (bdev) {
-            if (bdev->total_sectors >= 2048 + 10) {
+            bool eligible = (pass == 1) || !(bdev->flags & BLOCK_DEV_BOOTABLE);
+            if (eligible && bdev->total_sectors >= 2048 + 10) {
                 target_bdev = bdev;
                 break;
             }
@@ -726,6 +719,7 @@ int storage_pool_create_ex(const char *pool_uuid, const char *bdev_name) {
 
     if (!target_bdev || target_bdev->total_sectors == 0) {
         serial_printf("[storage_pool] Cannot create storage pool: no suitable block device found.\n");
+        kfree(sec_buf);
         spin_unlock(&s_pool_lock);
         return -2;
     }
@@ -737,6 +731,7 @@ int storage_pool_create_ex(const char *pool_uuid, const char *bdev_name) {
     s_storage_pool.member_capacity = 4;
     s_storage_pool.members = (pool_member_t *)kmalloc(s_storage_pool.member_capacity * sizeof(pool_member_t));
     if (!s_storage_pool.members) {
+        kfree(sec_buf);
         spin_unlock(&s_pool_lock);
         return -1;
     }
@@ -776,13 +771,13 @@ int storage_pool_create_ex(const char *pool_uuid, const char *bdev_name) {
 
     /* Initialize clear WAL journal on member 0 */
     if (s_storage_pool.members[0].bdev) {
-        uint8_t clear_buf[512];
-        memset(clear_buf, 0, sizeof(clear_buf));
+        memset(sec_buf, 0, 512);
         for (uint32_t s = 0; s < STORAGE_POOL_JOURNAL_SECTORS; s++) {
-            block_dev_write(s_storage_pool.members[0].bdev, s_storage_pool.journal_lba + s, 1, clear_buf);
+            block_dev_write(s_storage_pool.members[0].bdev, s_storage_pool.journal_lba + s, 1, sec_buf);
         }
         block_dev_flush(s_storage_pool.members[0].bdev);
     }
+    kfree(sec_buf);
 
     /* Write persistent superblocks to all members */
     storage_pool_save_metadata_unlocked();
@@ -870,7 +865,8 @@ uint64_t storage_pool_get_used(void) {
     if (fs_mounted) {
         uint32_t blk_used = 0;
         get_fs_stats(&blk_used, NULL, NULL, NULL);
-        return (uint64_t)blk_used;
+        uint32_t block_size = (sb.block_size >= 512u) ? (uint32_t)sb.block_size : 4096u;
+        return (uint64_t)blk_used * (uint64_t)(block_size / 512u);
     }
     return 0;
 }
@@ -884,11 +880,6 @@ uint64_t storage_pool_get_free(void) {
 uint32_t storage_pool_get_member_count(void) {
     if (!s_storage_pool.initialized) storage_pool_init();
     return s_storage_pool.member_count;
-}
-
-const storage_pool_t *storage_pool_get_info(void) {
-    if (!s_storage_pool.initialized) storage_pool_init();
-    return &s_storage_pool;
 }
 
 int storage_pool_add_device(block_device_t *bdev) {
@@ -963,16 +954,7 @@ int storage_pool_add_device(block_device_t *bdev) {
     return 0;
 }
 
-static bool storage_pool_read_unlocked(uint64_t pool_lba, uint16_t count, void *buf) {
-    if (count == 0 || buf == NULL) return false;
-
-    if (pool_lba + (uint64_t)count > s_storage_pool.total_capacity_sectors) {
-        serial_printf("[storage_pool] Read out of bounds: lba=%llu count=%u total=%llu\n",
-                      pool_lba, count, s_storage_pool.total_capacity_sectors);
-        return false;
-    }
-
-    /* Fast verification: Ensure all target member spans are healthy */
+static bool storage_pool_verify_span_unlocked(uint64_t pool_lba, uint16_t count, const char *op_name) {
     uint64_t span_lba = pool_lba;
     uint16_t span_rem = count;
 
@@ -982,8 +964,8 @@ static bool storage_pool_read_unlocked(uint64_t pool_lba, uint16_t count, void *
 
         if (span_lba >= mem->start_pool_lba && span_lba < mem_end) {
             if (!mem->online || !mem->bdev) {
-                serial_printf("[storage_pool] Read rejected: target sector %llu resides on offline member [%u] '%s'\n",
-                              span_lba, m, mem->bdev_name);
+                serial_printf("[storage_pool] %s rejected: target sector %llu resides on offline member [%u] '%s'\n",
+                              op_name, span_lba, m, mem->bdev_name ? mem->bdev_name : "unknown");
                 return false;
             }
             uint64_t avail = mem_end - span_lba;
@@ -993,7 +975,21 @@ static bool storage_pool_read_unlocked(uint64_t pool_lba, uint16_t count, void *
         }
     }
 
-    if (span_rem > 0) return false;
+    return span_rem == 0;
+}
+
+static bool storage_pool_read_unlocked(uint64_t pool_lba, uint16_t count, void *buf) {
+    if (count == 0 || buf == NULL) return false;
+
+    if (pool_lba + (uint64_t)count > s_storage_pool.total_capacity_sectors) {
+        serial_printf("[storage_pool] Read out of bounds: lba=%llu count=%u total=%llu\n",
+                      pool_lba, count, s_storage_pool.total_capacity_sectors);
+        return false;
+    }
+
+    if (!storage_pool_verify_span_unlocked(pool_lba, count, "Read")) {
+        return false;
+    }
 
     in_memory_journal_record(TX_OP_READ, pool_lba, count, TX_STATE_PENDING, 0);
 
@@ -1045,33 +1041,13 @@ static bool storage_pool_write_unlocked(uint64_t pool_lba, uint16_t count, const
         return false;
     }
 
-    /* In DEGRADED mode: strictly reject write if target range touches offline member */
-    uint64_t span_lba = pool_lba;
-    uint16_t span_rem = count;
-
-    for (uint32_t m = 0; m < s_storage_pool.member_count && span_rem > 0; m++) {
-        pool_member_t *mem = &s_storage_pool.members[m];
-        uint64_t mem_end = mem->start_pool_lba + mem->capacity_sectors;
-
-        if (span_lba >= mem->start_pool_lba && span_lba < mem_end) {
-            if (!mem->online || !mem->bdev) {
-                serial_printf("[storage_pool] Write REJECTED: target span [%llu..%llu] touches offline member [%u] '%s'\n",
-                              span_lba, span_lba + span_rem - 1, m, mem->bdev_name);
-                return false;
-            }
-            uint64_t avail = mem_end - span_lba;
-            uint16_t chunk = (span_rem < avail) ? span_rem : (uint16_t)avail;
-            span_lba += chunk;
-            span_rem -= chunk;
-        }
+    if (!storage_pool_verify_span_unlocked(pool_lba, count, "Write")) {
+        return false;
     }
 
-    if (span_rem > 0) return false;
-
-    /* Compute CRC32 of payload data */
     uint32_t data_crc = partition_crc32(buf, (size_t)count * 512u);
 
-    /* 1. On-Disk Write-Ahead Log (WAL): Write PENDING transaction to disk before data */
+    /* Write PENDING WAL entry to disk before updating data blocks */
     storage_journal_t *j = &s_storage_pool.journal;
     uint32_t slot = j->head % (uint32_t)STORAGE_DISK_WAL_SLOTS;
     in_memory_journal_record(TX_OP_WRITE, pool_lba, count, TX_STATE_PENDING, data_crc);
@@ -1090,7 +1066,6 @@ static bool storage_pool_write_unlocked(uint64_t pool_lba, uint16_t count, const
 
     disk_journal_write_entry(slot, &d_entry);
 
-    /* 2. Write data blocks to member device(s) */
     uint64_t curr_lba = pool_lba;
     const uint8_t *curr_buf = (const uint8_t *)buf;
     uint16_t remaining = count;
@@ -1122,7 +1097,7 @@ static bool storage_pool_write_unlocked(uint64_t pool_lba, uint16_t count, const
 
     if (remaining > 0) write_ok = false;
 
-    /* 3. Commit/finalize transaction on-disk and in memory */
+    /* Finalize WAL transaction state on disk and in memory */
     d_entry.state = write_ok ? (uint16_t)TX_STATE_COMMITTED : (uint16_t)TX_STATE_FAILED;
     d_entry.entry_crc = wal_entry_crc(&d_entry);
     disk_journal_write_entry(slot, &d_entry);
@@ -1157,19 +1132,24 @@ bool storage_pool_flush(void) {
 int storage_pool_check(void) {
     if (!s_storage_pool.initialized) storage_pool_init();
 
+    uint8_t *sec_buf = (uint8_t *)kmalloc(512);
+    if (!sec_buf) return -1;
+
+    spin_lock(&s_pool_lock);
+
     printf("=== Storage Pool Integrity Check ===\n");
-    printf("  Pool UUID:       %.16s\n", s_storage_pool.pool_uuid);
+    printf("  Pool UUID:       %.16s\n",
+           (s_storage_pool.pool_uuid && s_storage_pool.pool_uuid[0]) ? (const char *)s_storage_pool.pool_uuid : "Unknown");
     printf("  Pool Status:     %s\n", storage_pool_get_state_str());
     printf("  Generation:      %u\n", s_storage_pool.generation);
     printf("  Recoveries:      %u\n", s_storage_pool.recovery_count);
     printf("  Member Count:    %u\n\n", s_storage_pool.member_count);
 
     int errors = 0;
-    uint8_t test_buf[512];
 
     for (uint32_t m = 0; m < s_storage_pool.member_count; m++) {
         pool_member_t *mem = &s_storage_pool.members[m];
-        printf("  [Member %u: %s]\n", m, mem->bdev_name);
+        printf("  [Member %u: %s]\n", m, (mem->bdev_name && mem->bdev_name[0]) ? mem->bdev_name : "Unknown");
 
         if (!mem->bdev || !mem->online) {
             printf("    Status:        OFFLINE / MISSING (FAIL)\n");
@@ -1177,23 +1157,20 @@ int storage_pool_check(void) {
             continue;
         }
 
-        /* 1. Sector 0 Read Test */
-        if (!block_dev_read(mem->bdev, 0, 1, test_buf)) {
+        if (!block_dev_read(mem->bdev, 0, 1, sec_buf)) {
             printf("    Sector 0:      I/O Error (FAIL)\n");
             errors++;
         } else {
             printf("    Sector 0:      Read Verified (OK)\n");
         }
 
-        /* 2. Primary Superblock Test */
         uint64_t sb_lba = s_storage_pool.sb_lba ? s_storage_pool.sb_lba : STORAGE_POOL_PRIMARY_SB_LBA;
         uint64_t backup_sb_lba = s_storage_pool.backup_sb_lba ? s_storage_pool.backup_sb_lba : STORAGE_POOL_BACKUP_SB_LBA;
 
-        uint8_t psb_buf[512];
-        storage_pool_raw_sb_t *psb = (storage_pool_raw_sb_t *)psb_buf;
-        if (block_dev_read(mem->bdev, sb_lba, 1, psb_buf)) {
-            uint32_t c_crc = partition_crc32(psb_buf, 508);
-            uint32_t stored_crc = *(uint32_t *)(psb_buf + 508);
+        storage_pool_raw_sb_t *psb = (storage_pool_raw_sb_t *)sec_buf;
+        if (block_dev_read(mem->bdev, sb_lba, 1, sec_buf)) {
+            uint32_t c_crc = partition_crc32(sec_buf, 508);
+            uint32_t stored_crc = *(uint32_t *)(sec_buf + 508);
             if (psb->magic == STORAGE_POOL_MAGIC && c_crc == stored_crc) {
                 printf("    Primary SB:    LBA %llu Verified (OK, Gen %u, CRC 0x%08X)\n",
                        sb_lba, psb->generation, stored_crc);
@@ -1207,12 +1184,10 @@ int storage_pool_check(void) {
             errors++;
         }
 
-        /* 3. Backup Superblock Test */
-        uint8_t bsb_buf[512];
-        storage_pool_raw_sb_t *bsb = (storage_pool_raw_sb_t *)bsb_buf;
-        if (block_dev_read(mem->bdev, backup_sb_lba, 1, bsb_buf)) {
-            uint32_t b_crc = partition_crc32(bsb_buf, 508);
-            uint32_t stored_b_crc = *(uint32_t *)(bsb_buf + 508);
+        storage_pool_raw_sb_t *bsb = (storage_pool_raw_sb_t *)sec_buf;
+        if (block_dev_read(mem->bdev, backup_sb_lba, 1, sec_buf)) {
+            uint32_t b_crc = partition_crc32(sec_buf, 508);
+            uint32_t stored_b_crc = *(uint32_t *)(sec_buf + 508);
             if (bsb->magic == STORAGE_POOL_MAGIC && b_crc == stored_b_crc) {
                 printf("    Backup SB:     LBA %llu Verified (OK, Gen %u, CRC 0x%08X)\n",
                        backup_sb_lba, bsb->generation, stored_b_crc);
@@ -1226,7 +1201,6 @@ int storage_pool_check(void) {
             errors++;
         }
 
-        /* 4. Partition Table Scan */
         partition_table_t ptable;
         int parts = partition_scan(mem->bdev, &ptable);
         if (parts >= 0) {
@@ -1238,7 +1212,6 @@ int storage_pool_check(void) {
         partition_free_table(&ptable);
     }
 
-    /* 5. WAL On-Disk Journal Verification */
     uint64_t journal_start = s_storage_pool.journal_lba ? s_storage_pool.journal_lba : STORAGE_POOL_JOURNAL_LBA;
     printf("\n  [WAL On-Disk Journal (LBA %llu..%llu)]\n",
            journal_start, journal_start + STORAGE_POOL_JOURNAL_SECTORS - 1);
@@ -1248,10 +1221,11 @@ int storage_pool_check(void) {
     uint32_t committed_entries = 0;
     uint32_t failed_entries = 0;
 
-    if (s_storage_pool.members[0].online && s_storage_pool.members[0].bdev) {
+    if (s_storage_pool.member_count > 0 && s_storage_pool.members != NULL &&
+        s_storage_pool.members[0].online && s_storage_pool.members[0].bdev) {
         for (uint32_t s = 0; s < STORAGE_POOL_JOURNAL_SECTORS; s++) {
-            if (block_dev_read(s_storage_pool.members[0].bdev, journal_start + s, 1, test_buf)) {
-                storage_raw_disk_tx_entry_t *entries = (storage_raw_disk_tx_entry_t *)test_buf;
+            if (block_dev_read(s_storage_pool.members[0].bdev, journal_start + s, 1, sec_buf)) {
+                storage_raw_disk_tx_entry_t *entries = (storage_raw_disk_tx_entry_t *)sec_buf;
                 for (uint32_t e = 0; e < STORAGE_ENTRIES_PER_SECTOR; e++) {
                     if (entries[e].magic == STORAGE_JOURNAL_ENTRY_MAGIC) {
                         uint32_t c_crc = partition_crc32(&entries[e], offsetof(storage_raw_disk_tx_entry_t, entry_crc));
@@ -1284,12 +1258,15 @@ int storage_pool_check(void) {
         printf("  Result: Storage Pool has %d issue(s). Action required.\n", errors);
     }
 
+    spin_unlock(&s_pool_lock);
+    kfree(sec_buf);
     return errors;
 }
 
 void storage_pool_print_status(void) {
     if (!s_storage_pool.initialized) storage_pool_init();
 
+    spin_lock(&s_pool_lock);
     uint64_t cap = s_storage_pool.total_capacity_sectors;
     uint32_t cap_mb = (uint32_t)((cap * 512ull) / (1024ull * 1024ull));
 
@@ -1327,11 +1304,13 @@ void storage_pool_print_status(void) {
     printf("    Active Transactions: %u\n", s_storage_pool.journal.active_tx_count);
     printf("    Journal Capacity:    %u on-disk slots (%u in-memory entries)\n",
            (uint32_t)STORAGE_DISK_WAL_SLOTS, (uint32_t)s_storage_pool.journal.entries_cap);
+    spin_unlock(&s_pool_lock);
 }
 
 void storage_pool_print_usage(void) {
     if (!s_storage_pool.initialized) storage_pool_init();
 
+    spin_lock(&s_pool_lock);
     uint64_t cap_sectors = s_storage_pool.total_capacity_sectors;
     uint32_t cap_mb = (uint32_t)((cap_sectors * 512ull) / (1024ull * 1024ull));
 
@@ -1341,7 +1320,8 @@ void storage_pool_print_usage(void) {
         get_fs_stats(&blk_used, &blk_total, &ino_used, &ino_total);
     }
 
-    uint64_t used_sectors = (uint64_t)blk_used;
+    uint32_t block_size = (fs_mounted && sb.block_size >= 512u) ? (uint32_t)sb.block_size : 4096u;
+    uint64_t used_sectors = (uint64_t)blk_used * (uint64_t)(block_size / 512u);
     uint64_t free_sectors = (cap_sectors > used_sectors) ? (cap_sectors - used_sectors) : 0;
     uint32_t used_mb = (uint32_t)((used_sectors * 512ull) / (1024ull * 1024ull));
     uint32_t free_mb = (uint32_t)((free_sectors * 512ull) / (1024ull * 1024ull));
@@ -1366,10 +1346,12 @@ void storage_pool_print_usage(void) {
         uint32_t m_mb = (uint32_t)((mem->capacity_sectors * 512ull) / (1024ull * 1024ull));
         uint32_t m_pct = (cap_sectors > 0) ? (uint32_t)((mem->capacity_sectors * 100ull) / cap_sectors) : 0;
         printf("    %-10s: %-6u MiB (Pool Extent [%llu..%llu], %u%% of Pool) [%s]\n",
-               mem->bdev_name, m_mb, mem->start_pool_lba,
+               (mem->bdev_name && mem->bdev_name[0]) ? mem->bdev_name : "Unknown",
+               m_mb, mem->start_pool_lba,
                mem->start_pool_lba + mem->capacity_sectors - 1, m_pct,
                mem->online ? "ONLINE" : "OFFLINE");
     }
+    spin_unlock(&s_pool_lock);
 }
 
 void storage_pool_disk_member_init(storage_pool_disk_member_t *m) {
@@ -1454,10 +1436,13 @@ void storage_pool_disk_member_from_raw(storage_pool_disk_member_t *m, const stor
     storage_pool_disk_member_set_uuid(m, raw->uuid, 16);
     m->member_index = raw->member_index;
     m->flags = raw->flags;
-    char name_buf[sizeof(raw->bdev_name) + 1];
-    memcpy(name_buf, raw->bdev_name, sizeof(raw->bdev_name));
-    name_buf[sizeof(raw->bdev_name)] = '\0';
-    storage_pool_disk_member_set_bdev_name(m, name_buf);
+    char *name_buf = (char *)kmalloc(sizeof(raw->bdev_name) + 1);
+    if (name_buf) {
+        memcpy(name_buf, raw->bdev_name, sizeof(raw->bdev_name));
+        name_buf[sizeof(raw->bdev_name)] = '\0';
+        storage_pool_disk_member_set_bdev_name(m, name_buf);
+        kfree(name_buf);
+    }
     m->start_pool_lba = raw->start_pool_lba;
     m->capacity_sectors = raw->capacity_sectors;
 }
@@ -1479,7 +1464,19 @@ void storage_pool_disk_member_to_raw(const storage_pool_disk_member_t *m, storag
 }
 
 
-/* ---- pool_member_t ---- */
+static int sp_buf_set(uint8_t **buf, size_t *len, size_t *cap, const uint8_t *data, size_t n) {
+    if (n > *cap || !*buf) {
+        size_t nc = n ? n : 1;
+        uint8_t *nb = (uint8_t *)krealloc(*buf, nc);
+        if (!nb) return -1;
+        *buf = nb;
+        *cap = nc;
+    }
+    if (n) memcpy(*buf, data, n);
+    *len = n;
+    return 0;
+}
+
 void pool_member_init(pool_member_t *m) {
     if (!m) return;
     memset(m, 0, sizeof(*m));
@@ -1508,33 +1505,9 @@ int pool_member_set_name(pool_member_t *m, const char *name) {
 
 int pool_member_set_uuid(pool_member_t *m, const uint8_t *uuid, size_t len) {
     if (!m || (!uuid && len)) return -1;
-    if (len > m->uuid_cap || !m->uuid) {
-        size_t cap = len ? len : 1;
-        uint8_t *nb = (uint8_t *)krealloc(m->uuid, cap);
-        if (!nb) return -1;
-        m->uuid = nb;
-        m->uuid_cap = cap;
-    }
-    if (len) memcpy(m->uuid, uuid, len);
-    m->uuid_len = len;
-    return 0;
+    return sp_buf_set(&m->uuid, &m->uuid_len, &m->uuid_cap, uuid, len);
 }
 
-/* ---- generic dynamic byte buffer helper ---- */
-static int sp_buf_set(uint8_t **buf, size_t *len, size_t *cap, const uint8_t *data, size_t n) {
-    if (n > *cap || !*buf) {
-        size_t nc = n ? n : 1;
-        uint8_t *nb = (uint8_t *)krealloc(*buf, nc);
-        if (!nb) return -1;
-        *buf = nb;
-        *cap = nc;
-    }
-    if (n) memcpy(*buf, data, n);
-    *len = n;
-    return 0;
-}
-
-/* ---- storage_tx_entry_t ---- */
 void storage_tx_entry_init(storage_tx_entry_t *e) {
     if (e) memset(e, 0, sizeof(*e));
 }
@@ -1545,21 +1518,6 @@ void storage_tx_entry_free(storage_tx_entry_t *e) {
     memset(e, 0, sizeof(*e));
 }
 
-int storage_tx_entry_set_extra_data(storage_tx_entry_t *e, const uint8_t *data, size_t len) {
-    if (!e) return -1;
-    return sp_buf_set(&e->extra_data, &e->extra_data_len, &e->extra_data_cap, data, len);
-}
-
-int storage_tx_entry_copy(storage_tx_entry_t *dst, const storage_tx_entry_t *src) {
-    if (!dst || !src) return -1;
-    uint8_t *eb = dst->extra_data; size_t ec = dst->extra_data_cap;
-    *dst = *src;
-    dst->extra_data = eb; dst->extra_data_cap = ec; dst->extra_data_len = 0;
-    return sp_buf_set(&dst->extra_data, &dst->extra_data_len, &dst->extra_data_cap,
-                      src->extra_data, src->extra_data_len);
-}
-
-/* ---- storage_disk_tx_entry_t ---- */
 void storage_disk_tx_entry_init(storage_disk_tx_entry_t *e) {
     if (e) memset(e, 0, sizeof(*e));
 }
@@ -1607,7 +1565,6 @@ void storage_disk_tx_entry_to_raw(const storage_disk_tx_entry_t *e, storage_raw_
     }
 }
 
-/* ---- storage_pool_disk_sb_t ---- */
 void storage_pool_disk_sb_init(storage_pool_disk_sb_t *sb) {
     if (sb) memset(sb, 0, sizeof(*sb));
 }

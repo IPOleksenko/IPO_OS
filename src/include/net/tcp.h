@@ -86,10 +86,17 @@ typedef struct tcp_tcb {
     dyn_buf_t      tx_buf;        /* Queued data awaiting transmission or ACK */
 
     /* Retransmission & Timeout Timers (RFC 6298) */
-    uint32_t       rto_ms;        /* Retransmission Timeout in milliseconds */
-    uint32_t       last_tx_ms;    /* Timestamp of last transmitted segment */
-    uint8_t        retrans_count; /* Number of retries for current unacked data */
-    uint32_t       time_wait_ms;  /* TIME_WAIT entry timestamp */
+    uint16_t       mss;                   /* Maximum Segment Size passed at TCP call time */
+    uint32_t       default_rto_ms;        /* Default RTO in ms passed at TCP call time */
+    uint32_t       max_rto_ms;            /* Max RTO in ms passed at TCP call time */
+    uint8_t        max_retries;           /* Max retries passed at TCP call time */
+    uint32_t       time_wait_duration_ms; /* TIME_WAIT duration in ms passed at TCP call time */
+    uint32_t       max_rcv_wnd;           /* Hardware-derived maximum receive window */
+    size_t         max_tx_buf;            /* Hardware-derived maximum TX queue capacity */
+    uint32_t       rto_ms;                /* Retransmission Timeout in milliseconds */
+    uint32_t       last_tx_ms;            /* Timestamp of last transmitted segment */
+    uint8_t        retrans_count;         /* Number of retries for current unacked data */
+    uint32_t       time_wait_ms;          /* TIME_WAIT entry timestamp */
 
     /* Backlog & Connection Management */
     bool           is_passive;
@@ -102,28 +109,37 @@ typedef struct tcp_tcb {
     struct tcp_tcb *next;         /* Global linked list of active TCBs */
 } tcp_tcb_t;
 
-/* Core TCP functions */
+/* Core TCP functions (each TCP parameter is specified directly at call time) */
 void        tcp_init(void);
-void        tcp_poll(void);
-void        tcp_receive(ip4_addr_t src_ip, ip4_addr_t dst_ip, const void *payload, uint16_t len);
+void        tcp_poll(uint16_t mss, uint32_t default_rto_ms, uint32_t max_rto_ms,
+                     uint8_t max_retries, uint32_t time_wait_ms);
+void        tcp_receive(ip4_addr_t src_ip, ip4_addr_t dst_ip, const void *payload, uint16_t len,
+                        uint16_t mss, uint32_t default_rto_ms, uint32_t max_rto_ms,
+                        uint8_t max_retries, uint32_t time_wait_ms);
 
-tcp_tcb_t  *tcp_alloc_tcb(void);
+tcp_tcb_t  *tcp_alloc_tcb(uint16_t mss, uint32_t default_rto_ms, uint32_t max_rto_ms,
+                          uint8_t max_retries, uint32_t time_wait_ms);
 void        tcp_free_tcb(tcp_tcb_t *tcb);
 tcp_tcb_t  *tcp_find_tcb(ip4_addr_t local_ip, uint16_t local_port,
                           ip4_addr_t remote_ip, uint16_t remote_port);
 tcp_tcb_t  *tcp_find_listener(ip4_addr_t local_ip, uint16_t local_port);
 
-int         tcp_send_segment(tcp_tcb_t *tcb, uint8_t flags, const void *data, uint16_t len);
+int         tcp_send_segment(tcp_tcb_t *tcb, uint8_t flags, const void *data, uint16_t len,
+                             uint16_t mss, uint32_t default_rto_ms, uint32_t max_rto_ms,
+                             uint8_t max_retries, uint32_t time_wait_ms);
 int         tcp_send_ack(tcp_tcb_t *tcb);
 int         tcp_send_rst(ip4_addr_t src_ip, uint16_t src_port,
                          ip4_addr_t dst_ip, uint16_t dst_port,
                          uint32_t seq, uint32_t ack);
 
-int         tcp_active_open(tcp_tcb_t *tcb, ip4_addr_t remote_ip, uint16_t remote_port);
+int         tcp_active_open(tcp_tcb_t *tcb, ip4_addr_t remote_ip, uint16_t remote_port,
+                            uint16_t mss, uint32_t default_rto_ms, uint32_t max_rto_ms,
+                            uint8_t max_retries, uint32_t time_wait_ms);
 void        tcp_close(tcp_tcb_t *tcb);
 void        tcp_abort(tcp_tcb_t *tcb);
 
 uint16_t    tcp_checksum(ip4_addr_t src_ip, ip4_addr_t dst_ip, const void *tcp_seg, uint16_t seg_len);
+uint16_t    tcp_alloc_ephemeral_port(void);
 const char *tcp_state_to_str(tcp_state_t state);
 
 #endif /* IPO_NET_TCP_H */

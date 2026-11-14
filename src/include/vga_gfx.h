@@ -53,6 +53,14 @@ void vga_gfx_flip_scaled_buffer(const uint8_t *buf,
                                 int source_width,
                                 int source_height);
 
+/* Pure hardware blit: writes @buf to the BGA framebuffer or 0xA0000 without
+ * touching any per-process backup buffers and without yielding. Used by the
+ * kernel itself (WM compositor, workspace switching). */
+void vga_gfx_blit_hardware(const uint8_t *buf,
+                           bool scale_to_display,
+                           int source_width,
+                           int source_height);
+
 /* Active display bounds */
 void vga_gfx_get_screen_bounds(int *out_w, int *out_h);
 int  vga_gfx_get_width(void);

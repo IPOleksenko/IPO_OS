@@ -6,7 +6,6 @@
 #include <memory/kmalloc.h>
 #include <ioport.h>
 #include <syscall.h>
-#include <stdio.h>
 
 #define ARP_ENTRY_TIMEOUT_MS 60000u
 
@@ -25,6 +24,7 @@ static const mac_addr_t *get_broadcast_mac(void) {
 static void arp_cache_prune(void) {
     uint32_t now = timer_millis();
     net_shared_ctx_t *ctx = net_get_shared_context();
+    if (!ctx->arp_table) return;
     for (size_t i = 0; i < ctx->arp_table_capacity; i++) {
         if (ctx->arp_table[i].in_use && (now - ctx->arp_table[i].last_seen_ms >= ARP_ENTRY_TIMEOUT_MS)) {
             ctx->arp_table[i].in_use = false;
@@ -32,34 +32,36 @@ static void arp_cache_prune(void) {
     }
 }
 
-void arp_poll(void) {
-    arp_cache_prune();
-}
-
 static void arp_cache_insert(ip4_addr_t ip, const mac_addr_t *mac) {
     arp_cache_prune();
     uint32_t now = timer_millis();
     net_shared_ctx_t *ctx = net_get_shared_context();
+    if (!mac || mac_get_len(mac) == 0) return;
 
-    /* 1. Update existing entry if present */
-    for (size_t i = 0; i < ctx->arp_table_capacity; i++) {
-        if (ctx->arp_table[i].in_use && ctx->arp_table[i].ip == ip) {
-            mac_copy(&ctx->arp_table[i].mac, mac);
-            ctx->arp_table[i].last_seen_ms = now;
-            return;
+    /* Update existing entry if present */
+    if (ctx->arp_table) {
+        for (size_t i = 0; i < ctx->arp_table_capacity; i++) {
+            if (ctx->arp_table[i].in_use && ctx->arp_table[i].ip == ip) {
+                if (mac_copy(&ctx->arp_table[i].mac, mac)) {
+                    ctx->arp_table[i].last_seen_ms = now;
+                }
+                return;
+            }
         }
     }
 
-    /* 2. Find free slot */
+    /* Find free slot */
     size_t slot = ctx->arp_table_capacity;
-    for (size_t i = 0; i < ctx->arp_table_capacity; i++) {
-        if (!ctx->arp_table[i].in_use) {
-            slot = i;
-            break;
+    if (ctx->arp_table) {
+        for (size_t i = 0; i < ctx->arp_table_capacity; i++) {
+            if (!ctx->arp_table[i].in_use) {
+                slot = i;
+                break;
+            }
         }
     }
 
-    /* 3. If full, dynamically expand table capacity; fallback to oldest slot only on OOM */
+    /* Expand table if full; fall back to evicting oldest entry on OOM */
     if (slot == ctx->arp_table_capacity) {
         size_t new_cap = (ctx->arp_table_capacity == 0) ? 16 : (ctx->arp_table_capacity * 2);
         if (new_cap > ctx->arp_table_capacity && new_cap <= (SIZE_MAX / sizeof(arp_entry_t))) {
@@ -73,7 +75,7 @@ static void arp_cache_insert(ip4_addr_t ip, const mac_addr_t *mac) {
         }
 
         if (slot == ctx->arp_table_capacity) {
-            if (ctx->arp_table_capacity == 0) {
+            if (ctx->arp_table_capacity == 0 || !ctx->arp_table) {
                 return;
             }
             uint32_t oldest_time = 0xFFFFFFFF;
@@ -87,8 +89,10 @@ static void arp_cache_insert(ip4_addr_t ip, const mac_addr_t *mac) {
         }
     }
 
+    if (!mac_copy(&ctx->arp_table[slot].mac, mac)) {
+        return;
+    }
     ctx->arp_table[slot].ip = ip;
-    mac_copy(&ctx->arp_table[slot].mac, mac);
     ctx->arp_table[slot].last_seen_ms = now;
     ctx->arp_table[slot].in_use = true;
 }
@@ -96,11 +100,12 @@ static void arp_cache_insert(ip4_addr_t ip, const mac_addr_t *mac) {
 static bool arp_cache_lookup(ip4_addr_t ip, mac_addr_t *out_mac) {
     arp_cache_prune();
     net_shared_ctx_t *ctx = net_get_shared_context();
+    if (!ctx->arp_table) return false;
 
     for (size_t i = 0; i < ctx->arp_table_capacity; i++) {
         if (ctx->arp_table[i].in_use && ctx->arp_table[i].ip == ip) {
-            if (out_mac) {
-                mac_copy(out_mac, &ctx->arp_table[i].mac);
+            if (out_mac && !mac_copy(out_mac, &ctx->arp_table[i].mac)) {
+                return false;
             }
             return true;
         }
@@ -110,7 +115,10 @@ static bool arp_cache_lookup(ip4_addr_t ip, mac_addr_t *out_mac) {
 
 void arp_init(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
-    if (ctx->arp_table_capacity > 0) {
+    if (ctx->arp_table_capacity > 0 && ctx->arp_table) {
+        for (size_t i = 0; i < ctx->arp_table_capacity; i++) {
+            mac_free(&ctx->arp_table[i].mac);
+        }
         memset(ctx->arp_table, 0, ctx->arp_table_capacity * sizeof(*ctx->arp_table));
     }
 }
@@ -147,7 +155,10 @@ bool arp_packet_parse(arp_packet_t *pkt, const void *data, size_t len) {
     }
 
     size_t off = 8;
-    mac_set(&pkt->sender_mac, raw + off, pkt->hw_len);
+    if (!mac_set(&pkt->sender_mac, raw + off, pkt->hw_len)) {
+        arp_packet_free(pkt);
+        return false;
+    }
     off += pkt->hw_len;
 
     if (pkt->proto_len == 4) {
@@ -157,7 +168,10 @@ bool arp_packet_parse(arp_packet_t *pkt, const void *data, size_t len) {
     }
     off += pkt->proto_len;
 
-    mac_set(&pkt->target_mac, raw + off, pkt->hw_len);
+    if (!mac_set(&pkt->target_mac, raw + off, pkt->hw_len)) {
+        arp_packet_free(pkt);
+        return false;
+    }
     off += pkt->hw_len;
 
     if (pkt->proto_len == 4) {
@@ -195,6 +209,7 @@ size_t arp_packet_serialize(const arp_packet_t *pkt, void *buf, size_t buf_size)
     }
     off += hw_len;
 
+    memset(raw + off, 0, proto_len);
     uint32_t s_ip = htonl(pkt->sender_ip);
     memcpy(raw + off, &s_ip, proto_len <= 4 ? proto_len : 4);
     off += proto_len;
@@ -206,6 +221,7 @@ size_t arp_packet_serialize(const arp_packet_t *pkt, void *buf, size_t buf_size)
     }
     off += hw_len;
 
+    memset(raw + off, 0, proto_len);
     uint32_t t_ip = htonl(pkt->target_ip);
     memcpy(raw + off, &t_ip, proto_len <= 4 ? proto_len : 4);
     off += proto_len;
@@ -254,35 +270,25 @@ size_t arp_packet_serialize_dynamic(const arp_packet_t *pkt, uint8_t **out_raw) 
     return len;
 }
 
-void arp_send_request(ip4_addr_t target_ip) {
-    net_if_t *netif = net_get_interface();
-    if (!netif) return;
-
+static void arp_send_packet(const mac_addr_t *eth_dest, uint16_t opcode, uint8_t hw_len,
+                            const mac_addr_t *sender_mac, ip4_addr_t sender_ip,
+                            const mac_addr_t *target_mac, ip4_addr_t target_ip) {
     arp_packet_t pkt;
     arp_packet_init(&pkt);
     pkt.hw_type = 1;
     pkt.proto_type = 0x0800;
-    size_t mac_l = mac_get_len(&netif->mac);
-    pkt.hw_len = (uint8_t)(mac_l ? mac_l : 6);
+    pkt.hw_len = hw_len;
     pkt.proto_len = 4;
-    pkt.opcode = ARP_OP_REQUEST;
-    mac_copy(&pkt.sender_mac, &netif->mac);
-    pkt.sender_ip = netif->ip;
-
-    /* Dynamically allocate zero MAC buffer of exact hardware length */
-    uint8_t *zero_mac = (uint8_t *)kmalloc(pkt.hw_len);
-    if (zero_mac) {
-        memset(zero_mac, 0, pkt.hw_len);
-        mac_set(&pkt.target_mac, zero_mac, pkt.hw_len);
-        kfree(zero_mac);
-    }
+    pkt.opcode = opcode;
+    if (sender_mac) mac_copy(&pkt.sender_mac, sender_mac);
+    pkt.sender_ip = sender_ip;
+    if (target_mac) mac_copy(&pkt.target_mac, target_mac);
     pkt.target_ip = target_ip;
 
-    /* Self-expanding dynamic serialization buffer via kmalloc */
     uint8_t *raw = NULL;
     size_t len = arp_packet_serialize_dynamic(&pkt, &raw);
     if (raw && len > 0) {
-        eth_send(get_broadcast_mac(), ETHERTYPE_ARP, raw, (uint16_t)len);
+        eth_send(eth_dest, ETHERTYPE_ARP, raw, (uint16_t)len);
     }
     if (raw) {
         kfree(raw);
@@ -290,33 +296,24 @@ void arp_send_request(ip4_addr_t target_ip) {
     arp_packet_free(&pkt);
 }
 
+void arp_send_request(ip4_addr_t target_ip) {
+    net_if_t *netif = net_get_interface();
+    if (!netif) return;
+
+    size_t mac_l = mac_get_len(&netif->mac);
+    uint8_t hw_len = (uint8_t)(mac_l ? mac_l : 6);
+    arp_send_packet(get_broadcast_mac(), ARP_OP_REQUEST, hw_len,
+                    &netif->mac, netif->ip, NULL, target_ip);
+}
+
 void arp_send_gratuitous(void) {
     net_if_t *netif = net_get_interface();
     if (!netif || netif->ip == 0) return;
 
-    arp_packet_t pkt;
-    arp_packet_init(&pkt);
-    pkt.hw_type = 1;
-    pkt.proto_type = 0x0800;
     size_t mac_l = mac_get_len(&netif->mac);
-    pkt.hw_len = (uint8_t)(mac_l ? mac_l : 6);
-    pkt.proto_len = 4;
-    pkt.opcode = ARP_OP_REQUEST;
-    mac_copy(&pkt.sender_mac, &netif->mac);
-    pkt.sender_ip = netif->ip;
-    mac_copy(&pkt.target_mac, get_broadcast_mac());
-    pkt.target_ip = netif->ip;
-
-    /* Self-expanding dynamic serialization buffer via kmalloc */
-    uint8_t *raw = NULL;
-    size_t len = arp_packet_serialize_dynamic(&pkt, &raw);
-    if (raw && len > 0) {
-        eth_send(get_broadcast_mac(), ETHERTYPE_ARP, raw, (uint16_t)len);
-    }
-    if (raw) {
-        kfree(raw);
-    }
-    arp_packet_free(&pkt);
+    uint8_t hw_len = (uint8_t)(mac_l ? mac_l : 6);
+    arp_send_packet(get_broadcast_mac(), ARP_OP_REQUEST, hw_len,
+                    &netif->mac, netif->ip, get_broadcast_mac(), netif->ip);
 }
 
 void arp_receive(const void *data, uint16_t len) {
@@ -327,7 +324,7 @@ void arp_receive(const void *data, uint16_t len) {
         return;
     }
 
-    if (pkt.hw_type != 1 || pkt.proto_type != 0x0800) {
+    if (pkt.hw_type != 1 || pkt.proto_type != 0x0800 || pkt.proto_len != 4) {
         arp_packet_free(&pkt);
         return;
     }
@@ -341,34 +338,15 @@ void arp_receive(const void *data, uint16_t len) {
     ip4_addr_t target_ip = pkt.target_ip;
     uint16_t opcode = pkt.opcode;
 
-    /* Update cache with sender info (supports arbitrary length MAC via dynamic mac_addr_t) */
-    arp_cache_insert(sender_ip, &pkt.sender_mac);
+    if (sender_ip != 0 && mac_get_len(&pkt.sender_mac) > 0) {
+        arp_cache_insert(sender_ip, &pkt.sender_mac);
+    }
 
-    /* If it's a request for our IP, reply */
-    if (opcode == ARP_OP_REQUEST && target_ip == netif->ip) {
-        arp_packet_t reply;
-        arp_packet_init(&reply);
-        reply.hw_type = 1;
-        reply.proto_type = 0x0800;
+    if (opcode == ARP_OP_REQUEST && netif->ip != 0 && target_ip == netif->ip) {
         size_t mac_l = mac_get_len(&netif->mac);
-        reply.hw_len = pkt.hw_len ? pkt.hw_len : (uint8_t)(mac_l ? mac_l : 6);
-        reply.proto_len = 4;
-        reply.opcode = ARP_OP_REPLY;
-        mac_copy(&reply.sender_mac, &netif->mac);
-        reply.sender_ip = netif->ip;
-        mac_copy(&reply.target_mac, &pkt.sender_mac);
-        reply.target_ip = sender_ip;
-
-        /* Self-expanding dynamic serialization buffer via kmalloc */
-        uint8_t *raw = NULL;
-        size_t r_len = arp_packet_serialize_dynamic(&reply, &raw);
-        if (raw && r_len > 0) {
-            eth_send(&pkt.sender_mac, ETHERTYPE_ARP, raw, (uint16_t)r_len);
-        }
-        if (raw) {
-            kfree(raw);
-        }
-        arp_packet_free(&reply);
+        uint8_t hw_len = pkt.hw_len ? pkt.hw_len : (uint8_t)(mac_l ? mac_l : 6);
+        arp_send_packet(&pkt.sender_mac, ARP_OP_REPLY, hw_len,
+                        &netif->mac, netif->ip, &pkt.sender_mac, sender_ip);
     }
     arp_packet_free(&pkt);
 }

@@ -2,10 +2,12 @@
 #define _TERMINAL_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include <stdbool.h>
 
 #define TERMINAL_SCROLL_HISTORY_SIZE 40960
 
+void print_header_row(volatile uint16_t *row, size_t width);
 void print_header(void);
 
 void terminal_initialize(void);
@@ -29,11 +31,12 @@ void terminal_return_to_present(void);
 int terminal_get_top_buffer_count(void);
 int terminal_get_bottom_buffer_count(void);
 void terminal_on_external_output(void);
-
-void async_scheduler_init(void);
-void async_scheduler_tick(void);
-int async_start_task(const char *name, uint32_t interval_ms, void (*fn)(void));
-int async_stop_task(const char *name);
+size_t terminal_visual_offset_range(const char *buf, size_t len, size_t index);
+void terminal_render_text_line(int32_t *start_cursor_ptr,
+                               const char *buf, size_t len,
+                               uint8_t fg_color, size_t *prev_vis_len_ptr,
+                               size_t cursor_pos, uint16_t *mirror_vram,
+                               bool mirror_proc_cursor);
 
 int try_execute_command(const char *cmd);
 

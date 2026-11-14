@@ -17,9 +17,9 @@
  *   2. Return from main().  Kernel paths continue servicing the WM session.
  *   3. Optionally call wm_destroy_window() before returning to remove it.
  *
- * This means `run wm_demo & wm_demo2` works correctly:
- *   - wm_demo  creates its windows, returns.
- *   - wm_demo2 creates its windows, returns.
+ * Multiple separate programs running simultaneously can each create windows
+ * independently:
+ *   - each program creates its windows and returns or runs an event loop.
  *   - WM ticks composite the visible windows.
  *
  * System overlay
@@ -39,12 +39,11 @@
 #define LIB_WM_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include <stdbool.h>
 #include <vga_gfx.h>
 
-/* =========================================================================
- * Decoration style
- * ========================================================================= */
+/* Decoration style */
 typedef enum {
     WM_DECOR_DEFAULT = 0, /* Standard title bar + border                     */
     WM_DECOR_THIN,        /* 1-pixel border, no title bar                    */
@@ -52,32 +51,25 @@ typedef enum {
     WM_DECOR_CUSTOM,      /* Caller's draw_cb is responsible for all chrome  */
 } wm_decor_style_t;
 
-/* =========================================================================
- * Event codes passed to event_cb
- * ========================================================================= */
+/* Event codes passed to event_cb */
 #define WM_EVENT_KEY_DOWN   0x00000001u
 #define WM_EVENT_KEY_UP     0x00000002u
+#define WM_EVENT_KEY_EXT    0x00000004u  /* full 32-bit keycode in low 31 bits; bit 31 = break */
 #define WM_EVENT_FOCUS_IN   0x00000010u
 #define WM_EVENT_FOCUS_OUT  0x00000020u
 #define WM_EVENT_CLOSE      0x00000100u
 #define WM_EVENT_RESIZE     0x00000200u
 #define WM_EVENT_MOVE       0x00000400u
 #define WM_EVENT_CLICK      0x00001000u  /* left mouse click inside window without dragging */
+#define WM_EVENT_SHORTCUT   0x00002000u  /* custom registered shortcut fired (data = tag) */
 
-/* =========================================================================
- * Forward declaration
- * ========================================================================= */
 typedef struct wm_window wm_window_t;
 
-/* =========================================================================
- * Callback signatures
- * ========================================================================= */
+/* Callback signatures */
 typedef void (*wm_draw_cb_t) (wm_window_t *win);
 typedef void (*wm_event_cb_t)(wm_window_t *win, uint32_t event, uint32_t data);
 
-/* =========================================================================
- * Window options – pass to wm_create_window()
- * ========================================================================= */
+/* Window options passed to wm_create_window() */
 typedef struct {
     int16_t  x, y;
     uint16_t w, h;
@@ -121,9 +113,7 @@ typedef struct {
     .user_data   = NULL,              \
 }
 
-/* =========================================================================
- * Window structure
- * ========================================================================= */
+/* Window structure */
 struct wm_window {
     int16_t  x, y;
     uint16_t w, h;
@@ -160,11 +150,21 @@ struct wm_window {
 
     wm_window_t *prev;
     wm_window_t *next;
+
+    /* Kernel-only fields (kept at the end so the user-space layout of the
+     * fields above stays ABI compatible).
+     * OS-level bridge for raw graphics apps (Mode 13h / vga_gfx_flip*) that
+     * share a workspace with other processes: the kernel renders each such
+     * app into its own window instead of letting it draw fullscreen. */
+    bool     is_raw_gfx_bridge;
+    uint8_t *raw_lut;             /* dynamic 256-entry palette map (app -> WM DAC) */
+    uint8_t *raw_kbd_queue;       /* routed scancode queue */
+    size_t   raw_kbd_cap;
+    size_t   raw_kbd_head;
+    size_t   raw_kbd_tail;
 };
 
-/* =========================================================================
- * Session API  (video-mode lifecycle)
- * =========================================================================
+/* Session API (video-mode lifecycle)
  *
  * wm_session_start() — NON-BLOCKING.
  *   Activates the session and switches to VGA Mode 13h only when required.
@@ -189,9 +189,7 @@ void wm_session_run(void);     /* blocking (animated single-app mode) */
 void wm_session_stop(void);
 bool wm_session_active(void);
 
-/* =========================================================================
- * Core window API
- * ========================================================================= */
+/* Core window API */
 
 /** wm_init - (Re)initialise window list without entering video mode. */
 void wm_init(void);
@@ -213,6 +211,7 @@ void         wm_focus_prev(void);
 
 void wm_invalidate(wm_window_t *win);
 void wm_invalidate_all(void);
+void wm_notify_window_event(wm_window_t *win, uint32_t event, uint32_t data);
 
 void wm_set_fullscreen(wm_window_t *win, bool enable);
 void wm_minimize(wm_window_t *win);
@@ -235,19 +234,17 @@ bool wm_dispatch_key(uint8_t scancode);
  */
 void wm_compose(uint8_t *backbuf);
 
-/* =========================================================================
- * Drawing helpers  (operate on any uint8_t pixel buffer)
- * ========================================================================= */
+/* Drawing helpers (operate on any uint8_t pixel buffer) */
 void wm_buf_put_pixel   (uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, uint8_t color);
 void wm_buf_draw_line   (uint8_t *buf, uint16_t bw, uint16_t bh, int x0, int y0, int x1, int y1, uint8_t color);
 void wm_buf_fill_rect   (uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, int w, int h, uint8_t color);
 void wm_buf_draw_rect   (uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, int w, int h, uint8_t color);
 void wm_buf_draw_char   (uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, char c,         uint8_t color);
+void wm_buf_draw_char_bg(uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, char c,         uint8_t fg, uint8_t bg);
 void wm_buf_draw_string (uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, const char *str, uint8_t color);
+void wm_buf_draw_string_bg(uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, const char *str, uint8_t fg, uint8_t bg);
 
-/* =========================================================================
- * Compositor tick  (called from terminal_console each kernel loop iteration)
- * =========================================================================
+/* Compositor tick (called from terminal_console each kernel loop iteration)
  *
  * Called by terminal_console() and other kernel/process paths. When
  * applicable, the tick processes input and composes/flips a frame; overlay
@@ -256,6 +253,22 @@ void wm_buf_draw_string (uint8_t *buf, uint16_t bw, uint16_t bh, int x, int y, c
  */
 void wm_compositor_tick(void);
 void wm_raw_gfx_overlay_tick(void);
+void wm_terminal_putc(char c, uint8_t fg, uint8_t bg);
+
+/* Raw graphics bridge (kernel-internal)
+ * Used by vga_gfx / keyboard so that any raw graphics application running
+ * in a shared workspace (`run a && b`) is shown in its own non-overlapping
+ * window, with its own palette and its own keyboard queue.
+ */
+struct process;
+wm_window_t *wm_ensure_raw_gfx_window(struct process *proc);
+void         wm_present_raw_gfx_process(struct process *proc, const uint8_t *buf,
+                                        int src_w, int src_h);
+void         wm_raw_gfx_set_palette(struct process *proc, uint8_t idx,
+                                    uint8_t r, uint8_t g, uint8_t b);
+bool         wm_has_raw_gfx_window_for_pid(uint32_t pid);
+void         wm_destroy_raw_gfx_window_for_pid(uint32_t pid);
+uint8_t      wm_raw_gfx_get_scancode(struct process *proc);
 
 /**
  * Get current display/compositor screen bounds in pixels.

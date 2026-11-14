@@ -1,192 +1,60 @@
 #include <stdio.h>
 #include <vga.h>
 #include <vga_gfx.h>
+#include <wm.h>
 #include <ioport.h>
 #include <kernel/terminal.h>
 #include <kernel/driver.h>
 #include <kernel/process.h>
+#include <kernel/smp.h>
+#include <kernel/utf.h>
 #include <memory/kmalloc.h>
 #include <string.h>
 
-// Simple spinlock to prevent race conditions during VGA output
 static volatile uint8_t output_lock = 0;
 
 bool putchar_is_locked(void) {
-    return output_lock != 0;
+    return __atomic_load_n(&output_lock, __ATOMIC_RELAXED) != 0;
 }
 
 void putchar_unlock(void) {
-    output_lock = 0;
+    __atomic_clear(&output_lock, __ATOMIC_RELEASE);
 }
 
-static void acquire_output_lock(void) {
-    while (__sync_lock_test_and_set(&output_lock, 1)) {
-        if (process_is_batch_active() && process_in_process_context()) {
+static uint32_t acquire_output_lock(void) {
+    for (;;) {
+        uint32_t flags = irq_save();
+        if (!__atomic_test_and_set(&output_lock, __ATOMIC_ACQUIRE)) {
+            return flags;
+        }
+        irq_restore(flags);
+        if ((flags & 0x200u) && process_is_batch_active() && process_in_process_context()) {
             process_yield();
-        }
-    }
-}
-
-static void release_output_lock(void) {
-    __sync_lock_release(&output_lock);
-}
-
-static char *s_stdout_redir_buf = NULL;
-static size_t s_stdout_redir_len = 0;
-static size_t s_stdout_redir_cap = 0;
-static bool s_stdout_redir_active = false;
-
-void stdout_redirect_start(void) {
-    if (s_stdout_redir_buf) {
-        kfree(s_stdout_redir_buf);
-        s_stdout_redir_buf = NULL;
-    }
-    s_stdout_redir_len = 0;
-    s_stdout_redir_cap = 256;
-    s_stdout_redir_buf = (char *)kmalloc(s_stdout_redir_cap);
-    if (s_stdout_redir_buf) {
-        s_stdout_redir_buf[0] = '\0';
-    }
-    s_stdout_redir_active = true;
-}
-
-void stdout_redirect_end(char **out_buf, size_t *out_len) {
-    s_stdout_redir_active = false;
-    if (s_stdout_redir_buf) {
-        s_stdout_redir_buf[s_stdout_redir_len] = '\0';
-    }
-    if (out_buf) *out_buf = s_stdout_redir_buf;
-    else if (s_stdout_redir_buf) kfree(s_stdout_redir_buf);
-
-    if (out_len) *out_len = s_stdout_redir_len;
-
-    s_stdout_redir_buf = NULL;
-    s_stdout_redir_len = 0;
-    s_stdout_redir_cap = 0;
-}
-
-bool stdout_is_redirected(void) {
-    return s_stdout_redir_active;
-}
-
-/**
- * Output a single character to VGA memory at cursor position
- */
-void putchar(char c) {
-    putchar_color(c, VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-}
-
-void putchar_color(char c, uint8_t fg, uint8_t bg) {
-    if (s_stdout_redir_active) {
-        if (s_stdout_redir_len + 2 > s_stdout_redir_cap) {
-            size_t ncap = s_stdout_redir_cap ? s_stdout_redir_cap * 2 : 256;
-            char *nb = (char *)kmalloc(ncap);
-            if (nb) {
-                if (s_stdout_redir_buf) {
-                    memcpy(nb, s_stdout_redir_buf, s_stdout_redir_len);
-                    kfree(s_stdout_redir_buf);
-                }
-                s_stdout_redir_buf = nb;
-                s_stdout_redir_cap = ncap;
-            }
-        }
-        if (s_stdout_redir_buf && s_stdout_redir_len + 1 < s_stdout_redir_cap) {
-            s_stdout_redir_buf[s_stdout_redir_len++] = c;
-            s_stdout_redir_buf[s_stdout_redir_len] = '\0';
-        }
-        return;
-    }
-
-    serial_putc(c);
-
-    process_t *curr = process_get_current();
-    if (process_is_batch_active() && !process_get_separate_windows() && curr && !curr->wants_graphics && !curr->is_wm_app) {
-        if (curr->text_output_len + 2 > curr->text_output_cap) {
-            uint32_t ncap = curr->text_output_cap ? curr->text_output_cap * 2 : 256;
-            char *nb = (char *)kmalloc(ncap);
-            if (nb) {
-                if (curr->text_output_buf) {
-                    memcpy(nb, curr->text_output_buf, curr->text_output_len);
-                    kfree(curr->text_output_buf);
-                }
-                curr->text_output_buf = nb;
-                curr->text_output_cap = ncap;
-            }
-        }
-        if (curr->text_output_buf && curr->text_output_len + 1 < curr->text_output_cap) {
-            curr->text_output_buf[curr->text_output_len++] = c;
-            curr->text_output_buf[curr->text_output_len] = '\0';
-        }
-    }
-
-    bool has_virtual = (process_get_separate_windows() && curr != NULL && curr->text_vram_backup != NULL);
-    process_t *active_disp = process_get_separate_windows() ? process_get_displayed_foreground() : process_get_foreground();
-    bool is_fg = (!has_virtual || curr == active_disp);
-
-    if (vga_is_graphics_mode()) {
-        if (!has_virtual) {
-            c = driver_dispatch_char_output(c);
-            return;
-        }
-    }
-
-    if (is_fg && !vga_is_graphics_mode()) {
-        if (terminal_get_bottom_buffer_count() > 0) {
-            terminal_return_to_present();
-        }
-        terminal_on_external_output();
-    }
-    acquire_output_lock();
-
-    volatile uint16_t *vga = has_virtual ? curr->text_vram_backup : VGA_MEMORY;
-    uint16_t cursor = has_virtual ? curr->text_cursor_pos : vga_get_cursor_position();
-    uint16_t top_row = VGA_START_CURSOR_POSITION / VGA_WIDTH;
-    uint16_t terminal_rows = VGA_HEIGHT - top_row;
-    uint16_t terminal_bottom = (top_row + terminal_rows) * VGA_WIDTH;
-    uint16_t last_line_start = (top_row + terminal_rows - 1) * VGA_WIDTH;
-
-    c = driver_dispatch_char_output(c);
-
-    static char utf8_buf[4];
-    static uint8_t utf8_len = 0;
-    static uint8_t utf8_expected = 0;
-
-    unsigned char uc = (unsigned char)c;
-
-    if (utf8_len > 0) {
-        /* Accumulate continuation byte */
-        utf8_buf[utf8_len++] = c;
-        if (utf8_len < utf8_expected) {
-            release_output_lock();
-            return;
-        }
-
-        /* Full UTF-8 sequence received */
-        size_t b = 0;
-        uint8_t glyph = utf8_to_vga_glyph(utf8_buf, utf8_len, &b);
-        utf8_len = 0;
-        utf8_expected = 0;
-        c = (char)glyph;
-    } else if ((uc & 0x80) != 0) {
-        /* Start of UTF-8 multi-byte sequence */
-        if ((uc & 0xE0) == 0xC0) {
-            utf8_expected = 2;
-        } else if ((uc & 0xF0) == 0xE0) {
-            utf8_expected = 3;
-        } else if ((uc & 0xF8) == 0xF0) {
-            utf8_expected = 4;
         } else {
-            utf8_expected = 1;
-        }
-
-        if (utf8_expected > 1) {
-            utf8_buf[0] = c;
-            utf8_len = 1;
-            release_output_lock();
-            return;
+            __builtin_ia32_pause();
         }
     }
+}
 
+static void release_output_lock(uint32_t flags) {
+    __atomic_clear(&output_lock, __ATOMIC_RELEASE);
+    irq_restore(flags);
+}
+
+static uint16_t putchar_scroll_line(process_t *curr, bool has_virtual, bool is_fg,
+                                    uint16_t last_line_start) {
+    if (has_virtual && (!is_fg || vga_is_graphics_mode())) {
+        process_workspace_auto_scroll(curr);
+    } else {
+        terminal_auto_scroll();
+    }
+    return last_line_start;
+}
+
+static uint16_t putchar_render_glyph(process_t *curr, bool has_virtual, bool is_fg,
+                                     volatile uint16_t *vga, uint16_t cursor,
+                                     uint16_t terminal_bottom, uint16_t last_line_start,
+                                     char c, uint8_t fg, uint8_t bg) {
     if (cursor < VGA_START_CURSOR_POSITION || cursor >= VGA_WIDTH * VGA_HEIGHT) {
         cursor = VGA_START_CURSOR_POSITION;
     }
@@ -212,31 +80,13 @@ void putchar_color(char c, uint8_t fg, uint8_t bg) {
             spaces = 8;
         }
         if (cursor + spaces >= terminal_bottom) {
-            if (has_virtual) {
-                if (is_fg && !vga_is_graphics_mode()) {
-                    terminal_auto_scroll();
-                } else {
-                    process_workspace_auto_scroll(curr);
-                }
-            } else {
-                terminal_auto_scroll();
-            }
-            cursor = last_line_start;
+            cursor = putchar_scroll_line(curr, has_virtual, is_fg, last_line_start);
         } else {
             cursor += spaces;
         }
     } else {
         if (cursor >= terminal_bottom) {
-            if (has_virtual) {
-                if (is_fg && !vga_is_graphics_mode()) {
-                    terminal_auto_scroll();
-                } else {
-                    process_workspace_auto_scroll(curr);
-                }
-            } else {
-                terminal_auto_scroll();
-            }
-            cursor = last_line_start;
+            cursor = putchar_scroll_line(curr, has_virtual, is_fg, last_line_start);
         }
         vga[cursor] = vga_entry((unsigned char)c, fg, bg);
         if (has_virtual && is_fg && !vga_is_graphics_mode()) {
@@ -246,27 +96,97 @@ void putchar_color(char c, uint8_t fg, uint8_t bg) {
     }
 
     if (cursor >= terminal_bottom) {
-        if (has_virtual) {
-            if (is_fg && !vga_is_graphics_mode()) {
-                terminal_auto_scroll();
-            } else {
-                process_workspace_auto_scroll(curr);
-            }
-        } else {
-            terminal_auto_scroll();
-        }
-        cursor = last_line_start;
+        cursor = putchar_scroll_line(curr, has_virtual, is_fg, last_line_start);
     }
 
     if (cursor >= VGA_WIDTH * VGA_HEIGHT) {
         cursor = VGA_START_CURSOR_POSITION;
     }
+    return cursor;
+}
+
+void putchar(char c) {
+    putchar_color(c, VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
+}
+
+void putchar_color(char c, uint8_t fg, uint8_t bg) {
+    serial_putc(c);
+
+    process_t *curr = process_get_current();
+    bool has_virtual = (process_get_separate_windows() && curr != NULL && curr->text_vram_backup != NULL);
+    process_t *active_disp = process_get_separate_windows() ? process_get_displayed_foreground() : process_get_foreground();
+    bool is_fg = (!has_virtual || curr == active_disp ||
+                  (curr != NULL && active_disp != NULL && curr->window_id == active_disp->window_id));
+
+    uint32_t irq_flags = acquire_output_lock();
+
+    if (process_is_batch_active() && !process_get_separate_windows() && curr && !curr->wants_graphics && !curr->is_wm_app) {
+        if (curr->text_output_len + 2 > curr->text_output_cap) {
+            uint32_t ncap = curr->text_output_cap ? curr->text_output_cap * 2 : 256;
+            char *nb = (char *)krealloc(curr->text_output_buf, ncap);
+            if (nb) {
+                curr->text_output_buf = nb;
+                curr->text_output_cap = ncap;
+            }
+        }
+        if (curr->text_output_buf && curr->text_output_len + 1 < curr->text_output_cap) {
+            curr->text_output_buf[curr->text_output_len++] = c;
+            curr->text_output_buf[curr->text_output_len] = '\0';
+        }
+        if (!vga_is_graphics_mode()) {
+            curr->text_vga_written_len = curr->text_output_len;
+        }
+    }
+
+    if (vga_is_graphics_mode() && !has_virtual) {
+        release_output_lock(irq_flags);
+        driver_dispatch_char_output(c);
+        return;
+    }
+
+    if (is_fg && !vga_is_graphics_mode()) {
+        if (terminal_get_bottom_buffer_count() > 0) {
+            terminal_return_to_present();
+        }
+        terminal_on_external_output();
+    }
+
+    volatile uint16_t *vga = has_virtual ? curr->text_vram_backup : VGA_MEMORY;
+    uint16_t cursor = has_virtual ? curr->text_cursor_pos : vga_get_cursor_position();
+    uint16_t top_row = VGA_START_CURSOR_POSITION / VGA_WIDTH;
+    uint16_t terminal_rows = VGA_HEIGHT - top_row;
+    uint16_t terminal_bottom = (top_row + terminal_rows) * VGA_WIDTH;
+    uint16_t last_line_start = (top_row + terminal_rows - 1) * VGA_WIDTH;
+
+    c = driver_dispatch_char_output(c);
+
+    static utf_stream_t k_utf_stream = {0};
+    utf_stream_t *ustream = curr ? &curr->utf_stream : &k_utf_stream;
+
+    uint64_t codepoint = 0;
+    if (!utf_stream_push_byte(ustream, (uint8_t)c, &codepoint)) {
+        release_output_lock(irq_flags);
+        return;
+    }
+
+    uint8_t out_glyph = utf_codepoint_to_vga_glyph(codepoint);
+    cursor = putchar_render_glyph(curr, has_virtual, is_fg, vga, cursor,
+                                  terminal_bottom, last_line_start,
+                                  (char)out_glyph, fg, bg);
+
+    while (utf_stream_flush_next(ustream, &codepoint)) {
+        out_glyph = utf_codepoint_to_vga_glyph(codepoint);
+        cursor = putchar_render_glyph(curr, has_virtual, is_fg, vga, cursor,
+                                      terminal_bottom, last_line_start,
+                                      (char)out_glyph, fg, bg);
+    }
 
     if (has_virtual) {
         curr->text_cursor_pos = cursor;
+        process_sync_workspace_text_state(curr);
     }
     if (is_fg && !vga_is_graphics_mode()) {
         vga_set_cursor(cursor);
     }
-    release_output_lock();
+    release_output_lock(irq_flags);
 }

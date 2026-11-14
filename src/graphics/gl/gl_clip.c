@@ -19,6 +19,55 @@ static void interpolate_vertex(gl_vertex_t *out, const gl_vertex_t *v0, const gl
     }
 }
 
+static float plane_distance(const gl_vertex_t *v, int plane_idx) {
+    switch (plane_idx) {
+        case 0: return v->clip[3] + v->clip[0]; /* Left:   w + x >= 0 */
+        case 1: return v->clip[3] - v->clip[0]; /* Right:  w - x >= 0 */
+        case 2: return v->clip[3] + v->clip[1]; /* Bottom: w + y >= 0 */
+        case 3: return v->clip[3] - v->clip[1]; /* Top:    w - y >= 0 */
+        case 4: return v->clip[3] + v->clip[2]; /* Near:   w + z >= 0 */
+        case 5: return v->clip[3] - v->clip[2]; /* Far:    w - z >= 0 */
+        default: return 0.0f;
+    }
+}
+
+static void ndc_to_screen_vertex(const GLContext *ctx, gl_vertex_t *v) {
+    float w = v->clip[3];
+    if (w == 0.0f) w = 0.00001f;
+
+    float inv_w = 1.0f / w;
+    float half_w = (float)ctx->vp_w * 0.5f;
+    float half_h = (float)ctx->vp_h * 0.5f;
+    float center_x = (float)ctx->vp_x + half_w;
+    float center_y = (float)ctx->vp_y + half_h;
+    float z_ndc = v->clip[2] * inv_w;
+
+    v->inv_w  = inv_w;
+    v->win[0] = center_x + (v->clip[0] * inv_w) * half_w;
+    v->win[1] = center_y - (v->clip[1] * inv_w) * half_h; /* Y inverted for screen coordinates */
+    v->win[2] = (float)ctx->depth_near +
+                ((z_ndc + 1.0f) * 0.5f) * (float)(ctx->depth_far - ctx->depth_near);
+}
+
+static bool should_cull_triangle(const GLContext *ctx, const gl_vertex_t *v0,
+                                 const gl_vertex_t *v1, const gl_vertex_t *v2) {
+    if (!ctx->cull_face_enabled) return false;
+    if (ctx->cull_face_mode == GL_FRONT_AND_BACK) return true;
+
+    float ax = v1->win[0] - v0->win[0];
+    float ay = v1->win[1] - v0->win[1];
+    float bx = v2->win[0] - v0->win[0];
+    float by = v2->win[1] - v0->win[1];
+    float cross = ax * by - ay * bx;
+    if (cross == 0.0f) return true;
+
+    /* Screen Y grows downward, so a CCW triangle in NDC has negative 2D cross product. */
+    bool is_front = (ctx->front_face == GL_CCW) ? (cross < 0.0f) : (cross > 0.0f);
+    if (ctx->cull_face_mode == GL_BACK) return !is_front;
+    if (ctx->cull_face_mode == GL_FRONT) return is_front;
+    return false;
+}
+
 /* Clip polygon against one plane: dot(P, plane) >= 0 */
 static int clip_against_plane(const gl_vertex_t *in, int n_in, gl_vertex_t *out, int plane_idx) {
     int n_out = 0;
@@ -28,15 +77,8 @@ static int clip_against_plane(const gl_vertex_t *in, int n_in, gl_vertex_t *out,
         const gl_vertex_t *v0 = &in[i];
         const gl_vertex_t *v1 = &in[(i + 1) % n_in];
 
-        float d0 = 0.0f, d1 = 0.0f;
-        switch (plane_idx) {
-            case 0: d0 = v0->clip[3] + v0->clip[0]; d1 = v1->clip[3] + v1->clip[0]; break; /* Left:   w + x >= 0 */
-            case 1: d0 = v0->clip[3] - v0->clip[0]; d1 = v1->clip[3] - v1->clip[0]; break; /* Right:  w - x >= 0 */
-            case 2: d0 = v0->clip[3] + v0->clip[1]; d1 = v1->clip[3] + v1->clip[1]; break; /* Bottom: w + y >= 0 */
-            case 3: d0 = v0->clip[3] - v0->clip[1]; d1 = v1->clip[3] - v1->clip[1]; break; /* Top:    w - y >= 0 */
-            case 4: d0 = v0->clip[3] + v0->clip[2]; d1 = v1->clip[3] + v1->clip[2]; break; /* Near:   w + z >= 0 */
-            case 5: d0 = v0->clip[3] - v0->clip[2]; d1 = v1->clip[3] - v1->clip[2]; break; /* Far:    w - z >= 0 */
-        }
+        float d0 = plane_distance(v0, plane_idx);
+        float d1 = plane_distance(v1, plane_idx);
 
         bool in0 = (d0 >= 0.0f);
         bool in1 = (d1 >= 0.0f);
@@ -55,10 +97,62 @@ static int clip_against_plane(const gl_vertex_t *in, int n_in, gl_vertex_t *out,
     return n_out;
 }
 
+void gl_clip_and_render_point(GLContext *ctx, const gl_vertex_t *v0) {
+    if (!ctx || !v0) return;
+
+    float w = v0->clip[3];
+    if (w <= 0.0f) return;
+    if (v0->clip[0] < -w || v0->clip[0] > w ||
+        v0->clip[1] < -w || v0->clip[1] > w ||
+        v0->clip[2] < -w || v0->clip[2] > w) {
+        return;
+    }
+
+    gl_vertex_t pt = *v0;
+    ndc_to_screen_vertex(ctx, &pt);
+    gl_rasterize_point(ctx, &pt);
+}
+
+void gl_clip_and_render_line(GLContext *ctx, const gl_vertex_t *v0, const gl_vertex_t *v1) {
+    if (!ctx || !v0 || !v1) return;
+
+    float t0 = 0.0f;
+    float t1 = 1.0f;
+
+    for (int p = 0; p < 6; p++) {
+        float d0 = plane_distance(v0, p);
+        float d1 = plane_distance(v1, p);
+
+        if (d0 < 0.0f && d1 < 0.0f) return;
+
+        float denom = d0 - d1;
+        if (denom != 0.0f) {
+            float t = d0 / denom;
+            if (d0 < 0.0f) {
+                if (t > t0) t0 = t;
+            } else if (d1 < 0.0f) {
+                if (t < t1) t1 = t;
+            }
+            if (t0 > t1) return;
+        }
+    }
+
+    gl_vertex_t a, b;
+    if (t0 == 0.0f) a = *v0;
+    else interpolate_vertex(&a, v0, v1, t0);
+
+    if (t1 == 1.0f) b = *v1;
+    else interpolate_vertex(&b, v0, v1, t1);
+
+    ndc_to_screen_vertex(ctx, &a);
+    ndc_to_screen_vertex(ctx, &b);
+    gl_rasterize_line(ctx, &a, &b);
+}
+
 void gl_clip_and_render_polygon(GLContext *ctx, gl_vertex_t *verts, int nverts) {
     if (!ctx || nverts < 3) return;
 
-    /* High-performance fast path for standard 3D triangles */
+    /* Fast path for standard 3D triangles completely outside or inside the frustum */
     if (nverts == 3) {
         float w0 = verts[0].clip[3], w1 = verts[1].clip[3], w2 = verts[2].clip[3];
 
@@ -84,42 +178,11 @@ void gl_clip_and_render_polygon(GLContext *ctx, gl_vertex_t *verts, int nverts) 
             verts[2].clip[1] >= -w2 && verts[2].clip[1] <= w2 &&
             verts[2].clip[2] >= -w2 && verts[2].clip[2] <= w2) {
 
-            float half_w = (float)ctx->vp_w * 0.5f;
-            float half_h = (float)ctx->vp_h * 0.5f;
-            float center_x = (float)ctx->vp_x + half_w;
-            float center_y = (float)ctx->vp_y + half_h;
-
-            float inv_w0 = 1.0f / w0;
-            verts[0].inv_w = inv_w0;
-            verts[0].win[0] = center_x + (verts[0].clip[0] * inv_w0) * half_w;
-            verts[0].win[1] = center_y - (verts[0].clip[1] * inv_w0) * half_h;
-            verts[0].win[2] = ((verts[0].clip[2] * inv_w0) + 1.0f) * 0.5f;
-
-            float inv_w1 = 1.0f / w1;
-            verts[1].inv_w = inv_w1;
-            verts[1].win[0] = center_x + (verts[1].clip[0] * inv_w1) * half_w;
-            verts[1].win[1] = center_y - (verts[1].clip[1] * inv_w1) * half_h;
-            verts[1].win[2] = ((verts[1].clip[2] * inv_w1) + 1.0f) * 0.5f;
-
-            float inv_w2 = 1.0f / w2;
-            verts[2].inv_w = inv_w2;
-            verts[2].win[0] = center_x + (verts[2].clip[0] * inv_w2) * half_w;
-            verts[2].win[1] = center_y - (verts[2].clip[1] * inv_w2) * half_h;
-            verts[2].win[2] = ((verts[2].clip[2] * inv_w2) + 1.0f) * 0.5f;
-
-            /* Early Back-face culling check */
-            if (ctx->cull_face_enabled) {
-                float ax = verts[1].win[0] - verts[0].win[0];
-                float ay = verts[1].win[1] - verts[0].win[1];
-                float bx = verts[2].win[0] - verts[0].win[0];
-                float by = verts[2].win[1] - verts[0].win[1];
-                float cross = ax * by - ay * bx;
-
-                bool is_front = (ctx->front_face == GL_CCW) ? (cross > 0.0f) : (cross < 0.0f);
-                if (ctx->cull_face_mode == GL_BACK && !is_front) return;
-                if (ctx->cull_face_mode == GL_FRONT && is_front) return;
-                if (ctx->cull_face_mode == GL_FRONT_AND_BACK) return;
+            for (int i = 0; i < 3; i++) {
+                ndc_to_screen_vertex(ctx, &verts[i]);
             }
+
+            if (should_cull_triangle(ctx, &verts[0], &verts[1], &verts[2])) return;
 
             gl_rasterize_triangle(ctx, &verts[0], &verts[1], &verts[2]);
             return;
@@ -165,35 +228,11 @@ void gl_clip_and_render_polygon(GLContext *ctx, gl_vertex_t *verts, int nverts) 
         curr_out = tmp;
     }
 
-    /* Transform remaining clipped vertices to screen coordinates */
-    float half_w = (float)ctx->vp_w * 0.5f;
-    float half_h = (float)ctx->vp_h * 0.5f;
-    float center_x = (float)ctx->vp_x + half_w;
-    float center_y = (float)ctx->vp_y + half_h;
-
     for (int i = 0; i < count; i++) {
-        gl_vertex_t *v = &curr_in[i];
-        float w = v->clip[3];
-        if (w == 0.0f) w = 0.00001f;
-        v->inv_w = 1.0f / w;
-        v->win[0] = center_x + (v->clip[0] * v->inv_w) * half_w;
-        v->win[1] = center_y - (v->clip[1] * v->inv_w) * half_h; /* Y inverted for screen coordinates */
-        v->win[2] = ((v->clip[2] * v->inv_w) + 1.0f) * 0.5f;
+        ndc_to_screen_vertex(ctx, &curr_in[i]);
     }
 
-    /* Back-face culling check */
-    if (ctx->cull_face_enabled) {
-        float ax = curr_in[1].win[0] - curr_in[0].win[0];
-        float ay = curr_in[1].win[1] - curr_in[0].win[1];
-        float bx = curr_in[2].win[0] - curr_in[0].win[0];
-        float by = curr_in[2].win[1] - curr_in[0].win[1];
-        float cross = ax * by - ay * bx;
-
-        bool is_front = (ctx->front_face == GL_CCW) ? (cross > 0.0f) : (cross < 0.0f);
-        if (ctx->cull_face_mode == GL_BACK && !is_front) return;
-        if (ctx->cull_face_mode == GL_FRONT && is_front) return;
-        if (ctx->cull_face_mode == GL_FRONT_AND_BACK) return;
-    }
+    if (should_cull_triangle(ctx, &curr_in[0], &curr_in[1], &curr_in[2])) return;
 
     /* Triangle fan rasterization */
     for (int i = 1; i < count - 1; i++) {

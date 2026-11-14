@@ -1,72 +1,36 @@
 #include <GL/gl.h>
 #include <GL/ipo_gl.h>
-#include <GL/gl_math.h>
 #include <memory/kmalloc.h>
+#include <limits.h>
 #include <string.h>
 
 void glBegin(GLenum mode) {
     GLContext *ctx = gl_get_current_context();
     if (!ctx) return;
+    if (ctx->in_begin) {
+        ctx->error_flag = GL_INVALID_OPERATION;
+        return;
+    }
     ctx->prim_mode = mode;
     ctx->in_begin  = true;
     ctx->vert_buf.count = 0;
-}
-
-static void evaluate_vertex_lighting(GLContext *ctx, gl_vertex_t *v) {
-    if (!ctx->lighting_enabled) return;
-
-    float r = ctx->front_material.ambient[0];
-    float g = ctx->front_material.ambient[1];
-    float b = ctx->front_material.ambient[2];
-    float a = ctx->cur_color[3];
-
-    float nx = v->norm[0], ny = v->norm[1], nz = v->norm[2];
-    if (ctx->normalize_normals) {
-        float len = gl_sqrtf(nx * nx + ny * ny + nz * nz);
-        if (len > 0.0f) { nx /= len; ny /= len; nz /= len; }
-    }
-
-    for (size_t i = 0; i < ctx->lights_count; i++) {
-        gl_light_t *l = &ctx->lights[i];
-        if (!l->enabled) continue;
-
-        float lx = l->position[0];
-        float ly = l->position[1];
-        float lz = l->position[2];
-        float lw = l->position[3];
-
-        if (lw != 0.0f) {
-            lx -= v->eye[0];
-            ly -= v->eye[1];
-            lz -= v->eye[2];
-            float dist = gl_sqrtf(lx * lx + ly * ly + lz * lz);
-            if (dist > 0.0f) { lx /= dist; ly /= dist; lz /= dist; }
-        }
-
-        /* Lambertian diffuse: dot(N, L) */
-        float n_dot_l = nx * lx + ny * ly + nz * lz;
-        if (n_dot_l < 0.0f) n_dot_l = 0.0f;
-
-        r += l->ambient[0] * ctx->front_material.ambient[0] + l->diffuse[0] * ctx->front_material.diffuse[0] * n_dot_l;
-        g += l->ambient[1] * ctx->front_material.ambient[1] + l->diffuse[1] * ctx->front_material.diffuse[1] * n_dot_l;
-        b += l->ambient[2] * ctx->front_material.ambient[2] + l->diffuse[2] * ctx->front_material.diffuse[2] * n_dot_l;
-    }
-
-    if (r > 1.0f) r = 1.0f;
-    if (g > 1.0f) g = 1.0f;
-    if (b > 1.0f) b = 1.0f;
-    v->color[0] = r; v->color[1] = g; v->color[2] = b; v->color[3] = a;
 }
 
 void glVertex4f(GLfloat x, GLfloat y, GLfloat z, GLfloat w) {
     GLContext *ctx = gl_get_current_context();
     if (!ctx || !ctx->in_begin) return;
 
-    /* Expand vertex buffer dynamically without limits */
     if (ctx->vert_buf.count >= ctx->vert_buf.capacity) {
-        int new_cap = ctx->vert_buf.capacity * 2;
+        if (ctx->vert_buf.capacity > INT_MAX / 2) {
+            ctx->error_flag = GL_OUT_OF_MEMORY;
+            return;
+        }
+        int new_cap = ctx->vert_buf.capacity ? ctx->vert_buf.capacity * 2 : 64;
         gl_vertex_t *new_data = krealloc(ctx->vert_buf.data, (size_t)new_cap * sizeof(gl_vertex_t));
-        if (!new_data) return;
+        if (!new_data) {
+            ctx->error_flag = GL_OUT_OF_MEMORY;
+            return;
+        }
         ctx->vert_buf.data = new_data;
         ctx->vert_buf.capacity = new_cap;
     }
@@ -75,7 +39,17 @@ void glVertex4f(GLfloat x, GLfloat y, GLfloat z, GLfloat w) {
     v->obj[0] = x; v->obj[1] = y; v->obj[2] = z; v->obj[3] = w;
 
     memcpy(v->color, ctx->cur_color, 4 * sizeof(GLfloat));
-    memcpy(v->tex,   ctx->cur_texcoord, 4 * sizeof(GLfloat));
+
+    GLfloat *tx = gl_matrix_current(&ctx->texture_stack);
+    if (tx) {
+        const GLfloat *tc = ctx->cur_texcoord;
+        v->tex[0] = tx[0] * tc[0] + tx[4] * tc[1] + tx[8]  * tc[2] + tx[12] * tc[3];
+        v->tex[1] = tx[1] * tc[0] + tx[5] * tc[1] + tx[9]  * tc[2] + tx[13] * tc[3];
+        v->tex[2] = tx[2] * tc[0] + tx[6] * tc[1] + tx[10] * tc[2] + tx[14] * tc[3];
+        v->tex[3] = tx[3] * tc[0] + tx[7] * tc[1] + tx[11] * tc[2] + tx[15] * tc[3];
+    } else {
+        memcpy(v->tex, ctx->cur_texcoord, 4 * sizeof(GLfloat));
+    }
 
     /* Transform normal by ModelView */
     GLfloat *mv = gl_matrix_current(&ctx->modelview_stack);
@@ -94,7 +68,7 @@ void glVertex4f(GLfloat x, GLfloat y, GLfloat z, GLfloat w) {
         memcpy(v->eye, v->obj, 4 * sizeof(GLfloat));
     }
 
-    evaluate_vertex_lighting(ctx, v);
+    gl_evaluate_vertex_lighting(ctx, v);
 
     /* clip = Projection * eye */
     GLfloat *pj = gl_matrix_current(&ctx->projection_stack);
@@ -180,40 +154,52 @@ void glTexCoord2fv(const GLfloat *v) {
 
 void glEnd(void) {
     GLContext *ctx = gl_get_current_context();
-    if (!ctx || !ctx->in_begin) return;
+    if (!ctx) return;
+    if (!ctx->in_begin) {
+        ctx->error_flag = GL_INVALID_OPERATION;
+        return;
+    }
     ctx->in_begin = false;
 
     int n = ctx->vert_buf.count;
     gl_vertex_t *v = ctx->vert_buf.data;
+    gl_vertex_t scratch[4];
 
     switch (ctx->prim_mode) {
         case GL_TRIANGLES:
             for (int i = 0; i + 2 < n; i += 3) {
-                gl_vertex_t tri[3] = { v[i], v[i+1], v[i+2] };
-                gl_clip_and_render_polygon(ctx, tri, 3);
+                scratch[0] = v[i]; scratch[1] = v[i + 1]; scratch[2] = v[i + 2];
+                gl_clip_and_render_polygon(ctx, scratch, 3);
             }
             break;
         case GL_QUADS:
             for (int i = 0; i + 3 < n; i += 4) {
-                gl_vertex_t quad[4] = { v[i], v[i+1], v[i+2], v[i+3] };
-                gl_clip_and_render_polygon(ctx, quad, 4);
+                scratch[0] = v[i]; scratch[1] = v[i + 1];
+                scratch[2] = v[i + 2]; scratch[3] = v[i + 3];
+                gl_clip_and_render_polygon(ctx, scratch, 4);
+            }
+            break;
+        case GL_QUAD_STRIP:
+            for (int i = 0; i + 3 < n; i += 2) {
+                scratch[0] = v[i]; scratch[1] = v[i + 1];
+                scratch[2] = v[i + 3]; scratch[3] = v[i + 2];
+                gl_clip_and_render_polygon(ctx, scratch, 4);
             }
             break;
         case GL_TRIANGLE_STRIP:
             for (int i = 0; i + 2 < n; i++) {
-                gl_vertex_t tri[3];
                 if (i & 1) {
-                    tri[0] = v[i+1]; tri[1] = v[i]; tri[2] = v[i+2];
+                    scratch[0] = v[i + 1]; scratch[1] = v[i]; scratch[2] = v[i + 2];
                 } else {
-                    tri[0] = v[i]; tri[1] = v[i+1]; tri[2] = v[i+2];
+                    scratch[0] = v[i]; scratch[1] = v[i + 1]; scratch[2] = v[i + 2];
                 }
-                gl_clip_and_render_polygon(ctx, tri, 3);
+                gl_clip_and_render_polygon(ctx, scratch, 3);
             }
             break;
         case GL_TRIANGLE_FAN:
             for (int i = 1; i + 1 < n; i++) {
-                gl_vertex_t tri[3] = { v[0], v[i], v[i+1] };
-                gl_clip_and_render_polygon(ctx, tri, 3);
+                scratch[0] = v[0]; scratch[1] = v[i]; scratch[2] = v[i + 1];
+                gl_clip_and_render_polygon(ctx, scratch, 3);
             }
             break;
         case GL_POLYGON:
@@ -223,20 +209,34 @@ void glEnd(void) {
             break;
         case GL_LINES:
             for (int i = 0; i + 1 < n; i += 2) {
-                gl_clip_and_render_polygon(ctx, &v[i], 2);
+                gl_clip_and_render_line(ctx, &v[i], &v[i + 1]);
+            }
+            break;
+        case GL_LINE_STRIP:
+            for (int i = 0; i + 1 < n; i++) {
+                gl_clip_and_render_line(ctx, &v[i], &v[i + 1]);
+            }
+            break;
+        case GL_LINE_LOOP:
+            for (int i = 0; i + 1 < n; i++) {
+                gl_clip_and_render_line(ctx, &v[i], &v[i + 1]);
+            }
+            if (n >= 2) {
+                gl_clip_and_render_line(ctx, &v[n - 1], &v[0]);
             }
             break;
         case GL_POINTS:
             for (int i = 0; i < n; i++) {
-                gl_clip_and_render_polygon(ctx, &v[i], 1);
+                gl_clip_and_render_point(ctx, &v[i]);
             }
+            break;
+        default:
+            ctx->error_flag = GL_INVALID_ENUM;
             break;
     }
 }
 
-/* =========================================================================
- * Vertex Arrays (GL Specification)
- * ========================================================================= */
+/* Vertex Arrays */
 void glEnableClientState(GLenum array) {
     GLContext *ctx = gl_get_current_context();
     if (!ctx) return;

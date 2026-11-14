@@ -1,5 +1,5 @@
-#ifndef __GL_H__
-#define __GL_H__
+#ifndef IPO_GL_H
+#define IPO_GL_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -8,9 +8,7 @@
 extern "C" {
 #endif
 
-/* =========================================================================
- * GL Data Types
- * ========================================================================= */
+/* GL Data Types */
 typedef unsigned int   GLenum;
 typedef unsigned char  GLboolean;
 typedef unsigned int   GLbitfield;
@@ -27,9 +25,7 @@ typedef double         GLdouble;
 typedef double         GLclampd;
 typedef void           GLvoid;
 
-/* =========================================================================
- * Constants
- * ========================================================================= */
+/* Constants */
 #define GL_FALSE                          0
 #define GL_TRUE                           1
 
@@ -266,9 +262,7 @@ typedef void           GLvoid;
 #define GL_TEXTURE_MATRIX                 0x0BA8
 #define GL_SCISSOR_BOX                    0x0C10
 
-/* =========================================================================
- * Function Prototypes
- * ========================================================================= */
+/* Function Prototypes */
 
 /* State & Error */
 GLenum          glGetError(void);
@@ -402,4 +396,4 @@ void            glFinish(void);
 }
 #endif
 
-#endif /* __GL_H__ */
+#endif /* IPO_GL_H */

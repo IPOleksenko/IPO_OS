@@ -2,107 +2,27 @@
 #include <GL/ipo_gl.h>
 #include <GL/gl_math.h>
 
-void glPointSize(GLfloat size) {
-    GLContext *ctx = gl_get_current_context();
-    if (ctx && size > 0.0f) ctx->point_size = size;
-}
-
-void glLineWidth(GLfloat width) {
-    GLContext *ctx = gl_get_current_context();
-    if (ctx && width > 0.0f) ctx->line_width = width;
-}
-
-void glPolygonMode(GLenum face, GLenum mode) {
-    (void)face;
-    GLContext *ctx = gl_get_current_context();
-    if (!ctx) return;
-    if (mode == GL_POINT || mode == GL_LINE || mode == GL_FILL) {
-        ctx->polygon_mode = mode;
-    } else {
-        ctx->error_flag = GL_INVALID_ENUM;
+static float wrap_tex_coord(GLenum wrap_mode, float c) {
+    if (wrap_mode == GL_CLAMP || wrap_mode == GL_CLAMP_TO_EDGE) {
+        if (c < 0.0f) return 0.0f;
+        if (c > 1.0f) return 1.0f;
+        return c;
     }
+    /* GL_REPEAT */
+    c -= (float)gl_floor_to_int(c);
+    if (c < 0.0f) c += 1.0f;
+    if (c >= 1.0f) c -= 1.0f;
+    return c;
 }
 
-void glCullFace(GLenum mode) {
-    GLContext *ctx = gl_get_current_context();
-    if (!ctx) return;
-    if (mode == GL_FRONT || mode == GL_BACK || mode == GL_FRONT_AND_BACK) {
-        ctx->cull_face_mode = mode;
-    } else {
-        ctx->error_flag = GL_INVALID_ENUM;
+static int wrap_texel_index(GLenum wrap_mode, int idx, int limit) {
+    if (wrap_mode == GL_REPEAT) {
+        int r = idx % limit;
+        return (r < 0) ? (r + limit) : r;
     }
-}
-
-void glFrontFace(GLenum mode) {
-    GLContext *ctx = gl_get_current_context();
-    if (!ctx) return;
-    if (mode == GL_CW || mode == GL_CCW) {
-        ctx->front_face = mode;
-    } else {
-        ctx->error_flag = GL_INVALID_ENUM;
-    }
-}
-
-void glDepthFunc(GLenum func) {
-    GLContext *ctx = gl_get_current_context();
-    if (ctx) ctx->depth_func = func;
-}
-
-void glDepthMask(GLboolean flag) {
-    GLContext *ctx = gl_get_current_context();
-    if (ctx) ctx->depth_mask = flag;
-}
-
-void glAlphaFunc(GLenum func, GLclampf ref) {
-    GLContext *ctx = gl_get_current_context();
-    if (!ctx) return;
-    ctx->alpha_func = func;
-    ctx->alpha_ref  = ref;
-}
-
-void glBlendFunc(GLenum sfactor, GLenum dfactor) {
-    GLContext *ctx = gl_get_current_context();
-    if (!ctx) return;
-    ctx->blend_sfactor = sfactor;
-    ctx->blend_dfactor = dfactor;
-}
-
-void glBlendEquation(GLenum mode) {
-    GLContext *ctx = gl_get_current_context();
-    if (!ctx) return;
-    if (mode == GL_FUNC_ADD || mode == GL_FUNC_SUBTRACT ||
-        mode == GL_FUNC_REVERSE_SUBTRACT || mode == GL_MIN || mode == GL_MAX) {
-        ctx->blend_equation = mode;
-    } else {
-        ctx->error_flag = GL_INVALID_ENUM;
-    }
-}
-
-void glLogicOp(GLenum opcode) {
-    GLContext *ctx = gl_get_current_context();
-    if (!ctx) return;
-    ctx->logic_opcode = opcode;
-}
-
-void glStencilFunc(GLenum func, GLint ref, GLuint mask) {
-    GLContext *ctx = gl_get_current_context();
-    if (!ctx) return;
-    ctx->stencil_func = func;
-    ctx->stencil_ref  = ref;
-    ctx->stencil_mask = mask;
-}
-
-void glStencilOp(GLenum fail, GLenum zfail, GLenum zpass) {
-    GLContext *ctx = gl_get_current_context();
-    if (!ctx) return;
-    ctx->stencil_fail  = fail;
-    ctx->stencil_zfail = zfail;
-    ctx->stencil_zpass = zpass;
-}
-
-void glStencilMask(GLuint mask) {
-    GLContext *ctx = gl_get_current_context();
-    if (ctx) ctx->stencil_writemask = mask;
+    if (idx < 0) return 0;
+    if (idx >= limit) return limit - 1;
+    return idx;
 }
 
 /* Sample 2D texture with bilinear filtering and wrapping */
@@ -112,32 +32,17 @@ static uint32_t sample_tex2d(const gl_texture_t *tex, float s, float t) {
     int w = tex->width;
     int h = tex->height;
 
-    /* S wrapping */
-    if (tex->wrap_s == GL_CLAMP_TO_EDGE) {
-        if (s < 0.0f) s = 0.0f; else if (s > 1.0f) s = 1.0f;
-    } else if (tex->wrap_s == GL_REPEAT) {
-        s = s - (float)((int)s);
-        if (s < 0.0f) s += 1.0f;
-    }
+    s = wrap_tex_coord(tex->wrap_s, s);
+    t = wrap_tex_coord(tex->wrap_t, t);
 
-    /* T wrapping */
-    if (tex->wrap_t == GL_CLAMP_TO_EDGE) {
-        if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
-    } else if (tex->wrap_t == GL_REPEAT) {
-        t = t - (float)((int)t);
-        if (t < 0.0f) t += 1.0f;
+    if (tex->mag_filter == GL_NEAREST) {
+        int ix = wrap_texel_index(tex->wrap_s, gl_floor_to_int(s * (float)w), w);
+        int iy = wrap_texel_index(tex->wrap_t, gl_floor_to_int(t * (float)h), h);
+        return tex->pixels[(size_t)iy * (size_t)w + (size_t)ix];
     }
 
     float u = s * (float)w - 0.5f;
     float v = t * (float)h - 0.5f;
-
-    if (tex->mag_filter == GL_NEAREST) {
-        int ix = (int)(u + 0.5f);
-        int iy = (int)(v + 0.5f);
-        if (ix < 0) ix = 0; else if (ix >= w) ix = w - 1;
-        if (iy < 0) iy = 0; else if (iy >= h) iy = h - 1;
-        return tex->pixels[(size_t)iy * w + ix];
-    }
 
     /* Bilinear filtering (4-sample interpolation) */
     int x0 = gl_floor_to_int(u);
@@ -148,10 +53,10 @@ static uint32_t sample_tex2d(const gl_texture_t *tex, float s, float t) {
     float fx = u - (float)x0;
     float fy = v - (float)y0;
 
-    if (x0 < 0) x0 = 0; else if (x0 >= w) x0 = w - 1;
-    if (x1 < 0) x1 = 0; else if (x1 >= w) x1 = w - 1;
-    if (y0 < 0) y0 = 0; else if (y0 >= h) y0 = h - 1;
-    if (y1 < 0) y1 = 0; else if (y1 >= h) y1 = h - 1;
+    x0 = wrap_texel_index(tex->wrap_s, x0, w);
+    x1 = wrap_texel_index(tex->wrap_s, x1, w);
+    y0 = wrap_texel_index(tex->wrap_t, y0, h);
+    y1 = wrap_texel_index(tex->wrap_t, y1, h);
 
     uint32_t c00 = tex->pixels[(size_t)y0 * w + x0];
     uint32_t c10 = tex->pixels[(size_t)y0 * w + x1];
@@ -338,9 +243,9 @@ static void write_fragment(GLContext *ctx, int x, int y, uint16_t z_val, float r
         get_blend_factors(ctx->blend_dfactor, r, g, b, a, rd, gd, bd, ad, &fdr, &fdg, &fdb, &fda);
 
         if (ctx->blend_equation == GL_FUNC_SUBTRACT) {
-            r = r * fsr - rd * fdr; g = g * fsg - gd * fdr; b = b * fsb - bd * fdb; a = a * fsa - ad * fda;
+            r = r * fsr - rd * fdr; g = g * fsg - gd * fdg; b = b * fsb - bd * fdb; a = a * fsa - ad * fda;
         } else if (ctx->blend_equation == GL_FUNC_REVERSE_SUBTRACT) {
-            r = rd * fdr - r * fsr; g = gd * fdr - g * fsg; b = bd * fdb - b * fsb; a = ad * fda - a * fsa;
+            r = rd * fdr - r * fsr; g = gd * fdg - g * fsg; b = bd * fdb - b * fsb; a = ad * fda - a * fsa;
         } else if (ctx->blend_equation == GL_MIN) {
             if (rd < r) r = rd;
             if (gd < g) g = gd;
@@ -353,7 +258,7 @@ static void write_fragment(GLContext *ctx, int x, int y, uint16_t z_val, float r
             if (ad > a) a = ad;
         } else {
             /* GL_FUNC_ADD */
-            r = r * fsr + rd * fdr; g = g * fsg + gd * fdr; b = b * fsb + bd * fdb; a = a * fsa + ad * fda;
+            r = r * fsr + rd * fdr; g = g * fsg + gd * fdg; b = b * fsb + bd * fdb; a = a * fsa + ad * fda;
         }
     }
 
@@ -377,8 +282,12 @@ static void write_fragment(GLContext *ctx, int x, int y, uint16_t z_val, float r
             case GL_NOOP:          final_pixel = dst_col; break;
             case GL_INVERT:        final_pixel = ~dst_col; break;
             case GL_AND:           final_pixel &= dst_col; break;
+            case GL_AND_REVERSE:   final_pixel = final_pixel & ~dst_col; break;
+            case GL_AND_INVERTED:  final_pixel = (~final_pixel) & dst_col; break;
             case GL_NAND:          final_pixel = ~(final_pixel & dst_col); break;
             case GL_OR:            final_pixel |= dst_col; break;
+            case GL_OR_REVERSE:    final_pixel = final_pixel | ~dst_col; break;
+            case GL_OR_INVERTED:   final_pixel = (~final_pixel) | dst_col; break;
             case GL_NOR:           final_pixel = ~(final_pixel | dst_col); break;
             case GL_XOR:           final_pixel ^= dst_col; break;
             case GL_EQUIV:         final_pixel = ~(final_pixel ^ dst_col); break;
@@ -436,6 +345,9 @@ void gl_rasterize_triangle(GLContext *ctx, gl_vertex_t *v0, gl_vertex_t *v1, gl_
                        (ctx->depth_func == GL_LESS || ctx->depth_func == GL_LEQUAL);
 
     if (fast_opaque) {
+        bool flat = (ctx->shade_model == GL_FLAT);
+        bool z_lequal = (ctx->depth_func == GL_LEQUAL);
+
         float dw0_dx = (y1 - y2) * inv_area;
         float dw1_dx = (y2 - y0) * inv_area;
         float dw0_dy = (x2 - x1) * inv_area;
@@ -445,26 +357,32 @@ void gl_rasterize_triangle(GLContext *ctx, gl_vertex_t *v0, gl_vertex_t *v1, gl_
         float dz_dx = dw0_dx * (z0 - z2) + dw1_dx * (z1 - z2);
         float dz_dy = dw0_dy * (z0 - z2) + dw1_dy * (z1 - z2);
 
-        float r0 = v0->color[0] * 255.0f, r1 = v1->color[0] * 255.0f, r2 = v2->color[0] * 255.0f;
-        float dr_dx = dw0_dx * (r0 - r2) + dw1_dx * (r1 - r2);
-        float dr_dy = dw0_dy * (r0 - r2) + dw1_dy * (r1 - r2);
+        float r0 = (flat ? v2->color[0] : v0->color[0]) * 255.0f;
+        float r1 = (flat ? v2->color[0] : v1->color[0]) * 255.0f;
+        float r2 = v2->color[0] * 255.0f;
+        float dr_dx = flat ? 0.0f : (dw0_dx * (r0 - r2) + dw1_dx * (r1 - r2));
+        float dr_dy = flat ? 0.0f : (dw0_dy * (r0 - r2) + dw1_dy * (r1 - r2));
 
-        float g0 = v0->color[1] * 255.0f, g1 = v1->color[1] * 255.0f, g2 = v2->color[1] * 255.0f;
-        float dg_dx = dw0_dx * (g0 - g2) + dw1_dx * (g1 - g2);
-        float dg_dy = dw0_dy * (g0 - g2) + dw1_dy * (g1 - g2);
+        float g0 = (flat ? v2->color[1] : v0->color[1]) * 255.0f;
+        float g1 = (flat ? v2->color[1] : v1->color[1]) * 255.0f;
+        float g2 = v2->color[1] * 255.0f;
+        float dg_dx = flat ? 0.0f : (dw0_dx * (g0 - g2) + dw1_dx * (g1 - g2));
+        float dg_dy = flat ? 0.0f : (dw0_dy * (g0 - g2) + dw1_dy * (g1 - g2));
 
-        float b0 = v0->color[2] * 255.0f, b1 = v1->color[2] * 255.0f, b2 = v2->color[2] * 255.0f;
-        float db_dx = dw0_dx * (b0 - b2) + dw1_dx * (b1 - b2);
-        float db_dy = dw0_dy * (b0 - b2) + dw1_dy * (b1 - b2);
+        float b0 = (flat ? v2->color[2] : v0->color[2]) * 255.0f;
+        float b1 = (flat ? v2->color[2] : v1->color[2]) * 255.0f;
+        float b2 = v2->color[2] * 255.0f;
+        float db_dx = flat ? 0.0f : (dw0_dx * (b0 - b2) + dw1_dx * (b1 - b2));
+        float db_dy = flat ? 0.0f : (dw0_dy * (b0 - b2) + dw1_dy * (b1 - b2));
 
         float fx_start = (float)min_x + 0.5f;
         float fy_start = (float)min_y + 0.5f;
         float w0_base = ((x1 - fx_start) * (y2 - fy_start) - (y1 - fy_start) * (x2 - fx_start)) * inv_area;
         float w1_base = ((x2 - fx_start) * (y0 - fy_start) - (y2 - fy_start) * (x0 - fx_start)) * inv_area;
         float z_base  = z2 + w0_base * (z0 - z2) + w1_base * (z1 - z2);
-        float r_base  = r2 + w0_base * (r0 - r2) + w1_base * (r1 - r2);
-        float g_base  = g2 + w0_base * (g0 - g2) + w1_base * (g1 - g2);
-        float b_base  = b2 + w0_base * (b0 - b2) + w1_base * (b1 - b2);
+        float r_base  = flat ? r2 : (r2 + w0_base * (r0 - r2) + w1_base * (r1 - r2));
+        float g_base  = flat ? g2 : (g2 + w0_base * (g0 - g2) + w1_base * (g1 - g2));
+        float b_base  = flat ? b2 : (b2 + w0_base * (b0 - b2) + w1_base * (b1 - b2));
 
         for (int py = min_y; py <= max_y; py++) {
             int y_off = py - min_y;
@@ -483,7 +401,8 @@ void gl_rasterize_triangle(GLContext *ctx, gl_vertex_t *v0, gl_vertex_t *v1, gl_
                 if (w0 >= -0.001f && w1 >= -0.001f && w2 >= -0.001f) {
                     had_inside = true;
                     uint16_t z_val = (z_cur > 0.0f) ? ((z_cur < 65535.0f) ? (uint16_t)z_cur : 65535) : 0;
-                    if (z_val < ctx->z_buffer[pixel_idx]) {
+                    bool z_pass = z_lequal ? (z_val <= ctx->z_buffer[pixel_idx]) : (z_val < ctx->z_buffer[pixel_idx]);
+                    if (z_pass) {
                         ctx->z_buffer[pixel_idx] = z_val;
                         uint32_t cr = (r_cur > 0.0f) ? ((r_cur < 255.0f) ? (uint32_t)r_cur : 255) : 0;
                         uint32_t cg = (g_cur > 0.0f) ? ((g_cur < 255.0f) ? (uint32_t)g_cur : 255) : 0;
@@ -535,11 +454,19 @@ void gl_rasterize_triangle(GLContext *ctx, gl_vertex_t *v0, gl_vertex_t *v1, gl_
             if (z_norm < 0.0f) z_norm = 0.0f; else if (z_norm > 1.0f) z_norm = 1.0f;
             uint16_t z_val = (uint16_t)(z_norm * 65535.0f);
 
-            /* Interpolate color (Gouraud shading) */
-            float r = (w0 * v0->color[0] + w1 * v1->color[0] + w2 * v2->color[0]);
-            float g = (w0 * v0->color[1] + w1 * v1->color[1] + w2 * v2->color[1]);
-            float b = (w0 * v0->color[2] + w1 * v1->color[2] + w2 * v2->color[2]);
-            float a = (w0 * v0->color[3] + w1 * v1->color[3] + w2 * v2->color[3]);
+            /* Interpolate color (Gouraud or Flat shading) */
+            float r, g, b, a;
+            if (ctx->shade_model == GL_FLAT) {
+                r = v2->color[0];
+                g = v2->color[1];
+                b = v2->color[2];
+                a = v2->color[3];
+            } else {
+                r = w0 * v0->color[0] + w1 * v1->color[0] + w2 * v2->color[0];
+                g = w0 * v0->color[1] + w1 * v1->color[1] + w2 * v2->color[1];
+                b = w0 * v0->color[2] + w1 * v1->color[2] + w2 * v2->color[2];
+                a = w0 * v0->color[3] + w1 * v1->color[3] + w2 * v2->color[3];
+            }
 
             /* Interpolate texture coordinates with perspective correction */
             if (tex) {
@@ -568,22 +495,26 @@ void gl_rasterize_triangle(GLContext *ctx, gl_vertex_t *v0, gl_vertex_t *v1, gl_
 }
 
 void gl_rasterize_point(GLContext *ctx, gl_vertex_t *v0) {
-    if (!ctx) return;
+    if (!ctx || !v0) return;
     int cx = (int)v0->win[0];
     int cy = (int)v0->win[1];
-    int radius = (int)(ctx->point_size * 0.5f);
-    if (radius < 1) radius = 1;
+    int size = (int)(ctx->point_size + 0.5f);
+    if (size < 1) size = 1;
+    int start = -(size / 2);
+    int end = start + size - 1;
 
-    uint16_t z_val = (uint16_t)(v0->win[2] * 65535.0f);
-    for (int dy = -radius; dy <= radius; dy++) {
-        for (int dx = -radius; dx <= radius; dx++) {
+    float z_norm = v0->win[2];
+    if (z_norm < 0.0f) z_norm = 0.0f; else if (z_norm > 1.0f) z_norm = 1.0f;
+    uint16_t z_val = (uint16_t)(z_norm * 65535.0f);
+    for (int dy = start; dy <= end; dy++) {
+        for (int dx = start; dx <= end; dx++) {
             write_fragment(ctx, cx + dx, cy + dy, z_val, v0->color[0], v0->color[1], v0->color[2], v0->color[3], v0->eye[2]);
         }
     }
 }
 
 void gl_rasterize_line(GLContext *ctx, gl_vertex_t *v0, gl_vertex_t *v1) {
-    if (!ctx) return;
+    if (!ctx || !v0 || !v1) return;
     int x0 = (int)v0->win[0], y0 = (int)v0->win[1];
     int x1 = (int)v1->win[0], y1 = (int)v1->win[1];
 
@@ -592,6 +523,12 @@ void gl_rasterize_line(GLContext *ctx, gl_vertex_t *v0, gl_vertex_t *v1) {
     int sx = (x0 < x1) ? 1 : -1;
     int sy = (y0 < y1) ? 1 : -1;
     int err = dx - dy;
+    bool x_major = (dx >= dy);
+    int width = (int)(ctx->line_width + 0.5f);
+    if (width < 1) width = 1;
+    int w_start = -(width / 2);
+    int w_end = w_start + width - 1;
+    bool flat = (ctx->shade_model == GL_FLAT);
 
     int total_steps = dx > dy ? dx : dy;
     if (total_steps <= 0) total_steps = 1;
@@ -599,15 +536,20 @@ void gl_rasterize_line(GLContext *ctx, gl_vertex_t *v0, gl_vertex_t *v1) {
 
     while (1) {
         float t = (float)step / (float)total_steps;
-        float r = (1.0f - t) * v0->color[0] + t * v1->color[0];
-        float g = (1.0f - t) * v0->color[1] + t * v1->color[1];
-        float b = (1.0f - t) * v0->color[2] + t * v1->color[2];
-        float a = (1.0f - t) * v0->color[3] + t * v1->color[3];
+        float r = flat ? v1->color[0] : ((1.0f - t) * v0->color[0] + t * v1->color[0]);
+        float g = flat ? v1->color[1] : ((1.0f - t) * v0->color[1] + t * v1->color[1]);
+        float b = flat ? v1->color[2] : ((1.0f - t) * v0->color[2] + t * v1->color[2]);
+        float a = flat ? v1->color[3] : ((1.0f - t) * v0->color[3] + t * v1->color[3]);
         float z_norm = (1.0f - t) * v0->win[2] + t * v1->win[2];
+        if (z_norm < 0.0f) z_norm = 0.0f; else if (z_norm > 1.0f) z_norm = 1.0f;
         uint16_t z_val = (uint16_t)(z_norm * 65535.0f);
         float eye_z = (1.0f - t) * v0->eye[2] + t * v1->eye[2];
 
-        write_fragment(ctx, x0, y0, z_val, r, g, b, a, eye_z);
+        for (int off = w_start; off <= w_end; off++) {
+            int px = x_major ? x0 : (x0 + off);
+            int py = x_major ? (y0 + off) : y0;
+            write_fragment(ctx, px, py, z_val, r, g, b, a, eye_z);
+        }
 
         if (x0 == x1 && y0 == y1) break;
         int e2 = 2 * err;

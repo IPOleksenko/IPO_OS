@@ -27,7 +27,7 @@ static inline uint16_t bga_read_register(uint16_t index) {
 }
 
 bool vbe_bga_probe(vbe_bga_info_t *out_info) {
-    /* 1. Probe PCI for device 0x1234:0x1111 to find exact LFB BAR0 address */
+    /* Probe PCI device 0x1234:0x1111 to locate exact LFB BAR0 address */
     pci_device_t dev;
     bool pci_found = pci_find_device(BGA_PCI_VENDOR_ID, BGA_PCI_DEVICE_ID, &dev);
     if (pci_found) {
@@ -36,13 +36,15 @@ bool vbe_bga_probe(vbe_bga_info_t *out_info) {
         cmd |= 0x07;
         pci_write_word(dev.bus, dev.slot, dev.func, 0x04, cmd);
 
-        uint32_t bar0 = dev.bar0 & ~0x0Fu;
-        if (bar0 >= 0x01000000u && bar0 < 0xFF000000u) {
-            g_bga_info.lfb_addr = bar0;
+        if ((dev.bar0 & 1u) == 0) {
+            uint32_t bar0 = dev.bar0 & ~0x0Fu;
+            if (bar0 >= 0x01000000u && bar0 < 0xFF000000u) {
+                g_bga_info.lfb_addr = bar0;
+            }
         }
     }
 
-    /* 2. Check I/O ports 0x1CE / 0x1CF */
+    /* Probe BGA VBE DISPI registers on I/O ports 0x1CE / 0x1CF */
     bga_write_register(VBE_DISPI_INDEX_ID, VBE_DISPI_ID5);
     uint16_t id = bga_read_register(VBE_DISPI_INDEX_ID);
     if (id < VBE_DISPI_ID0 || id > VBE_DISPI_ID5) {
@@ -84,7 +86,8 @@ bool vbe_bga_is_enabled(void) {
 }
 
 bool vbe_bga_mode_request_valid(int width, int height, int bpp) {
-    if (!vbe_bga_is_available() || width < 0 || height < 0 ||
+    if (!vbe_bga_is_available() || width <= 0 || height <= 0 ||
+        width > 0xFFFF || height > 0xFFFF ||
         (bpp != 8 && bpp != 15 && bpp != 16 && bpp != 24 && bpp != 32)) {
         return false;
     }
@@ -132,6 +135,7 @@ bool vbe_bga_set_mode(int width, int height, int bpp) {
     if (actual_width != width || actual_height != height || actual_bpp != bpp) {
         serial_printf("[vbe_bga] device rejected mode; read back %ux%u at %u bpp\n",
                       actual_width, actual_height, actual_bpp);
+        vbe_bga_restore_text_mode();
         return false;
     }
 

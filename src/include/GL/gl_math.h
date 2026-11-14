@@ -1,5 +1,5 @@
-#ifndef LIB_GL_MATH_H
-#define LIB_GL_MATH_H
+#ifndef IPO_GL_MATH_H
+#define IPO_GL_MATH_H
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -73,5 +73,5 @@ static inline float gl_exp_neg(float x) {
     return (sum < 0.0f) ? 0.0f : ((sum > 1.0f) ? 1.0f : sum);
 }
 
-#endif /* LIB_GL_MATH_H */
+#endif /* IPO_GL_MATH_H */
 

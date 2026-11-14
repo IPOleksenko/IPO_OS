@@ -1,8 +1,6 @@
 #include <net/net.h>
-#include <net/net_state.h>
 #include <memory/kmalloc.h>
 #include <string.h>
-#include <stdio.h>
 
 void mac_init(mac_addr_t *mac) {
     if (!mac) return;
@@ -37,9 +35,9 @@ uint8_t mac_get_byte(const mac_addr_t *mac, size_t index) {
 }
 
 bool mac_set(mac_addr_t *mac, const void *data, size_t len) {
-    if (!mac) return false;
+    if (!mac || (!data && len > 0)) return false;
 
-    if (!data || len == 0) {
+    if (len == 0) {
         mac_free(mac);
         return true;
     }
@@ -72,7 +70,7 @@ bool mac_equal(const mac_addr_t *a, const mac_addr_t *b) {
 }
 
 void mac_set_broadcast(mac_addr_t *mac) {
-    static const uint8_t bcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    const uint8_t *bcast = (const uint8_t *)"\xFF\xFF\xFF\xFF\xFF\xFF";
     mac_set(mac, bcast, 6);
 }
 
@@ -137,15 +135,18 @@ int mac_format(const mac_addr_t *mac, char *out_buf, size_t out_cap) {
         return 0;
     }
 
+    const char *hex = "0123456789abcdef";
     size_t written = 0;
     for (size_t i = 0; i < len; i++) {
-        char chunk[4];
-        int n = snprintf(chunk, sizeof(chunk), (i + 1 < len) ? "%02x:" : "%02x", (unsigned int)bytes[i]);
-        if (n < 0 || written + (size_t)n >= out_cap) {
+        size_t need = (i + 1 < len) ? 3u : 2u;
+        if (written + need >= out_cap) {
             break;
         }
-        memcpy(out_buf + written, chunk, n);
-        written += n;
+        out_buf[written++] = hex[(bytes[i] >> 4) & 0x0F];
+        out_buf[written++] = hex[bytes[i] & 0x0F];
+        if (i + 1 < len) {
+            out_buf[written++] = ':';
+        }
     }
     out_buf[written] = '\0';
     return (int)written;
@@ -166,47 +167,4 @@ char *mac_format_dyn(const mac_addr_t *mac) {
 
     mac_format(mac, buf, req_cap);
     return buf;
-}
-
-bool net_set_mac(net_if_t *iface, const void *data, size_t len) {
-    if (!iface) {
-        iface = net_get_interface();
-    }
-    if (!iface) return false;
-    return mac_set(&iface->mac, data, len);
-}
-
-/* =========================================================================
- * Dynamic Network & Interface IP Queries (replacing hardcoded values)
- * ========================================================================= */
-
-ip4_addr_t net_get_any_ip(void) {
-    return (ip4_addr_t)0;
-}
-
-void net_set_loopback_ip(ip4_addr_t ip) {
-    net_shared_ctx_t *ctx = net_get_shared_context();
-    if (ctx) {
-        ctx->loopback_ip = ip;
-    }
-}
-
-ip4_addr_t net_get_loopback_ip(void) {
-    net_shared_ctx_t *ctx = net_get_shared_context();
-    if (ctx && ctx->loopback_ip != 0) {
-        return ctx->loopback_ip;
-    }
-    return IP4_ADDR(127, 0, 0, 1);
-}
-
-ip4_addr_t net_get_broadcast_ip(const void *iface_ptr) {
-    const net_if_t *iface = (const net_if_t *)iface_ptr;
-    if (!iface) {
-        iface = net_get_interface();
-    }
-    if (!iface || iface->ip == 0 || iface->netmask == 0) {
-        return (ip4_addr_t)0xFFFFFFFFu; /* Fallback to limited broadcast */
-    }
-    /* Calculate dynamic subnet broadcast: ip | ~netmask */
-    return (iface->ip | (~iface->netmask));
 }

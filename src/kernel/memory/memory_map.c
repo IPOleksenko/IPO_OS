@@ -16,6 +16,32 @@ static e820_entry_t *s_raw_e820_entries = NULL;
 static uint32_t s_raw_e820_count = 0;
 static uint32_t s_raw_e820_capacity = 0;
 
+#define MEMORY_PAGE_SIZE 4096u
+#define MEMORY_FRAME_COUNT (0x100000000ull / MEMORY_PAGE_SIZE)
+#define MEMORY_FRAME_BITMAP_WORDS (MEMORY_FRAME_COUNT / 32u)
+
+typedef struct reusable_frame {
+    struct reusable_frame *next;
+} reusable_frame_t;
+
+static spinlock_t s_frame_lock = {0};
+static uint32_t s_frame_bitmap[MEMORY_FRAME_BITMAP_WORDS];
+static reusable_frame_t *s_free_frames;
+
+static bool memory_frame_is_allocated(uint32_t frame_index) {
+    return (s_frame_bitmap[frame_index >> 5] &
+            (1u << (frame_index & 31u))) != 0u;
+}
+
+static void memory_frame_set_allocated(uint32_t frame_index, bool allocated) {
+    uint32_t mask = 1u << (frame_index & 31u);
+    if (allocated) {
+        s_frame_bitmap[frame_index >> 5] |= mask;
+    } else {
+        s_frame_bitmap[frame_index >> 5] &= ~mask;
+    }
+}
+
 static bool memory_map_add_region(uint32_t base, uint32_t size, uint32_t used, bool is_usable) {
     if (region_count >= region_capacity) {
         uint32_t new_cap = (region_capacity == 0) ? 8 : (region_capacity * 2);
@@ -94,22 +120,19 @@ void memory_map_init(void) {
             if (type == E820_TYPE_USABLE) {
                 total_usable_ram += len;
 
-                /* Filter usable memory for dynamic allocator:
-                 * Skip conventional low memory (< 1 MiB), kernel static reserved space (1-8 MiB),
-                 * process binary execution space (8-64 MiB), and kernel kmalloc heap (64-128 MiB).
-                 * Only register usable regions above 128 MiB (0x08000000) for general dynamic allocation. */
-                if (base >= 0x08000000ull && base < 0xFFFFFFFFull) {
+                /* Filter usable memory for dynamic allocator above 128 MiB (0x08000000). */
+                if (base >= 0x08000000ull && base < 0x100000000ull) {
                     uint64_t usable_len = len;
-                    if (base + usable_len > 0xFFFFFFFFull) {
-                        usable_len = 0xFFFFFFFFull - base;
+                    if (usable_len > 0x100000000ull - base) {
+                        usable_len = 0x100000000ull - base;
                     }
 
                     memory_map_add_region((uint32_t)base, (uint32_t)usable_len, 0, true);
-                } else if (base < 0x08000000ull && (base + len) > 0x08000000ull) {
+                } else if (base < 0x08000000ull && len > 0x08000000ull - base) {
                     uint32_t start = 0x08000000u;
                     uint64_t usable_len = (base + len) - 0x08000000ull;
-                    if ((uint64_t)start + usable_len > 0xFFFFFFFFull) {
-                        usable_len = 0xFFFFFFFFull - (uint64_t)start;
+                    if (usable_len > 0x100000000ull - (uint64_t)start) {
+                        usable_len = 0x100000000ull - (uint64_t)start;
                     }
 
                     memory_map_add_region(start, (uint32_t)usable_len, 0, true);
@@ -122,7 +145,8 @@ void memory_map_init(void) {
         total_usable_ram = fallback_ram;
 
         if (total_usable_ram > 0x08000000ull) {
-            uint32_t sz = (uint32_t)(total_usable_ram - 0x08000000ull);
+            uint64_t clamped = total_usable_ram > 0x100000000ull ? 0x100000000ull : total_usable_ram;
+            uint32_t sz = (uint32_t)(clamped - 0x08000000ull);
             memory_map_add_region(0x08000000u, sz, 0, true);
         }
     }
@@ -157,27 +181,84 @@ void *memory_map_alloc(size_t size, size_t alignment) {
     if (size == 0) return NULL;
     if (alignment == 0) alignment = 16;
 
-    spin_lock(&s_memory_map_lock);
+    uint32_t irq_flags = spin_lock_irqsave(&s_memory_map_lock);
 
     if (region_count == 0) memory_map_init();
 
-    /* Try to allocate from each available usable region */
     for (uint32_t i = 0; i < region_count; i++) {
         if (!regions[i].is_usable) continue;
 
-        uint32_t current_addr = regions[i].base + regions[i].used;
-        uint32_t aligned_addr = (current_addr + (alignment - 1)) & ~(alignment - 1);
-        uint32_t needed = (aligned_addr - regions[i].base) + size;
+        uint64_t reg_base = regions[i].base;
+        uint64_t reg_size = regions[i].size;
+        uint64_t current_addr = reg_base + regions[i].used;
+        uint64_t rem = current_addr % (uint64_t)alignment;
+        uint64_t aligned_addr = rem ? current_addr + ((uint64_t)alignment - rem) : current_addr;
+        if (aligned_addr < current_addr || aligned_addr > 0x100000000ull) {
+            continue;
+        }
 
-        if (needed <= regions[i].size) {
-            regions[i].used = needed;
-            spin_unlock(&s_memory_map_lock);
+        uint64_t offset = aligned_addr - reg_base;
+        if (size <= reg_size && offset <= reg_size - size) {
+            regions[i].used = (uint32_t)(offset + size);
+            spin_unlock_irqrestore(&s_memory_map_lock, irq_flags);
             return (void *)(uintptr_t)aligned_addr;
         }
     }
 
-    spin_unlock(&s_memory_map_lock);
+    spin_unlock_irqrestore(&s_memory_map_lock, irq_flags);
     return NULL;
+}
+
+void *memory_page_alloc(void) {
+    uint32_t irq_flags = spin_lock_irqsave(&s_frame_lock);
+    void *page;
+    if (s_free_frames) {
+        reusable_frame_t *frame = s_free_frames;
+        s_free_frames = frame->next;
+        page = frame;
+    } else {
+        page = memory_map_alloc(MEMORY_PAGE_SIZE, MEMORY_PAGE_SIZE);
+    }
+
+    if (!page) {
+        spin_unlock_irqrestore(&s_frame_lock, irq_flags);
+        return NULL;
+    }
+
+    uint32_t frame_index = (uint32_t)(uintptr_t)page / MEMORY_PAGE_SIZE;
+    if (memory_frame_is_allocated(frame_index)) {
+        serial_printf("[mem] page allocator returned an already allocated frame at 0x%x\n",
+                      (uint32_t)(uintptr_t)page);
+        spin_unlock_irqrestore(&s_frame_lock, irq_flags);
+        return NULL;
+    }
+    memory_frame_set_allocated(frame_index, true);
+    spin_unlock_irqrestore(&s_frame_lock, irq_flags);
+
+    memset(page, 0, MEMORY_PAGE_SIZE);
+    return page;
+}
+
+bool memory_page_free(void *page) {
+    uintptr_t address = (uintptr_t)page;
+    if (!page || (address & (MEMORY_PAGE_SIZE - 1u)) != 0u ||
+        !memory_map_is_valid_ram((uint32_t)address, MEMORY_PAGE_SIZE)) {
+        return false;
+    }
+
+    uint32_t frame_index = (uint32_t)address / MEMORY_PAGE_SIZE;
+    uint32_t irq_flags = spin_lock_irqsave(&s_frame_lock);
+    if (!memory_frame_is_allocated(frame_index)) {
+        spin_unlock_irqrestore(&s_frame_lock, irq_flags);
+        return false;
+    }
+
+    reusable_frame_t *frame = (reusable_frame_t *)page;
+    frame->next = s_free_frames;
+    s_free_frames = frame;
+    memory_frame_set_allocated(frame_index, false);
+    spin_unlock_irqrestore(&s_frame_lock, irq_flags);
+    return true;
 }
 
 bool memory_map_is_valid_ram(uint32_t addr, uint32_t len) {
@@ -186,8 +267,10 @@ bool memory_map_is_valid_ram(uint32_t addr, uint32_t len) {
 
     uint64_t req_start = addr;
     uint64_t req_end = (uint64_t)addr + len;
+    if (req_end > 0x100000000ull) {
+        return false;
+    }
 
-    /* Check if requested range falls within any known usable region */
     for (uint32_t i = 0; i < region_count; i++) {
         uint64_t reg_start = regions[i].base;
         uint64_t reg_end = (uint64_t)regions[i].base + regions[i].size;
@@ -197,82 +280,27 @@ bool memory_map_is_valid_ram(uint32_t addr, uint32_t len) {
         }
     }
 
-    /* Check if in low conventional RAM */
     if (req_start >= 0x10000 && req_end <= 0x08000000) {
-        return true;
-    }
-
-    return false;
-}
-
-extern uint8_t _kernel_text_start[];
-extern uint8_t _kernel_rodata_end[];
-
-void paging_init(void) {
-    uint32_t *page_dir = (uint32_t *)memory_map_alloc(4096, 4096);
-    uint32_t *pt_low   = (uint32_t *)memory_map_alloc(4 * 4096, 4096);
-    if (!page_dir || !pt_low) {
-        serial_printf("[paging] Failed to allocate page tables\n");
-        return;
-    }
-
-    memset(page_dir, 0, 4096);
-    memset(pt_low, 0, 4 * 4096);
-
-    uint32_t ktext_start = (uint32_t)(uintptr_t)_kernel_text_start;
-    uint32_t krodata_end = ((uint32_t)(uintptr_t)_kernel_rodata_end) & ~0xFFFu;
-
-    /* Map 0x00000000 - 0x00FFFFFF (first 16 MiB) using 4 KiB pages */
-    for (uint32_t page = 0; page < 4096; page++) {
-        uint32_t addr = page * 4096u;
-        if (page == 0) {
-            /* Page 0 (0x00000000 - 0x00000FFF): Unmapped to trap NULL pointer reads/writes/jumps */
-            pt_low[page] = 0;
-        } else if (page >= 2 && page <= 5) {
-            /* 0x00002000 - 0x00005FFF: Unmapped low memory guard */
-            pt_low[page] = 0;
-        } else if (page == 7) {
-            /* 0x00007000 - 0x00007FFF (old bootloader at 0x7C00): Unmapped guard */
-            pt_low[page] = 0;
-        } else if (page >= 9 && page <= 15) {
-            /* 0x00009000 - 0x0000FFFF: Unmapped guard before kernel .text at 0x10000 */
-            pt_low[page] = 0;
-        } else if (addr >= ktext_start && addr < krodata_end) {
-            /* Kernel .text and .rodata: Present + Read-Only (enforced by CR0.WP in Ring 0) */
-            pt_low[page] = addr | 0x01u;
-        } else if (addr >= 0x000C0000u && addr < 0x00100000u) {
-            /* BIOS ROM area: Present + Read-Only */
-            pt_low[page] = addr | 0x01u;
-        } else {
-            /* Writable RAM & VGA VRAM (0x1000, 0x6000, 0x8000, kernel .data/.bss, stack, 0x800000 process area) */
-            pt_low[page] = addr | 0x03u;
+        if (req_end > 0x000A0000u && req_start < 0x00100000u) {
+            return false;
+        }
+        if (s_raw_e820_count == 0) {
+            return true;
+        }
+        for (uint32_t i = 0; i < s_raw_e820_count; i++) {
+            if (s_raw_e820_entries[i].type != E820_TYPE_USABLE ||
+                s_raw_e820_entries[i].length == 0) {
+                continue;
+            }
+            uint64_t e_start = s_raw_e820_entries[i].base;
+            uint64_t e_end = (s_raw_e820_entries[i].length > UINT64_MAX - e_start)
+                                 ? UINT64_MAX
+                                 : e_start + s_raw_e820_entries[i].length;
+            if (req_start >= e_start && req_end <= e_end) {
+                return true;
+            }
         }
     }
 
-    for (uint32_t pde = 0; pde < 4; pde++) {
-        page_dir[pde] = ((uint32_t)(uintptr_t)&pt_low[pde * 1024]) | 0x03u;
-    }
-
-    /* Map 16 MiB .. 4 GiB using 4 MiB PSE pages (Present + RW + PS) */
-    for (uint32_t pde = 4; pde < 1024; pde++) {
-        uint32_t addr = pde << 22;
-        page_dir[pde] = addr | 0x83u;
-    }
-
-    /* Enable CR4.PSE (bit 4) for 4 MB pages, load CR3, and enable CR0.PG (bit 31) + CR0.WP (bit 16) */
-    __asm__ volatile(
-        "movl %%cr4, %%eax\n\t"
-        "orl $0x00000010, %%eax\n\t"
-        "movl %%eax, %%cr4\n\t"
-        "movl %0, %%cr3\n\t"
-        "movl %%cr0, %%eax\n\t"
-        "orl $0x80010001, %%eax\n\t"
-        "movl %%eax, %%cr0\n\t"
-        :
-        : "r"(page_dir)
-        : "eax", "memory"
-    );
-
-    serial_printf("[paging] Paging enabled (NULL guard active, kernel .text/.rodata write-protected [0x%x - 0x%x])\n",
-                  ktext_start, krodata_end);
+    return false;
 }

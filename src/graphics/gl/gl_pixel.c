@@ -1,10 +1,14 @@
 #include <GL/gl.h>
 #include <GL/ipo_gl.h>
-#include <string.h>
 
 void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLvoid *pixels) {
     GLContext *ctx = gl_get_current_context();
-    if (!ctx || !ctx->color_buffer || !pixels || width <= 0 || height <= 0) return;
+    if (!ctx) return;
+    if (width < 0 || height < 0) {
+        ctx->error_flag = GL_INVALID_VALUE;
+        return;
+    }
+    if (!ctx->color_buffer || !pixels || width == 0 || height == 0) return;
 
     for (int cy = 0; cy < height; cy++) {
         int sy = y + cy;

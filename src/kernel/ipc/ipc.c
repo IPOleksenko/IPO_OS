@@ -1,4 +1,5 @@
 #include <kernel/ipc.h>
+#include <kernel/input_ext.h>
 #include <kernel/process.h>
 #include <kernel/smp.h>
 #include <ipc.h>
@@ -65,7 +66,7 @@ bool ipc_user_range(const void *ptr, uint32_t length) {
         if (start >= base && end <= limit) return true;
     }
 
-    if (proc->stack_base && proc->stack_size) {
+    if (!proc->address_space && proc->stack_base && proc->stack_size) {
         uint64_t base = (uint32_t)(uintptr_t)proc->stack_base;
         uint64_t limit = base + proc->stack_size;
         if (start >= base && end <= limit) return true;
@@ -78,34 +79,31 @@ bool ipc_user_range(const void *ptr, uint32_t length) {
     }
 
     for (process_thread_t *th = proc->threads; th; th = th->next) {
-        if (th->stack_base && th->stack_size) {
+        if (th->stack_virtual_top && th->stack_virtual_bottom) {
+            uint64_t base = th->stack_virtual_bottom;
+            uint64_t limit = th->stack_virtual_top;
+            if (start >= base && end <= limit) return true;
+        } else if (th->stack_base && th->stack_size) {
             uint64_t base = (uint32_t)(uintptr_t)th->stack_base;
             uint64_t limit = base + th->stack_size;
             if (start >= base && end <= limit) return true;
         }
     }
 
-    if (proc->user_heap_base && proc->user_heap_break > proc->user_heap_base) {
+    if (proc->heap_chunks && proc->heap_chunk_count > 0) {
+        for (uint32_t i = 0; i < proc->heap_chunk_count; i++) {
+            uint64_t base = proc->heap_chunks[i].base;
+            uint64_t limit = proc->heap_chunks[i].brk;
+            if (start >= base && end <= limit) return true;
+        }
+    } else if (proc->user_heap_base && proc->user_heap_break > proc->user_heap_base) {
         uint64_t base = proc->user_heap_base;
         uint64_t limit = proc->user_heap_break;
         if (start >= base && end <= limit) return true;
     }
 
-    return ipc_shared_memory_user_range(proc->pid, ptr, length);
-}
-
-bool ipc_copy_name(char *dst, const char *src) {
-    if (!dst || !src) return false;
-    for (uint32_t i = 0u;; i++) {
-        if (!ipc_user_range(&src[i], 1u)) return false;
-        char c = src[i];
-        dst[i] = c;
-        if (c == '\0') return i > 0u;
-        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-              (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')) {
-            return false;
-        }
-    }
+    if (ipc_shared_memory_user_range(proc->pid, ptr, length)) return true;
+    return ipo_hw_user_range(proc->pid, ptr, length);
 }
 
 char *ipc_copy_name_alloc(const char *name) {
@@ -405,7 +403,6 @@ static int ipc_send(int id_int, const void *data, uint32_t length, uint32_t flag
     process_t *proc = process_get_current();
     if (!proc) return IPO_IPC_ERR_INVALID;
 
-retry:
     spin_lock(&ipc_lock);
     ipc_endpoint_t *endpoint = ipc_find_id_locked(id);
     if (!endpoint) {
@@ -479,6 +476,7 @@ static int ipc_receive(int id_int, void *buffer, uint32_t capacity,
     if (!proc) return IPO_IPC_ERR_INVALID;
 
 retry:
+    if (!proc->is_running) return IPO_IPC_ERR_WOULD_BLOCK;
     spin_lock(&ipc_lock);
     ipc_endpoint_t *endpoint = ipc_find_id_locked(id);
     if (!endpoint) {
@@ -609,8 +607,8 @@ void ipc_process_terminated(uint32_t pid) {
     ipc_shared_memory_process_terminated(pid);
 }
 
-static bool ipc_copy_syscall_args(uint32_t argc, const uint32_t *argv,
-                                  uint32_t expected_count, uint32_t *args) {
+bool ipc_copy_syscall_args(uint32_t argc, const uint32_t *argv,
+                           uint32_t expected_count, uint32_t *args) {
     if (argc < expected_count || !argv) return false;
     if (!ipc_user_range((const void *)argv, expected_count * sizeof(uint32_t))) {
         return false;

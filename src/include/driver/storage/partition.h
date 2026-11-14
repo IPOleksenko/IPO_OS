@@ -12,7 +12,7 @@ typedef enum {
     PARTITION_TABLE_GPT
 } partition_table_type_t;
 
-/* Normalized partition descriptor with dynamic self-expanding buffers */
+/* Normalized partition descriptor */
 typedef struct {
     uint32_t part_number;          /* 1-based partition number */
     uint64_t start_lba;            /* Starting LBA */
@@ -39,7 +39,7 @@ int  partition_info_set_gpt_type_guid(partition_info_t *p, const uint8_t *guid, 
 int  partition_info_set_unique_guid(partition_info_t *p, const uint8_t *guid, size_t len);
 int  partition_info_copy(partition_info_t *dst, const partition_info_t *src);
 
-/* Disk partition table summary with dynamic self-expanding capacity */
+/* Disk partition table summary */
 typedef struct {
     char                   *bdev_name;
     size_t                 bdev_name_len;

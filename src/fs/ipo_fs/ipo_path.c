@@ -65,33 +65,41 @@ int path_resolve(const char *path, uint64_t *out_inode) {
 
     uint64_t cur = 1;
     const char *p = tmp + 1; /* skip leading slash */
+    char *token = NULL;
+    size_t token_cap = 0;
 
     while (*p) {
         const char *slash = strchr(p, '/');
         size_t len = slash ? (size_t)(slash - p) : strlen(p);
 
-        char stack_tok[128];
-        char *token = (len < sizeof(stack_tok)) ? stack_tok : (char *)kmalloc(len + 1);
-        if (!token) {
-            kfree(tmp);
-            return -1;
+        if (len + 1 > token_cap) {
+            size_t new_cap = token_cap ? token_cap : 128u;
+            while (new_cap < len + 1) new_cap *= 2u;
+            char *nb = (char *)krealloc(token, new_cap);
+            if (!nb) {
+                kfree(token);
+                kfree(tmp);
+                return -1;
+            }
+            token = nb;
+            token_cap = new_cap;
         }
         memcpy(token, p, len);
         token[len] = '\0';
 
         struct ipo_dir_entry de;
         if (dir_find_entry(cur, token, &de, NULL) < 0) {
-            if (token != stack_tok) kfree(token);
+            kfree(token);
             kfree(tmp);
             return -1;
         }
 
-        if (token != stack_tok) kfree(token);
         cur = dir_entry_get_inode(&de);
         if (!slash) break;
         p = slash + 1;
     }
 
+    kfree(token);
     kfree(tmp);
     *out_inode = cur;
     return 0;
@@ -110,11 +118,14 @@ bool fs_canonicalize(const char *in, char *out, size_t out_size) {
         }
     }
 
-    const char *stack_ptrs[256];
-    size_t stack_lens[256];
-    const char **token_ptrs = stack_ptrs;
-    size_t *token_lens = stack_lens;
-    size_t token_cap = 256;
+    size_t token_cap = 32;
+    const char **token_ptrs = (const char **)kmalloc(token_cap * sizeof(const char *));
+    size_t *token_lens = (size_t *)kmalloc(token_cap * sizeof(size_t));
+    if (!token_ptrs || !token_lens) {
+        if (token_ptrs) kfree((void *)token_ptrs);
+        if (token_lens) kfree(token_lens);
+        return false;
+    }
     size_t tcount = 0;
 
     const char *c = in;
@@ -136,20 +147,19 @@ bool fs_canonicalize(const char *in, char *out, size_t out_size) {
 
         if (tcount >= token_cap) {
             size_t new_cap = token_cap * 2;
-            const char **new_ptrs = (const char **)kmalloc(new_cap * sizeof(const char *));
-            size_t *new_lens = (size_t *)kmalloc(new_cap * sizeof(size_t));
-            if (!new_ptrs || !new_lens) {
-                if (new_ptrs) kfree((void *)new_ptrs);
-                if (new_lens) kfree(new_lens);
-                if (token_ptrs != stack_ptrs) kfree((void *)token_ptrs);
-                if (token_lens != stack_lens) kfree(token_lens);
+            const char **new_ptrs = (const char **)krealloc((void *)token_ptrs, new_cap * sizeof(const char *));
+            if (!new_ptrs) {
+                kfree((void *)token_ptrs);
+                kfree(token_lens);
                 return false;
             }
-            memcpy(new_ptrs, token_ptrs, tcount * sizeof(const char *));
-            memcpy(new_lens, token_lens, tcount * sizeof(size_t));
-            if (token_ptrs != stack_ptrs) kfree((void *)token_ptrs);
-            if (token_lens != stack_lens) kfree(token_lens);
             token_ptrs = new_ptrs;
+            size_t *new_lens = (size_t *)krealloc(token_lens, new_cap * sizeof(size_t));
+            if (!new_lens) {
+                kfree((void *)token_ptrs);
+                kfree(token_lens);
+                return false;
+            }
             token_lens = new_lens;
             token_cap = new_cap;
         }
@@ -160,8 +170,8 @@ bool fs_canonicalize(const char *in, char *out, size_t out_size) {
     }
 
     if (tcount == 0) {
-        if (token_ptrs != stack_ptrs) kfree((void *)token_ptrs);
-        if (token_lens != stack_lens) kfree(token_lens);
+        kfree((void *)token_ptrs);
+        kfree(token_lens);
         if (out_size < 2) {
             if (out_size > 0) out[0] = '\0';
             return false;
@@ -174,8 +184,8 @@ bool fs_canonicalize(const char *in, char *out, size_t out_size) {
     size_t pos = 0;
     for (size_t i = 0; i < tcount; i++) {
         if (pos + 1 + token_lens[i] >= out_size) {
-            if (token_ptrs != stack_ptrs) kfree((void *)token_ptrs);
-            if (token_lens != stack_lens) kfree(token_lens);
+            kfree((void *)token_ptrs);
+            kfree(token_lens);
             if (out_size > 0) out[0] = '\0';
             return false;
         }
@@ -185,8 +195,8 @@ bool fs_canonicalize(const char *in, char *out, size_t out_size) {
     }
     out[pos] = '\0';
 
-    if (token_ptrs != stack_ptrs) kfree((void *)token_ptrs);
-    if (token_lens != stack_lens) kfree(token_lens);
+    kfree((void *)token_ptrs);
+    kfree(token_lens);
     return true;
 }
 
@@ -225,7 +235,13 @@ int path_resolve_parent(const char *path, uint64_t *out_parent_inode, char *out_
     }
 
     const char *name = r + 1;
-    strcpy(out_name, name);
+    size_t name_len = strlen(name);
+    if (name_len == 0 || name_len > 255) {
+        kfree(parent_path);
+        kfree(tmp);
+        return -1;
+    }
+    memcpy(out_name, name, name_len + 1u);
 
     uint64_t pino;
     int res = path_resolve(parent_path, &pino);

@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <kernel/utf.h>
 
 enum vga_color {
     VGA_COLOR_BLACK = 0,
@@ -24,9 +25,16 @@ enum vga_color {
     VGA_COLOR_WHITE = 15,
 };
 
-#define VGA_WIDTH 80
-#define VGA_HEIGHT 25
-#define VGA_MEMORY ((volatile uint16_t*)0xB8000)
+void vga_probe_text_hardware(void);
+uint16_t vga_get_width(void);
+uint16_t vga_get_height(void);
+volatile uint16_t *vga_get_memory(void);
+uint8_t vga_get_char_height(void);
+void vga_get_text_mode_info(uint16_t *out_w, uint16_t *out_h, uint32_t *out_vram_addr);
+
+#define VGA_WIDTH  (vga_get_width())
+#define VGA_HEIGHT (vga_get_height())
+#define VGA_MEMORY (vga_get_memory())
 
 #define VGA_START_CURSOR_POSITION (VGA_WIDTH * 2)
 
@@ -81,6 +89,8 @@ typedef struct {
 } dynamic_glyph_def_t;
 
 void vga_load_font(uint8_t start_code, uint32_t count, const uint8_t *glyphs);
+uint32_t vga_plane2_font_enter(void);
+void vga_plane2_font_exit(uint32_t saved_flags);
 int vga_font_load(const char *path);
 int vga_load_cyrillic_font(const char *path);
 int vga_font_load_database(const char *path);

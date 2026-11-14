@@ -92,7 +92,7 @@
 #define IPO_SYSCALL_NET_GET_INTERFACE 0x109Du
 #define IPO_SYSCALL_NET_INIT        0x109Eu
 #define IPO_SYSCALL_NET_SET_IP      0x109Fu
-#define IPO_SYSCALL_NET_SET_MAC     0x10A0u
+#define IPO_SYSCALL_NET_SET_MAC     0x10FFu
 
 #define IPO_SYSCALL_FREE         0x1047u
 
@@ -211,6 +211,7 @@
 #define IPO_SYSCALL_VGA_SET_PALETTE       0x10C4u
 #define IPO_SYSCALL_VGA_SET_OVERLAY_FLAGS 0x10C5u
 #define IPO_SYSCALL_VGA_GET_OVERLAY_FLAGS 0x10C6u
+#define IPO_SYSCALL_VGA_GET_TEXT_INFO     0x10C7u
 
 /* Audio Core Syscalls */
 #define IPO_SYSCALL_AUDIO_INIT            0x10D0u
@@ -262,11 +263,64 @@
 #define IPO_SYSCALL_THREAD_SELF       0x1123u
 #define IPO_SYSCALL_THREAD_SYNC       0x1130u
 
+/* Extended Input, Custom Shortcuts & Generic Input Devices */
+#define IPO_SYSCALL_INPUT_POLL_KEY_EXT    0x1140u
+#define IPO_SYSCALL_INPUT_GET_KEY_STATE   0x1141u
+#define IPO_SYSCALL_INPUT_GET_MODIFIERS   0x1142u
+#define IPO_SYSCALL_SHORTCUT_REGISTER     0x1143u
+#define IPO_SYSCALL_SHORTCUT_UNREGISTER   0x1144u
+#define IPO_SYSCALL_SHORTCUT_POLL         0x1145u
+#define IPO_SYSCALL_INPUT_DEV_REGISTER    0x1146u
+#define IPO_SYSCALL_INPUT_DEV_UNREGISTER  0x1147u
+#define IPO_SYSCALL_INPUT_DEV_EMIT        0x1148u
+#define IPO_SYSCALL_INPUT_DEV_LIST        0x1149u
+#define IPO_SYSCALL_INPUT_DEV_POLL_EVENT  0x114Au
+#define IPO_SYSCALL_INPUT_DEV_GET_STATE   0x114Bu
+#define IPO_SYSCALL_MOUSE_INJECT          0x114Cu
+
+/* Low-Level PS/2 Hooks & Transactions */
+#define IPO_SYSCALL_PS2_HOOK_REGISTER     0x1150u
+#define IPO_SYSCALL_PS2_HOOK_UNREGISTER   0x1151u
+#define IPO_SYSCALL_PS2_HOOK_POLL         0x1152u
+#define IPO_SYSCALL_PS2_TRANSACT          0x1153u
+
+/* Low-Level Hardware IRQ Primitives */
+#define IPO_SYSCALL_IRQ_SUBSCRIBE         0x1160u
+#define IPO_SYSCALL_IRQ_UNSUBSCRIBE       0x1161u
+#define IPO_SYSCALL_IRQ_POLL              0x1162u
+#define IPO_SYSCALL_IRQ_GET_COUNT         0x1163u
+#define IPO_SYSCALL_IRQ_REGISTER_CB       0x1164u
+#define IPO_SYSCALL_IRQ_UNREGISTER_CB     0x1165u
+
+/* Low-Level MMIO / DMA Hardware Memory Primitives */
+#define IPO_SYSCALL_HW_MAP_MMIO           0x1170u
+#define IPO_SYSCALL_HW_UNMAP_MMIO         0x1171u
+#define IPO_SYSCALL_HW_ALLOC_DMA          0x1172u
+#define IPO_SYSCALL_HW_FREE_DMA           0x1173u
+#define IPO_SYSCALL_HW_VIRT_TO_PHYS       0x1174u
+
+/* PCI Enumeration & Configuration Primitives */
+#define IPO_SYSCALL_PCI_GET_COUNT         0x1178u
+#define IPO_SYSCALL_PCI_GET_DEVICE        0x1179u
+#define IPO_SYSCALL_PCI_CONFIG_READ       0x117Au
+#define IPO_SYSCALL_PCI_CONFIG_WRITE      0x117Bu
+#define IPO_SYSCALL_PCI_ENABLE_BUS_MASTER 0x117Cu
+
+/* Device Registry Primitives */
+#define IPO_SYSCALL_DEV_GET_COUNT         0x1180u
+#define IPO_SYSCALL_DEV_GET_INFO          0x1181u
+#define IPO_SYSCALL_DEV_REGISTER          0x1182u
+#define IPO_SYSCALL_DEV_UNREGISTER        0x1183u
+
 #define IPO_SYSCALL_EXIT         0xFFFFu
 
 typedef uint32_t (*ipo_syscall_handler_t)(uint32_t, uint32_t, uint32_t *);
 
 void syscall_init(void);
+void fpu_init(void);
+bool syscall_prepare_cpu_exceptions(uint32_t cpu_count);
+bool syscall_init_cpu(uint32_t cpu_id);
+void syscall_update_exception_page_directory(void);
 
 void ipo_register_syscall(uint32_t num, ipo_syscall_handler_t handler);
 
@@ -660,6 +714,201 @@ static inline int ipo_binfmt_unregister(const char *name) {
 
 static inline int ipo_binfmt_list(void) {
     return ipo_syscall(IPO_SYSCALL_BINFMT_LIST, 0u, NULL);
+}
+
+static inline int ipo_vga_get_text_info(uint16_t *out_w, uint16_t *out_h, uint32_t *out_vram_addr) {
+    uint32_t args[3] = {
+        (uint32_t)(uintptr_t)out_w,
+        (uint32_t)(uintptr_t)out_h,
+        (uint32_t)(uintptr_t)out_vram_addr
+    };
+    return ipo_syscall(IPO_SYSCALL_VGA_GET_TEXT_INFO, 3u, args);
+}
+
+static inline int ipo_sys_input_poll_key_ext(void *out_ev) {
+    uint32_t args[1] = { (uint32_t)(uintptr_t)out_ev };
+    return ipo_syscall(IPO_SYSCALL_INPUT_POLL_KEY_EXT, 1u, args);
+}
+
+static inline int ipo_sys_input_get_key_state(uint32_t keycode) {
+    uint32_t args[1] = { keycode };
+    return ipo_syscall(IPO_SYSCALL_INPUT_GET_KEY_STATE, 1u, args);
+}
+
+static inline uint32_t ipo_sys_input_get_modifiers(void) {
+    return (uint32_t)ipo_syscall(IPO_SYSCALL_INPUT_GET_MODIFIERS, 0u, NULL);
+}
+
+static inline uint32_t ipo_sys_shortcut_register(const void *spec) {
+    uint32_t args[1] = { (uint32_t)(uintptr_t)spec };
+    return (uint32_t)ipo_syscall(IPO_SYSCALL_SHORTCUT_REGISTER, 1u, args);
+}
+
+static inline int ipo_sys_shortcut_unregister(uint32_t shortcut_id) {
+    uint32_t args[1] = { shortcut_id };
+    return ipo_syscall(IPO_SYSCALL_SHORTCUT_UNREGISTER, 1u, args);
+}
+
+static inline int ipo_sys_shortcut_poll(void *out_ev) {
+    uint32_t args[1] = { (uint32_t)(uintptr_t)out_ev };
+    return ipo_syscall(IPO_SYSCALL_SHORTCUT_POLL, 1u, args);
+}
+
+static inline uint32_t ipo_sys_input_dev_register(const void *desc) {
+    uint32_t args[1] = { (uint32_t)(uintptr_t)desc };
+    return (uint32_t)ipo_syscall(IPO_SYSCALL_INPUT_DEV_REGISTER, 1u, args);
+}
+
+static inline int ipo_sys_input_dev_unregister(uint32_t dev_id) {
+    uint32_t args[1] = { dev_id };
+    return ipo_syscall(IPO_SYSCALL_INPUT_DEV_UNREGISTER, 1u, args);
+}
+
+static inline int ipo_sys_input_dev_emit(uint32_t dev_id, const void *ev) {
+    uint32_t args[2] = { dev_id, (uint32_t)(uintptr_t)ev };
+    return ipo_syscall(IPO_SYSCALL_INPUT_DEV_EMIT, 2u, args);
+}
+
+static inline uint32_t ipo_sys_input_dev_list(void *out_arr, uint32_t max_count) {
+    uint32_t args[2] = { (uint32_t)(uintptr_t)out_arr, max_count };
+    return (uint32_t)ipo_syscall(IPO_SYSCALL_INPUT_DEV_LIST, 2u, args);
+}
+
+static inline int ipo_sys_input_dev_poll_event(uint32_t dev_filter_id, void *out_ev) {
+    uint32_t args[2] = { dev_filter_id, (uint32_t)(uintptr_t)out_ev };
+    return ipo_syscall(IPO_SYSCALL_INPUT_DEV_POLL_EVENT, 2u, args);
+}
+
+static inline int ipo_sys_input_dev_get_state(uint32_t dev_id, uint16_t type, uint32_t code, int32_t *out_val) {
+    uint32_t args[4] = { dev_id, (uint32_t)type, code, (uint32_t)(uintptr_t)out_val };
+    return ipo_syscall(IPO_SYSCALL_INPUT_DEV_GET_STATE, 4u, args);
+}
+
+static inline int ipo_sys_mouse_inject(int32_t dx_or_x, int32_t dy_or_y, int32_t dz,
+                                       uint32_t buttons_mask, bool is_absolute) {
+    uint32_t args[5] = {
+        (uint32_t)dx_or_x, (uint32_t)dy_or_y, (uint32_t)dz,
+        buttons_mask, is_absolute ? 1u : 0u
+    };
+    return ipo_syscall(IPO_SYSCALL_MOUSE_INJECT, 5u, args);
+}
+
+static inline uint32_t ipo_sys_ps2_hook_register(uint32_t chan_mask, uint32_t flags) {
+    uint32_t args[2] = { chan_mask, flags };
+    return (uint32_t)ipo_syscall(IPO_SYSCALL_PS2_HOOK_REGISTER, 2u, args);
+}
+
+static inline int ipo_sys_ps2_hook_unregister(uint32_t handle) {
+    uint32_t args[1] = { handle };
+    return ipo_syscall(IPO_SYSCALL_PS2_HOOK_UNREGISTER, 1u, args);
+}
+
+static inline uint32_t ipo_sys_ps2_hook_poll(uint32_t handle, void *out_events, uint32_t max_count) {
+    uint32_t args[3] = { handle, (uint32_t)(uintptr_t)out_events, max_count };
+    return (uint32_t)ipo_syscall(IPO_SYSCALL_PS2_HOOK_POLL, 3u, args);
+}
+
+static inline int ipo_sys_ps2_transact(const void *req) {
+    uint32_t args[1] = { (uint32_t)(uintptr_t)req };
+    return ipo_syscall(IPO_SYSCALL_PS2_TRANSACT, 1u, args);
+}
+
+static inline uint32_t ipo_sys_irq_subscribe(uint8_t irq) {
+    uint32_t args[1] = { (uint32_t)irq };
+    return (uint32_t)ipo_syscall(IPO_SYSCALL_IRQ_SUBSCRIBE, 1u, args);
+}
+
+static inline int ipo_sys_irq_unsubscribe(uint32_t handle) {
+    uint32_t args[1] = { handle };
+    return ipo_syscall(IPO_SYSCALL_IRQ_UNSUBSCRIBE, 1u, args);
+}
+
+static inline uint32_t ipo_sys_irq_poll(uint32_t handle, uint32_t *out_total, uint64_t *out_last_ms) {
+    uint32_t args[3] = { handle, (uint32_t)(uintptr_t)out_total, (uint32_t)(uintptr_t)out_last_ms };
+    return (uint32_t)ipo_syscall(IPO_SYSCALL_IRQ_POLL, 3u, args);
+}
+
+static inline uint32_t ipo_sys_irq_get_count(uint8_t irq) {
+    uint32_t args[1] = { (uint32_t)irq };
+    return (uint32_t)ipo_syscall(IPO_SYSCALL_IRQ_GET_COUNT, 1u, args);
+}
+
+static inline uint32_t ipo_sys_irq_register_cb(uint8_t irq, void (*fn)(uint8_t, void *), void *ctx) {
+    uint32_t args[3] = { (uint32_t)irq, (uint32_t)(uintptr_t)fn, (uint32_t)(uintptr_t)ctx };
+    return (uint32_t)ipo_syscall(IPO_SYSCALL_IRQ_REGISTER_CB, 3u, args);
+}
+
+static inline int ipo_sys_irq_unregister_cb(uint32_t handle) {
+    uint32_t args[1] = { handle };
+    return ipo_syscall(IPO_SYSCALL_IRQ_UNREGISTER_CB, 1u, args);
+}
+
+static inline void *ipo_sys_hw_map_mmio(uint32_t phys_addr, uint32_t size, uint32_t flags) {
+    uint32_t args[3] = { phys_addr, size, flags };
+    return (void *)(uintptr_t)(uint32_t)ipo_syscall(IPO_SYSCALL_HW_MAP_MMIO, 3u, args);
+}
+
+static inline int ipo_sys_hw_unmap_mmio(void *virt_addr, uint32_t size) {
+    uint32_t args[2] = { (uint32_t)(uintptr_t)virt_addr, size };
+    return ipo_syscall(IPO_SYSCALL_HW_UNMAP_MMIO, 2u, args);
+}
+
+static inline void *ipo_sys_hw_alloc_dma(uint32_t size, uint32_t alignment, uint32_t *out_phys) {
+    uint32_t args[3] = { size, alignment, (uint32_t)(uintptr_t)out_phys };
+    return (void *)(uintptr_t)(uint32_t)ipo_syscall(IPO_SYSCALL_HW_ALLOC_DMA, 3u, args);
+}
+
+static inline int ipo_sys_hw_free_dma(void *virt_addr) {
+    uint32_t args[1] = { (uint32_t)(uintptr_t)virt_addr };
+    return ipo_syscall(IPO_SYSCALL_HW_FREE_DMA, 1u, args);
+}
+
+static inline uint32_t ipo_sys_hw_virt_to_phys(const void *virt_addr) {
+    uint32_t args[1] = { (uint32_t)(uintptr_t)virt_addr };
+    return (uint32_t)ipo_syscall(IPO_SYSCALL_HW_VIRT_TO_PHYS, 1u, args);
+}
+
+static inline uint32_t ipo_sys_pci_get_count(void) {
+    return (uint32_t)ipo_syscall(IPO_SYSCALL_PCI_GET_COUNT, 0u, NULL);
+}
+
+static inline int ipo_sys_pci_get_device(uint32_t index, void *out_info) {
+    uint32_t args[2] = { index, (uint32_t)(uintptr_t)out_info };
+    return ipo_syscall(IPO_SYSCALL_PCI_GET_DEVICE, 2u, args);
+}
+
+static inline uint32_t ipo_sys_pci_config_read(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint8_t width) {
+    uint32_t args[5] = { bus, slot, func, offset, width };
+    return (uint32_t)ipo_syscall(IPO_SYSCALL_PCI_CONFIG_READ, 5u, args);
+}
+
+static inline int ipo_sys_pci_config_write(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint8_t width, uint32_t value) {
+    uint32_t args[6] = { bus, slot, func, offset, width, value };
+    return ipo_syscall(IPO_SYSCALL_PCI_CONFIG_WRITE, 6u, args);
+}
+
+static inline int ipo_sys_pci_enable_bus_master(uint8_t bus, uint8_t slot, uint8_t func) {
+    uint32_t args[3] = { bus, slot, func };
+    return ipo_syscall(IPO_SYSCALL_PCI_ENABLE_BUS_MASTER, 3u, args);
+}
+
+static inline uint32_t ipo_sys_device_get_count(void) {
+    return (uint32_t)ipo_syscall(IPO_SYSCALL_DEV_GET_COUNT, 0u, NULL);
+}
+
+static inline int ipo_sys_device_get_info(uint32_t index, void *out_info) {
+    uint32_t args[2] = { index, (uint32_t)(uintptr_t)out_info };
+    return ipo_syscall(IPO_SYSCALL_DEV_GET_INFO, 2u, args);
+}
+
+static inline uint32_t ipo_sys_device_register(const void *info) {
+    uint32_t args[1] = { (uint32_t)(uintptr_t)info };
+    return (uint32_t)ipo_syscall(IPO_SYSCALL_DEV_REGISTER, 1u, args);
+}
+
+static inline int ipo_sys_device_unregister(uint32_t dev_id) {
+    uint32_t args[1] = { dev_id };
+    return ipo_syscall(IPO_SYSCALL_DEV_UNREGISTER, 1u, args);
 }
 
 void syscall_reset_user_heap(void);

@@ -161,6 +161,9 @@ bool block_read(uint64_t fs_block_index, void *buffer);
 bool block_read_multi(uint64_t fs_block_index, uint16_t count, void *buffer);
 bool block_write(uint64_t fs_block_index, const void *buffer);
 bool block_write_multi(uint64_t fs_block_index, uint16_t count, const void *buffer);
+int64_t allocate_block(void);
+int64_t allocate_contiguous_blocks(uint32_t count);
+bool free_block(uint64_t phys_block);
 
 /* Bitmap API */
 bool bitmap_get(uint64_t bitmap_start, uint64_t bit_index);
@@ -172,13 +175,11 @@ bool read_inode(uint64_t inode_no, struct ipo_inode *out);
 bool write_inode(uint64_t inode_no, const struct ipo_inode *in);
 int64_t allocate_inode(void);
 bool free_inode(uint64_t inode_no);
-int64_t allocate_block(void);
-int64_t allocate_contiguous_blocks(uint32_t count);
-bool free_block(uint64_t phys_block);
 int64_t get_data_block_for_inode(struct ipo_inode *inode, uint64_t logical_index, bool alloc);
 int64_t get_contiguous_data_blocks_for_inode(struct ipo_inode *inode, uint64_t logical_index, uint64_t *out_count);
 int inode_read_bytes(struct ipo_inode *inode, void *buffer, uint32_t size, uint64_t offset);
 int inode_write_bytes(uint64_t inode_no, struct ipo_inode *inode, const void *buffer, uint32_t size, uint64_t offset);
+bool inode_truncate_blocks(uint64_t inode_no, struct ipo_inode *inode, uint64_t new_size);
 
 /* Directory / path */
 int dir_find_entry(uint64_t dir_inode_no, const char *name, struct ipo_dir_entry *out_entry, uint64_t *out_offset);

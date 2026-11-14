@@ -1,5 +1,5 @@
-#ifndef __GLU_H__
-#define __GLU_H__
+#ifndef IPO_GLU_H
+#define IPO_GLU_H
 
 #include <GL/gl.h>
 
@@ -17,5 +17,5 @@ void gluOrtho2D(GLdouble left, GLdouble right, GLdouble bottom, GLdouble top);
 }
 #endif
 
-#endif /* __GLU_H__ */
+#endif /* IPO_GLU_H */
 

@@ -85,23 +85,6 @@ int device_resources_add_bar(device_resources_t *res, uint32_t bar) {
     return 0;
 }
 
-int device_resources_set_bar(device_resources_t *res, size_t index, uint32_t bar) {
-    if (!res) return -1;
-    if (index >= res->bar_cap) {
-        size_t new_cap = index + 4;
-        uint32_t *new_bar = (uint32_t *)krealloc(res->bar, new_cap * sizeof(uint32_t));
-        if (!new_bar) return -1;
-        memset(new_bar + res->bar_cap, 0, (new_cap - res->bar_cap) * sizeof(uint32_t));
-        res->bar = new_bar;
-        res->bar_cap = new_cap;
-    }
-    res->bar[index] = bar;
-    if (index >= res->bar_count) {
-        res->bar_count = index + 1;
-    }
-    return 0;
-}
-
 int device_resources_copy(device_resources_t *dst, const device_resources_t *src) {
     if (!dst) return -1;
     device_resources_free(dst);
@@ -112,11 +95,12 @@ int device_resources_copy(device_resources_t *dst, const device_resources_t *src
     dst->bar_cap = 0;
     if (src->bar && src->bar_count > 0) {
         dst->bar = (uint32_t *)kmalloc(src->bar_count * sizeof(uint32_t));
-        if (dst->bar) {
-            memcpy(dst->bar, src->bar, src->bar_count * sizeof(uint32_t));
-            dst->bar_count = src->bar_count;
-            dst->bar_cap = src->bar_count;
+        if (!dst->bar) {
+            return -1;
         }
+        memcpy(dst->bar, src->bar, src->bar_count * sizeof(uint32_t));
+        dst->bar_count = src->bar_count;
+        dst->bar_cap = src->bar_count;
     }
     return 0;
 }
@@ -198,12 +182,15 @@ int device_node_copy(device_node_t *dst, const device_node_t *src) {
     dst->capabilities = src->capabilities;
     dst->type = src->type;
     dst->state = src->state;
-    device_node_set_name(dst, src->name);
-    device_node_set_vendor(dst, src->vendor);
-    device_node_set_model(dst, src->model);
-    device_node_set_description(dst, src->description);
-    device_node_set_driver_name(dst, src->driver_name);
-    device_resources_copy(&dst->res, &src->res);
+    if ((src->name && device_node_set_name(dst, src->name) != 0) ||
+        (src->vendor && device_node_set_vendor(dst, src->vendor) != 0) ||
+        (src->model && device_node_set_model(dst, src->model) != 0) ||
+        (src->description && device_node_set_description(dst, src->description) != 0) ||
+        (src->driver_name && device_node_set_driver_name(dst, src->driver_name) != 0) ||
+        device_resources_copy(&dst->res, &src->res) != 0) {
+        device_node_free(dst);
+        return -1;
+    }
     dst->driver_ptr = src->driver_ptr;
     dst->ops = src->ops;
     dst->priv_data = src->priv_data;
@@ -246,7 +233,17 @@ device_node_t *device_register(const device_node_t *dev) {
 
     spin_lock(&s_device_lock);
 
-    /* Allocate dynamic node */
+    if (dev->id != 0) {
+        device_node_t *dup = s_device_head;
+        while (dup) {
+            if (dup->id == dev->id) {
+                spin_unlock(&s_device_lock);
+                return NULL;
+            }
+            dup = dup->next;
+        }
+    }
+
     device_node_t *node = (device_node_t *)kmalloc(sizeof(device_node_t));
     if (!node) {
         spin_unlock(&s_device_lock);
@@ -254,8 +251,16 @@ device_node_t *device_register(const device_node_t *dev) {
     }
 
     device_node_init(node);
-    device_node_copy(node, dev);
+    if (device_node_copy(node, dev) != 0) {
+        device_node_free(node);
+        kfree(node);
+        spin_unlock(&s_device_lock);
+        return NULL;
+    }
     node->id = (dev->id != 0) ? dev->id : s_next_id++;
+    if (node->id >= s_next_id) {
+        s_next_id = node->id + 1u;
+    }
     node->next = NULL;
 
     /* Append to tail of linked list */
@@ -380,9 +385,7 @@ const device_node_t *device_get_list(void) {
     return s_device_head;
 }
 
-/* -------------------------------------------------------------
- * Hardware Discovery & Enumeration Engine
- * ------------------------------------------------------------- */
+/* Hardware discovery and enumeration */
 
 static void scan_cpu_subsystem(void) {
     char *vendor = smp_get_cpu_vendor_dyn();
@@ -566,7 +569,7 @@ static char *acpi_copy_trimmed_field(const uint8_t *src, size_t len) {
 }
 
 static char *acpi_decode_eisa_id_dyn(uint32_t val) {
-    static const char hex[] = "0123456789ABCDEF";
+    static const char * const hex = "0123456789ABCDEF";
     char *out = (char *)kmalloc(8);
     if (!out) return NULL;
     uint8_t b0 = (uint8_t)(val & 0xFFu);
@@ -675,7 +678,6 @@ static void scan_acpi_aml_table(const uint8_t *sdt) {
     if (sdt_len < 36 || sdt_len > 0x100000u) return;
 
     char *table_oem = acpi_copy_trimmed_field(sdt + 10, 6);
-    uint16_t last_kbd_io = 0;
 
     size_t i = 36;
     while (i + 6 < sdt_len) {
@@ -690,10 +692,14 @@ static void scan_acpi_aml_table(const uint8_t *sdt) {
                 size_t dev_end = i + 2 + pkg_len;
 
                 size_t own_end = dev_end;
-                for (size_t k = body_start; k + 2 < dev_end; k++) {
+                for (size_t k = body_start; k + 3 < dev_end; k++) {
                     if (sdt[k] == 0x5Bu && sdt[k + 1] == 0x82u) {
-                        own_end = k;
-                        break;
+                        size_t n_lb = 0;
+                        size_t n_pkg = aml_parse_pkg_length(sdt + k + 2, dev_end - (k + 2), &n_lb);
+                        if (n_pkg > 0 && n_lb > 0 && k + 2 + n_pkg <= dev_end) {
+                            own_end = k;
+                            break;
+                        }
                     }
                 }
 
@@ -793,14 +799,6 @@ static void scan_acpi_aml_table(const uint8_t *sdt) {
                                 break;
                             }
                         }
-                    }
-
-                    if (hid && strncmp(hid, "PNP03", 5) == 0 && io_base != 0) {
-                        last_kbd_io = io_base;
-                    }
-                    if (hid && strncmp(hid, "PNP0F", 5) == 0 && io_base == 0 && last_kbd_io != 0) {
-                        io_base = last_kbd_io;
-                        io_size = 1;
                     }
 
                     if (!sta_disabled && hid && (io_base != 0 || mmio_base != 0 || irq != 0xFF)) {
@@ -953,6 +951,13 @@ static void device_registry_clear(void) {
 }
 
 int device_rescan(void) {
+    if (!s_registry_initialized) {
+        spinlock_init(&s_device_lock);
+        s_device_head = NULL;
+        s_next_id = 1;
+        s_registry_initialized = true;
+    }
+
     device_registry_clear();
 
     /* Rescan all hardware buses and register components */

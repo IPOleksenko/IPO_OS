@@ -3,14 +3,22 @@
 #include <string.h>
 #include <file_system/ipo_fs.h>
 #include <kernel/process.h>
+#include <kernel/smp.h>
 #include <kernel/ipc.h>
 #include <memory/kmalloc.h>
+#include <memory/memory_map.h>
+#include <memory/address_space.h>
 #include <kernel/terminal.h>
+#include <kernel/async.h>
 #include <driver/input/keyboard.h>
 #include <driver/input/mouse.h>
 #include <driver/input/keymap/keymap.h>
 #include <driver/input/keymap/dynamic_keymap.h>
 #include <kernel/driver.h>
+#include <kernel/irq.h>
+#include <kernel/input_ext.h>
+#include <kernel/device.h>
+#include <driver/net/pci.h>
 #include <system/state.h>
 #include <system/timer.h>
 #include <driver/sound.h>
@@ -57,8 +65,8 @@ static uint32_t ipo_shared_var_capacity = 0u;
 extern void syscall_isr_entry(void);
 extern uint32_t isr_stub_table[32];
 extern void irq0_isr(void);
-extern void irq_ignore_master(void);
-extern void irq_ignore_slave(void);
+extern uint32_t irq_stub_table[15];
+void syscall_load_idt(void);
 
 static uint32_t kernel_gs_tls_area[16] __attribute__((aligned(16))) = {
     0, 0, 0, 0, 0, 0x595e9fbdU, 0, 0
@@ -71,26 +79,357 @@ static uint64_t kernel_gdt[4] __attribute__((aligned(8))) = {
     0x00CF93000000FFFFULL  /* 0x18: 32-bit TLS/GS Data, base=kernel_gs_tls_area, limit=4GB */
 };
 
-static const char *exception_names[32] = {
-    "Divide-by-zero (#DE)", "Debug (#DB)", "Non-maskable Interrupt (#NMI)", "Breakpoint (#BP)",
-    "Overflow (#OF)", "Bound Range Exceeded (#BR)", "Invalid Opcode (#UD)", "Device Not Available (#NM)",
-    "Double Fault (#DF)", "Coprocessor Segment Overrun", "Invalid TSS (#TS)", "Segment Not Present (#NP)",
-    "Stack-Segment Fault (#SS)", "General Protection Fault (#GP)", "Page Fault (#PF)", "Reserved",
-    "x87 FPU Error (#MF)", "Alignment Check (#AC)", "Machine Check (#MC)", "SIMD Floating-Point (#XM)",
-    "Virtualization (#VE)", "Control Protection (#CP)", "Reserved", "Reserved",
-    "Reserved", "Reserved", "Reserved", "Reserved", "Hypervisor Injection", "VMM Communication",
-    "Security Exception", "Reserved"
-};
+typedef struct __attribute__((packed)) {
+    uint16_t backlink;
+    uint16_t reserved0;
+    uint32_t esp0;
+    uint16_t ss0;
+    uint16_t reserved1;
+    uint32_t esp1;
+    uint16_t ss1;
+    uint16_t reserved2;
+    uint32_t esp2;
+    uint16_t ss2;
+    uint16_t reserved3;
+    uint32_t cr3;
+    uint32_t eip;
+    uint32_t eflags;
+    uint32_t eax;
+    uint32_t ecx;
+    uint32_t edx;
+    uint32_t ebx;
+    uint32_t esp;
+    uint32_t ebp;
+    uint32_t esi;
+    uint32_t edi;
+    uint16_t es;
+    uint16_t reserved4;
+    uint16_t cs;
+    uint16_t reserved5;
+    uint16_t ss;
+    uint16_t reserved6;
+    uint16_t ds;
+    uint16_t reserved7;
+    uint16_t fs;
+    uint16_t reserved8;
+    uint16_t gs;
+    uint16_t reserved9;
+    uint16_t ldt;
+    uint16_t reserved10;
+    uint16_t trap;
+    uint16_t iomap_base;
+} x86_tss32_t;
+
+typedef struct {
+    uint64_t gdt[7];
+    ipo_idt_entry_t idt[256];
+    x86_tss32_t current_tss;
+    x86_tss32_t page_fault_tss;
+    x86_tss32_t double_fault_tss;
+    uint8_t page_fault_stack[16384];
+    uint8_t double_fault_stack[8192];
+} cpu_exception_tables_t;
+
+#define X86_TSS_CURRENT_SELECTOR 0x20u
+#define X86_TSS_PAGE_FAULT_SELECTOR 0x28u
+#define X86_TSS_DOUBLE_FAULT_SELECTOR 0x30u
+
+static cpu_exception_tables_t *cpu_exception_tables;
+static uint32_t cpu_exception_table_count;
+
+static const char *x86_exception_name(uint32_t vector) {
+    switch (vector) {
+        case 0:  return "Divide-by-zero (#DE)";
+        case 1:  return "Debug (#DB)";
+        case 2:  return "Non-maskable Interrupt (#NMI)";
+        case 3:  return "Breakpoint (#BP)";
+        case 4:  return "Overflow (#OF)";
+        case 5:  return "Bound Range Exceeded (#BR)";
+        case 6:  return "Invalid Opcode (#UD)";
+        case 7:  return "Device Not Available (#NM)";
+        case 8:  return "Double Fault (#DF)";
+        case 9:  return "Coprocessor Segment Overrun";
+        case 10: return "Invalid TSS (#TS)";
+        case 11: return "Segment Not Present (#NP)";
+        case 12: return "Stack-Segment Fault (#SS)";
+        case 13: return "General Protection Fault (#GP)";
+        case 14: return "Page Fault (#PF)";
+        case 16: return "x87 FPU Error (#MF)";
+        case 17: return "Alignment Check (#AC)";
+        case 18: return "Machine Check (#MC)";
+        case 19: return "SIMD Floating-Point (#XM)";
+        case 20: return "Virtualization (#VE)";
+        case 21: return "Control Protection (#CP)";
+        case 28: return "Hypervisor Injection";
+        case 29: return "VMM Communication";
+        case 30: return "Security Exception";
+        default: return (vector < 32) ? "Reserved" : "Unknown Exception";
+    }
+}
+
+extern void page_fault_task_entry(void);
+extern void double_fault_task_entry(void);
+
+static uint32_t x86_read_cr3(void) {
+    uint32_t value;
+    __asm__ volatile("movl %%cr3, %0" : "=r"(value));
+    return value;
+}
+
+static uint64_t x86_tss_descriptor(const x86_tss32_t *tss) {
+    uint32_t base = (uint32_t)(uintptr_t)tss;
+    uint32_t limit = sizeof(*tss) - 1u;
+    return (uint64_t)(limit & 0xFFFFu) |
+           ((uint64_t)(base & 0xFFFFu) << 16) |
+           ((uint64_t)((base >> 16) & 0xFFu) << 32) |
+           ((uint64_t)0x89u << 40) |
+           ((uint64_t)((limit >> 16) & 0x0Fu) << 48) |
+           ((uint64_t)((base >> 24) & 0xFFu) << 56);
+}
+
+static void x86_tss_initialize(x86_tss32_t *tss, uint32_t cr3,
+                               uint32_t eip, uint32_t esp) {
+    memset(tss, 0, sizeof(*tss));
+    tss->cr3 = cr3;
+    tss->eip = eip;
+    tss->eflags = 0x2u;
+    tss->esp = esp;
+    tss->esp0 = esp;
+    tss->cs = 0x08u;
+    tss->ss = 0x10u;
+    tss->ss0 = 0x10u;
+    tss->ds = 0x10u;
+    tss->es = 0x10u;
+    tss->fs = 0x10u;
+    tss->gs = 0x18u;
+    tss->iomap_base = sizeof(*tss);
+}
+
+static void x86_idt_set_task_gate(ipo_idt_entry_t *idt, uint8_t vector, uint16_t selector) {
+    idt[vector].base_lo = 0u;
+    idt[vector].selector = selector;
+    idt[vector].zero = 0u;
+    idt[vector].flags = 0x85u;
+    idt[vector].base_hi = 0u;
+}
+
+void fpu_init(void) {
+    uint32_t cr0;
+    __asm__ volatile("movl %%cr0, %0" : "=r"(cr0));
+    cr0 &= ~(1u << 2); /* Clear EM (bit 2) */
+    cr0 &= ~(1u << 3); /* Clear TS (bit 3) */
+    cr0 |= (1u << 1);  /* Set MP (bit 1) */
+    cr0 |= (1u << 5);  /* Set NE (bit 5) */
+    __asm__ volatile("movl %0, %%cr0" : : "r"(cr0));
+
+    uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1));
+    if (edx & (1u << 24)) { /* FXSR supported */
+        uint32_t cr4;
+        __asm__ volatile("movl %%cr4, %0" : "=r"(cr4));
+        cr4 |= (1u << 9); /* CR4.OSFXSR */
+        if (edx & (1u << 25)) { /* SSE supported */
+            cr4 |= (1u << 10); /* CR4.OSXMMEXCPT */
+        }
+        __asm__ volatile("movl %0, %%cr4" : : "r"(cr4));
+    }
+
+    __asm__ volatile("fninit");
+}
+
+bool syscall_init_cpu(uint32_t cpu_id) {
+    if (!cpu_exception_tables || cpu_id >= cpu_exception_table_count) {
+        return false;
+    }
+
+    fpu_init();
+
+    cpu_exception_tables_t *tables = &cpu_exception_tables[cpu_id];
+    ipo_idt_ptr_t gdt_ptr = {
+        .limit = (uint16_t)(sizeof(tables->gdt) - 1u),
+        .base = (uint32_t)(uintptr_t)tables->gdt
+    };
+    ipo_idt_ptr_t idt_ptr = {
+        .limit = (uint16_t)(sizeof(tables->idt) - 1u),
+        .base = (uint32_t)(uintptr_t)tables->idt
+    };
+
+    __asm__ volatile(
+        "lgdt %0\n\t"
+        "ljmp $0x08, $1f\n\t"
+        "1:\n\t"
+        "movw $0x10, %%ax\n\t"
+        "movw %%ax, %%ds\n\t"
+        "movw %%ax, %%es\n\t"
+        "movw %%ax, %%fs\n\t"
+        "movw %%ax, %%ss\n\t"
+        "movw $0x18, %%ax\n\t"
+        "movw %%ax, %%gs\n\t"
+        "lidt %1\n\t"
+        "movw $0x20, %%ax\n\t"
+        "ltr %%ax"
+        :
+        : "m"(gdt_ptr), "m"(idt_ptr)
+        : "eax", "memory"
+    );
+    return true;
+}
+
+bool syscall_prepare_cpu_exceptions(uint32_t cpu_count) {
+    if (cpu_count == 0u) return false;
+    if (cpu_exception_tables && cpu_count <= cpu_exception_table_count) {
+        return true;
+    }
+
+    cpu_exception_tables_t *old_tables = cpu_exception_tables;
+    cpu_exception_tables_t *tables =
+        (cpu_exception_tables_t *)kmalloc(cpu_count * sizeof(*tables));
+    if (!tables) return false;
+    memset(tables, 0, cpu_count * sizeof(*tables));
+
+    uint32_t cr3 = x86_read_cr3();
+    for (uint32_t i = 0u; i < cpu_count; i++) {
+        cpu_exception_tables_t *cpu = &tables[i];
+        memcpy(cpu->gdt, kernel_gdt, sizeof(kernel_gdt));
+        cpu->gdt[4] = x86_tss_descriptor(&cpu->current_tss);
+        cpu->gdt[5] = x86_tss_descriptor(&cpu->page_fault_tss);
+        cpu->gdt[6] = x86_tss_descriptor(&cpu->double_fault_tss);
+        x86_tss_initialize(&cpu->current_tss, cr3, 0u, 0u);
+        x86_tss_initialize(&cpu->page_fault_tss, cr3,
+                           (uint32_t)(uintptr_t)page_fault_task_entry,
+                           (uint32_t)(uintptr_t)&cpu->page_fault_stack[
+                               sizeof(cpu->page_fault_stack)]);
+        x86_tss_initialize(&cpu->double_fault_tss, cr3,
+                           (uint32_t)(uintptr_t)double_fault_task_entry,
+                           (uint32_t)(uintptr_t)&cpu->double_fault_stack[
+                               sizeof(cpu->double_fault_stack)]);
+
+        /* Copy master IDT to per-CPU IDT table */
+        memcpy(cpu->idt, ipo_idt_table, sizeof(ipo_idt_table));
+
+        /* Vector 8 (#DF) -> Double fault per-CPU Task Gate (0x85) */
+        x86_idt_set_task_gate(cpu->idt, 8, X86_TSS_DOUBLE_FAULT_SELECTOR);
+
+        /* Vector 14 (#PF) -> Page fault per-CPU Task Gate (0x85) */
+        x86_idt_set_task_gate(cpu->idt, 14, X86_TSS_PAGE_FAULT_SELECTOR);
+    }
+
+    cpu_exception_tables = tables;
+    cpu_exception_table_count = cpu_count;
+    if (!syscall_init_cpu(0u)) {
+        cpu_exception_tables = old_tables;
+        kfree(tables);
+        return false;
+    }
+
+    if (old_tables) {
+        kfree(old_tables);
+    }
+
+    return true;
+}
+
+void syscall_update_exception_page_directory(void) {
+    if (!cpu_exception_tables) return;
+    uint32_t cr3 = x86_read_cr3();
+    for (uint32_t i = 0u; i < cpu_exception_table_count; i++) {
+        cpu_exception_tables[i].current_tss.cr3 = cr3;
+        cpu_exception_tables[i].page_fault_tss.cr3 = cr3;
+        cpu_exception_tables[i].double_fault_tss.cr3 = cr3;
+    }
+}
+
+static void __attribute__((noreturn)) page_fault_terminate_process(void) {
+    process_emergency_crash_exit();
+    for (;;) __asm__ volatile("cli; hlt");
+}
+
+void cpu_page_fault_task_handler(uint32_t error_code) {
+    uint32_t cr2;
+    __asm__ volatile("movl %%cr2, %0" : "=r"(cr2));
+
+    uint32_t cpu_id = smp_get_current_cpu_id();
+    process_t *proc = process_get_current();
+    cpu_exception_tables_t *tables =
+        (cpu_id < cpu_exception_table_count)
+            ? &cpu_exception_tables[cpu_id]
+            : NULL;
+
+    if (tables &&
+        address_space_handle_trampoline_fault(cr2, error_code, tables->current_tss.esp)) {
+        tables->current_tss.cr3 = tables->page_fault_tss.cr3;
+        return;
+    }
+
+    if (proc && proc->current_thread && tables &&
+        process_thread_handle_stack_fault(
+            proc, proc->current_thread, cr2, error_code,
+            tables->current_tss.esp)) {
+        tables->current_tss.cr3 = tables->page_fault_tss.cr3;
+        return;
+    }
+
+    uint32_t eip = tables ? tables->current_tss.eip : 0u;
+    uint32_t esp = tables ? tables->current_tss.esp : 0u;
+    uint32_t tid = (proc && proc->current_thread) ? proc->current_thread->id : 0u;
+    serial_printf("[page-fault] DIAGNOSTIC: cpu=%u pid=%u tid=%u cr2=0x%08x eip=0x%08x esp=0x%08x err=0x%x\n",
+                  cpu_id, proc ? proc->pid : 0u, tid, cr2, eip, esp, error_code);
+    if (tables) {
+        serial_printf("[page-fault] REGS: eax=0x%08x ebx=0x%08x ecx=0x%08x edx=0x%08x esi=0x%08x edi=0x%08x ebp=0x%08x eflags=0x%08x cr3=0x%08x cs=0x%x ss=0x%x\n",
+                      tables->current_tss.eax, tables->current_tss.ebx, tables->current_tss.ecx,
+                      tables->current_tss.edx, tables->current_tss.esi, tables->current_tss.edi,
+                      tables->current_tss.ebp, tables->current_tss.eflags, tables->current_tss.cr3,
+                      tables->current_tss.cs, tables->current_tss.ss);
+    }
+    if (!proc || !tables) {
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+
+    process_thread_main_exit(proc);
+    proc->is_running = 0u;
+    tables->current_tss.eip =
+        (uint32_t)(uintptr_t)page_fault_terminate_process;
+    tables->current_tss.esp =
+        (uint32_t)(uintptr_t)&tables->page_fault_stack[
+            sizeof(tables->page_fault_stack) - 64u];
+    tables->current_tss.ebp = 0u;
+    tables->current_tss.eflags = 0x2u;
+    tables->current_tss.cs = 0x08u;
+    tables->current_tss.ss = 0x10u;
+    tables->current_tss.ds = 0x10u;
+    tables->current_tss.es = 0x10u;
+    tables->current_tss.fs = 0x10u;
+    tables->current_tss.gs = 0x18u;
+
+    /* Re-arm page fault TSS state */
+    tables->page_fault_tss.esp = (uint32_t)(uintptr_t)&tables->page_fault_stack[
+        sizeof(tables->page_fault_stack)];
+    tables->page_fault_tss.eip = (uint32_t)(uintptr_t)page_fault_task_entry;
+    tables->page_fault_tss.cr3 = x86_read_cr3();
+}
+
+void cpu_double_fault_task_handler(void) {
+    uint32_t cpu_id = smp_get_current_cpu_id();
+    serial_printf("KERNEL PANIC: double fault on CPU %u\n", cpu_id);
+    for (;;) __asm__ volatile("cli; hlt");
+}
 
 void cpu_exception_handler(uint32_t *frame) {
     uint32_t vector = frame[7];
+    if (vector == 7) {
+        /* Device Not Available (#NM):
+         * Hardware task switch (e.g. from page fault handler) automatically sets CR0.TS = 1.
+         * Clear TS flag so the thread can continue using FPU/SSE, and return. */
+        __asm__ volatile("clts");
+        return;
+    }
     uint32_t err_code = frame[8];
     uint32_t eip = frame[9];
     uint32_t cr2 = 0;
     if (vector == 14) {
         __asm__ volatile("movl %%cr2, %0" : "=r"(cr2));
     }
-    const char *name = (vector < 32) ? exception_names[vector] : "Unknown Exception";
+    const char *name = x86_exception_name(vector);
 
     putchar_unlock();
 
@@ -139,7 +478,7 @@ static int set_shared_var(const char *name, const void *value, uint32_t value_le
     ipo_shared_var_t *existing = find_shared_var_locked(name);
     if (existing != NULL) {
         void *new_value = kmalloc(value_len == 0u ? 1u : value_len);
-        if (new_value == NULL && value_len != 0u) {
+        if (new_value == NULL) {
             return -1;
         }
 
@@ -180,7 +519,7 @@ static int set_shared_var(const char *name, const void *value, uint32_t value_le
     memcpy(name_copy, name, name_len);
 
     void *value_copy = kmalloc(value_len == 0u ? 1u : value_len);
-    if (value_copy == NULL && value_len != 0u) {
+    if (value_copy == NULL) {
         kfree(name_copy);
         return -1;
     }
@@ -255,11 +594,23 @@ static void ipo_idt_set_gate(uint8_t num, uint32_t base, uint16_t selector, uint
     ipo_idt_table[num].zero = 0;
     ipo_idt_table[num].flags = flags;
     ipo_idt_table[num].base_hi = (uint16_t)((base >> 16) & 0xFFFFu);
+
+    if (cpu_exception_tables) {
+        for (uint32_t i = 0u; i < cpu_exception_table_count; i++) {
+            if (num != 8u && num != 14u) {
+                cpu_exception_tables[i].idt[num] = ipo_idt_table[num];
+            }
+        }
+    }
 }
 
 void ipo_register_syscall(uint32_t num, ipo_syscall_handler_t handler) {
+    if (num >= 65536u) {
+        return;
+    }
+
     if (ipo_syscall_table == NULL || num >= ipo_syscall_table_size) {
-        uint32_t new_size = (num + 1u > 64u) ? (num + 1u) : 64u;
+        uint32_t new_size = ipo_syscall_table_size ? ipo_syscall_table_size : 64u;
         while (new_size <= num) {
             new_size *= 2u;
         }
@@ -303,7 +654,12 @@ static uint32_t syscall_builtin_register(uint32_t num,
     uint32_t syscall_num = argv[0];
     uint32_t handler_ptr = argv[1];
 
-    if (syscall_num >= 0x10000000u) {
+    if (syscall_num < 0x2000u || syscall_num >= 65536u || handler_ptr == 0u) {
+        return IPO_SYSCALL_ENOSYS;
+    }
+
+    if (process_in_process_context() &&
+        !ipc_user_range((const void *)(uintptr_t)handler_ptr, 1u)) {
         return IPO_SYSCALL_ENOSYS;
     }
 
@@ -340,16 +696,6 @@ static uint32_t syscall_builtin_call(uint32_t num,
               argc > 1u ? &argv[1] : NULL);
 }
 
-static uint32_t syscall_default_handler(uint32_t num,
-                                        uint32_t argc,
-                                        uint32_t *argv) {
-    (void)argc;
-    (void)argv;
-
-    serial_printf("syscall: unregistered 0x%x\n", num);
-    return IPO_SYSCALL_ENOSYS;
-}
-
 static uint32_t syscall_builtin_print(uint32_t num,
                                       uint32_t argc,
                                       uint32_t *argv) {
@@ -359,7 +705,13 @@ static uint32_t syscall_builtin_print(uint32_t num,
         return IPO_SYSCALL_ENOSYS;
     }
 
-    return (uint32_t)printf((const char *)(uintptr_t)argv[0]);
+    const char *str = (const char *)(uintptr_t)argv[0];
+    if (str == NULL ||
+        (process_in_process_context() && !ipc_user_range(str, 1u))) {
+        return IPO_SYSCALL_ENOSYS;
+    }
+
+    return (uint32_t)printf("%s", str);
 }
 
 static uint32_t syscall_builtin_write(uint32_t num,
@@ -392,19 +744,6 @@ static uint32_t syscall_builtin_write(uint32_t num,
     }
 
     return count;
-}
-
-static uint32_t syscall_builtin_fs_create(uint32_t num,
-                                          uint32_t argc,
-                                          uint32_t *argv) {
-    (void)num;
-
-    if (argc < 2u || argv == NULL) {
-        return IPO_SYSCALL_ENOSYS;
-    }
-
-    return (uint32_t)ipo_fs_create((const char *)(uintptr_t)argv[0],
-                                   (uint8_t)argv[1]);
 }
 
 static uint32_t syscall_builtin_fs_open(uint32_t num,
@@ -573,7 +912,11 @@ static uint32_t syscall_builtin_fs_statvfs(uint32_t num,
     (void)num;
     if (argc < 1u || argv == NULL) return IPO_SYSCALL_ENOSYS;
     uint32_t *out = (uint32_t *)(uintptr_t)argv[0];
-    if (out == NULL || !fs_mounted) return 1u;
+    if (out == NULL ||
+        (process_in_process_context() && !ipc_user_range(out, 7u * sizeof(uint32_t))) ||
+        !fs_mounted) {
+        return 1u;
+    }
 
     uint32_t data_start = (uint32_t)sb.data_blocks_start;
     uint32_t total = (sb.fs_size_blocks > data_start)
@@ -1063,101 +1406,22 @@ static uint32_t syscall_builtin_binfmt_list(uint32_t num,
     return IPO_SYSCALL_OK;
 }
 
-static size_t syscall_read_visual_offset(const char *buf, uint32_t len, uint32_t index) {
-    size_t vcol = 0;
-    for (uint32_t i = 0; i < index && i < len; i++) {
-        unsigned char uc = (unsigned char)buf[i];
-        if ((uc & 0xC0) == 0x80) {
-            continue; /* Skip UTF-8 continuation bytes */
-        }
-        if (buf[i] == '\t') {
-            size_t tab_spaces = 4 - (vcol % 4);
-            if (tab_spaces == 0) tab_spaces = 4;
-            vcol += tab_spaces;
-        } else {
-            vcol += 1;
-        }
+static uint32_t utf8_prev_char(const char *buf, uint32_t pos) {
+    if (pos == 0u) return 0u;
+    pos--;
+    while (pos > 0u && ((unsigned char)buf[pos] & 0xC0u) == 0x80u) {
+        pos--;
     }
-    return vcol;
+    return pos;
 }
 
-static void syscall_read_render(int32_t *start_cursor_ptr, int32_t start_origin, const char *buf, uint32_t len, uint32_t prev_len, uint32_t cursor_pos) {
-    (void)start_origin;
-    size_t vis_cursor = syscall_read_visual_offset(buf, len, cursor_pos);
-    size_t vis_len = syscall_read_visual_offset(buf, len, len);
-    size_t vis_prev = (prev_len > len) ? (vis_len + (prev_len - len)) : vis_len;
-
-    /* If cursor or text tail exceeds bottom of screen, auto-scroll */
-    while (*start_cursor_ptr + (int32_t)vis_cursor >= VGA_WIDTH * VGA_HEIGHT) {
-        terminal_auto_scroll();
-        *start_cursor_ptr -= VGA_WIDTH;
+static uint32_t utf8_next_char(const char *buf, uint32_t len, uint32_t pos) {
+    if (pos >= len) return len;
+    pos++;
+    while (pos < len && ((unsigned char)buf[pos] & 0xC0u) == 0x80u) {
+        pos++;
     }
-    while (*start_cursor_ptr + (int32_t)vis_len >= VGA_WIDTH * VGA_HEIGHT) {
-        terminal_auto_scroll();
-        *start_cursor_ptr -= VGA_WIDTH;
-    }
-
-    volatile uint16_t *vga = VGA_MEMORY;
-    process_t *proc = process_get_current();
-
-    /* Draw text */
-    size_t vcol = 0;
-    size_t i = 0;
-    while (i < len) {
-        if (buf[i] == '\t') {
-            size_t tab_spaces = 4 - (vcol % 4);
-            if (tab_spaces == 0) tab_spaces = 4;
-            for (size_t s = 0; s < tab_spaces; s++) {
-                int32_t off = *start_cursor_ptr + (int32_t)(vcol + s);
-                if (off >= VGA_START_CURSOR_POSITION && off < VGA_WIDTH * VGA_HEIGHT) {
-                    uint16_t entry = vga_entry(' ', VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-                    vga[off] = entry;
-                    if (proc && proc->text_vram_backup) {
-                        proc->text_vram_backup[off] = entry;
-                    }
-                }
-            }
-            vcol += tab_spaces;
-            i++;
-        } else {
-            size_t bytes = 1;
-            uint8_t glyph = utf8_to_vga_glyph(&buf[i], len - i, &bytes);
-
-            int32_t off = *start_cursor_ptr + (int32_t)vcol;
-            if (off >= VGA_START_CURSOR_POSITION && off < VGA_WIDTH * VGA_HEIGHT) {
-                uint16_t entry = vga_entry(glyph, VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-                vga[off] = entry;
-                if (proc && proc->text_vram_backup) {
-                    proc->text_vram_backup[off] = entry;
-                }
-            }
-            vcol += 1;
-            i += bytes;
-        }
-    }
-
-    /* Erase old tail with spaces */
-    for (size_t i = vcol; i < vis_prev; i++) {
-        int32_t off = *start_cursor_ptr + (int32_t)i;
-        if (off >= VGA_START_CURSOR_POSITION && off < VGA_WIDTH * VGA_HEIGHT) {
-            uint16_t entry = vga_entry(' ', VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
-            vga[off] = entry;
-            if (proc && proc->text_vram_backup) {
-                proc->text_vram_backup[off] = entry;
-            }
-        }
-    }
-
-    /* Position cursor */
-    int32_t cur = *start_cursor_ptr + (int32_t)vis_cursor;
-    if (cur < VGA_START_CURSOR_POSITION) cur = VGA_START_CURSOR_POSITION;
-    if (cur >= VGA_WIDTH * VGA_HEIGHT) cur = VGA_WIDTH * VGA_HEIGHT - 1;
-    vga_set_cursor((uint16_t)cur);
-    vga_show_cursor();
-    if (proc) {
-        proc->text_cursor_pos = (uint16_t)cur;
-        proc->text_cursor_visible = true;
-    }
+    return pos;
 }
 
 static uint32_t syscall_builtin_read(uint32_t num,
@@ -1165,7 +1429,11 @@ static uint32_t syscall_builtin_read(uint32_t num,
                                      uint32_t *argv) {
     (void)num;
 
-    if (argc < 1u || argv == NULL) {
+    if (argc < 2u || argv == NULL) {
+        return IPO_SYSCALL_ENOSYS;
+    }
+    if (process_in_process_context() &&
+        !ipc_user_range(argv, 2u * sizeof(uint32_t))) {
         return IPO_SYSCALL_ENOSYS;
     }
 
@@ -1176,7 +1444,8 @@ static uint32_t syscall_builtin_read(uint32_t num,
 
     if (max_len == 0u) {
         out_ptr = (char **)(uintptr_t)argv[0];
-        if (out_ptr == NULL) {
+        if (out_ptr == NULL ||
+            (process_in_process_context() && !ipc_user_range(out_ptr, sizeof(char *)))) {
             return IPO_SYSCALL_ENOSYS;
         }
         capacity = 256u;
@@ -1186,7 +1455,8 @@ static uint32_t syscall_builtin_read(uint32_t num,
         }
     } else {
         buffer = (char *)(uintptr_t)argv[0];
-        if (buffer == NULL) {
+        if (buffer == NULL ||
+            (process_in_process_context() && !ipc_user_range(buffer, max_len))) {
             return IPO_SYSCALL_ENOSYS;
         }
         capacity = max_len;
@@ -1221,6 +1491,7 @@ static uint32_t syscall_builtin_read(uint32_t num,
 
     uint32_t len = 0u;
     uint32_t cursor_pos = 0u;
+    size_t prev_vis_len = 0u;
     int32_t start_origin = (int32_t)vga_get_cursor_position();
     if (start_origin < VGA_START_CURSOR_POSITION || start_origin >= VGA_WIDTH * VGA_HEIGHT) {
         start_origin = VGA_START_CURSOR_POSITION;
@@ -1271,19 +1542,17 @@ static uint32_t syscall_builtin_read(uint32_t num,
             continue;
         }
 
-        /* 2. Default Ctrl+C: cancel active line input */
         if (keyboard_is_ctrl_pressed() && scancode == 0x2E) {
             while (terminal_get_bottom_buffer_count() > 0) {
                 terminal_scroll_down();
                 start_cursor -= VGA_WIDTH;
             }
-            size_t vis_len = syscall_read_visual_offset(buffer, len, len);
+            size_t vis_len = terminal_visual_offset_range(buffer, len, len);
             int32_t cur = start_cursor + (int32_t)vis_len;
             if (cur < VGA_START_CURSOR_POSITION) cur = VGA_START_CURSOR_POSITION;
             if (cur >= VGA_WIDTH * VGA_HEIGHT) cur = VGA_WIDTH * VGA_HEIGHT - 1;
             vga_set_cursor((uint16_t)cur);
             printf("^C\n");
-            /* Signal interrupt to kernel and return special code */
             system_request_interrupt();
             keyboard_set_app_input_mode(false);
             system_set_state(proc ? SYSTEM_STATE_PROCESS_RUNNING : prev_state);
@@ -1291,11 +1560,10 @@ static uint32_t syscall_builtin_read(uint32_t num,
                 kfree(buffer);
                 *out_ptr = NULL;
             }
-            return (uint32_t)(-2); /* IPO_SYSCALL_EINTR */
+            return (uint32_t)(-2);
         }
 
         if (scancode == 0x20 && keyboard_is_ctrl_pressed()) {
-            /* Ctrl+D: EOF when at start of empty line */
             if (len == 0u) {
                 keyboard_set_app_input_mode(false);
                 system_set_state(proc ? SYSTEM_STATE_PROCESS_RUNNING : prev_state);
@@ -1303,26 +1571,25 @@ static uint32_t syscall_builtin_read(uint32_t num,
                     kfree(buffer);
                     *out_ptr = NULL;
                 }
-                return (uint32_t)(-3); /* EOF */
+                return (uint32_t)(-3);
             }
         }
 
-        /* Navigation and Scrolling keys */
-        if (scancode == 0x49) { /* Page Up */
+        if (scancode == 0x49) {
             if (terminal_get_top_buffer_count() > 0) {
                 terminal_scroll_up();
                 start_cursor += VGA_WIDTH;
             }
             continue;
         }
-        if (scancode == 0x51) { /* Page Down */
+        if (scancode == 0x51) {
             if (terminal_get_bottom_buffer_count() > 0) {
                 terminal_scroll_down();
                 start_cursor -= VGA_WIDTH;
             }
             continue;
         }
-        if (scancode == 0x48) { /* Up arrow */
+        if (scancode == 0x48) {
             if (terminal_get_bottom_buffer_count() > 0) {
                 terminal_scroll_up();
                 start_cursor += VGA_WIDTH;
@@ -1330,14 +1597,21 @@ static uint32_t syscall_builtin_read(uint32_t num,
             }
             if (cursor_pos >= VGA_WIDTH) {
                 cursor_pos -= VGA_WIDTH;
-                syscall_read_render(&start_cursor, start_origin, buffer, len, len, cursor_pos);
+                while (cursor_pos > 0u && ((unsigned char)buffer[cursor_pos] & 0xC0u) == 0x80u) {
+                    cursor_pos--;
+                }
+                terminal_render_text_line(&start_cursor, buffer, len, VGA_COLOR_LIGHT_GREY,
+                                          &prev_vis_len, cursor_pos,
+                                          proc ? proc->text_vram_backup : NULL, true);
             } else if (cursor_pos > 0) {
                 cursor_pos = 0u;
-                syscall_read_render(&start_cursor, start_origin, buffer, len, len, cursor_pos);
+                terminal_render_text_line(&start_cursor, buffer, len, VGA_COLOR_LIGHT_GREY,
+                                          &prev_vis_len, cursor_pos,
+                                          proc ? proc->text_vram_backup : NULL, true);
             }
             continue;
         }
-        if (scancode == 0x50) { /* Down arrow */
+        if (scancode == 0x50) {
             if (terminal_get_bottom_buffer_count() > 0) {
                 terminal_scroll_down();
                 start_cursor -= VGA_WIDTH;
@@ -1345,64 +1619,82 @@ static uint32_t syscall_builtin_read(uint32_t num,
             }
             if (cursor_pos + VGA_WIDTH <= len) {
                 cursor_pos += VGA_WIDTH;
-                syscall_read_render(&start_cursor, start_origin, buffer, len, len, cursor_pos);
+                while (cursor_pos < len && ((unsigned char)buffer[cursor_pos] & 0xC0u) == 0x80u) {
+                    cursor_pos++;
+                }
+                terminal_render_text_line(&start_cursor, buffer, len, VGA_COLOR_LIGHT_GREY,
+                                          &prev_vis_len, cursor_pos,
+                                          proc ? proc->text_vram_backup : NULL, true);
             } else if (cursor_pos < len) {
                 cursor_pos = len;
-                syscall_read_render(&start_cursor, start_origin, buffer, len, len, cursor_pos);
+                terminal_render_text_line(&start_cursor, buffer, len, VGA_COLOR_LIGHT_GREY,
+                                          &prev_vis_len, cursor_pos,
+                                          proc ? proc->text_vram_backup : NULL, true);
             }
             continue;
         }
-        if (scancode == 0x4B) { /* Left arrow */
+        if (scancode == 0x4B) {
             while (terminal_get_bottom_buffer_count() > 0) {
                 terminal_scroll_down();
                 start_cursor -= VGA_WIDTH;
             }
             if (cursor_pos > 0u) {
-                cursor_pos--;
-                syscall_read_render(&start_cursor, start_origin, buffer, len, len, cursor_pos);
+                cursor_pos = utf8_prev_char(buffer, cursor_pos);
+                terminal_render_text_line(&start_cursor, buffer, len, VGA_COLOR_LIGHT_GREY,
+                                          &prev_vis_len, cursor_pos,
+                                          proc ? proc->text_vram_backup : NULL, true);
             }
             continue;
         }
-        if (scancode == 0x4D) { /* Right arrow */
+        if (scancode == 0x4D) {
             while (terminal_get_bottom_buffer_count() > 0) {
                 terminal_scroll_down();
                 start_cursor -= VGA_WIDTH;
             }
             if (cursor_pos < len) {
-                cursor_pos++;
-                syscall_read_render(&start_cursor, start_origin, buffer, len, len, cursor_pos);
+                cursor_pos = utf8_next_char(buffer, len, cursor_pos);
+                terminal_render_text_line(&start_cursor, buffer, len, VGA_COLOR_LIGHT_GREY,
+                                          &prev_vis_len, cursor_pos,
+                                          proc ? proc->text_vram_backup : NULL, true);
             }
             continue;
         }
-        if (scancode == 0x47) { /* Home */
+        if (scancode == 0x47) {
             while (terminal_get_bottom_buffer_count() > 0) {
                 terminal_scroll_down();
                 start_cursor -= VGA_WIDTH;
             }
             cursor_pos = 0u;
-            syscall_read_render(&start_cursor, start_origin, buffer, len, len, cursor_pos);
+            terminal_render_text_line(&start_cursor, buffer, len, VGA_COLOR_LIGHT_GREY,
+                                      &prev_vis_len, cursor_pos,
+                                      proc ? proc->text_vram_backup : NULL, true);
             continue;
         }
-        if (scancode == 0x4F) { /* End */
+        if (scancode == 0x4F) {
             while (terminal_get_bottom_buffer_count() > 0) {
                 terminal_scroll_down();
                 start_cursor -= VGA_WIDTH;
             }
             cursor_pos = len;
-            syscall_read_render(&start_cursor, start_origin, buffer, len, len, cursor_pos);
+            terminal_render_text_line(&start_cursor, buffer, len, VGA_COLOR_LIGHT_GREY,
+                                      &prev_vis_len, cursor_pos,
+                                      proc ? proc->text_vram_backup : NULL, true);
             continue;
         }
-        if (scancode == 0x53) { /* Delete */
+        if (scancode == 0x53) {
             while (terminal_get_bottom_buffer_count() > 0) {
                 terminal_scroll_down();
                 start_cursor -= VGA_WIDTH;
             }
             if (cursor_pos < len) {
-                uint32_t old_len = len;
-                memmove(&buffer[cursor_pos], &buffer[cursor_pos + 1], len - cursor_pos);
-                len--;
+                uint32_t next_pos = utf8_next_char(buffer, len, cursor_pos);
+                uint32_t del_bytes = next_pos - cursor_pos;
+                memmove(&buffer[cursor_pos], &buffer[next_pos], len - next_pos + 1u);
+                len -= del_bytes;
                 buffer[len] = '\0';
-                syscall_read_render(&start_cursor, start_origin, buffer, len, old_len, cursor_pos);
+                terminal_render_text_line(&start_cursor, buffer, len, VGA_COLOR_LIGHT_GREY,
+                                          &prev_vis_len, cursor_pos,
+                                          proc ? proc->text_vram_backup : NULL, true);
             }
             continue;
         }
@@ -1414,7 +1706,7 @@ static uint32_t syscall_builtin_read(uint32_t num,
                 terminal_scroll_down();
                 start_cursor -= VGA_WIDTH;
             }
-            size_t vis_len = syscall_read_visual_offset(buffer, len, len);
+            size_t vis_len = terminal_visual_offset_range(buffer, len, len);
             int32_t cur = start_cursor + (int32_t)vis_len;
             if (cur < VGA_START_CURSOR_POSITION) cur = VGA_START_CURSOR_POSITION;
             if (cur >= VGA_WIDTH * VGA_HEIGHT) cur = VGA_WIDTH * VGA_HEIGHT - 1;
@@ -1430,17 +1722,15 @@ static uint32_t syscall_builtin_read(uint32_t num,
                 start_cursor -= VGA_WIDTH;
             }
             if (cursor_pos > 0u) {
-                uint32_t del_bytes = 1;
-                while (cursor_pos >= del_bytes + 1u &&
-                       ((unsigned char)buffer[cursor_pos - del_bytes] & 0xC0) == 0x80) {
-                    del_bytes++;
-                }
-                uint32_t old_len = len;
-                memmove(&buffer[cursor_pos - del_bytes], &buffer[cursor_pos], len - cursor_pos + 1);
-                cursor_pos -= del_bytes;
+                uint32_t prev_pos = utf8_prev_char(buffer, cursor_pos);
+                uint32_t del_bytes = cursor_pos - prev_pos;
+                memmove(&buffer[prev_pos], &buffer[cursor_pos], len - cursor_pos + 1u);
+                cursor_pos = prev_pos;
                 len -= del_bytes;
                 buffer[len] = '\0';
-                syscall_read_render(&start_cursor, start_origin, buffer, len, old_len, cursor_pos);
+                terminal_render_text_line(&start_cursor, buffer, len, VGA_COLOR_LIGHT_GREY,
+                                          &prev_vis_len, cursor_pos,
+                                          proc ? proc->text_vram_backup : NULL, true);
             }
             continue;
         }
@@ -1452,26 +1742,31 @@ static uint32_t syscall_builtin_read(uint32_t num,
             }
             if (max_len == 0u) {
                 if (len + 1u >= capacity) {
+                    if (capacity > UINT32_MAX / 2u - 16u) {
+                        continue;
+                    }
                     uint32_t new_cap = (capacity + 16u) * 2u;
                     char *new_buf = (char *)kmalloc(new_cap);
-                    if (new_buf != NULL) {
-                        memcpy(new_buf, buffer, len + 1);
-                        kfree(buffer);
-                        buffer = new_buf;
-                        capacity = new_cap;
+                    if (new_buf == NULL) {
+                        continue;
                     }
+                    memcpy(new_buf, buffer, len + 1);
+                    kfree(buffer);
+                    buffer = new_buf;
+                    capacity = new_cap;
                 }
             } else {
                 if (len + 1u >= capacity) continue;
             }
 
-            uint32_t old_len = len;
             memmove(&buffer[cursor_pos + 1], &buffer[cursor_pos], len - cursor_pos + 1);
             buffer[cursor_pos] = '\t';
             cursor_pos++;
             len++;
             buffer[len] = '\0';
-            syscall_read_render(&start_cursor, start_origin, buffer, len, old_len, cursor_pos);
+            terminal_render_text_line(&start_cursor, buffer, len, VGA_COLOR_LIGHT_GREY,
+                                      &prev_vis_len, cursor_pos,
+                                      proc ? proc->text_vram_backup : NULL, true);
             continue;
         }
 
@@ -1483,29 +1778,34 @@ static uint32_t syscall_builtin_read(uint32_t num,
                 start_cursor -= VGA_WIDTH;
             }
             if (max_len == 0u) {
-                if (len + slen >= capacity) {
-                    uint32_t new_cap = (capacity + slen + 32u) * 2u;
-                    char *new_buf = (char *)kmalloc(new_cap);
-                    if (new_buf != NULL) {
-                        memcpy(new_buf, buffer, len + 1);
-                        kfree(buffer);
-                        buffer = new_buf;
-                        capacity = new_cap;
+                if (slen >= (size_t)(capacity - len)) {
+                    if (slen > UINT32_MAX / 2u || capacity > UINT32_MAX / 2u - slen - 32u) {
+                        continue;
                     }
+                    uint32_t new_cap = (capacity + (uint32_t)slen + 32u) * 2u;
+                    char *new_buf = (char *)kmalloc(new_cap);
+                    if (new_buf == NULL) {
+                        continue;
+                    }
+                    memcpy(new_buf, buffer, len + 1);
+                    kfree(buffer);
+                    buffer = new_buf;
+                    capacity = new_cap;
                 }
             } else {
-                if (len + slen >= capacity) {
+                if (slen >= (size_t)(capacity - len)) {
                     continue;
                 }
             }
 
-            uint32_t old_len = len;
             memmove(&buffer[cursor_pos + slen], &buffer[cursor_pos], len - cursor_pos + 1);
             memcpy(&buffer[cursor_pos], out_str, slen);
             cursor_pos += (uint32_t)slen;
             len += (uint32_t)slen;
             buffer[len] = '\0';
-            syscall_read_render(&start_cursor, start_origin, buffer, len, old_len, cursor_pos);
+            terminal_render_text_line(&start_cursor, buffer, len, VGA_COLOR_LIGHT_GREY,
+                                      &prev_vis_len, cursor_pos,
+                                      proc ? proc->text_vram_backup : NULL, true);
         }
     }
 
@@ -1725,85 +2025,127 @@ static uint32_t syscall_builtin_sbrk(uint32_t num, uint32_t argc, uint32_t *argv
     process_t *proc = process_get_current();
 
     if (proc && proc->user_heap_base != 0) {
-        uint32_t prev = proc->user_heap_break;
+        if (proc->heap_chunk_count == 0) {
+            if (!process_heap_ensure_capacity(proc, 1)) {
+                return (uint32_t)-1;
+            }
+            proc->heap_chunk_count = 1;
+            proc->heap_chunks[0].base = proc->user_heap_base;
+            proc->heap_chunks[0].limit = proc->user_heap_limit;
+            proc->heap_chunks[0].brk = proc->user_heap_break;
+        }
+        if (!proc->heap_chunks) {
+            return (uint32_t)-1;
+        }
+        uint32_t active_idx = proc->heap_chunk_count - 1;
+        uint32_t prev = proc->heap_chunks[active_idx].brk;
         if (inc == 0) {
             return prev;
         }
         if (inc > 0) {
-            if ((uint32_t)inc > USER_HEAP_PROCESS_STRIDE ||
-                (uint32_t)inc > UINT32_MAX - proc->user_heap_break) {
+            uint32_t current_brk = proc->heap_chunks[active_idx].brk;
+            uint32_t current_limit = proc->heap_chunks[active_idx].limit;
+            uint64_t needed64 = (uint64_t)current_brk + (uint32_t)inc;
+            if (needed64 > 0xB0000000ULL) {
                 return (uint32_t)-1;
             }
-            uint32_t needed = proc->user_heap_break + (uint32_t)inc;
-            if (needed > proc->user_heap_limit) {
-                if (process_heap_can_expand(proc, needed)) {
-                    uint64_t aligned = ((uint64_t)needed + 0xFFFFu) & ~0xFFFFULL;
-                    uint32_t aligned_limit = aligned <= UINT32_MAX
-                        ? (uint32_t)aligned : needed;
-                    if (!process_heap_can_expand(proc, aligned_limit)) {
-                        aligned_limit = needed;
-                        if (!process_heap_can_expand(proc, aligned_limit)) {
-                            return (uint32_t)-1;
-                        }
-                    }
-                    uint32_t mapped_start =
-                        proc->user_heap_limit & ~0xFFFu;
-                    uint64_t mapped_end =
-                        ((uint64_t)aligned_limit + 0xFFFu) & ~0xFFFULL;
-                    if (mapped_end > UINT32_MAX) {
-                        return (uint32_t)-1;
-                    }
+            uint32_t needed = (uint32_t)needed64;
+
+            bool can_expand = false;
+            uint32_t aligned_limit = 0;
+            if (needed <= current_limit) {
+                can_expand = true;
+                aligned_limit = current_limit;
+            } else {
+                uint64_t aligned = ((uint64_t)needed + 0xFFFu) & ~0xFFFULL;
+                if (aligned <= 0xB0000000ULL) {
+                    aligned_limit = (uint32_t)aligned;
+                    can_expand = process_heap_chunk_can_expand(proc, active_idx, aligned_limit);
+                }
+            }
+
+            if (can_expand) {
+                if (aligned_limit > current_limit) {
+                    uint32_t mapped_start = current_limit & ~0xFFFu;
+                    uint32_t mapped_end = aligned_limit;
                     if (mapped_end > mapped_start &&
                         !process_update_memory_mappings(
                             proc, mapped_start,
-                            (uint32_t)mapped_end - mapped_start,
+                            mapped_end - mapped_start,
                             true)) {
                         return (uint32_t)-1;
                     }
+                    proc->heap_chunks[active_idx].limit = aligned_limit;
                     proc->user_heap_limit = aligned_limit;
-                    serial_printf("[process] Dynamic on-demand heap expanded for pid=%u: limit=0x%x (+%u KiB, total=%u MiB)\n",
-                                  proc->pid, proc->user_heap_limit, (uint32_t)inc / 1024,
-                                  (proc->user_heap_limit - proc->user_heap_base) / (1024 * 1024));
+                    serial_printf("[process] Dynamic on-demand heap expanded for pid=%u chunk %u: limit=0x%x (+%u KiB)\n",
+                                  proc->pid, active_idx, aligned_limit, (uint32_t)inc / 1024);
+                }
+                if ((uint32_t)inc <= 65536u) {
+                    memset((void *)(uintptr_t)current_brk, 0, (uint32_t)inc);
                 } else {
-                    serial_printf("[process] Out of physical RAM for pid=%u heap: need=0x%x limit=0x%x\n",
-                                  proc->pid, needed, proc->user_heap_limit);
+                    memset((void *)(uintptr_t)current_brk, 0, 4096u);
+                }
+                proc->heap_chunks[active_idx].brk = needed;
+                proc->user_heap_break = needed;
+                return current_brk;
+            } else {
+                /* Current chunk is blocked by another process or boundary!
+                 * Allocate a NEW discontinuous chunk (jumping over the other process)! */
+                uint32_t new_chunk_base = process_heap_allocate_new_chunk(proc, (uint32_t)inc);
+                if (new_chunk_base == 0) {
+                    serial_printf("[process] Out of physical RAM for pid=%u heap: failed to allocate %u KiB\n",
+                                  proc->pid, (uint32_t)inc / 1024);
                     return (uint32_t)-1;
                 }
+                if ((uint32_t)inc <= 65536u) {
+                    memset((void *)(uintptr_t)new_chunk_base, 0, (uint32_t)inc);
+                } else {
+                    memset((void *)(uintptr_t)new_chunk_base, 0, 4096u);
+                }
+                return new_chunk_base;
             }
-            /* Guarantee complete memory isolation: zero-fill newly allocated memory */
-            memset((void *)(uintptr_t)prev, 0, (uint32_t)inc);
-            proc->user_heap_break = needed;
-            return prev;
         } else {
             uint32_t dec = 0u - (uint32_t)inc;
-            if (dec > proc->user_heap_break - proc->user_heap_base) {
+            uint32_t current_brk = proc->heap_chunks[active_idx].brk;
+            uint32_t current_base = proc->heap_chunks[active_idx].base;
+
+            if (dec > current_brk - current_base) {
                 return (uint32_t)-1;
             }
-            uint32_t new_break = proc->user_heap_break - dec;
-            uint64_t aligned_limit =
-                ((uint64_t)new_break + 0xFFFFu) & ~0xFFFFULL;
-            if (aligned_limit > UINT32_MAX) {
+            uint32_t new_break = current_brk - dec;
+            if (new_break == current_base && proc->heap_chunk_count > 1) {
+                uint32_t mapped_start = current_base & ~0xFFFu;
+                uint32_t mapped_end = (proc->heap_chunks[active_idx].limit + 0xFFFu) & ~0xFFFu;
+                if (mapped_end > mapped_start) {
+                    process_update_memory_mappings(proc, mapped_start, mapped_end - mapped_start, false);
+                }
+                proc->heap_chunk_count--;
+                active_idx = proc->heap_chunk_count - 1;
+                proc->user_heap_break = proc->heap_chunks[active_idx].brk;
+                proc->user_heap_limit = proc->heap_chunks[active_idx].limit;
+                return current_brk;
+            }
+            uint64_t aligned_limit = ((uint64_t)new_break + 0xFFFu) & ~0xFFFULL;
+            if (aligned_limit > 0xB0000000ULL) {
                 return (uint32_t)-1;
             }
             uint32_t new_limit = (uint32_t)aligned_limit;
-            if (new_limit < proc->user_heap_limit) {
+            if (new_limit < proc->heap_chunks[active_idx].limit) {
                 uint32_t mapped_start = new_limit & ~0xFFFu;
-                uint64_t mapped_end =
-                    ((uint64_t)proc->user_heap_limit + 0xFFFu) & ~0xFFFULL;
-                if (mapped_end > UINT32_MAX) {
-                    return (uint32_t)-1;
-                }
+                uint32_t mapped_end = ((uint64_t)proc->heap_chunks[active_idx].limit + 0xFFFu) & ~0xFFFULL;
                 if (mapped_end > mapped_start &&
                     !process_update_memory_mappings(
                         proc, mapped_start,
-                        (uint32_t)mapped_end - mapped_start,
+                        (uint32_t)(mapped_end - mapped_start),
                         false)) {
                     return (uint32_t)-1;
                 }
+                proc->heap_chunks[active_idx].limit = new_limit;
+                proc->user_heap_limit = new_limit;
             }
+            proc->heap_chunks[active_idx].brk = new_break;
             proc->user_heap_break = new_break;
-            proc->user_heap_limit = new_limit;
-            return prev;
+            return current_brk;
         }
     }
 
@@ -1813,7 +2155,9 @@ static uint32_t syscall_builtin_sbrk(uint32_t num, uint32_t argc, uint32_t *argv
         return prev;
     }
     if (inc > 0) {
-        if (user_heap_break + (uint32_t)inc > USER_HEAP_START + USER_HEAP_PROCESS_STRIDE) {
+        uint64_t total_ram = memory_map_get_total_ram();
+        uint64_t limit_ram = total_ram > 0 ? total_ram : 0xB0000000ULL;
+        if ((uint64_t)user_heap_break + (uint32_t)inc > limit_ram) {
             return (uint32_t)-1;
         }
         memset((void *)(uintptr_t)prev, 0, (uint32_t)inc);
@@ -2081,6 +2425,7 @@ static uint32_t syscall_builtin_exit(uint32_t num, uint32_t argc, uint32_t *argv
     sound_stop();
     process_t *proc = process_get_current();
     if (proc != NULL) {
+        wm_destroy_raw_gfx_window_for_pid(proc->pid);
         proc->is_running = 0;
         proc->exit_code = code;
         if (!process_get_separate_windows() ||
@@ -2350,6 +2695,8 @@ static uint32_t syscall_builtin_process_switch_fg(uint32_t num, uint32_t argc, u
     return 0;
 }
 
+static bool syscall_cur_owns_foreground_vga(process_t *cur);
+
 static uint32_t syscall_builtin_vga_set_mode(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num;
     if (argc == 0 || !argv) return 0;
@@ -2367,16 +2714,25 @@ static uint32_t syscall_builtin_vga_set_mode(uint32_t num, uint32_t argc, uint32
         }
         return 0;
     }
+    if (argv[0] == 4 && argc >= 3) {
+        return vga_gfx_set_resolution((int)argv[1], (int)argv[2]) ? 1u : 0u;
+    }
     process_t *cur = process_get_current();
-    process_t *fg = process_get_foreground();
     if (argv[0] == 1) {
         if (cur) cur->wants_graphics = true;
-        if (!fg || cur == fg) {
+        if (cur && (wm_has_raw_gfx_window_for_pid(cur->pid) ||
+                    process_workspace_get_proc_count(cur->window_id) > 1 ||
+                    (wm_session_active() && !process_get_separate_windows()))) {
+            wm_ensure_raw_gfx_window(cur);
+        } else if (syscall_cur_owns_foreground_vga(cur)) {
             vga_set_mode_13h_hardware();
         }
     } else {
-        if (cur) cur->wants_graphics = false;
-        if (!fg || cur == fg) {
+        if (cur) {
+            cur->wants_graphics = false;
+            wm_destroy_raw_gfx_window_for_pid(cur->pid);
+        }
+        if (syscall_cur_owns_foreground_vga(cur) && !wm_session_active()) {
             if (vga_is_graphics_mode()) {
                 vga_set_mode_text_hardware();
             }
@@ -2398,29 +2754,37 @@ static uint32_t syscall_builtin_vga_get_bounds(uint32_t num,
         return IPO_SYSCALL_ENOSYS;
     }
 
+    int32_t *w_ptr = (int32_t *)(uintptr_t)argv[0];
+    int32_t *h_ptr = (int32_t *)(uintptr_t)argv[1];
+    if (process_in_process_context() &&
+        (!ipc_user_range(argv, 2u * sizeof(uint32_t)) ||
+         !ipc_user_range(w_ptr, sizeof(int32_t)) ||
+         !ipc_user_range(h_ptr, sizeof(int32_t)))) {
+        return IPO_SYSCALL_ENOSYS;
+    }
+
     int width;
     int height;
     vga_gfx_get_screen_bounds(&width, &height);
-    *(int32_t *)(uintptr_t)argv[0] = width;
-    *(int32_t *)(uintptr_t)argv[1] = height;
+    *w_ptr = width;
+    *h_ptr = height;
     return 0;
 }
-
-static volatile bool kernel_system_interrupted = false;
 
 static uint32_t syscall_builtin_system_interrupt(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num;
     if (argc > 0 && argv) {
-        if (argv[0] == 1) {
-            kernel_system_interrupted = true;
+        if (argv[0] == 1u) {
+            system_request_interrupt();
             serial_printf("[syscall] system_interrupt requested\n");
-            return 1;
-        } else if (argv[0] == 0) {
-            kernel_system_interrupted = false;
-            return 0;
+            return 1u;
+        }
+        if (argv[0] == 0u) {
+            system_clear_interrupt();
+            return 0u;
         }
     }
-    return kernel_system_interrupted ? 1 : 0;
+    return system_is_interrupted() ? 1u : 0u;
 }
 
 static uint32_t syscall_builtin_kbd_get_scancode(uint32_t num, uint32_t argc, uint32_t *argv) {
@@ -2505,28 +2869,62 @@ static uint32_t syscall_builtin_mouse_get_motion(uint32_t num, uint32_t argc, ui
     return 0;
 }
 
+static bool syscall_cur_owns_foreground_vga(process_t *cur) {
+    if (!cur || !process_is_batch_active() || !process_get_separate_windows()) {
+        return true;
+    }
+    process_t *fg = process_get_displayed_foreground();
+    return (!fg || fg->window_id == cur->window_id);
+}
+
 static uint32_t syscall_builtin_vga_set_cursor(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num;
     if (argc > 0 && argv) {
-        vga_set_cursor((uint16_t)argv[0]);
+        uint16_t pos = (uint16_t)argv[0];
+        process_t *cur = process_get_current();
+        if (cur) {
+            cur->text_cursor_pos = pos;
+            process_sync_workspace_text_state(cur);
+        }
+        if (syscall_cur_owns_foreground_vga(cur)) {
+            vga_set_cursor(pos);
+        }
     }
     return 0;
 }
 
 static uint32_t syscall_builtin_vga_get_cursor(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num; (void)argc; (void)argv;
+    process_t *cur = process_get_current();
+    if (cur && !syscall_cur_owns_foreground_vga(cur)) {
+        return (uint32_t)cur->text_cursor_pos;
+    }
     return (uint32_t)vga_get_cursor_position();
 }
 
 static uint32_t syscall_builtin_vga_show_cursor(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num; (void)argc; (void)argv;
-    vga_show_cursor();
+    process_t *cur = process_get_current();
+    if (cur) {
+        cur->text_cursor_visible = true;
+        process_sync_workspace_text_state(cur);
+    }
+    if (syscall_cur_owns_foreground_vga(cur)) {
+        vga_show_cursor();
+    }
     return 0;
 }
 
 static uint32_t syscall_builtin_vga_hide_cursor(uint32_t num, uint32_t argc, uint32_t *argv) {
     (void)num; (void)argc; (void)argv;
-    vga_hide_cursor();
+    process_t *cur = process_get_current();
+    if (cur) {
+        cur->text_cursor_visible = false;
+        process_sync_workspace_text_state(cur);
+    }
+    if (syscall_cur_owns_foreground_vga(cur)) {
+        vga_hide_cursor();
+    }
     return 0;
 }
 
@@ -2551,6 +2949,15 @@ static uint32_t syscall_builtin_vga_get_overlay_flags(uint32_t num, uint32_t arg
     (void)num; (void)argc; (void)argv;
     process_t *cur = process_get_current();
     return cur ? cur->gfx_overlay_flags : 0;
+}
+
+static uint32_t syscall_builtin_vga_get_text_info(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 3u || !argv) return IPO_SYSCALL_ENOSYS;
+    vga_get_text_mode_info((uint16_t *)(uintptr_t)argv[0],
+                           (uint16_t *)(uintptr_t)argv[1],
+                           (uint32_t *)(uintptr_t)argv[2]);
+    return 0;
 }
 
 static uint32_t syscall_builtin_audio_init(uint32_t num, uint32_t argc, uint32_t *argv) {
@@ -2662,6 +3069,245 @@ static uint32_t syscall_builtin_audio_stream_update(uint32_t num, uint32_t argc,
     return 0;
 }
 
+static uint32_t syscall_caller_pid(void) {
+    process_t *p = process_get_current();
+    return p ? p->pid : 0u;
+}
+
+static uint32_t syscall_builtin_input_poll_key_ext(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv || !argv[0]) return (uint32_t)-1;
+    return ipo_input_poll_key_event(syscall_caller_pid(), (ipo_key_event_t *)(uintptr_t)argv[0]) ? 1u : 0u;
+}
+
+static uint32_t syscall_builtin_input_get_key_state(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv) return 0u;
+    return ipo_input_is_key_down(argv[0]) ? 1u : 0u;
+}
+
+static uint32_t syscall_builtin_input_get_modifiers(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    return ipo_input_get_modifiers();
+}
+
+static uint32_t syscall_builtin_shortcut_register(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv || !argv[0]) return 0u;
+    return ipo_shortcut_register((const ipo_shortcut_spec_t *)(uintptr_t)argv[0], syscall_caller_pid());
+}
+
+static uint32_t syscall_builtin_shortcut_unregister(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv) return (uint32_t)-1;
+    return (uint32_t)ipo_shortcut_unregister(argv[0], syscall_caller_pid());
+}
+
+static uint32_t syscall_builtin_shortcut_poll(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv || !argv[0]) return (uint32_t)-1;
+    return ipo_shortcut_poll(syscall_caller_pid(), (ipo_shortcut_event_t *)(uintptr_t)argv[0]) ? 1u : 0u;
+}
+
+static uint32_t syscall_builtin_input_dev_register(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv || !argv[0]) return 0u;
+    return ipo_input_dev_register((const ipo_input_dev_desc_t *)(uintptr_t)argv[0], syscall_caller_pid());
+}
+
+static uint32_t syscall_builtin_input_dev_unregister(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv) return (uint32_t)-1;
+    return (uint32_t)ipo_input_dev_unregister(argv[0], syscall_caller_pid());
+}
+
+static uint32_t syscall_builtin_input_dev_emit(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 2u || !argv || !argv[1]) return (uint32_t)-1;
+    return (uint32_t)ipo_input_dev_emit(argv[0], (const ipo_input_event_t *)(uintptr_t)argv[1], syscall_caller_pid());
+}
+
+static uint32_t syscall_builtin_input_dev_list(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 2u || !argv) return 0u;
+    return ipo_input_dev_list((ipo_input_dev_info_t *)(uintptr_t)argv[0], argv[1]);
+}
+
+static uint32_t syscall_builtin_input_dev_poll_event(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 2u || !argv || !argv[1]) return (uint32_t)-1;
+    return ipo_input_dev_poll_event(syscall_caller_pid(), argv[0], (ipo_input_event_t *)(uintptr_t)argv[1]) ? 1u : 0u;
+}
+
+static uint32_t syscall_builtin_input_dev_get_state(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 4u || !argv || !argv[3]) return (uint32_t)-1;
+    return (uint32_t)ipo_input_dev_get_state(argv[0], (uint16_t)argv[1], argv[2], (int32_t *)(uintptr_t)argv[3]);
+}
+
+static uint32_t syscall_builtin_mouse_inject(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 5u || !argv) return (uint32_t)-1;
+    mouse_inject_event((int32_t)argv[0], (int32_t)argv[1], (int32_t)argv[2], argv[3], argv[4] != 0u);
+    return 0u;
+}
+
+static uint32_t syscall_builtin_ps2_hook_register(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 2u || !argv) return 0u;
+    return ipo_ps2_hook_register(argv[0], argv[1], syscall_caller_pid());
+}
+
+static uint32_t syscall_builtin_ps2_hook_unregister(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv) return (uint32_t)-1;
+    return (uint32_t)ipo_ps2_hook_unregister(argv[0], syscall_caller_pid());
+}
+
+static uint32_t syscall_builtin_ps2_hook_poll(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 3u || !argv || !argv[1]) return 0u;
+    return ipo_ps2_hook_poll(argv[0], syscall_caller_pid(), (ipo_ps2_byte_event_t *)(uintptr_t)argv[1], argv[2]);
+}
+
+static uint32_t syscall_builtin_ps2_transact(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv || !argv[0]) return (uint32_t)-1;
+    return (uint32_t)ipo_ps2_transact((const ipo_ps2_transact_req_t *)(uintptr_t)argv[0]);
+}
+
+static uint32_t syscall_builtin_irq_subscribe(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv) return 0u;
+    return irq_subscribe((uint8_t)argv[0], syscall_caller_pid());
+}
+
+static uint32_t syscall_builtin_irq_unsubscribe(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv) return (uint32_t)-1;
+    return (uint32_t)irq_unsubscribe(argv[0], syscall_caller_pid());
+}
+
+static uint32_t syscall_builtin_irq_poll(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 3u || !argv) return 0u;
+    return irq_poll(argv[0], syscall_caller_pid(), (uint32_t *)(uintptr_t)argv[1], (uint64_t *)(uintptr_t)argv[2]);
+}
+
+static uint32_t syscall_builtin_irq_get_count(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv) return 0u;
+    return irq_get_count((uint8_t)argv[0]);
+}
+
+static uint32_t syscall_builtin_irq_register_cb(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 3u || !argv || !argv[1]) return 0u;
+    return irq_register_handler((uint8_t)argv[0], (irq_handler_fn_t)(uintptr_t)argv[1],
+                                (void *)(uintptr_t)argv[2], syscall_caller_pid());
+}
+
+static uint32_t syscall_builtin_irq_unregister_cb(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv) return (uint32_t)-1;
+    return (uint32_t)irq_unregister_handler(argv[0], syscall_caller_pid());
+}
+
+static uint32_t syscall_builtin_hw_map_mmio(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 3u || !argv) return 0u;
+    return (uint32_t)(uintptr_t)ipo_hw_map_mmio(argv[0], argv[1], argv[2], syscall_caller_pid());
+}
+
+static uint32_t syscall_builtin_hw_unmap_mmio(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 2u || !argv) return (uint32_t)-1;
+    return (uint32_t)ipo_hw_unmap_mmio((void *)(uintptr_t)argv[0], argv[1], syscall_caller_pid());
+}
+
+static uint32_t syscall_builtin_hw_alloc_dma(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 3u || !argv) return 0u;
+    return (uint32_t)(uintptr_t)ipo_hw_alloc_dma(argv[0], argv[1], (uint32_t *)(uintptr_t)argv[2], syscall_caller_pid());
+}
+
+static uint32_t syscall_builtin_hw_free_dma(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv) return (uint32_t)-1;
+    return (uint32_t)ipo_hw_free_dma((void *)(uintptr_t)argv[0], syscall_caller_pid());
+}
+
+static uint32_t syscall_builtin_hw_virt_to_phys(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv) return 0u;
+    return ipo_hw_virt_to_phys((const void *)(uintptr_t)argv[0], syscall_caller_pid());
+}
+
+static uint32_t syscall_builtin_pci_get_count(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    return pci_get_count();
+}
+
+static uint32_t syscall_builtin_pci_get_device(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 2u || !argv || !argv[1]) return (uint32_t)-1;
+    return (uint32_t)ipo_pci_fill_info(argv[0], (ipo_pci_dev_info_t *)(uintptr_t)argv[1]);
+}
+
+static uint32_t syscall_builtin_pci_config_read(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 5u || !argv) return 0xFFFFFFFFu;
+    uint8_t bus = (uint8_t)argv[0], slot = (uint8_t)argv[1], func = (uint8_t)argv[2], off = (uint8_t)argv[3];
+    if (argv[4] == 1u) return (uint32_t)pci_read_byte(bus, slot, func, off);
+    if (argv[4] == 2u) return (uint32_t)pci_read_word(bus, slot, func, off);
+    return pci_read_dword(bus, slot, func, off);
+}
+
+static uint32_t syscall_builtin_pci_config_write(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 6u || !argv) return (uint32_t)-1;
+    uint8_t bus = (uint8_t)argv[0], slot = (uint8_t)argv[1], func = (uint8_t)argv[2], off = (uint8_t)argv[3];
+    if (argv[4] == 1u) pci_write_byte(bus, slot, func, off, (uint8_t)argv[5]);
+    else if (argv[4] == 2u) pci_write_word(bus, slot, func, off, (uint16_t)argv[5]);
+    else pci_write_dword(bus, slot, func, off, argv[5]);
+    return 0u;
+}
+
+static uint32_t syscall_builtin_pci_enable_bus_master(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 3u || !argv) return (uint32_t)-1;
+    pci_device_t dev;
+    memset(&dev, 0, sizeof(dev));
+    dev.bus = (uint8_t)argv[0];
+    dev.slot = (uint8_t)argv[1];
+    dev.func = (uint8_t)argv[2];
+    pci_enable_bus_mastering(&dev);
+    return 0u;
+}
+
+static uint32_t syscall_builtin_dev_get_count(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num; (void)argc; (void)argv;
+    return device_get_count();
+}
+
+static uint32_t syscall_builtin_dev_get_info(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 2u || !argv || !argv[1]) return (uint32_t)-1;
+    return (uint32_t)ipo_device_fill_info(argv[0], (ipo_device_info_t *)(uintptr_t)argv[1]);
+}
+
+static uint32_t syscall_builtin_dev_register(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv || !argv[0]) return 0u;
+    return ipo_device_register_user((const ipo_device_info_t *)(uintptr_t)argv[0], syscall_caller_pid());
+}
+
+static uint32_t syscall_builtin_dev_unregister(uint32_t num, uint32_t argc, uint32_t *argv) {
+    (void)num;
+    if (argc < 1u || !argv) return (uint32_t)-1;
+    return (uint32_t)ipo_device_unregister_user(argv[0], syscall_caller_pid());
+}
+
 void syscall_load_idt(void) {
 
     ipo_idt_ptr_t idt_ptr = {
@@ -2699,10 +3345,6 @@ void syscall_init(void) {
         syscall_builtin_write);
 
     ipo_register_syscall(
-        IPO_SYSCALL_FS_CREATE,
-        syscall_builtin_fs_create);
-
-    ipo_register_syscall(
         IPO_SYSCALL_FS_OPEN,
         syscall_builtin_fs_open);
 
@@ -2729,6 +3371,10 @@ void syscall_init(void) {
     ipo_register_syscall(
         IPO_SYSCALL_FS_STAT,
         syscall_builtin_fs_stat);
+
+    ipo_register_syscall(
+        IPO_SYSCALL_FS_STATVFS,
+        syscall_builtin_fs_statvfs);
 
     ipo_register_syscall(
         IPO_SYSCALL_FS_LIST,
@@ -3101,6 +3747,7 @@ void syscall_init(void) {
     ipo_register_syscall(IPO_SYSCALL_VGA_SET_PALETTE, syscall_builtin_vga_set_palette);
     ipo_register_syscall(IPO_SYSCALL_VGA_SET_OVERLAY_FLAGS, syscall_builtin_vga_set_overlay_flags);
     ipo_register_syscall(IPO_SYSCALL_VGA_GET_OVERLAY_FLAGS, syscall_builtin_vga_get_overlay_flags);
+    ipo_register_syscall(IPO_SYSCALL_VGA_GET_TEXT_INFO, syscall_builtin_vga_get_text_info);
 
     ipo_register_syscall(IPO_SYSCALL_AUDIO_INIT, syscall_builtin_audio_init);
     ipo_register_syscall(IPO_SYSCALL_AUDIO_TICK, syscall_builtin_audio_tick);
@@ -3119,6 +3766,49 @@ void syscall_init(void) {
     ipo_register_syscall(IPO_SYSCALL_BINFMT_REGISTER, syscall_builtin_binfmt_register);
     ipo_register_syscall(IPO_SYSCALL_BINFMT_UNREGISTER, syscall_builtin_binfmt_unregister);
     ipo_register_syscall(IPO_SYSCALL_BINFMT_LIST, syscall_builtin_binfmt_list);
+
+    ipo_register_syscall(IPO_SYSCALL_INPUT_POLL_KEY_EXT, syscall_builtin_input_poll_key_ext);
+    ipo_register_syscall(IPO_SYSCALL_INPUT_GET_KEY_STATE, syscall_builtin_input_get_key_state);
+    ipo_register_syscall(IPO_SYSCALL_INPUT_GET_MODIFIERS, syscall_builtin_input_get_modifiers);
+    ipo_register_syscall(IPO_SYSCALL_SHORTCUT_REGISTER, syscall_builtin_shortcut_register);
+    ipo_register_syscall(IPO_SYSCALL_SHORTCUT_UNREGISTER, syscall_builtin_shortcut_unregister);
+    ipo_register_syscall(IPO_SYSCALL_SHORTCUT_POLL, syscall_builtin_shortcut_poll);
+    ipo_register_syscall(IPO_SYSCALL_INPUT_DEV_REGISTER, syscall_builtin_input_dev_register);
+    ipo_register_syscall(IPO_SYSCALL_INPUT_DEV_UNREGISTER, syscall_builtin_input_dev_unregister);
+    ipo_register_syscall(IPO_SYSCALL_INPUT_DEV_EMIT, syscall_builtin_input_dev_emit);
+    ipo_register_syscall(IPO_SYSCALL_INPUT_DEV_LIST, syscall_builtin_input_dev_list);
+    ipo_register_syscall(IPO_SYSCALL_INPUT_DEV_POLL_EVENT, syscall_builtin_input_dev_poll_event);
+    ipo_register_syscall(IPO_SYSCALL_INPUT_DEV_GET_STATE, syscall_builtin_input_dev_get_state);
+    ipo_register_syscall(IPO_SYSCALL_MOUSE_INJECT, syscall_builtin_mouse_inject);
+
+    ipo_register_syscall(IPO_SYSCALL_PS2_HOOK_REGISTER, syscall_builtin_ps2_hook_register);
+    ipo_register_syscall(IPO_SYSCALL_PS2_HOOK_UNREGISTER, syscall_builtin_ps2_hook_unregister);
+    ipo_register_syscall(IPO_SYSCALL_PS2_HOOK_POLL, syscall_builtin_ps2_hook_poll);
+    ipo_register_syscall(IPO_SYSCALL_PS2_TRANSACT, syscall_builtin_ps2_transact);
+
+    ipo_register_syscall(IPO_SYSCALL_IRQ_SUBSCRIBE, syscall_builtin_irq_subscribe);
+    ipo_register_syscall(IPO_SYSCALL_IRQ_UNSUBSCRIBE, syscall_builtin_irq_unsubscribe);
+    ipo_register_syscall(IPO_SYSCALL_IRQ_POLL, syscall_builtin_irq_poll);
+    ipo_register_syscall(IPO_SYSCALL_IRQ_GET_COUNT, syscall_builtin_irq_get_count);
+    ipo_register_syscall(IPO_SYSCALL_IRQ_REGISTER_CB, syscall_builtin_irq_register_cb);
+    ipo_register_syscall(IPO_SYSCALL_IRQ_UNREGISTER_CB, syscall_builtin_irq_unregister_cb);
+
+    ipo_register_syscall(IPO_SYSCALL_HW_MAP_MMIO, syscall_builtin_hw_map_mmio);
+    ipo_register_syscall(IPO_SYSCALL_HW_UNMAP_MMIO, syscall_builtin_hw_unmap_mmio);
+    ipo_register_syscall(IPO_SYSCALL_HW_ALLOC_DMA, syscall_builtin_hw_alloc_dma);
+    ipo_register_syscall(IPO_SYSCALL_HW_FREE_DMA, syscall_builtin_hw_free_dma);
+    ipo_register_syscall(IPO_SYSCALL_HW_VIRT_TO_PHYS, syscall_builtin_hw_virt_to_phys);
+
+    ipo_register_syscall(IPO_SYSCALL_PCI_GET_COUNT, syscall_builtin_pci_get_count);
+    ipo_register_syscall(IPO_SYSCALL_PCI_GET_DEVICE, syscall_builtin_pci_get_device);
+    ipo_register_syscall(IPO_SYSCALL_PCI_CONFIG_READ, syscall_builtin_pci_config_read);
+    ipo_register_syscall(IPO_SYSCALL_PCI_CONFIG_WRITE, syscall_builtin_pci_config_write);
+    ipo_register_syscall(IPO_SYSCALL_PCI_ENABLE_BUS_MASTER, syscall_builtin_pci_enable_bus_master);
+
+    ipo_register_syscall(IPO_SYSCALL_DEV_GET_COUNT, syscall_builtin_dev_get_count);
+    ipo_register_syscall(IPO_SYSCALL_DEV_GET_INFO, syscall_builtin_dev_get_info);
+    ipo_register_syscall(IPO_SYSCALL_DEV_REGISTER, syscall_builtin_dev_register);
+    ipo_register_syscall(IPO_SYSCALL_DEV_UNREGISTER, syscall_builtin_dev_unregister);
 
     for (int i = 0; i < 32; i++) {
         ipo_idt_set_gate(
@@ -3141,11 +3831,8 @@ void syscall_init(void) {
     outb(0xA1, 0xFF); io_wait();
 
     ipo_idt_set_gate(0x20, (uint32_t)irq0_isr, IPO_KERNEL_CODE_SEG, 0x8Eu);
-    for (int i = 0x21; i <= 0x27; i++) {
-        ipo_idt_set_gate((uint8_t)i, (uint32_t)irq_ignore_master, IPO_KERNEL_CODE_SEG, 0x8Eu);
-    }
-    for (int i = 0x28; i <= 0x2F; i++) {
-        ipo_idt_set_gate((uint8_t)i, (uint32_t)irq_ignore_slave, IPO_KERNEL_CODE_SEG, 0x8Eu);
+    for (int i = 0x21; i <= 0x2F; i++) {
+        ipo_idt_set_gate((uint8_t)i, irq_stub_table[i - 0x21], IPO_KERNEL_CODE_SEG, 0x8Eu);
     }
 
     ipo_idt_set_gate(
@@ -3177,7 +3864,13 @@ void syscall_init(void) {
         : : "m"(gdt_ptr) : "eax", "memory"
     );
 
+    x86_idt_set_task_gate(ipo_idt_table, 8, X86_TSS_DOUBLE_FAULT_SELECTOR);
+    x86_idt_set_task_gate(ipo_idt_table, 14, X86_TSS_PAGE_FAULT_SELECTOR);
+
     syscall_load_idt();
+    if (!syscall_prepare_cpu_exceptions(1u)) {
+        serial_printf("[syscall] Warning: Failed to prepare BSP per-CPU exceptions\n");
+    }
     printf("[syscall] System call dispatch table initialized (IDT vector 0x80 registered).\n");
 }
 
@@ -3189,25 +3882,35 @@ uint64_t syscall_dispatch(uint32_t num,
     if (curr && curr->demand_loading) {
         process_demand_load_step(curr);
     }
-    ipo_syscall_handler_t fn = (ipo_syscall_table && num < ipo_syscall_table_size) ? ipo_syscall_table[num] : NULL;
-    if (fn == NULL) {
-        return IPO_SYSCALL_ENOSYS;
-    }
-
     uint64_t result;
     if (num == IPO_SYSCALL_FS_CREATE) {
-        if (argc < 2u || argv == NULL) {
+        if (argc < 2u || argv == NULL ||
+            (process_in_process_context() && !ipc_user_range(argv, 2u * sizeof(uint32_t)))) {
             result = (uint64_t)(int64_t)-1;
         } else {
-            result = (uint64_t)ipo_fs_create(
-                (const char *)(uintptr_t)argv[0], (uint8_t)argv[1]);
+            const char *path = (const char *)(uintptr_t)argv[0];
+            if (path == NULL ||
+                (process_in_process_context() && !ipc_user_range(path, 1u))) {
+                result = (uint64_t)(int64_t)-1;
+            } else {
+                result = (uint64_t)ipo_fs_create(path, (uint8_t)argv[1]);
+            }
         }
     } else {
+        ipo_syscall_handler_t fn = (ipo_syscall_table && num < ipo_syscall_table_size)
+                                       ? ipo_syscall_table[num]
+                                       : NULL;
+        if (fn == NULL) {
+            return IPO_SYSCALL_ENOSYS;
+        }
         result = fn(num, argc, argv);
     }
     process_signal_deliver_pending();
-    if (curr && !curr->is_running && process_in_process_context())
+    if (curr && !curr->is_running && process_in_process_context()) {
         process_yield_kernel();
+    } else if (process_is_batch_active() && process_in_process_context() && !putchar_is_locked()) {
+        timer_tick();
+    }
     return result;
 }
 

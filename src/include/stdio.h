@@ -18,79 +18,17 @@ void putchar_color(char c, uint8_t fg, uint8_t bg);
 bool putchar_is_locked(void);
 void putchar_unlock(void);
 
-/**
- * Initialize COM1 serial port (38400 baud, 8N1)
- */
 void serial_init(void);
-
-/**
- * Low-level serial output (COM1)
- * @param c Character to output
- */
+void serial_putc_raw(char c);
 void serial_putc(char c);
-
-/**
- * Non-blocking serial input (COM1)
- * @return Character read, or -1 if no data available
- */
 int serial_getc(void);
-
-/**
- * Output a single character to VGA memory at cursor position
- * @param c Character to output
- */
 void putchar(char c);
 
-/**
- * Formatted print function
- * Supports: %d (int), %u (unsigned), %x (hex), %c (char), %s (string), %%
- * @param format Format string
- * @param ... Variable arguments
- * @return Number of characters printed
- */
+int stdio_vformat(void (*emit)(void *ctx, char ch), void *ctx, const char *format, va_list args);
 int printf(const char *format, ...);
-
-/**
- * Minimal scanf implementation for keyboard input.
- * Supports: %s, %c, %d, %u.
- */
 int scanf(const char *format, ...);
-
-/**
- * Formatted print to buffer
- * @param buf Output buffer
- * @param size Maximum size to write (including null terminator)
- * @param format Format string
- * @param ... Variable arguments
- * @return Number of characters written (excluding null terminator)
- */
 int snprintf(char *buf, size_t size, const char *format, ...);
 int vsnprintf(char *buf, size_t size, const char *format, va_list args);
-
-/**
- * Convert unsigned integer to string (internal use)
- */
-int itoa(unsigned int num, char *str, int base);
-
-/**
- * Convert unsigned 64-bit integer to string (internal use)
- */
-int itoa64(uint64_t num, char *str, int base);
-
-/**
- * Formatted print to serial port
- * Supports: %d (int), %u (unsigned), %x (hex), %c (char), %s (string), %%
- * @param format Format string
- * @param ... Variable arguments
- * @return Number of characters printed
- */
 int serial_printf(const char *format, ...);
-
-/**
- * Standard output redirection controls for shell pipelines and file redirection.
- */
-void stdout_redirect_start(void);
-void stdout_redirect_end(char **out_buf, size_t *out_len);
-bool stdout_is_redirected(void);
 
 #endif

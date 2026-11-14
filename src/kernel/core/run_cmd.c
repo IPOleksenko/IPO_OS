@@ -1,21 +1,34 @@
 #include <system/run_cmd.h>
 #include <kernel/process.h>
-#include <kernel/async.h>
 #include <kernel/terminal.h>
-#include <system/timer.h>
 #include <system/state.h>
-#include <driver/input/keyboard.h>
 #include <memory/kmalloc.h>
-#include <wm.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <ioport.h>
+#include <limits.h>
 
-/* =========================================================================
- * Section 1: Lexer
- * ========================================================================= */
+static bool grow_buf(void **ptr, int *cap, int count, int extra,
+                     size_t elem_size, int init_cap) {
+    if (count > INT_MAX - extra) return false;
+    if (count + extra <= *cap) return true;
+    int nc = (*cap > 0) ? *cap : init_cap;
+    while (nc < count + extra) {
+        if (nc > INT_MAX / 2) return false;
+        nc *= 2;
+    }
+    if ((size_t)nc > SIZE_MAX / elem_size) return false;
+    void *nd = kmalloc((size_t)nc * elem_size);
+    if (!nd) return false;
+    if (*ptr && count > 0) {
+        memcpy(nd, *ptr, (size_t)count * elem_size);
+        kfree(*ptr);
+    }
+    *ptr = nd;
+    *cap = nc;
+    return true;
+}
 
 typedef struct {
     char  *str;
@@ -29,7 +42,9 @@ typedef struct {
 } token_list_t;
 
 static void token_list_init(token_list_t *tl) {
-    tl->data = NULL; tl->len = 0; tl->cap = 0;
+    tl->data = NULL;
+    tl->len = 0;
+    tl->cap = 0;
 }
 
 static void token_list_free(token_list_t *tl) {
@@ -37,16 +52,14 @@ static void token_list_free(token_list_t *tl) {
         if (tl->data[i].str) kfree(tl->data[i].str);
     }
     if (tl->data) kfree(tl->data);
-    tl->data = NULL; tl->len = 0; tl->cap = 0;
+    tl->data = NULL;
+    tl->len = 0;
+    tl->cap = 0;
 }
 
 static bool token_list_push(token_list_t *tl, char *str, bool is_op) {
-    if (tl->len >= tl->cap) {
-        int nc = tl->cap ? tl->cap * 2 : 8;
-        token_t *nd = kmalloc((size_t)nc * sizeof(token_t));
-        if (!nd) return false;
-        if (tl->data) { memcpy(nd, tl->data, (size_t)tl->len * sizeof(token_t)); kfree(tl->data); }
-        tl->data = nd; tl->cap = nc;
+    if (!grow_buf((void **)&tl->data, &tl->cap, tl->len, 1, sizeof(token_t), 8)) {
+        return false;
     }
     tl->data[tl->len].str   = str;
     tl->data[tl->len].is_op = is_op;
@@ -54,17 +67,21 @@ static bool token_list_push(token_list_t *tl, char *str, bool is_op) {
     return true;
 }
 
-typedef struct { char *buf; size_t len, cap; } cbuf_t;
+typedef struct {
+    char *buf;
+    int   len;
+    int   cap;
+} cbuf_t;
 
-static void cbuf_init(cbuf_t *cb) { cb->buf = NULL; cb->len = 0; cb->cap = 0; }
+static void cbuf_init(cbuf_t *cb) {
+    cb->buf = NULL;
+    cb->len = 0;
+    cb->cap = 0;
+}
 
 static bool cbuf_append(cbuf_t *cb, char c) {
-    if (cb->len + 1 >= cb->cap) {
-        size_t nc = cb->cap ? cb->cap * 2 : 64;
-        char *nb  = kmalloc(nc);
-        if (!nb) return false;
-        if (cb->buf) { memcpy(nb, cb->buf, cb->len); kfree(cb->buf); }
-        cb->buf = nb; cb->cap = nc;
+    if (!grow_buf((void **)&cb->buf, &cb->cap, cb->len, 1, sizeof(char), 64)) {
+        return false;
     }
     cb->buf[cb->len++] = c;
     return true;
@@ -72,11 +89,10 @@ static bool cbuf_append(cbuf_t *cb, char c) {
 
 static bool cbuf_flush(cbuf_t *cb, token_list_t *tl, bool is_op) {
     if (cb->len == 0 && !is_op) return true;
-    if (!cbuf_append(cb, '\0')) return false;
-    cb->len--;
-    char *copy = kmalloc(cb->len + 1);
+    char *copy = kmalloc((size_t)cb->len + 1u);
     if (!copy) return false;
-    memcpy(copy, cb->buf, cb->len + 1);
+    if (cb->len > 0) memcpy(copy, cb->buf, (size_t)cb->len);
+    copy[cb->len] = '\0';
     bool ok = token_list_push(tl, copy, is_op);
     if (!ok) kfree(copy);
     cb->len = 0;
@@ -85,28 +101,40 @@ static bool cbuf_flush(cbuf_t *cb, token_list_t *tl, bool is_op) {
 
 static bool lex_cmdline(const char *src, token_list_t *out) {
     token_list_init(out);
-    cbuf_t cb; cbuf_init(&cb);
+    cbuf_t cb;
+    cbuf_init(&cb);
     bool in_double = false, in_single = false, have_content = false;
 
     while (*src) {
         char c = *src++;
 
         if (in_double) {
-            if (c == '\\' && *src && (*src == '"' || *src == '\\')) { if (!cbuf_append(&cb, *src++)) goto oom; }
-            else if (c == '"') { in_double = false; }
-            else { if (!cbuf_append(&cb, c)) goto oom; }
-            have_content = true; continue;
+            if (c == '\\' && (*src == '"' || *src == '\\')) {
+                if (!cbuf_append(&cb, *src++)) goto oom;
+            } else if (c == '"') {
+                in_double = false;
+            } else {
+                if (!cbuf_append(&cb, c)) goto oom;
+            }
+            have_content = true;
+            continue;
         }
         if (in_single) {
-            if (c == '\\' && *src && (*src == '\'' || *src == '\\')) { if (!cbuf_append(&cb, *src++)) goto oom; }
-            else if (c == '\'') { in_single = false; }
-            else { if (!cbuf_append(&cb, c)) goto oom; }
-            have_content = true; continue;
+            if (c == '\\' && (*src == '\'' || *src == '\\')) {
+                if (!cbuf_append(&cb, *src++)) goto oom;
+            } else if (c == '\'') {
+                in_single = false;
+            } else {
+                if (!cbuf_append(&cb, c)) goto oom;
+            }
+            have_content = true;
+            continue;
         }
 
         if (c == '\\' && *src) {
             char next = *src;
-            if (next == ' ' || next == '\t' || next == '"' || next == '\'' || next == '\\' || next == '&' || next == ';' || next == '|') {
+            if (next == ' ' || next == '\t' || next == '"' || next == '\'' ||
+                next == '\\' || next == '&' || next == ';' || next == '|') {
                 if (!cbuf_append(&cb, *src++)) goto oom;
                 have_content = true;
                 continue;
@@ -119,25 +147,29 @@ static bool lex_cmdline(const char *src, token_list_t *out) {
         if (c == '\'') { in_single = true;  have_content = true; continue; }
 
         if (c == ' ' || c == '\t') {
-            if (have_content || cb.len > 0) { if (!cbuf_flush(&cb, out, false)) goto oom; }
-            have_content = false; cb.len = 0; continue;
+            if (have_content || cb.len > 0) {
+                if (!cbuf_flush(&cb, out, false)) goto oom;
+            }
+            have_content = false;
+            cb.len = 0;
+            continue;
         }
 
         if (c == '&' || c == ';' || c == '|') {
-            if (c == '|' && *src == '|') {
-                if (!cbuf_append(&cb, '|')) goto oom;
-                if (!cbuf_append(&cb, *src++)) goto oom;
-                have_content = true;
-                continue;
+            if (have_content || cb.len > 0) {
+                if (!cbuf_flush(&cb, out, false)) goto oom;
+                have_content = false;
+                cb.len = 0;
             }
-            if (have_content || cb.len > 0) { if (!cbuf_flush(&cb, out, false)) goto oom; have_content = false; cb.len = 0; }
-            if (c == '&' && *src == '&') {
+            if ((c == '&' || c == '|') && *src == c) {
                 src++;
-                char *op = kmalloc(3); if (!op) goto oom;
-                op[0] = '&'; op[1] = '&'; op[2] = '\0';
+                char *op = kmalloc(3);
+                if (!op) goto oom;
+                op[0] = c; op[1] = c; op[2] = '\0';
                 if (!token_list_push(out, op, true)) { kfree(op); goto oom; }
             } else {
-                char *op = kmalloc(2); if (!op) goto oom;
+                char *op = kmalloc(2);
+                if (!op) goto oom;
                 op[0] = c; op[1] = '\0';
                 if (!token_list_push(out, op, true)) { kfree(op); goto oom; }
             }
@@ -148,7 +180,9 @@ static bool lex_cmdline(const char *src, token_list_t *out) {
         have_content = true;
     }
 
-    if (have_content || cb.len > 0) { if (!cbuf_flush(&cb, out, false)) goto oom; }
+    if (have_content || cb.len > 0) {
+        if (!cbuf_flush(&cb, out, false)) goto oom;
+    }
     if (cb.buf) kfree(cb.buf);
     return true;
 oom:
@@ -157,20 +191,18 @@ oom:
     return false;
 }
 
-/* =========================================================================
- * Section 2: AST / Execution Plan structures
- * ========================================================================= */
-
 typedef struct {
     char **argv;
     int argc;
     int cap;
+    int window;
 } run_cmd_t;
 
 static void cmd_init(run_cmd_t *c) {
     c->argv = NULL;
     c->argc = 0;
     c->cap = 0;
+    c->window = 0;
 }
 
 static void cmd_free(run_cmd_t *c) {
@@ -180,22 +212,13 @@ static void cmd_free(run_cmd_t *c) {
         }
         kfree(c->argv);
     }
-    c->argv = NULL;
-    c->argc = 0;
-    c->cap = 0;
+    cmd_init(c);
 }
 
 static bool cmd_push(run_cmd_t *c, const char *arg) {
-    if (c->argc + 1 >= c->cap) {
-        int nc = c->cap ? c->cap * 2 : RUN_ARGV_INIT_CAP;
-        char **nd = kmalloc((size_t)(nc + 1) * sizeof(char *));
-        if (!nd) return false;
-        if (c->argv) {
-            memcpy(nd, c->argv, (size_t)c->argc * sizeof(char *));
-            kfree(c->argv);
-        }
-        c->argv = nd;
-        c->cap = nc;
+    if (!grow_buf((void **)&c->argv, &c->cap, c->argc, 2,
+                  sizeof(char *), RUN_ARGV_INIT_CAP + 1)) {
+        return false;
     }
     size_t len = strlen(arg);
     char *copy = kmalloc(len + 1);
@@ -206,85 +229,98 @@ static bool cmd_push(run_cmd_t *c, const char *arg) {
     return true;
 }
 
-typedef struct {
-    run_cmd_t *cmds;
-    int count;
-    int cap;
-    int window;
-} run_pipeline_t;
-
-static void pipe_init(run_pipeline_t *p) {
-    p->cmds = NULL;
-    p->count = 0;
-    p->cap = 0;
-    p->window = 0;
+static void cmd_strip_redundant_run(run_cmd_t *c) {
+    while (c->argc > 1 && strcmp(c->argv[0], "run") == 0) {
+        kfree(c->argv[0]);
+        for (int i = 0; i < c->argc - 1; i++) {
+            c->argv[i] = c->argv[i + 1];
+        }
+        c->argc--;
+        c->argv[c->argc] = NULL;
+    }
 }
 
-static void pipe_free(run_pipeline_t *p) {
-    if (p->cmds) {
-        for (int i = 0; i < p->count; i++) {
-            cmd_free(&p->cmds[i]);
-        }
-        kfree(p->cmds);
-    }
-    p->cmds = NULL;
-    p->count = 0;
-    p->cap = 0;
-}
+static bool cmd_prepend_return_args(run_cmd_t *cmd,
+                                    const process_return_value_t *last_val,
+                                    int last_exit_code) {
+    if (cmd->argc == 0) return true;
 
-static bool pipe_push(run_pipeline_t *p, run_cmd_t *c) {
-    if (p->count >= p->cap) {
-        int nc = p->cap ? p->cap * 2 : 4;
-        run_cmd_t *nd = kmalloc((size_t)nc * sizeof(run_cmd_t));
-        if (!nd) return false;
-        if (p->cmds) {
-            memcpy(nd, p->cmds, (size_t)p->count * sizeof(run_cmd_t));
-            kfree(p->cmds);
-        }
-        p->cmds = nd;
-        p->cap = nc;
+    uint32_t pass_count = 0;
+    char **pass_args = NULL;
+    char exit_buf[16];
+    char *exit_ptr = exit_buf;
+
+    if (last_val && last_val->arg_count > 0 && last_val->arg_vals) {
+        pass_count = last_val->arg_count;
+        pass_args = last_val->arg_vals;
+    } else if (last_val && last_val->str_val && last_val->str_val[0] != '\0') {
+        pass_count = 1;
+        pass_args = (char **)&last_val->str_val;
+    } else {
+        snprintf(exit_buf, sizeof(exit_buf), "%d", last_exit_code);
+        pass_count = 1;
+        pass_args = &exit_ptr;
     }
-    p->cmds[p->count++] = *c;
+
+    if (pass_count > (uint32_t)(INT_MAX - cmd->argc - 1)) return false;
+    int new_argc = cmd->argc + (int)pass_count;
+    char **new_argv = kmalloc((size_t)(new_argc + 1) * sizeof(char *));
+    if (!new_argv) return false;
+
+    new_argv[0] = cmd->argv[0];
+    for (uint32_t k = 0; k < pass_count; k++) {
+        const char *src = pass_args[k] ? pass_args[k] : "";
+        size_t slen = strlen(src);
+        char *copy = kmalloc(slen + 1);
+        if (!copy) {
+            for (uint32_t r = 0; r < k; r++) kfree(new_argv[1 + r]);
+            kfree(new_argv);
+            return false;
+        }
+        memcpy(copy, src, slen + 1);
+        new_argv[1 + k] = copy;
+    }
+    for (int j = 1; j < cmd->argc; j++) {
+        new_argv[pass_count + (uint32_t)j] = cmd->argv[j];
+    }
+    new_argv[new_argc] = NULL;
+
+    kfree(cmd->argv);
+    cmd->argv = new_argv;
+    cmd->argc = new_argc;
+    cmd->cap = new_argc + 1;
     return true;
 }
 
 typedef struct {
-    run_pipeline_t *pipes;
+    run_cmd_t *cmds;
     int count;
     int cap;
+    bool pipe_to_next;
 } run_stage_t;
 
 static void stage_init(run_stage_t *s) {
-    s->pipes = NULL;
+    s->cmds = NULL;
     s->count = 0;
     s->cap = 0;
+    s->pipe_to_next = false;
 }
 
 static void stage_free(run_stage_t *s) {
-    if (s->pipes) {
+    if (s->cmds) {
         for (int i = 0; i < s->count; i++) {
-            pipe_free(&s->pipes[i]);
+            cmd_free(&s->cmds[i]);
         }
-        kfree(s->pipes);
+        kfree(s->cmds);
     }
-    s->pipes = NULL;
-    s->count = 0;
-    s->cap = 0;
+    stage_init(s);
 }
 
-static bool stage_push(run_stage_t *s, run_pipeline_t *p) {
-    if (s->count >= s->cap) {
-        int nc = s->cap ? s->cap * 2 : 4;
-        run_pipeline_t *nd = kmalloc((size_t)nc * sizeof(run_pipeline_t));
-        if (!nd) return false;
-        if (s->pipes) {
-            memcpy(nd, s->pipes, (size_t)s->count * sizeof(run_pipeline_t));
-            kfree(s->pipes);
-        }
-        s->pipes = nd;
-        s->cap = nc;
+static bool stage_push_cmd(run_stage_t *s, run_cmd_t *c) {
+    if (!grow_buf((void **)&s->cmds, &s->cap, s->count, 1, sizeof(run_cmd_t), 4)) {
+        return false;
     }
-    s->pipes[s->count++] = *p;
+    s->cmds[s->count++] = *c;
     return true;
 }
 
@@ -307,36 +343,34 @@ static void plan_free(run_plan_t *pl) {
         }
         kfree(pl->stages);
     }
-    pl->stages = NULL;
-    pl->count = 0;
-    pl->cap = 0;
+    plan_init(pl);
 }
 
-static bool plan_push(run_plan_t *pl, run_stage_t *s) {
-    if (pl->count >= pl->cap) {
-        int nc = pl->cap ? pl->cap * 2 : 4;
-        run_stage_t *nd = kmalloc((size_t)nc * sizeof(run_stage_t));
-        if (!nd) return false;
-        if (pl->stages) {
-            memcpy(nd, pl->stages, (size_t)pl->count * sizeof(run_stage_t));
-            kfree(pl->stages);
-        }
-        pl->stages = nd;
-        pl->cap = nc;
+static bool plan_push_stage(run_plan_t *pl, run_stage_t *s) {
+    if (!grow_buf((void **)&pl->stages, &pl->cap, pl->count, 1, sizeof(run_stage_t), 4)) {
+        return false;
     }
     pl->stages[pl->count++] = *s;
     return true;
 }
 
-static void cmd_strip_redundant_run(run_cmd_t *c) {
-    while (c->argc > 1 && strcmp(c->argv[0], "run") == 0) {
-        kfree(c->argv[0]);
-        for (int i = 0; i < c->argc - 1; i++) {
-            c->argv[i] = c->argv[i + 1];
-        }
-        c->argc--;
-        c->argv[c->argc] = NULL;
-    }
+static bool flush_cmd_to_stage(run_cmd_t *cmd, run_stage_t *stage, int cur_window) {
+    if (cmd->argc <= 0) return true;
+    cmd_strip_redundant_run(cmd);
+    cmd->window = cur_window;
+    if (!stage_push_cmd(stage, cmd)) return false;
+    cmd_init(cmd);
+    return true;
+}
+
+static bool flush_stage_to_plan(run_stage_t *stage, run_plan_t *plan,
+                                bool pipe_to_next, int *cur_window) {
+    if (stage->count <= 0) return true;
+    stage->pipe_to_next = pipe_to_next;
+    if (!plan_push_stage(plan, stage)) return false;
+    stage_init(stage);
+    *cur_window = 0;
+    return true;
 }
 
 static bool build_run_plan(const token_list_t *tl, run_plan_t *plan) {
@@ -345,9 +379,6 @@ static bool build_run_plan(const token_list_t *tl, run_plan_t *plan) {
     run_stage_t cur_stage;
     stage_init(&cur_stage);
 
-    run_pipeline_t cur_pipe;
-    pipe_init(&cur_pipe);
-
     run_cmd_t cur_cmd;
     cmd_init(&cur_cmd);
 
@@ -355,253 +386,59 @@ static bool build_run_plan(const token_list_t *tl, run_plan_t *plan) {
 
     for (int i = 0; i < tl->len; i++) {
         if (!tl->data[i].is_op) {
-            if (!cmd_push(&cur_cmd, tl->data[i].str)) goto oom;
-        } else {
-            const char *op_str = tl->data[i].str;
-            if (strcmp(op_str, "|") == 0) {
-                if (cur_cmd.argc > 0) {
-                    cmd_strip_redundant_run(&cur_cmd);
-                    if (!pipe_push(&cur_pipe, &cur_cmd)) goto oom;
-                    cmd_init(&cur_cmd);
-                }
-            } else if (strcmp(op_str, "&") == 0) {
-                if (cur_cmd.argc > 0) {
-                    cmd_strip_redundant_run(&cur_cmd);
-                    if (!pipe_push(&cur_pipe, &cur_cmd)) goto oom;
-                    cmd_init(&cur_cmd);
-                }
-                if (cur_pipe.count > 0) {
-                    cur_pipe.window = cur_window;
-                    if (!stage_push(&cur_stage, &cur_pipe)) goto oom;
-                    pipe_init(&cur_pipe);
-                    cur_window++;
-                }
-            } else if (strcmp(op_str, "&&") == 0) {
-                if (cur_cmd.argc > 0) {
-                    cmd_strip_redundant_run(&cur_cmd);
-                    if (!pipe_push(&cur_pipe, &cur_cmd)) goto oom;
-                    cmd_init(&cur_cmd);
-                }
-                if (cur_pipe.count > 0) {
-                    cur_pipe.window = cur_window;
-                    if (!stage_push(&cur_stage, &cur_pipe)) goto oom;
-                    pipe_init(&cur_pipe);
-                }
-            } else if (strcmp(op_str, ";") == 0) {
-                if (cur_cmd.argc > 0) {
-                    cmd_strip_redundant_run(&cur_cmd);
-                    if (!pipe_push(&cur_pipe, &cur_cmd)) goto oom;
-                    cmd_init(&cur_cmd);
-                }
-                if (cur_pipe.count > 0) {
-                    cur_pipe.window = cur_window;
-                    if (!stage_push(&cur_stage, &cur_pipe)) goto oom;
-                    pipe_init(&cur_pipe);
-                }
-                if (cur_stage.count > 0) {
-                    if (!plan_push(plan, &cur_stage)) goto oom;
-                    stage_init(&cur_stage);
-                    cur_window = 0;
-                }
+            if (!cmd_push(&cur_cmd, tl->data[i].str)) goto fail;
+            continue;
+        }
+        const char *op_str = tl->data[i].str;
+        if (strcmp(op_str, "&") == 0) {
+            if (cur_cmd.argc > 0) {
+                if (!flush_cmd_to_stage(&cur_cmd, &cur_stage, cur_window)) goto fail;
+                cur_window++;
             }
+        } else if (strcmp(op_str, "&&") == 0) {
+            if (!flush_cmd_to_stage(&cur_cmd, &cur_stage, cur_window)) goto fail;
+        } else if (strcmp(op_str, ";") == 0 || strcmp(op_str, "|") == 0) {
+            if (!flush_cmd_to_stage(&cur_cmd, &cur_stage, cur_window)) goto fail;
+            bool is_pipe = (op_str[0] == '|');
+            if (!flush_stage_to_plan(&cur_stage, plan, is_pipe, &cur_window)) goto fail;
+        } else {
+            printf("run: unsupported operator '%s'\n", op_str);
+            goto fail;
         }
     }
 
-    /* Flush trailing elements */
     if (cur_cmd.argc > 0) {
-        cmd_strip_redundant_run(&cur_cmd);
-        if (!pipe_push(&cur_pipe, &cur_cmd)) goto oom;
-        cmd_init(&cur_cmd);
+        if (!flush_cmd_to_stage(&cur_cmd, &cur_stage, cur_window)) goto fail;
     } else {
         cmd_free(&cur_cmd);
     }
 
-    if (cur_pipe.count > 0) {
-        cur_pipe.window = cur_window;
-        if (!stage_push(&cur_stage, &cur_pipe)) goto oom;
-        pipe_init(&cur_pipe);
-    } else {
-        pipe_free(&cur_pipe);
-    }
-
     if (cur_stage.count > 0) {
-        if (!plan_push(plan, &cur_stage)) goto oom;
-        stage_init(&cur_stage);
+        if (!flush_stage_to_plan(&cur_stage, plan, false, &cur_window)) goto fail;
     } else {
         stage_free(&cur_stage);
     }
 
     return true;
 
-oom:
+fail:
     cmd_free(&cur_cmd);
-    pipe_free(&cur_pipe);
     stage_free(&cur_stage);
     plan_free(plan);
     return false;
 }
 
-/* =========================================================================
- * Section 3: Execution helpers
- * ========================================================================= */
-
-/**
- * exec_one_pid — execute a single program; return its PID (> 0) or error.
- * Sets last_exit_code via process_exec internals or process_set_last_exit_code.
- */
-static int exec_one_pid(int argc, char **argv) {
-    if (argc == 0 || !argv || !argv[0]) return RUN_NOT_FOUND;
-    char *path = resolve_command_path(argv[0]);
-    if (!path) {
-        printf("run: program not found: %s\n", argv[0]);
-        process_set_last_exit_code(127);
-        return RUN_NOT_FOUND;
-    }
-    int ret = universal_process_execute(path, argc, argv);
-    kfree(path);
-    return ret; /* = PID on success (or negative on error) */
-}
-
-/**
- * wait_for_command — spin until the process with @pid is no longer active
- */
-static void wait_for_command(int pid) {
-    while (pid > 0 && pid != 1000) {
-        process_t *proc = process_find_by_pid((uint32_t)pid);
-        if (!proc || !process_is_active_or_has_windows(proc)) {
-            break;
-        }
-        async_scheduler_tick();
-        if (wm_session_active()) {
-            wm_compositor_tick();
-        }
-        if (system_is_interrupted()) break;
-        io_wait();
-    }
-}
-
-static int exec_pipeline(const run_pipeline_t *pipe) {
-    if (pipe->count == 0) return RUN_OK;
-
-    int pipe_exit = 0;
-    for (int i = 0; i < pipe->count; i++) {
-        const run_cmd_t *cmd = &pipe->cmds[i];
-        if (cmd->argc == 0) continue;
-
-        int ret = 0;
-        if (i == 0) {
-            ret = exec_one_pid(cmd->argc, cmd->argv);
-            wait_for_command(ret);
-            pipe_exit = process_get_exit_code();
-            if (ret > 0 && ret != 1000 && terminal_get_show_return_value()) {
-                process_print_last_return_value();
-            }
-        } else {
-            /* Prepend return values as arguments for the next command */
-            const process_return_value_t *last_val = process_get_last_return_value();
-            uint32_t pass_count = 0;
-            char **pass_args = NULL;
-            char *dynamic_exit_str = NULL;
-
-            if (last_val && last_val->arg_count > 0 && last_val->arg_vals) {
-                pass_count = last_val->arg_count;
-                pass_args = last_val->arg_vals;
-            } else {
-                bool neg = (pipe_exit < 0);
-                uint32_t uval = neg ? (uint32_t)(-pipe_exit) : (uint32_t)pipe_exit;
-                uint32_t temp = uval;
-                size_t elen = 0;
-                if (temp == 0) elen = 1;
-                else {
-                    while (temp > 0) { temp /= 10; elen++; }
-                }
-                if (neg) elen++;
-                dynamic_exit_str = kmalloc(elen + 1);
-                if (dynamic_exit_str) {
-                    dynamic_exit_str[elen] = '\0';
-                    if (uval == 0) {
-                        dynamic_exit_str[0] = '0';
-                    } else {
-                        int ej = (int)elen - 1;
-                        while (uval > 0) {
-                            dynamic_exit_str[ej--] = '0' + (char)(uval % 10);
-                            uval /= 10;
-                        }
-                        if (neg) dynamic_exit_str[0] = '-';
-                    }
-                }
-                pass_count = 1;
-            }
-
-            int new_argc = cmd->argc + (int)pass_count;
-            char **new_argv = kmalloc((size_t)(new_argc + 1) * sizeof(char *));
-            if (!new_argv) {
-                if (dynamic_exit_str) kfree(dynamic_exit_str);
-                ret = exec_one_pid(cmd->argc, cmd->argv);
-                wait_for_command(ret);
-                pipe_exit = process_get_exit_code();
-                if (ret > 0 && ret != 1000 && terminal_get_show_return_value()) {
-                    process_print_last_return_value();
-                }
-            } else {
-                new_argv[0] = cmd->argv[0];
-                if (pass_args) {
-                    for (uint32_t k = 0; k < pass_count; k++) {
-                        size_t alen = pass_args[k] ? strlen(pass_args[k]) : 0;
-                        new_argv[1 + k] = kmalloc(alen + 1);
-                        if (new_argv[1 + k]) {
-                            if (pass_args[k]) memcpy(new_argv[1 + k], pass_args[k], alen + 1);
-                            else new_argv[1 + k][0] = '\0';
-                        }
-                    }
-                } else {
-                    new_argv[1] = dynamic_exit_str;
-                    dynamic_exit_str = NULL;
-                }
-                for (int j = 1; j < cmd->argc; j++) {
-                    new_argv[pass_count + j] = cmd->argv[j];
-                }
-                new_argv[new_argc] = NULL;
-                ret = exec_one_pid(new_argc, new_argv);
-                wait_for_command(ret);
-                pipe_exit = process_get_exit_code();
-                for (uint32_t k = 0; k < pass_count; k++) {
-                    if (new_argv[1 + k]) {
-                        kfree(new_argv[1 + k]);
-                    }
-                }
-                kfree(new_argv);
-                if (dynamic_exit_str) kfree(dynamic_exit_str);
-                if (ret > 0 && ret != 1000 && terminal_get_show_return_value()) {
-                    process_print_last_return_value();
-                }
-            }
-        }
-
-        if (system_is_interrupted()) {
-            break;
-        }
-    }
-    process_set_last_exit_code(pipe_exit);
-    return pipe_exit;
-}
-
-static int exec_stage(const run_stage_t *stage) {
+static int exec_stage(run_stage_t *stage, const process_return_value_t *prev_return_val,
+                      int prev_exit_code, bool has_pipe_input, bool *out_ran_proc) {
+    if (out_ran_proc) *out_ran_proc = false;
     if (stage->count == 0) return RUN_OK;
 
-    if (stage->count == 1) {
-        /* Single pipeline (sequential or single command) */
-        return exec_pipeline(&stage->pipes[0]);
+    if (has_pipe_input && stage->count > 0) {
+        if (!cmd_prepend_return_args(&stage->cmds[0], prev_return_val, prev_exit_code)) {
+            return RUN_ERROR;
+        }
     }
 
-    /* Multiple pipelines in stage -> batch execution.
-     * Pipelines are grouped by their window ID (assigned during parsing in build_run_plan()):
-     *   - Groups of size n == 1 (isolated by '&') run in a dedicated workspace (separate_windows = true).
-     *   - Groups of size n > 1  (chained by '&&') share a common workspace (separate_windows = false).
-     *
-     * NOTE: Each window group is executed sequentially via process_run_batch_ex(); true parallelism
-     * across different window groups is bounded because subsequent groups wait for earlier groups to finish.
-     */
     int total_procs = 0;
     process_t **procs = kmalloc((size_t)stage->count * sizeof(process_t *));
     if (!procs) return RUN_ERROR;
@@ -611,36 +448,27 @@ static int exec_stage(const run_stage_t *stage) {
         return RUN_ERROR;
     }
 
-    for (int p = 0; p < stage->count; p++) {
-        const run_pipeline_t *pipe = &stage->pipes[p];
-        if (pipe->count == 0) continue;
-
-        if (pipe->count == 1) {
-            const run_cmd_t *cmd = &pipe->cmds[0];
-            if (cmd->argc == 0) continue;
-            char *path = resolve_command_path(cmd->argv[0]);
-            if (!path) {
-                printf("run: program not found: %s\n", cmd->argv[0]);
-                continue;
-            }
-            process_t *proc = process_spawn(path, cmd->argc, cmd->argv);
-            kfree(path);
-            if (proc) {
-                wins[total_procs] = pipe->window;
-                procs[total_procs++] = proc;
-            }
-        } else {
-            /* If a branch is a pipeline, execute it directly */
-            exec_pipeline(pipe);
+    for (int i = 0; i < stage->count; i++) {
+        run_cmd_t *cmd = &stage->cmds[i];
+        if (cmd->argc == 0) continue;
+        char *path = resolve_command_path(cmd->argv[0]);
+        if (!path) {
+            printf("run: program not found: %s\n", cmd->argv[0]);
+            continue;
+        }
+        process_t *proc = process_spawn(path, cmd->argc, cmd->argv);
+        kfree(path);
+        if (proc) {
+            wins[total_procs] = cmd->window;
+            procs[total_procs++] = proc;
         }
     }
 
-    int stage_exit = 0;
+    int stage_exit = RUN_ERROR;
     if (total_procs > 0) {
-        /* Run all processes in one batch with window grouping.
-         * process_run_batch_windows() handles shared text screens for same-window
-         * groups and runs everything in parallel in a single batch loop. */
+        if (out_ran_proc) *out_ran_proc = true;
         process_run_batch_windows(procs, total_procs, wins);
+
         if (terminal_get_show_return_value()) {
             for (int k = 0; k < total_procs; k++) {
                 process_print_batch_return_value(k);
@@ -654,10 +482,6 @@ static int exec_stage(const run_stage_t *stage) {
     process_set_last_exit_code(stage_exit);
     return stage_exit;
 }
-
-/* =========================================================================
- * Section 4: Main entry point
- * ========================================================================= */
 
 int run_cmd_execute(const char *cmdline) {
     if (!cmdline || !*cmdline) {
@@ -674,7 +498,6 @@ int run_cmd_execute(const char *cmdline) {
         return RUN_BUILTIN_OK;
     }
 
-    /* --- Lex --- */
     token_list_t tl;
     if (!lex_cmdline(cmdline, &tl)) {
         printf("run: out of memory during lexing\n");
@@ -685,7 +508,6 @@ int run_cmd_execute(const char *cmdline) {
         return RUN_BUILTIN_OK;
     }
 
-    /* --- Build hierarchical execution plan (Stages ';' -> Parallel '&'/ '&&' -> Pipe '|') --- */
     run_plan_t plan;
     if (!build_run_plan(&tl, &plan)) {
         token_list_free(&tl);
@@ -694,13 +516,33 @@ int run_cmd_execute(const char *cmdline) {
     token_list_free(&tl);
 
     int last_exit = 0;
+    bool has_pipe_input = false;
+    process_return_value_t last_ret;
+    process_return_val_init(&last_ret);
+
     for (int s = 0; s < plan.count; s++) {
-        last_exit = exec_stage(&plan.stages[s]);
+        bool ran_proc = false;
+        last_exit = exec_stage(&plan.stages[s], &last_ret, last_exit,
+                               has_pipe_input, &ran_proc);
+
+        has_pipe_input = plan.stages[s].pipe_to_next;
+        if (has_pipe_input && ran_proc) {
+            const process_return_value_t *cur_ret = process_get_last_return_value();
+            if (cur_ret) {
+                process_return_val_copy(&last_ret, cur_ret);
+            } else {
+                process_return_val_reset(&last_ret);
+            }
+        } else {
+            process_return_val_reset(&last_ret);
+        }
+
         if (system_is_interrupted()) {
             break;
         }
     }
 
+    process_return_val_free_fields(&last_ret);
     plan_free(&plan);
     return last_exit;
 }

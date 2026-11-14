@@ -8,6 +8,6 @@ include mk/image.mk
 include mk/run.mk
 include mk/clean.mk
 
-all: clean lib kernel boot image disks run
+all: clean lib kernel boot image disk run
 
-.PHONY: all run patch-config lib kernel boot image disks setup-tap
+.PHONY: all run patch-config lib kernel boot image disk setup-tap
