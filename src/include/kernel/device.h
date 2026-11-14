@@ -61,7 +61,7 @@ typedef struct device_ops {
     int (*ioctl)(struct device_node *dev, uint32_t cmd, void *arg);
 } device_ops_t;
 
-/* Hardware resource descriptors with self-expanding BAR array */
+/* Hardware resource descriptors with growable BAR array */
 typedef struct {
     bus_type_t bus_type;
     uint8_t    pci_bus;
@@ -116,7 +116,6 @@ typedef struct device_node {
 void device_resources_init(device_resources_t *res);
 void device_resources_free(device_resources_t *res);
 int  device_resources_add_bar(device_resources_t *res, uint32_t bar);
-int  device_resources_set_bar(device_resources_t *res, size_t index, uint32_t bar);
 int  device_resources_copy(device_resources_t *dst, const device_resources_t *src);
 
 /* Lifecycle helpers for dynamic device nodes */

@@ -26,6 +26,11 @@ void sound_stop(void);
  */
 void sound_beep(uint32_t frequency, uint32_t duration);
 
+/**
+ * Play OS boot startup melody via active audio backend or PC speaker
+ */
+void play_startup_sound(void);
+
 /* Define musical notes with their corresponding frequencies (in Hz) */
 #define NOTE_REST 0
 

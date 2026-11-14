@@ -2,11 +2,12 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x10000;
+    . = 0x100000;
     _kernel_text_start = .;
 
     .text :
     {
+        KEEP(*(.text.entry))
         *(.text*)
     }
     _kernel_text_end = .;
@@ -22,9 +23,10 @@ SECTIONS
     .data :
     {
         *(.data*)
+        *(.got*)
     }
 
-    . = 0x100000;
+    . = ALIGN(4096);
     _kernel_bss_start = .;
 
     .bss :
@@ -38,6 +40,7 @@ SECTIONS
     {
         *(.eh_frame*)
         *(.comment*)
+        *(.note*)
     }
 }
 

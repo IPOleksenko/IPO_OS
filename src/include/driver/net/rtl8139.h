@@ -13,6 +13,13 @@ size_t rtl8139_get_tx_buffer_size(void);
 bool   rtl8139_set_rx_buffer_size(size_t new_size);
 bool   rtl8139_set_tx_buffer_size(size_t new_size);
 
+size_t   rtl8139_get_hw_rx_ring_size(void);
+size_t   rtl8139_get_hw_tx_descriptor_count(void);
+size_t   rtl8139_get_hw_max_dma_burst(void);
+size_t   rtl8139_get_hw_socket_capacity(void);
+uint32_t rtl8139_get_hw_max_window(void);
+uint16_t rtl8139_get_hw_mss(void);
+
 #ifndef RTL8139_RX_BUFFER_SIZE
 #define RTL8139_RX_BUFFER_SIZE (rtl8139_get_rx_buffer_size())
 #endif

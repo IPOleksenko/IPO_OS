@@ -12,5 +12,6 @@ uint32_t timer_seconds(void);
 uint32_t timer_elapsed_ms(uint32_t start_ms);
 int timer_after(uint32_t start_ms, uint32_t delay_ms);
 uint64_t read_tsc(void);
+uint64_t timer_get_tsc_per_ms(void);
 
 #endif

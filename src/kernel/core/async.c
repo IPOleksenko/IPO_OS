@@ -26,7 +26,6 @@ typedef struct async_task {
 
 
 static async_task_t *async_task_list = NULL;
-static uint32_t async_ticks = 0;
 static bool async_initialized = false;
 
 static void remove_inactive_tasks(void) {
@@ -83,7 +82,6 @@ static void run_async_task(async_task_t *task) {
 void async_scheduler_init(void)
 {
     async_task_list = NULL;
-    async_ticks = 0;
     async_initialized = true;
     printf("[async] Asynchronous task scheduler initialized.\n");
 }
@@ -105,10 +103,6 @@ int async_start_task(
 
     process_t *owner = process_get_current();
 
-    if (owner != NULL) {
-        process_set_keep_alive(owner, 1);
-    }
-
     if (interval_ms == 0) {
         interval_ms = 10000u;
     }
@@ -128,12 +122,7 @@ int async_start_task(
         node = node->next;
     }
 
-    /*
-     * Allocate new task.
-     */
-    async_task_t *new_task =
-        kmalloc(sizeof(async_task_t));
-
+    async_task_t *new_task = kmalloc(sizeof(async_task_t));
     if (new_task == NULL) {
         return -1;
     }
@@ -156,6 +145,10 @@ int async_start_task(
 
     new_task->next = async_task_list;
     async_task_list = new_task;
+
+    if (owner != NULL) {
+        process_set_keep_alive(owner, 1);
+    }
 
     printf(
         "[async] registered task '%s' interval=%u ms owner_pid=%u\n",
@@ -190,6 +183,7 @@ int async_stop_task(const char *name)
                 process_set_keep_alive(owner, 0);
             }
 
+            remove_inactive_tasks();
             return 0;
         }
 

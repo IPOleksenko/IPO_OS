@@ -6,7 +6,6 @@
 
 bool ipc_init(void);
 void ipc_process_terminated(uint32_t pid);
-void process_signal_cleanup(uint32_t pid);
 uint32_t ipc_syscall_handler(uint32_t num, uint32_t argc, uint32_t *argv);
 bool ipc_stream_init(void);
 void ipc_stream_process_terminated(uint32_t pid);
@@ -22,7 +21,8 @@ uint32_t ipc_shared_memory_syscall_handler(uint32_t num, uint32_t argc,
 void ipc_stream_kernel_notify(uint32_t recipient_pid, uint32_t event,
                               uint32_t value);
 bool ipc_user_range(const void *ptr, uint32_t length);
-bool ipc_copy_name(char *dst, const char *src);
+bool ipc_copy_syscall_args(uint32_t argc, const uint32_t *argv,
+                           uint32_t expected_count, uint32_t *args);
 char *ipc_copy_name_alloc(const char *name);
 
 #endif

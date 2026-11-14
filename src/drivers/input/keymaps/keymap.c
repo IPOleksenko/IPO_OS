@@ -1,26 +1,53 @@
 #include <driver/input/keymap/keymap.h>
+#include <kernel/driver.h>
+#include <kernel/input_ext.h>
 #include <memory/kmalloc.h>
 #include <kernel/process.h>
 #include <string.h>
 
-static bool s_default_key_state[256] = {false};
-bool *key_state = s_default_key_state;
-uint32_t key_state_cap = 256;
+static uint64_t s_early_keys_0 = 0;
+static uint64_t s_early_keys_1 = 0;
+static uint64_t s_early_keys_2 = 0;
+static uint64_t s_early_keys_3 = 0;
+bool *key_state = NULL;
+uint32_t key_state_cap = 0;
 bool shift_mode = false;
 
+static bool early_key_get(uint32_t key) {
+    if (key < 64u) return (s_early_keys_0 & (1ULL << key)) != 0;
+    if (key < 128u) return (s_early_keys_1 & (1ULL << (key - 64u))) != 0;
+    if (key < 192u) return (s_early_keys_2 & (1ULL << (key - 128u))) != 0;
+    if (key < 256u) return (s_early_keys_3 & (1ULL << (key - 192u))) != 0;
+    return false;
+}
+
+static void early_key_set(uint32_t key, bool val) {
+    uint64_t bit = 1ULL << (key & 63u);
+    uint64_t *slot = NULL;
+    if (key < 64u) slot = &s_early_keys_0;
+    else if (key < 128u) slot = &s_early_keys_1;
+    else if (key < 192u) slot = &s_early_keys_2;
+    else if (key < 256u) slot = &s_early_keys_3;
+    if (!slot) return;
+    if (val) *slot |= bit;
+    else *slot &= ~bit;
+}
+
 static void key_state_ensure_capacity(uint32_t needed) {
-    if (needed < key_state_cap) return;
-    uint32_t new_cap = (key_state_cap == 0) ? 256 : (key_state_cap * 2);
+    if (key_state && needed < key_state_cap) return;
+    uint32_t new_cap = (key_state_cap == 0) ? 256u : (key_state_cap * 2u);
     while (new_cap <= needed) {
-        new_cap *= 2;
+        new_cap *= 2u;
     }
     bool *new_arr = (bool *)kmalloc(new_cap * sizeof(bool));
     if (!new_arr) return;
     memset(new_arr, 0, new_cap * sizeof(bool));
     if (key_state && key_state_cap > 0) {
         memcpy(new_arr, key_state, key_state_cap * sizeof(bool));
-        if (key_state != s_default_key_state) {
-            kfree(key_state);
+        kfree(key_state);
+    } else {
+        for (uint32_t k = 0; k < 256u && k < new_cap; k++) {
+            new_arr[k] = early_key_get(k);
         }
     }
     key_state = new_arr;
@@ -28,7 +55,8 @@ static void key_state_ensure_capacity(uint32_t needed) {
 }
 
 bool keyboard_is_key_pressed(uint32_t key) {
-    if (!key_state || key >= key_state_cap) return false;
+    if (!key_state) return early_key_get(key);
+    if (key >= key_state_cap) return false;
     return key_state[key];
 }
 
@@ -150,6 +178,7 @@ void hot_key_handler(uint8_t scancode) {
 
 
 static bool e0_prefix = false;
+static bool layout_switch_triggered = false;
 
 void keyboard_clear_key_state(void) {
     if (process_is_batch_active() && !process_is_foreground()) {
@@ -158,9 +187,16 @@ void keyboard_clear_key_state(void) {
     if (key_state && key_state_cap > 0) {
         memset(key_state, 0, key_state_cap * sizeof(bool));
     }
+    s_early_keys_0 = 0;
+    s_early_keys_1 = 0;
+    s_early_keys_2 = 0;
+    s_early_keys_3 = 0;
     shift_mode = false;
     e0_prefix = false;
     right_ctrl_pressed = false;
+    layout_switch_triggered = false;
+    input_ext_clear_key_state();
+    driver_clear_key_state();
 }
 
 void update_hot_key_state(uint8_t scancode) {
@@ -171,36 +207,41 @@ void update_hot_key_state(uint8_t scancode) {
         return;
     }
 
-    if (scancode == SC_PRESS_CTRL) {
-        if (e0_prefix) right_ctrl_pressed = true;
-    } else if (scancode == (uint8_t)SC_UNPRESS_CTRL) {
-        if (e0_prefix) right_ctrl_pressed = false;
+    if (e0_prefix && (scancode == SC_PRESS_CTRL || scancode == (uint8_t)SC_UNPRESS_CTRL)) {
+        right_ctrl_pressed = (scancode == SC_PRESS_CTRL);
+        e0_prefix = false;
+        shift_mode = keyboard_is_shift_pressed();
+        goto check_layout_hotkey;
     }
 
     key_state_ensure_capacity(scancode);
 
     if (scancode < 0x80u) {
-        if (scancode < key_state_cap) {
+        if (key_state && scancode < key_state_cap) {
             key_state[scancode] = true;
+        } else {
+            early_key_set(scancode, true);
         }
     } else {
         uint8_t base = scancode & 0x7Fu;
-        if (base < key_state_cap) {
-            key_state[base] = false;
-        }
-        if (scancode < key_state_cap) {
-            key_state[scancode] = false;
+        if (key_state) {
+            if (base < key_state_cap) {
+                key_state[base] = false;
+            }
+            if (scancode < key_state_cap) {
+                key_state[scancode] = false;
+            }
+        } else {
+            early_key_set(base, false);
+            early_key_set(scancode, false);
         }
     }
 
     e0_prefix = false;
     shift_mode = keyboard_is_shift_pressed();
 
-    /* Hotkey: Ctrl + Shift or Alt + Shift cycles between registered keyboard layouts.
-     * Left side (Left Shift / Left Ctrl) cycles backwards (previous layout).
-     * Right side (Right Shift / Right Ctrl) cycles forwards (next layout).
-     */
-    static bool layout_switch_triggered = false;
+check_layout_hotkey:
+    /* Hotkey: Ctrl+Shift or Alt+Shift cycles between enabled layouts */
     if ((keyboard_is_alt_pressed() && keyboard_is_shift_pressed()) ||
         (keyboard_is_ctrl_pressed() && keyboard_is_shift_pressed())) {
         if (!layout_switch_triggered) {

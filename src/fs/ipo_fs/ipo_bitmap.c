@@ -1,51 +1,49 @@
 #include <file_system/ipo_fs.h>
+#include <memory/kmalloc.h>
 #include <string.h>
-#include <stdio.h>
 #include <ioport.h>
 
-/* Reads a bit from the bitmap. bitmap_start is the block where the bitmap starts, bit_index is the bit index */
-bool bitmap_get(uint64_t bitmap_start, uint64_t bit_index) {
-    uint8_t buf[IPO_FS_BLOCK_SIZE];
-    uint64_t byte_index = bit_index / 8;
-    uint64_t block_offset = byte_index / IPO_FS_BLOCK_SIZE;
-    uint32_t inblock = (uint32_t)(byte_index % IPO_FS_BLOCK_SIZE);
-    int tries = 0;
-    uint64_t lba = bitmap_start + block_offset;
-    while (tries < 5) {
-        if (block_read(lba, buf)) break;
-        for (volatile int __t = 0; __t < 1000; __t++) inb(0x80);
-        tries++;
+static bool bitmap_block_io(uint64_t lba, void *buf, bool write) {
+    for (int tries = 0; tries < 5; tries++) {
+        bool ok = write ? block_write(lba, buf) : block_read(lba, buf);
+        if (ok) return true;
+        for (volatile int t = 0; t < 1000; t++) inb(0x80);
     }
-    if (tries == 5) return false;
-    return (buf[inblock] >> (bit_index & 7)) & 1;
+    return false;
 }
 
-/* Set/clear bit */
+bool bitmap_get(uint64_t bitmap_start, uint64_t bit_index) {
+    uint8_t *buf = (uint8_t *)kmalloc(IPO_FS_BLOCK_SIZE);
+    if (!buf) return false;
+    uint64_t byte_index = bit_index / 8;
+    uint64_t block_offset = byte_index / IPO_FS_BLOCK_SIZE;
+    uint32_t inblock = (uint32_t)(byte_index % IPO_FS_BLOCK_SIZE);
+    bool res = false;
+    if (bitmap_block_io(bitmap_start + block_offset, buf, false)) {
+        res = ((buf[inblock] >> (bit_index & 7)) & 1) != 0;
+    }
+    kfree(buf);
+    return res;
+}
+
 bool bitmap_set(uint64_t bitmap_start, uint64_t bit_index, bool value) {
-    uint8_t buf[IPO_FS_BLOCK_SIZE];
+    uint8_t *buf = (uint8_t *)kmalloc(IPO_FS_BLOCK_SIZE);
+    if (!buf) return false;
     uint64_t byte_index = bit_index / 8;
     uint64_t block_offset = byte_index / IPO_FS_BLOCK_SIZE;
     uint32_t inblock = (uint32_t)(byte_index % IPO_FS_BLOCK_SIZE);
     uint64_t lba = bitmap_start + block_offset;
-    int tries = 0;
-    while (tries < 5) {
-        if (block_read(lba, buf)) break;
-        for (volatile int __t = 0; __t < 1000; __t++) inb(0x80);
-        tries++;
+    if (!bitmap_block_io(lba, buf, false)) {
+        kfree(buf);
+        return false;
     }
-    if (tries == 5) return false;
     if (value)
-        buf[inblock] |= (1 << (bit_index & 7));
+        buf[inblock] |= (uint8_t)(1u << (bit_index & 7));
     else
-        buf[inblock] &= ~(1 << (bit_index & 7));
-    tries = 0;
-    while (tries < 5) {
-        if (block_write(lba, buf)) break;
-        for (volatile int __t = 0; __t < 1000; __t++) inb(0x80);
-        tries++;
-    }
-    if (tries == 5) return false;
-    return true;
+        buf[inblock] &= (uint8_t)~(1u << (bit_index & 7));
+    bool ok = bitmap_block_io(lba, buf, true);
+    kfree(buf);
+    return ok;
 }
 
 static inline uint32_t popcount32(uint32_t x) {
@@ -54,27 +52,16 @@ static inline uint32_t popcount32(uint32_t x) {
     return (((x + (x >> 4)) & 0x0F0F0F0Fu) * 0x01010101u) >> 24;
 }
 
-/* Fast block-wise bitmap bit counter */
 uint32_t bitmap_count_set(uint64_t bitmap_start, uint64_t total_bits) {
     if (total_bits == 0) return 0;
 
     uint64_t total_blocks = (total_bits + (IPO_FS_BLOCK_SIZE * 8) - 1) / (IPO_FS_BLOCK_SIZE * 8);
-    uint8_t buf[IPO_FS_BLOCK_SIZE];
+    uint8_t *buf = (uint8_t *)kmalloc(IPO_FS_BLOCK_SIZE);
+    if (!buf) return 0;
     uint32_t count = 0;
 
     for (uint64_t b = 0; b < total_blocks; b++) {
-        uint64_t lba = bitmap_start + b;
-        int tries = 0;
-        bool ok = false;
-        while (tries < 5) {
-            if (block_read(lba, buf)) {
-                ok = true;
-                break;
-            }
-            for (volatile int __t = 0; __t < 1000; __t++) inb(0x80);
-            tries++;
-        }
-        if (!ok) continue;
+        if (!bitmap_block_io(bitmap_start + b, buf, false)) continue;
 
         uint64_t bits_in_block = IPO_FS_BLOCK_SIZE * 8;
         uint64_t bits_left = total_bits - (b * bits_in_block);
@@ -96,5 +83,6 @@ uint32_t bitmap_count_set(uint64_t bitmap_start, uint64_t total_bits) {
         }
     }
 
+    kfree(buf);
     return count;
 }

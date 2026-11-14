@@ -7,9 +7,7 @@
 #define ETHERTYPE_IPV4 0x0800
 #define ETHERTYPE_ARP  0x0806
 
-/* Dynamic self-expanding Ethernet frame/header abstraction:
- * Automatically supports arbitrary hardware address lengths via kmalloc
- */
+/* Ethernet frame header with variable-length hardware addresses */
 typedef struct {
     mac_addr_t dest;
     mac_addr_t src;

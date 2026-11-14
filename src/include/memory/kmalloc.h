@@ -3,14 +3,21 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
-#define KMALLOC_HEAP_START  (0x4000000u)  // 64 MiB kernel heap start
+#define KMALLOC_HEAP_START  (0x4000000u)  // 64 MiB — kernel heap start
 size_t kmalloc_get_heap_capacity(void);
+
 #define KMALLOC_HEAP_SIZE   (kmalloc_get_heap_capacity())
 
 void* kmalloc(size_t size);
 
 void* krealloc(void* ptr, size_t size);
+
+/**
+ * Overflow-safe geometric array growth helper (zero-fills newly grown tail).
+ */
+bool kgrow_array(void **ptr, size_t *cap, size_t min_cap, size_t elem_size, size_t init_cap);
 
 void kfree(void* ptr);
 

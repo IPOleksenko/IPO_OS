@@ -3,8 +3,8 @@
 #include <net/dyn_buf.h>
 #include <net/net_state.h>
 #include <system/timer.h>
+#include <system/state.h>
 #include <string.h>
-#include <stdio.h>
 #include <memory/kmalloc.h>
 #include <ioport.h>
 #include <syscall.h>
@@ -17,6 +17,26 @@ typedef struct {
     uint16_t nscount;
     uint16_t arcount;
 } __attribute__((packed)) dns_header_t;
+
+static const uint8_t *dns_skip_name(const uint8_t *p, const uint8_t *end) {
+    while (p < end) {
+        uint8_t len = *p;
+        if (len == 0) {
+            return p + 1;
+        }
+        if ((len & 0xC0u) == 0xC0u) {
+            return (p + 2 <= end) ? (p + 2) : NULL;
+        }
+        if ((len & 0xC0u) != 0) {
+            return NULL;
+        }
+        if ((size_t)(end - p) < (size_t)len + 1u) {
+            return NULL;
+        }
+        p += 1u + len;
+    }
+    return NULL;
+}
 
 void dns_process_response_packet(const void *data, uint16_t len) {
     if (!data || len < sizeof(dns_header_t)) return;
@@ -35,36 +55,15 @@ void dns_process_response_packet(const void *data, uint16_t len) {
     /* Skip Question Section */
     uint16_t qdcount = ntohs(hdr->qdcount);
     for (uint16_t q = 0; q < qdcount; q++) {
-        while (p < end) {
-            if (*p == 0) {
-                p++;
-                break;
-            }
-            if ((*p & 0xC0) == 0xC0) {
-                p += 2;
-                break;
-            }
-            p += (*p + 1);
-        }
-        p += 4; // Skip QTYPE and QCLASS
+        p = dns_skip_name(p, end);
+        if (!p || (size_t)(end - p) < 4u) return;
+        p += 4;
     }
 
     /* Parse Answer Section */
     for (uint16_t a = 0; a < ancount && p < end; a++) {
-        /* Skip NAME */
-        while (p < end) {
-            if (*p == 0) {
-                p++;
-                break;
-            }
-            if ((*p & 0xC0) == 0xC0) {
-                p += 2;
-                break;
-            }
-            p += (*p + 1);
-        }
-
-        if (p + 10 > end) break;
+        p = dns_skip_name(p, end);
+        if (!p || (size_t)(end - p) < 10u) break;
 
         uint16_t atype = (uint16_t)((p[0] << 8) | p[1]);
         uint16_t aclass = (uint16_t)((p[2] << 8) | p[3]);
@@ -148,9 +147,10 @@ bool dns_resolve_ex(const char *hostname, ip4_addr_t *out_ip, uint32_t timeout_m
     uint16_t query_id = (uint16_t)(((pid & 0x3F) << 10) ^ (timer_millis() & 0x3FF) ^ 0xA5A5);
     if (query_id == 0) query_id = 0x1234;
 
-    /* Construct DNS query packet dynamically */
+    /* Construct DNS query packet */
     dyn_buf_t qbuf;
     dyn_buf_init(&qbuf, 128);
+    if (!qbuf.data) return false;
 
     dns_header_t hdr;
     hdr.id = htons(query_id);
@@ -159,10 +159,10 @@ bool dns_resolve_ex(const char *hostname, ip4_addr_t *out_ip, uint32_t timeout_m
     hdr.ancount = 0;
     hdr.nscount = 0;
     hdr.arcount = 0;
-    dyn_buf_append(&qbuf, &hdr, sizeof(hdr));
+    bool ok = dyn_buf_append(&qbuf, &hdr, sizeof(hdr));
 
     const char *src = hostname;
-    while (*src && *src != '/' && *src != ':') {
+    while (ok && *src && *src != '/' && *src != ':') {
         size_t label_len = 0;
         while (src[label_len] && src[label_len] != '.' && src[label_len] != '/' && src[label_len] != ':') {
             label_len++;
@@ -171,18 +171,23 @@ bool dns_resolve_ex(const char *hostname, ip4_addr_t *out_ip, uint32_t timeout_m
         if (label_len > 63) label_len = 63;
 
         uint8_t llen = (uint8_t)label_len;
-        dyn_buf_append_byte(&qbuf, llen);
-        dyn_buf_append(&qbuf, src, label_len);
+        ok = dyn_buf_append_byte(&qbuf, llen) && dyn_buf_append(&qbuf, src, label_len);
 
         src += label_len;
         if (*src == '.') src++;
         else break;
     }
-    dyn_buf_append_byte(&qbuf, 0x00); // Zero terminator for QNAME
+    ok = ok &&
+         dyn_buf_append_byte(&qbuf, 0x00) &&
+         dyn_buf_append_byte(&qbuf, 0x00) &&
+         dyn_buf_append_byte(&qbuf, 0x01) &&
+         dyn_buf_append_byte(&qbuf, 0x00) &&
+         dyn_buf_append_byte(&qbuf, 0x01);
 
-    /* QTYPE = 1 (A), QCLASS = 1 (IN) */
-    uint8_t qtail[4] = { 0x00, 0x01, 0x00, 0x01 };
-    dyn_buf_append(&qbuf, qtail, sizeof(qtail));
+    if (!ok || qbuf.size > 65535u - 28u) {
+        dyn_buf_free(&qbuf);
+        return false;
+    }
 
     ip4_addr_t primary_dns = (netif->dns != 0) ? netif->dns : IP4_ADDR(8, 8, 8, 8);
     udp_send(primary_dns, client_port, 53, qbuf.data, (uint16_t)qbuf.size);
@@ -193,15 +198,18 @@ bool dns_resolve_ex(const char *hostname, ip4_addr_t *out_ip, uint32_t timeout_m
     bool resolved = false;
 
     while (timer_millis() - start < timeout_ms) {
+        if (system_is_interrupted()) break;
         net_poll();
 
         net_shared_ctx_t *ctx = net_get_shared_context();
-        for (size_t i = 0; i < ctx->dns_queue_capacity; i++) {
-            if (ctx->dns_queue[i].valid && ctx->dns_queue[i].id == query_id) {
-                *out_ip = ctx->dns_queue[i].ip;
-                ctx->dns_queue[i].valid = false;
-                resolved = true;
-                break;
+        if (ctx->dns_queue) {
+            for (size_t i = 0; i < ctx->dns_queue_capacity; i++) {
+                if (ctx->dns_queue[i].valid && ctx->dns_queue[i].id == query_id) {
+                    *out_ip = ctx->dns_queue[i].ip;
+                    ctx->dns_queue[i].valid = false;
+                    resolved = true;
+                    break;
+                }
             }
         }
         if (resolved) break;

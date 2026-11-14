@@ -3,6 +3,7 @@
 #include <kernel/ipc.h>
 #include <kernel/terminal.h>
 #include <system/state.h>
+#include <system/timer.h>
 #include <file_system/ipo_fs.h>
 #include <memory/kmalloc.h>
 #include <memory/address_space.h>
@@ -12,6 +13,7 @@
 #include <driver/input/keyboard.h>
 #include <vga.h>
 #include <vga_gfx.h>
+#include <driver/vbe_bga.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -20,6 +22,9 @@
 #include <driver/input/mouse.h>
 #include <driver/audio_core.h>
 #include <ioport.h>
+#include <kernel/driver.h>
+#include <kernel/input_ext.h>
+#include <kernel/smp.h>
 
 
 /**
@@ -49,15 +54,26 @@ bool process_update_memory_mappings(process_t *proc, uint32_t address,
         (uint64_t)address + length > 0x100000000ULL)
         return false;
 
+    if (proc->address_space) {
+        if (!address_space_set_identity_range(proc->address_space, address,
+                                              length, allocated)) {
+            return false;
+        }
+    }
+
     for (process_t *other = process_list; other; other = other->next) {
         if (other == proc || !other->address_space) continue;
         if (!address_space_set_identity_range(other->address_space, address,
                                               length, !allocated)) {
-            for (process_t *restore = process_list; restore; restore = restore->next) {
+            for (process_t *restore = process_list; restore != other; restore = restore->next) {
                 if (restore != proc && restore->address_space) {
                     (void)address_space_set_identity_range(
-                        restore->address_space, address, length, true);
+                        restore->address_space, address, length, allocated);
                 }
+            }
+            if (proc->address_space) {
+                (void)address_space_set_identity_range(
+                    proc->address_space, address, length, !allocated);
             }
             return false;
         }
@@ -69,7 +85,20 @@ static bool process_address_space_initialize(process_t *proc) {
     if (!proc || !proc->address_space) return false;
     for (process_t *other = process_list; other; other = other->next) {
         if (other == proc) continue;
-        if (other->user_heap_limit > other->user_heap_base) {
+        if (other->heap_chunks && other->heap_chunk_count > 0) {
+            for (uint32_t i = 0; i < other->heap_chunk_count; i++) {
+                if (other->heap_chunks[i].limit > other->heap_chunks[i].base) {
+                    uint32_t start = other->heap_chunks[i].base & ~0xFFFu;
+                    uint64_t end = ((uint64_t)other->heap_chunks[i].limit + 0xFFFu) & ~0xFFFULL;
+                    if (end > UINT32_MAX ||
+                        (end > start &&
+                         !address_space_set_identity_range(
+                             proc->address_space, start,
+                             (uint32_t)end - start, false)))
+                        return false;
+                }
+            }
+        } else if (other->user_heap_limit > other->user_heap_base) {
             uint32_t start = other->user_heap_base & ~0xFFFu;
             uint64_t end =
                 ((uint64_t)other->user_heap_limit + 0xFFFu) & ~0xFFFULL;
@@ -296,6 +325,8 @@ static int batch_current_idx = 0;
 static uint32_t scheduler_esp = 0;
 static bool batch_active = false;
 static bool batch_separate_windows = false;
+static bool batch_shared_console_view = false;
+static bool batch_wm_was_active = false;
 static process_t *batch_foreground_proc = NULL;
 static process_t *batch_displayed_fg = NULL;
 static process_t *currently_mapped_app = NULL;
@@ -489,11 +520,21 @@ bool process_is_active_or_has_windows(process_t *p) {
     return false;
 }
 
+static bool process_proc_wants_active_gfx(const process_t *p) {
+    if (!p) return false;
+    if (p->is_wm_app) {
+        return p->wants_graphics &&
+               wm_session_active() &&
+               (wm_has_windows_for_pid(p->pid) || p == process_get_current());
+    }
+    return p->wants_graphics;
+}
+
 static process_t *pick_workspace_active_proc(int wid) {
     if (!batch_active || !batch_procs) return NULL;
     for (int i = 0; i < batch_proc_count; i++) {
         process_t *p = batch_procs[i];
-        if (p && p->window_id == wid && (p->is_wm_app || p->wants_graphics) && process_is_active_or_has_windows(p)) {
+        if (p && p->window_id == wid && process_proc_wants_active_gfx(p) && process_is_active_or_has_windows(p)) {
             return p;
         }
     }
@@ -516,18 +557,41 @@ static bool workspace_has_wm_app(int wid) {
     if (!batch_active || !batch_procs) return false;
     for (int i = 0; i < batch_proc_count; i++) {
         process_t *p = batch_procs[i];
-        if (p && p->window_id == wid && p->is_wm_app && process_is_active_or_has_windows(p)) {
+        if (p && p->window_id == wid && p->is_wm_app &&
+            process_proc_wants_active_gfx(p) && process_is_active_or_has_windows(p)) {
             return true;
         }
     }
     return false;
 }
 
+static bool workspace_has_wm_or_bridge(int wid) {
+    return workspace_has_wm_app(wid);
+}
+
+int process_workspace_get_proc_count(int wid) {
+    int cnt = 0;
+    if (batch_active && batch_procs) {
+        for (int i = 0; i < batch_proc_count; i++) {
+            process_t *p = batch_procs[i];
+            if (p && p->window_id == wid &&
+                (p->is_running || process_is_active_or_has_windows(p))) {
+                cnt++;
+            }
+        }
+        return cnt;
+    }
+    if (current_process && current_process->window_id == wid && current_process->is_running) {
+        return 1;
+    }
+    return 0;
+}
+
 static bool workspace_wants_graphics(int wid) {
     if (!batch_active || !batch_procs) return false;
     for (int i = 0; i < batch_proc_count; i++) {
         process_t *p = batch_procs[i];
-        if (p && p->window_id == wid && (p->wants_graphics || p->is_wm_app) && process_is_active_or_has_windows(p)) {
+        if (p && p->window_id == wid && process_proc_wants_active_gfx(p) && process_is_active_or_has_windows(p)) {
             return true;
         }
     }
@@ -608,7 +672,7 @@ static void process_switch_workspace_screen(process_t *old_fg, process_t *new_fg
             ctx->batch_displayed_fg = new_fg;
         }
         process_sync_shared_context();
-        if (wm_session_active() && (new_fg->is_wm_app || workspace_has_wm_app(new_fg->window_id))) {
+        if (wm_session_active() && (new_fg->is_wm_app || workspace_has_wm_or_bridge(new_fg->window_id))) {
             wm_focus_window_for_pid(new_fg->pid);
             wm_invalidate_all();
         }
@@ -625,33 +689,53 @@ static void process_switch_workspace_screen(process_t *old_fg, process_t *new_fg
     keyboard_flush_app_queue();
 
     /* 1. Preserve outgoing graphics or text screen state */
-    if (old_fg) {
-        if (old_fg->wants_graphics || old_fg->is_wm_app || workspace_wants_graphics(old_fg->window_id) || vga_is_graphics_mode()) {
-            if (!old_fg->gfx_vram_backup) {
-                old_fg->gfx_vram_backup = (uint8_t *)kmalloc(VGA_GFX_SIZE);
-            }
-            if (old_fg->gfx_vram_backup) {
-                memcpy(old_fg->gfx_vram_backup, (const void *)VGA_GFX_VRAM_ADDR, VGA_GFX_SIZE);
-            }
-            if (!old_fg->gfx_palette_backup) {
-                old_fg->gfx_palette_backup = (uint8_t *)kmalloc(768);
-            }
-            if (old_fg->gfx_palette_backup) {
-                for (int i = 0; i < 256; i++) {
-                    outb(0x3C7, (uint8_t)i);
-                    old_fg->gfx_palette_backup[i * 3 + 0] = inb(0x3C9);
-                    old_fg->gfx_palette_backup[i * 3 + 1] = inb(0x3C9);
-                    old_fg->gfx_palette_backup[i * 3 + 2] = inb(0x3C9);
+    if (old_fg && !old_fg->completed_and_acknowledged) {
+        bool old_uses_wm = old_fg->is_wm_app ||
+                           workspace_has_wm_or_bridge(old_fg->window_id);
+        if (old_uses_wm || old_fg->wants_graphics || workspace_wants_graphics(old_fg->window_id)) {
+            if (!old_uses_wm && vga_is_graphics_mode() && !vbe_bga_is_enabled()) {
+                int hw_w = vga_gfx_get_mode13h_width();
+                int hw_h = vga_gfx_get_mode13h_height();
+                if (hw_w > 0 && hw_h > 0 && (size_t)hw_w <= SIZE_MAX / (size_t)hw_h) {
+                    size_t hw_sz = (size_t)hw_w * (size_t)hw_h;
+                    if (!old_fg->gfx_vram_backup ||
+                        old_fg->gfx_vram_backup_w != hw_w ||
+                        old_fg->gfx_vram_backup_h != hw_h) {
+                        uint8_t *nb = (uint8_t *)krealloc(old_fg->gfx_vram_backup, hw_sz);
+                        if (nb) {
+                            old_fg->gfx_vram_backup = nb;
+                            old_fg->gfx_vram_backup_w = hw_w;
+                            old_fg->gfx_vram_backup_h = hw_h;
+                        }
+                    }
+                    if (old_fg->gfx_vram_backup &&
+                        old_fg->gfx_vram_backup_w == hw_w &&
+                        old_fg->gfx_vram_backup_h == hw_h) {
+                        memcpy(old_fg->gfx_vram_backup, (const void *)VGA_GFX_VRAM_ADDR, hw_sz);
+                    }
+                }
+                if (!old_fg->gfx_palette_backup) {
+                    old_fg->gfx_palette_backup = (uint8_t *)kmalloc(768);
+                }
+                if (old_fg->gfx_palette_backup) {
+                    for (int i = 0; i < 256; i++) {
+                        outb(0x3C7, (uint8_t)i);
+                        old_fg->gfx_palette_backup[i * 3 + 0] = inb(0x3C9);
+                        old_fg->gfx_palette_backup[i * 3 + 1] = inb(0x3C9);
+                        old_fg->gfx_palette_backup[i * 3 + 2] = inb(0x3C9);
+                    }
                 }
             }
+            process_sync_workspace_text_state(old_fg);
         } else {
             if (old_fg->scroll_bottom_count > 0) {
                 terminal_return_to_present();
             }
             if (old_fg->text_vram_backup) {
-                memcpy(old_fg->text_vram_backup, (const void *)0xB8000, 80 * 25 * sizeof(uint16_t));
+                memcpy(old_fg->text_vram_backup, (const void *)VGA_MEMORY, (size_t)VGA_WIDTH * (size_t)VGA_HEIGHT * sizeof(uint16_t));
                 old_fg->text_cursor_pos = vga_get_cursor_position();
                 old_fg->text_cursor_visible = vga_is_cursor_visible();
+                process_sync_workspace_text_state(old_fg);
             }
         }
     }
@@ -668,7 +752,12 @@ static void process_switch_workspace_screen(process_t *old_fg, process_t *new_fg
     /* 2. Restore incoming graphics or text screen state */
     if (new_fg == NULL) {
         keyboard_set_app_input_mode(false);
-        if (vga_is_graphics_mode()) {
+        if (process_wm_has_focus()) {
+            vga_set_mode_13h_hardware();
+            vga_gfx_init_default_palette();
+            mouse_set_bounds_from_display();
+            wm_invalidate_all();
+        } else if (vga_is_graphics_mode()) {
             vga_set_mode_text_hardware();
             dynamic_keymap_reapply_fonts();
             mouse_set_bounds_from_display();
@@ -676,14 +765,22 @@ static void process_switch_workspace_screen(process_t *old_fg, process_t *new_fg
     } else {
         new_fg->waiting_for_input = false;
         keyboard_set_app_input_mode(true);
-        if (new_fg->is_wm_app || workspace_has_wm_app(new_fg->window_id)) {
+        bool wm_view_active = batch_separate_windows
+            ? (workspace_has_wm_or_bridge(new_fg->window_id) ||
+               (new_fg->is_wm_app && process_proc_wants_active_gfx(new_fg)))
+            : process_wm_has_focus();
+        bool raw_gfx_view = !wm_view_active &&
+            (batch_separate_windows
+                ? (!new_fg->is_wm_app && (new_fg->wants_graphics || workspace_wants_graphics(new_fg->window_id)))
+                : (!batch_shared_console_view && !new_fg->is_wm_app && new_fg->wants_graphics));
+        if (wm_view_active) {
             vga_set_mode_13h_hardware();
             vga_gfx_init_default_palette();
             mouse_set_bounds_from_display();
             wm_focus_window_for_pid(new_fg->pid);
             wm_invalidate_all();
             wm_compositor_tick();
-        } else if (new_fg->wants_graphics || workspace_wants_graphics(new_fg->window_id)) {
+        } else if (raw_gfx_view) {
             vga_set_mode_13h_hardware();
             if (new_fg->gfx_palette_backup) {
                 for (int i = 0; i < 256; i++) {
@@ -696,8 +793,12 @@ static void process_switch_workspace_screen(process_t *old_fg, process_t *new_fg
                 vga_gfx_init_default_palette();
             }
             mouse_set_bounds_from_display();
-            if (new_fg->gfx_vram_backup) {
-                memcpy((void *)VGA_GFX_VRAM_ADDR, new_fg->gfx_vram_backup, VGA_GFX_SIZE);
+            if (new_fg->gfx_vram_backup &&
+                new_fg->gfx_vram_backup_w > 0 &&
+                new_fg->gfx_vram_backup_h > 0) {
+                vga_gfx_blit_hardware(new_fg->gfx_vram_backup, true,
+                                      new_fg->gfx_vram_backup_w,
+                                      new_fg->gfx_vram_backup_h);
             }
         } else {
             if (vga_is_graphics_mode()) {
@@ -706,7 +807,7 @@ static void process_switch_workspace_screen(process_t *old_fg, process_t *new_fg
                 mouse_set_bounds_from_display();
             }
             if (new_fg->text_vram_backup) {
-                memcpy((void *)0xB8000, new_fg->text_vram_backup, 80 * 25 * sizeof(uint16_t));
+                memcpy((void *)VGA_MEMORY, new_fg->text_vram_backup, (size_t)VGA_WIDTH * (size_t)VGA_HEIGHT * sizeof(uint16_t));
                 vga_set_cursor(new_fg->text_cursor_pos);
                 if (new_fg->text_cursor_visible) {
                     vga_show_cursor();
@@ -759,25 +860,28 @@ bool process_get_separate_windows(void) {
 
 void process_init_text_screen(process_t *proc) {
     if (!proc) return;
+    size_t vga_w = (size_t)VGA_WIDTH;
+    size_t vga_h = (size_t)VGA_HEIGHT;
+    size_t cells = vga_w * vga_h;
     if (!proc->text_vram_backup) {
-        proc->text_vram_backup = (uint16_t *)kmalloc(80 * 25 * sizeof(uint16_t));
+        proc->text_vram_backup = (uint16_t *)kmalloc(cells * sizeof(uint16_t));
     }
     if (!proc->text_vram_backup) return;
 
     if (!proc->scroll_top_buffer) {
         proc->scroll_top_capacity = 128;
-        proc->scroll_top_buffer = (uint16_t *)kmalloc(proc->scroll_top_capacity * 80 * sizeof(uint16_t));
+        proc->scroll_top_buffer = (uint16_t *)kmalloc((size_t)proc->scroll_top_capacity * vga_w * sizeof(uint16_t));
         if (proc->scroll_top_buffer) {
-            for (int i = 0; i < proc->scroll_top_capacity * 80; i++) {
+            for (size_t i = 0; i < (size_t)proc->scroll_top_capacity * vga_w; i++) {
                 proc->scroll_top_buffer[i] = 0x0720;
             }
         }
     }
     if (!proc->scroll_bottom_buffer) {
         proc->scroll_bottom_capacity = 128;
-        proc->scroll_bottom_buffer = (uint16_t *)kmalloc(proc->scroll_bottom_capacity * 80 * sizeof(uint16_t));
+        proc->scroll_bottom_buffer = (uint16_t *)kmalloc((size_t)proc->scroll_bottom_capacity * vga_w * sizeof(uint16_t));
         if (proc->scroll_bottom_buffer) {
-            for (int i = 0; i < proc->scroll_bottom_capacity * 80; i++) {
+            for (size_t i = 0; i < (size_t)proc->scroll_bottom_capacity * vga_w; i++) {
                 proc->scroll_bottom_buffer[i] = 0x0720;
             }
         }
@@ -785,22 +889,12 @@ void process_init_text_screen(process_t *proc) {
     proc->scroll_top_count = 0;
     proc->scroll_bottom_count = 0;
 
-    /* Fill entire screen with clean blank spaces 0x0720 */
-    for (int i = 0; i < 80 * 25; i++) {
+    /* Fill screen with clean blank spaces before drawing header */
+    for (size_t i = 0; i < cells; i++) {
         proc->text_vram_backup[i] = 0x0720;
     }
 
-    /* Top row 0: Header "IPO_OS" on left, "Created by IPOleksenko" on right */
-    const char *os_name = "IPO_OS";
-    const char *created_by = "Created by IPOleksenko";
-    int os_len = strlen(os_name);
-    int cr_len = strlen(created_by);
-    for (int i = 0; i < os_len; i++) {
-        proc->text_vram_backup[i] = vga_entry(os_name[i], VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
-    }
-    for (int i = 0; i < cr_len; i++) {
-        proc->text_vram_backup[80 - cr_len + i] = vga_entry(created_by[i], VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
-    }
+    print_header_row(proc->text_vram_backup, vga_w);
 
     /* Start at beginning of workspace display content (row 2, column 0) */
     proc->text_cursor_pos = (uint16_t)VGA_START_CURSOR_POSITION;
@@ -810,162 +904,148 @@ void process_init_text_screen(process_t *proc) {
 void process_workspace_auto_scroll(process_t *proc) {
     if (!proc || !proc->text_vram_backup) return;
 
-    uint16_t top_row = VGA_START_CURSOR_POSITION / VGA_WIDTH;
+    uint16_t vga_w = VGA_WIDTH;
+    uint16_t top_row = VGA_START_CURSOR_POSITION / vga_w;
     uint16_t terminal_rows = VGA_HEIGHT - top_row;
-    uint16_t last_line_start = (top_row + terminal_rows - 1) * VGA_WIDTH;
+    uint16_t last_line_start = (top_row + terminal_rows - 1) * vga_w;
 
     if (proc->scroll_top_count >= proc->scroll_top_capacity) {
         int new_cap = (proc->scroll_top_capacity == 0) ? 128 : (proc->scroll_top_capacity * 2);
-        uint16_t *new_buf = (uint16_t *)krealloc(proc->scroll_top_buffer, (size_t)new_cap * 80 * sizeof(uint16_t));
+        uint16_t *new_buf = (uint16_t *)krealloc(proc->scroll_top_buffer, (size_t)new_cap * (size_t)vga_w * sizeof(uint16_t));
         if (new_buf) {
             proc->scroll_top_buffer = new_buf;
             proc->scroll_top_capacity = new_cap;
         }
     }
     if (proc->scroll_top_buffer && proc->scroll_top_count < proc->scroll_top_capacity) {
-        memcpy(&proc->scroll_top_buffer[proc->scroll_top_count * 80],
-               &proc->text_vram_backup[top_row * 80],
-               80 * sizeof(uint16_t));
+        memcpy(&proc->scroll_top_buffer[(size_t)proc->scroll_top_count * (size_t)vga_w],
+               &proc->text_vram_backup[(size_t)top_row * (size_t)vga_w],
+               (size_t)vga_w * sizeof(uint16_t));
         proc->scroll_top_count++;
     }
     proc->scroll_bottom_count = 0;
 
     for (uint16_t r = top_row; r < top_row + terminal_rows - 1; r++) {
-        memcpy((void *)&proc->text_vram_backup[r * 80],
-               (const void *)&proc->text_vram_backup[(r + 1) * 80],
-               80 * sizeof(uint16_t));
+        memcpy((void *)&proc->text_vram_backup[(size_t)r * (size_t)vga_w],
+               (const void *)&proc->text_vram_backup[(size_t)(r + 1) * (size_t)vga_w],
+               (size_t)vga_w * sizeof(uint16_t));
     }
-    for (uint16_t col = 0; col < 80; col++) {
+    for (uint16_t col = 0; col < vga_w; col++) {
         proc->text_vram_backup[last_line_start + col] = 0x0720;
     }
+    process_sync_workspace_text_state(proc);
+}
+
+void process_sync_workspace_text_state(process_t *proc) {
+    if (!proc || !batch_active || !batch_procs) return;
+    for (int i = 0; i < batch_proc_count; i++) {
+        process_t *other = batch_procs[i];
+        if (other && other != proc && other->window_id == proc->window_id) {
+            if (proc->text_vram_backup && other->text_vram_backup == proc->text_vram_backup) {
+                other->text_cursor_pos = proc->text_cursor_pos;
+                other->text_cursor_visible = proc->text_cursor_visible;
+                other->scroll_top_buffer = proc->scroll_top_buffer;
+                other->scroll_top_count = proc->scroll_top_count;
+                other->scroll_top_capacity = proc->scroll_top_capacity;
+                other->scroll_bottom_buffer = proc->scroll_bottom_buffer;
+                other->scroll_bottom_count = proc->scroll_bottom_count;
+                other->scroll_bottom_capacity = proc->scroll_bottom_capacity;
+            }
+        }
+    }
+}
+
+static void process_switch_foreground_step(int step) {
+    if (!batch_active || batch_proc_count <= 1) return;
+    if (!batch_separate_windows) {
+        if (!wm_session_active() || !process_batch_has_terminal_procs()) {
+            return;
+        }
+        keyboard_flush_hardware();
+        keyboard_flush_queue();
+        keyboard_flush_app_queue();
+        batch_shared_console_view = !batch_shared_console_view;
+        if (batch_shared_console_view) {
+            if (vga_is_graphics_mode()) {
+                vga_set_mode_text_hardware();
+            }
+            dynamic_keymap_reapply_fonts();
+            mouse_set_bounds_from_display();
+        } else {
+            if (!vga_is_graphics_mode()) {
+                vga_set_mode_13h_hardware();
+            }
+            vga_gfx_init_default_palette();
+            mouse_set_bounds_from_display();
+            wm_invalidate_all();
+        }
+        process_sync_shared_context();
+        process_yield_kernel();
+        return;
+    }
+    process_t *cur_fg = process_get_foreground();
+
+    int *unique_wins = (int *)kmalloc((size_t)batch_proc_count * sizeof(int));
+    if (!unique_wins) return;
+    int unique_count = 0;
+    for (int i = 0; i < batch_proc_count; i++) {
+        if (batch_procs && batch_procs[i] && process_is_active_or_has_windows(batch_procs[i])) {
+            int wid = batch_procs[i]->window_id;
+            bool exists = false;
+            for (int u = 0; u < unique_count; u++) {
+                if (unique_wins[u] == wid) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) {
+                unique_wins[unique_count++] = wid;
+            }
+        }
+    }
+
+    if (unique_count <= 1) {
+        kfree(unique_wins);
+        return;
+    }
+
+    int cur_wid = cur_fg ? cur_fg->window_id : unique_wins[0];
+    int cur_win_idx = 0;
+    for (int u = 0; u < unique_count; u++) {
+        if (unique_wins[u] == cur_wid) {
+            cur_win_idx = u;
+            break;
+        }
+    }
+
+    int target_idx = ((cur_win_idx + step) % unique_count + unique_count) % unique_count;
+    int target_wid = unique_wins[target_idx];
+    kfree(unique_wins);
+
+    process_t *target_proc = pick_workspace_active_proc(target_wid);
+    if (!target_proc) return;
+
+    serial_printf("[proc] switch_fg(%+d): %s -> %s (win %d -> %d)\n",
+        step,
+        cur_fg ? cur_fg->name : "none",
+        target_proc->name,
+        cur_fg ? cur_fg->window_id : 0,
+        target_wid);
+
+    process_set_foreground(target_proc);
+    if (wm_session_active() && (!process_get_separate_windows() || target_proc->is_wm_app || workspace_has_wm_app(target_wid))) {
+        wm_focus_window_for_pid(target_proc->pid);
+        wm_invalidate_all();
+    }
+    process_yield_kernel();
 }
 
 void process_switch_foreground_next(void) {
-    if (!batch_active || batch_proc_count <= 1) return;
-    if (!batch_separate_windows) return;
-    process_t *cur_fg = process_get_foreground();
-
-    /* 1. Collect all distinct active workspace IDs (window_id) in order */
-    int *unique_wins = (int *)kmalloc((size_t)batch_proc_count * sizeof(int));
-    if (!unique_wins) return;
-    int unique_count = 0;
-    for (int i = 0; i < batch_proc_count; i++) {
-        if (batch_procs && batch_procs[i] && process_is_active_or_has_windows(batch_procs[i])) {
-            int wid = batch_procs[i]->window_id;
-            bool exists = false;
-            for (int u = 0; u < unique_count; u++) {
-                if (unique_wins[u] == wid) {
-                    exists = true;
-                    break;
-                }
-            }
-            if (!exists) {
-                unique_wins[unique_count++] = wid;
-            }
-        }
-    }
-
-    if (unique_count <= 1) {
-        kfree(unique_wins);
-        return;
-    }
-
-    /* 2. Find index of current workspace */
-    int cur_wid = cur_fg ? cur_fg->window_id : unique_wins[0];
-    int cur_win_idx = -1;
-    for (int u = 0; u < unique_count; u++) {
-        if (unique_wins[u] == cur_wid) {
-            cur_win_idx = u;
-            break;
-        }
-    }
-    if (cur_win_idx == -1) cur_win_idx = 0;
-
-    /* 3. Determine next workspace */
-    int next_win_idx = (cur_win_idx + 1) % unique_count;
-    int target_wid = unique_wins[next_win_idx];
-    kfree(unique_wins);
-
-    /* 4. Pick canonical foreground process for target workspace */
-    process_t *target_proc = pick_workspace_active_proc(target_wid);
-    if (!target_proc) return;
-
-    serial_printf("[proc] switch_fg: %s -> %s (win %d -> %d)\n",
-        cur_fg ? cur_fg->name : "none",
-        target_proc->name,
-        cur_fg ? cur_fg->window_id : 0,
-        target_wid);
-
-    process_set_foreground(target_proc);
-    if (wm_session_active() && (!process_get_separate_windows() || target_proc->is_wm_app || workspace_has_wm_app(target_wid))) {
-        wm_focus_window_for_pid(target_proc->pid);
-        wm_invalidate_all();
-    }
-    process_yield_kernel();
+    process_switch_foreground_step(1);
 }
 
 void process_switch_foreground_prev(void) {
-    if (!batch_active || batch_proc_count <= 1) return;
-    if (!batch_separate_windows) return;
-    process_t *cur_fg = process_get_foreground();
-
-    /* 1. Collect all distinct active workspace IDs (window_id) in order */
-    int *unique_wins = (int *)kmalloc((size_t)batch_proc_count * sizeof(int));
-    if (!unique_wins) return;
-    int unique_count = 0;
-    for (int i = 0; i < batch_proc_count; i++) {
-        if (batch_procs && batch_procs[i] && process_is_active_or_has_windows(batch_procs[i])) {
-            int wid = batch_procs[i]->window_id;
-            bool exists = false;
-            for (int u = 0; u < unique_count; u++) {
-                if (unique_wins[u] == wid) {
-                    exists = true;
-                    break;
-                }
-            }
-            if (!exists) {
-                unique_wins[unique_count++] = wid;
-            }
-        }
-    }
-
-    if (unique_count <= 1) {
-        kfree(unique_wins);
-        return;
-    }
-
-    /* 2. Find index of current workspace */
-    int cur_wid = cur_fg ? cur_fg->window_id : unique_wins[0];
-    int cur_win_idx = -1;
-    for (int u = 0; u < unique_count; u++) {
-        if (unique_wins[u] == cur_wid) {
-            cur_win_idx = u;
-            break;
-        }
-    }
-    if (cur_win_idx == -1) cur_win_idx = 0;
-
-    /* 3. Determine previous workspace */
-    int prev_win_idx = (cur_win_idx - 1 + unique_count) % unique_count;
-    int target_wid = unique_wins[prev_win_idx];
-    kfree(unique_wins);
-
-    /* 4. Pick canonical foreground process for target workspace */
-    process_t *target_proc = pick_workspace_active_proc(target_wid);
-    if (!target_proc) return;
-
-    serial_printf("[proc] switch_fg_prev: %s -> %s (win %d -> %d)\n",
-        cur_fg ? cur_fg->name : "none",
-        target_proc->name,
-        cur_fg ? cur_fg->window_id : 0,
-        target_wid);
-
-    process_set_foreground(target_proc);
-    if (wm_session_active() && (!process_get_separate_windows() || target_proc->is_wm_app || workspace_has_wm_app(target_wid))) {
-        wm_focus_window_for_pid(target_proc->pid);
-        wm_invalidate_all();
-    }
-    process_yield_kernel();
+    process_switch_foreground_step(-1);
 }
 
 void process_switch_foreground_to_workspace(int target_wid) {
@@ -991,15 +1071,163 @@ void process_switch_foreground_to_workspace(int target_wid) {
     process_yield_kernel();
 }
 
-bool process_is_foreground(void) {
+bool process_batch_has_terminal_procs(void) {
+    if (!batch_active || !batch_procs || batch_proc_count <= 0) {
+        return false;
+    }
+    for (int i = 0; i < batch_proc_count; i++) {
+        process_t *p = batch_procs[i];
+        if (p && !p->is_wm_app && !p->wants_graphics) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool process_get_batch_wm_was_active(void) {
+    return batch_wm_was_active;
+}
+
+bool process_wm_has_focus(void) {
+    if (!wm_session_active()) {
+        return false;
+    }
     if (!batch_active) {
         return true;
     }
-    process_t *cur = process_get_current();
+    if (batch_separate_windows) {
+        process_t *fg = process_get_displayed_foreground();
+        if (!fg) fg = process_get_foreground();
+        if (!fg) {
+            return vga_is_graphics_mode();
+        }
+        return (workspace_has_wm_or_bridge(fg->window_id) ||
+                (fg->is_wm_app && process_proc_wants_active_gfx(fg)));
+    }
+    return !batch_shared_console_view;
+}
+
+void process_on_wm_window_created(process_t *owner) {
+    if (!batch_active) {
+        return;
+    }
+    if (!batch_separate_windows) {
+        batch_shared_console_view = false;
+        return;
+    }
+    if (owner) {
+        process_t *fg = process_get_foreground();
+        if (!fg || (!process_proc_wants_active_gfx(fg) && !workspace_wants_graphics(fg->window_id))) {
+            process_set_foreground(owner);
+        }
+    }
+}
+
+void process_on_wm_windows_empty(void) {
+    batch_shared_console_view = false;
+    if (!batch_active) {
+        return;
+    }
     process_t *fg = process_get_foreground();
+    if (!batch_separate_windows) {
+        if (fg && !fg->is_wm_app && !fg->wants_graphics && fg->is_running) {
+            return;
+        }
+        if (batch_procs) {
+            for (int i = 0; i < batch_proc_count; i++) {
+                process_t *p = batch_procs[i];
+                if (p && p->is_running && !p->is_wm_app && !p->wants_graphics && p->waiting_for_input) {
+                    process_set_foreground(p);
+                    return;
+                }
+            }
+            for (int i = 0; i < batch_proc_count; i++) {
+                process_t *p = batch_procs[i];
+                if (p && p->is_running && !p->is_wm_app && !p->wants_graphics) {
+                    process_set_foreground(p);
+                    return;
+                }
+            }
+        }
+        return;
+    }
+    if (fg && !fg->is_wm_app && !fg->wants_graphics && process_is_active_or_has_windows(fg)) {
+        return;
+    }
+    if (batch_procs) {
+        for (int i = 0; i < batch_proc_count; i++) {
+            process_t *p = batch_procs[i];
+            if (p && p->is_running && !p->is_wm_app && !p->wants_graphics) {
+                process_set_foreground(p);
+                return;
+            }
+        }
+        /* Under separate workspaces (&), switch to any open finished text workspace
+         * instead of leaving foreground on a closing WM process. */
+        for (int i = 0; i < batch_proc_count; i++) {
+            process_t *p = batch_procs[i];
+            if (p && !p->is_wm_app && !p->wants_graphics && process_is_active_or_has_windows(p)) {
+                process_set_foreground(p);
+                return;
+            }
+        }
+    }
+}
+
+void process_append_text_output(process_t *proc, const char *str, uint32_t len) {
+    if (!proc || !str || len == 0u) {
+        return;
+    }
+    const uint32_t max_buf_cap = 65536u;
+    if (proc->text_output_len >= max_buf_cap - 1u) {
+        return;
+    }
+    uint32_t avail = (max_buf_cap - 1u) - proc->text_output_len;
+    if (len > avail) {
+        len = avail;
+    }
+    if (proc->text_output_len + len + 1u > proc->text_output_cap) {
+        uint32_t ncap = proc->text_output_cap ? proc->text_output_cap : 256u;
+        while (ncap < proc->text_output_len + len + 1u && ncap < max_buf_cap) {
+            ncap = (ncap <= max_buf_cap / 2u) ? (ncap * 2u) : max_buf_cap;
+        }
+        if (ncap > max_buf_cap) {
+            ncap = max_buf_cap;
+        }
+        char *nb = (char *)krealloc(proc->text_output_buf, ncap);
+        if (!nb) {
+            return;
+        }
+        proc->text_output_buf = nb;
+        proc->text_output_cap = ncap;
+    }
+    if (proc->text_output_buf && proc->text_output_len + len < proc->text_output_cap) {
+        memcpy(proc->text_output_buf + proc->text_output_len, str, len);
+        proc->text_output_len += len;
+        proc->text_output_buf[proc->text_output_len] = '\0';
+    }
+}
+
+bool process_is_foreground(void) {
+    if (!batch_active || !in_process_context) {
+        return true;
+    }
+    process_t *cur = process_get_current();
+    if (process_wm_has_focus()) {
+        if (!cur) return false;
+        return (cur->is_wm_app || cur->wants_graphics);
+    }
+    if (!batch_separate_windows) {
+        if (cur && (cur->is_wm_app || cur->wants_graphics)) {
+            return false;
+        }
+        return true;
+    }
+    process_t *fg = process_get_displayed_foreground();
+    if (!fg) fg = process_get_foreground();
     if (!fg || !cur) return true;
     if (cur == fg) return true;
-    if (batch_separate_windows && cur->window_id == fg->window_id) return true;
+    if (cur->window_id == fg->window_id) return true;
     return false;
 }
 
@@ -1052,7 +1280,7 @@ static char *format_int_dynamic(int64_t val) {
     uint64_t num;
     if (val < 0) {
         neg = true;
-        num = (uint64_t)(-val);
+        num = (uint64_t)0 - (uint64_t)val;
     } else {
         num = (uint64_t)val;
     }
@@ -1244,16 +1472,23 @@ static char *format_float_dynamic(uint32_t bits) {
         frac_part = 0;
     }
 
-    char buf[64];
-    char frac_str[16];
-    snprintf(frac_str, sizeof(frac_str), "%06u", (uint32_t)frac_part);
+    char *frac_str = (char *)kmalloc(32u);
+    if (!frac_str) {
+        return NULL;
+    }
+    snprintf(frac_str, 32u, "%06u", (uint32_t)frac_part);
     int flen = (int)strlen(frac_str);
     while (flen > 1 && frac_str[flen - 1] == '0') {
         frac_str[--flen] = '\0';
     }
 
-    snprintf(buf, sizeof(buf), "%s%u.%s", s ? "-" : "", (uint32_t)int_part, frac_str);
-    return kstrdup(buf);
+    size_t out_cap = 32u + (size_t)flen + 4u;
+    char *buf = (char *)kmalloc(out_cap);
+    if (buf) {
+        snprintf(buf, out_cap, "%s%u.%s", s ? "-" : "", (uint32_t)int_part, frac_str);
+    }
+    kfree(frac_str);
+    return buf;
 }
 
 static char *format_double_dynamic(uint64_t bits) {
@@ -1282,7 +1517,11 @@ static char *format_double_dynamic(uint64_t bits) {
     int32_t shift = 52 - exp;
     uint64_t int_part = 0;
 
-    char frac_str[16];
+    size_t frac_cap = 16u;
+    char *frac_str = (char *)kmalloc(frac_cap);
+    if (!frac_str) {
+        return NULL;
+    }
     int flen = 0;
 
     if (shift <= 0) {
@@ -1307,9 +1546,13 @@ static char *format_double_dynamic(uint64_t bits) {
         frac_str[--flen] = '\0';
     }
 
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%s%llu.%s", s ? "-" : "", (unsigned long long)int_part, frac_str);
-    return kstrdup(buf);
+    size_t out_cap = 32u + (size_t)flen + 4u;
+    char *buf = (char *)kmalloc(out_cap);
+    if (buf) {
+        snprintf(buf, out_cap, "%s%llu.%s", s ? "-" : "", (unsigned long long)int_part, frac_str);
+    }
+    kfree(frac_str);
+    return buf;
 }
 
 static bool is_entry_struct_return(void *entry_ptr) {
@@ -1399,7 +1642,7 @@ static char *format_char_dynamic(uint8_t c) {
         s[4] = '\0';
         return s;
     }
-    if (c >= 0xF0 && c <= 0xFF) {
+    if (c >= 0xF0) {
         char *s = (char *)kmalloc(5);
         if (!s) return NULL;
         s[0] = '\'';
@@ -1456,7 +1699,7 @@ static char *format_char_arg_dynamic(uint8_t c) {
         s[2] = '\0';
         return s;
     }
-    if (c >= 0xF0 && c <= 0xFF) {
+    if (c >= 0xF0) {
         char *s = (char *)kmalloc(3);
         if (!s) return NULL;
         s[0] = (char)0xD1;
@@ -2073,10 +2316,8 @@ static void format_struct_fields_universal(process_return_value_t *ret_val, cons
                 if (field_str) field_arg = kstrdup(field_str);
                 advance = 8;
             }
-            /* Valid RAM pointer (non-string) */
-            else if (val32 >= 0x10000 && memory_map_is_valid_ram(val32, 1) && (val32 % 4 == 0) &&
-                     !is_valid_string_pointer((const void*)val32, NULL) &&
-                     (val32 >= 0xC0000000 || val32 >= 0x01000000)) {
+            else if (val32 >= 0x01000000u && memory_map_is_valid_ram(val32, 1) && (val32 % 4 == 0) &&
+                     !is_valid_string_pointer((const void*)val32, NULL)) {
                 field_str = format_hex_dynamic(val32);
                 if (field_str) field_arg = kstrdup(field_str);
                 advance = 4;
@@ -2321,17 +2562,20 @@ static void process_trampoline(void) {
                     process_return_val_add_arg(&proc->return_val, (const char*)ret_eax);
                 }
             } else if (embedded_fmt && embedded_fmt[0] == '{') {
-                uint8_t reg_buf[8];
-                memcpy(reg_buf, &ret_eax, 4);
-                memcpy(reg_buf + 4, &ret_edx, 4);
-                proc->return_val.type = PROC_RET_STRUCT;
-                process_return_val_set_type_name(&proc->return_val, embedded_fmt);
-                process_return_val_set_struct_data(&proc->return_val, reg_buf, 8);
-                proc->return_val.raw_eax = ret_eax;
-                proc->return_val.raw_edx = ret_edx;
-                proc->return_val.int_val = (int32_t)ret_eax;
-                proc->exit_code = (int32_t)ret_eax;
-                format_struct_fields(&proc->return_val, reg_buf, 8, embedded_fmt);
+                uint8_t *reg_buf = (uint8_t *)kmalloc(8u);
+                if (reg_buf) {
+                    memcpy(reg_buf, &ret_eax, 4);
+                    memcpy(reg_buf + 4, &ret_edx, 4);
+                    proc->return_val.type = PROC_RET_STRUCT;
+                    process_return_val_set_type_name(&proc->return_val, embedded_fmt);
+                    process_return_val_set_struct_data(&proc->return_val, reg_buf, 8);
+                    proc->return_val.raw_eax = ret_eax;
+                    proc->return_val.raw_edx = ret_edx;
+                    proc->return_val.int_val = (int32_t)ret_eax;
+                    proc->exit_code = (int32_t)ret_eax;
+                    format_struct_fields(&proc->return_val, reg_buf, 8, embedded_fmt);
+                    kfree(reg_buf);
+                }
             } else if (ret_eax == 0) {
                 proc->return_val.type = PROC_RET_INT;
                 proc->return_val.int_val = 0;
@@ -2352,8 +2596,7 @@ static void process_trampoline(void) {
                 process_return_val_append_str(&proc->return_val, (const char*)ret_eax);
                 process_return_val_append_str(&proc->return_val, "\"");
                 process_return_val_add_arg(&proc->return_val, (const char*)ret_eax);
-            } else if (ret_eax >= 0x10000 && memory_map_is_valid_ram(ret_eax, 1) && (ret_eax % 4 == 0) &&
-                       (ret_eax >= 0xC0000000 || ret_eax >= 0x01000000)) {
+            } else if (ret_eax >= 0x01000000u && memory_map_is_valid_ram(ret_eax, 1) && (ret_eax % 4 == 0)) {
                 proc->return_val.type = PROC_RET_POINTER;
                 process_return_val_set_type_name(&proc->return_val, "void*");
                 proc->return_val.raw_eax = ret_eax;
@@ -2369,24 +2612,28 @@ static void process_trampoline(void) {
             } else {
                 /* Check if scalar return is a 2-byte UTF-8 character constant */
                 if (((ret_eax >> 8) & 0xE0) == 0xC0 && (ret_eax & 0xC0) == 0x80) {
-                    char c_str[5];
-                    c_str[0] = '\'';
-                    c_str[1] = (char)((ret_eax >> 8) & 0xFF);
-                    c_str[2] = (char)(ret_eax & 0xFF);
-                    c_str[3] = '\'';
-                    c_str[4] = '\0';
-                    char c_arg[3];
-                    c_arg[0] = (char)((ret_eax >> 8) & 0xFF);
-                    c_arg[1] = (char)(ret_eax & 0xFF);
-                    c_arg[2] = '\0';
+                    char *c_str = (char *)kmalloc(5u);
+                    char *c_arg = (char *)kmalloc(3u);
+                    if (c_str && c_arg) {
+                        c_str[0] = '\'';
+                        c_str[1] = (char)((ret_eax >> 8) & 0xFF);
+                        c_str[2] = (char)(ret_eax & 0xFF);
+                        c_str[3] = '\'';
+                        c_str[4] = '\0';
+                        c_arg[0] = (char)((ret_eax >> 8) & 0xFF);
+                        c_arg[1] = (char)(ret_eax & 0xFF);
+                        c_arg[2] = '\0';
+                        process_return_val_set_str(&proc->return_val, c_str);
+                        process_return_val_add_arg(&proc->return_val, c_arg);
+                    }
+                    if (c_str) kfree(c_str);
+                    if (c_arg) kfree(c_arg);
                     proc->return_val.type = PROC_RET_INT;
                     process_return_val_set_type_name(&proc->return_val, "char");
                     proc->return_val.int_val = (int32_t)ret_eax;
                     proc->return_val.raw_eax = ret_eax;
                     proc->return_val.raw_edx = ret_edx;
                     proc->exit_code = (int32_t)ret_eax;
-                    process_return_val_set_str(&proc->return_val, c_str);
-                    process_return_val_add_arg(&proc->return_val, c_arg);
                 } else if ((int32_t)ret_eax >= -128 && (int32_t)ret_eax < 0 && is_char_byte((uint8_t)ret_eax)) {
                     /* Sign-extended 8-bit character return */
                     uint8_t cb = (uint8_t)(ret_eax & 0xFF);
@@ -2504,7 +2751,13 @@ static uint64_t get_active_process_memory_used(void) {
     }
     process_t *curr = process_list;
     while (curr) {
-        if (curr->user_heap_base > 0 && curr->user_heap_limit > curr->user_heap_base) {
+        if (curr->heap_chunks && curr->heap_chunk_count > 0) {
+            for (uint32_t i = 0; i < curr->heap_chunk_count; i++) {
+                if (curr->heap_chunks[i].limit > curr->heap_chunks[i].base) {
+                    used += (uint64_t)(curr->heap_chunks[i].limit - curr->heap_chunks[i].base);
+                }
+            }
+        } else if (curr->user_heap_base > 0 && curr->user_heap_limit > curr->user_heap_base) {
             used += (uint64_t)(curr->user_heap_limit - curr->user_heap_base);
         }
         curr = curr->next;
@@ -2526,72 +2779,244 @@ static void log_process_heap_state(const char *stage) {
                  stage, used, total, used_pct, remaining);
 }
 
+typedef struct {
+    uint32_t start;
+    uint32_t end;
+} mem_interval_t;
+
+static bool mem_interval_push(mem_interval_t **arr, int *count, int *cap, uint32_t start, uint32_t end) {
+    if (*count >= *cap) {
+        int new_cap = *cap > 0 ? (*cap * 2) : 16;
+        mem_interval_t *grown = (mem_interval_t *)krealloc(*arr, (size_t)new_cap * sizeof(mem_interval_t));
+        if (!grown) return false;
+        *arr = grown;
+        *cap = new_cap;
+    }
+    (*arr)[*count].start = start;
+    (*arr)[*count].end = end;
+    (*count)++;
+    return true;
+}
+
+bool process_heap_ensure_capacity(process_t *proc, uint32_t min_chunks) {
+    if (!proc) return false;
+    if (proc->heap_chunks && proc->heap_chunk_cap >= min_chunks) {
+        return true;
+    }
+    uint32_t new_cap = proc->heap_chunk_cap > 0 ? proc->heap_chunk_cap : 4u;
+    while (new_cap < min_chunks) {
+        if (new_cap > UINT32_MAX / 2u) {
+            new_cap = min_chunks;
+            break;
+        }
+        new_cap *= 2u;
+    }
+    process_heap_chunk_t *grown = (process_heap_chunk_t *)krealloc(
+        proc->heap_chunks, (size_t)new_cap * sizeof(process_heap_chunk_t));
+    if (!grown) {
+        return false;
+    }
+    if (new_cap > proc->heap_chunk_cap) {
+        memset(&grown[proc->heap_chunk_cap], 0,
+               (size_t)(new_cap - proc->heap_chunk_cap) * sizeof(process_heap_chunk_t));
+    }
+    proc->heap_chunks = grown;
+    proc->heap_chunk_cap = new_cap;
+    return true;
+}
+
+static uint32_t get_user_heap_start(uint64_t total_ram) {
+    uint32_t heap_start = USER_HEAP_START;
+    if (total_ram > 0 && total_ram <= heap_start) {
+        /* On low-RAM systems (<= 256 MiB), start user heap at 144 MiB (0x09000000),
+         * reserving 128..144 MiB (0x08000000..0x09000000) for kernel page tables. */
+        heap_start = 0x09000000u;
+    }
+    const memory_region_t *reg0 = memory_map_get_region(0);
+    if (reg0 && reg0->is_usable && reg0->used > 0) {
+        uint32_t min_start = (reg0->base + reg0->used + 0x00FFFFFFu) & ~0x003FFFFFu;
+        if (min_start > heap_start) {
+            heap_start = min_start;
+        }
+    }
+    return heap_start;
+}
+
 bool process_heap_init(process_t *proc) {
     if (!proc) return false;
 
     uint64_t total_ram = get_process_heap_capacity();
-    uint32_t heap_start = USER_HEAP_START;
+    uint32_t heap_start = get_user_heap_start(total_ram);
 
-    if (total_ram > 0 && total_ram <= heap_start) {
-        /* On low-RAM systems (<= 256 MiB), start heap at 128 MiB (above kmalloc) */
-        heap_start = 0x08000000u;
+    uint32_t heap_end = (total_ram > 0 && total_ram < 0xB0000000ULL)
+        ? (uint32_t)total_ram : 0x7FFE0000u;
+
+    if (heap_end <= heap_start + 0x01000000u) {
+        serial_printf("[process] Not enough RAM for user heaps: start=0x%x end=0x%x\n",
+                      heap_start, heap_end);
+        return false;
     }
 
-    uint32_t stride = USER_HEAP_PROCESS_STRIDE; /* 256 MiB default */
-    if (total_ram > heap_start) {
-        uint32_t available = (uint32_t)(total_ram - heap_start);
-        if (stride > available / 2) {
-            stride = available / 2;
-        }
-    }
-    if (stride < 0x02000000u) {
-        stride = 0x02000000u; /* Minimum 32 MiB stride */
+    if (!process_heap_ensure_capacity(proc, 1)) {
+        return false;
     }
 
-    uint32_t slot = 0;
-    while (1) {
-        uint32_t candidate_base = heap_start + slot * stride;
+    /* Collect all existing active process heaps and binaries dynamically */
+    mem_interval_t *active = NULL;
+    int count = 0;
+    int cap = 0;
 
-        if (total_ram > 0 && candidate_base >= (uint32_t)total_ram) {
-            serial_printf("[process] Physical RAM exhausted for pid=%u heap (slot=%u base=0x%x total=0x%llx)\n",
-                          proc->pid, slot, candidate_base, total_ram);
-            return false;
-        }
-
-        /* Check if candidate_base or slot is in use by any other active process */
-        bool in_use = false;
-        process_t *curr = process_list;
-        while (curr) {
-            if (curr != proc && curr->user_heap_slot == (int32_t)slot) {
-                in_use = true;
-                break;
-            }
-            if (curr != proc && curr->user_heap_base > 0) {
-                uint32_t curr_limit = curr->user_heap_limit > curr->user_heap_base ?
-                                      curr->user_heap_limit : (curr->user_heap_base + stride);
-                if (candidate_base < curr_limit && (candidate_base + stride) > curr->user_heap_base) {
-                    in_use = true;
-                    break;
+    process_t *curr = process_list;
+    while (curr) {
+        if (curr != proc) {
+            if (curr->binary_base && curr->binary_size) {
+                uint32_t b_start = (uint32_t)(uintptr_t)curr->binary_base;
+                uint32_t b_end = (b_start + curr->binary_size + 0xFFFu) & ~0xFFFu;
+                if (b_end > heap_start && b_start < heap_end) {
+                    uint32_t s = b_start < heap_start ? heap_start : b_start;
+                    uint32_t e = b_end > heap_end ? heap_end : b_end;
+                    mem_interval_push(&active, &count, &cap, s, e);
                 }
             }
-            curr = curr->next;
+            if (curr->heap_chunks && curr->heap_chunk_count > 0) {
+                for (uint32_t i = 0; i < curr->heap_chunk_count; i++) {
+                    uint32_t b = curr->heap_chunks[i].base;
+                    uint32_t lim = curr->heap_chunks[i].limit > curr->heap_chunks[i].base ?
+                                   curr->heap_chunks[i].limit : curr->heap_chunks[i].base;
+                    if (b > 0) {
+                        mem_interval_push(&active, &count, &cap, b, lim);
+                    }
+                }
+            } else if (curr->user_heap_base > 0) {
+                uint32_t b = curr->user_heap_base;
+                uint32_t lim = curr->user_heap_limit > curr->user_heap_base ?
+                               curr->user_heap_limit : curr->user_heap_base;
+                mem_interval_push(&active, &count, &cap, b, lim);
+            }
         }
-
-        if (!in_use) {
-            proc->user_heap_slot = (int32_t)slot;
-            proc->user_heap_base = candidate_base;
-            proc->user_heap_break = candidate_base;
-            proc->user_heap_limit = candidate_base; /* Starts at 0 bytes committed! Expands dynamically on demand! */
-            serial_printf("[process] Initialized dynamic on-demand heap for pid=%u at base=0x%x (slot=%u, stride=%u MiB, total_ram=%llu MiB)\n",
-                          proc->pid, proc->user_heap_base, slot, stride / (1024 * 1024), total_ram / (1024 * 1024));
-            return true;
-        }
-        slot++;
+        curr = curr->next;
     }
+
+    /* Sort active ranges by start address ascending */
+    for (int i = 0; i < count - 1; i++) {
+        for (int j = i + 1; j < count; j++) {
+            if (active[j].start < active[i].start) {
+                mem_interval_t tmp = active[i];
+                active[i] = active[j];
+                active[j] = tmp;
+            }
+        }
+    }
+
+    /* If no other processes exist, place at heap_start */
+    if (count == 0) {
+        if (active) kfree(active);
+        proc->heap_chunk_count = 1;
+        proc->heap_chunks[0].base = heap_start;
+        proc->heap_chunks[0].limit = heap_start;
+        proc->heap_chunks[0].brk = heap_start;
+
+        proc->user_heap_slot = 0;
+        proc->user_heap_base = heap_start;
+        proc->user_heap_break = heap_start;
+        proc->user_heap_limit = heap_start;
+        serial_printf("[process] Initialized dynamic on-demand heap for pid=%u at base=0x%x (slot=0, single proc, total_ram=%llu MiB)\n",
+                      proc->pid, proc->user_heap_base, total_ram / (1024 * 1024));
+        return true;
+    }
+
+    /* Find the largest gap between existing processes and boundaries */
+    uint32_t best_gap_start = 0;
+    uint32_t best_gap_end = 0;
+    uint32_t best_gap_size = 0;
+
+    /* Gap 0: Before the first active process */
+    if (active[0].start > heap_start) {
+        uint32_t sz = active[0].start - heap_start;
+        if (sz > best_gap_size) {
+            best_gap_size = sz;
+            best_gap_start = heap_start;
+            best_gap_end = active[0].start;
+        }
+    }
+
+    /* Gaps between processes */
+    for (int i = 0; i < count - 1; i++) {
+        uint32_t gap_s = active[i].end > active[i].start ? active[i].end : active[i].start;
+        uint32_t gap_e = active[i + 1].start;
+        if (gap_e > gap_s) {
+            uint32_t sz = gap_e - gap_s;
+            if (sz > best_gap_size) {
+                best_gap_size = sz;
+                best_gap_start = gap_s;
+                best_gap_end = gap_e;
+            }
+        }
+    }
+
+    /* Gap after the last active process */
+    uint32_t last_end = active[count - 1].end > active[count - 1].start ?
+                        active[count - 1].end : active[count - 1].start;
+    if (heap_end > last_end) {
+        uint32_t sz = heap_end - last_end;
+        if (sz > best_gap_size) {
+            best_gap_size = sz;
+            best_gap_start = last_end;
+            best_gap_end = heap_end;
+        }
+    }
+
+    if (best_gap_size < 0x01000000u) { /* At least 16 MiB */
+        if (active) kfree(active);
+        serial_printf("[process] Physical RAM exhausted for pid=%u heap (best gap=%u KiB)\n",
+                      proc->pid, best_gap_size / 1024);
+        return false;
+    }
+
+    uint32_t candidate_base;
+    if (best_gap_start == heap_start && active[0].start > heap_start) {
+        /* Take the beginning of heap space directly */
+        candidate_base = heap_start;
+    } else {
+        /* Split the gap in half so the previous process can still grow,
+         * or if the previous process already has plenty of space, give balanced room.
+         * Align to 4 MiB boundary (0x400000). */
+        uint32_t mid = best_gap_start + (best_gap_end - best_gap_start) / 2;
+        candidate_base = (mid + 0x003FFFFFu) & ~0x003FFFFFu;
+        if (candidate_base >= best_gap_end - 0x00400000u) {
+            candidate_base = (best_gap_start + 0x003FFFFFu) & ~0x003FFFFFu;
+        }
+    }
+
+    if (active) kfree(active);
+
+    proc->heap_chunk_count = 1;
+    proc->heap_chunks[0].base = candidate_base;
+    proc->heap_chunks[0].limit = candidate_base;
+    proc->heap_chunks[0].brk = candidate_base;
+
+    proc->user_heap_slot = count;
+    proc->user_heap_base = candidate_base;
+    proc->user_heap_break = candidate_base;
+    proc->user_heap_limit = candidate_base;
+
+    serial_printf("[process] Initialized dynamic on-demand heap for pid=%u at base=0x%x (gap_size=%u MiB, total_ram=%llu MiB)\n",
+                  proc->pid, proc->user_heap_base, best_gap_size / (1024 * 1024), total_ram / (1024 * 1024));
+    return true;
 }
 
 void process_heap_cleanup(process_t *proc) {
     if (!proc) return;
+    if (proc->heap_chunk_count > 0) {
+        serial_printf("[process] Freed isolated heap for pid=%u: %u chunks\n",
+                      proc->pid, proc->heap_chunk_count);
+        proc->heap_chunk_count = 0;
+    }
+    if (proc->heap_chunks) {
+        kfree(proc->heap_chunks);
+        proc->heap_chunks = NULL;
+    }
+    proc->heap_chunk_cap = 0;
     if (proc->user_heap_base != 0) {
         serial_printf("[process] Freed isolated heap for pid=%u: slot=%d [0x%x - 0x%x]\n",
                       proc->pid, proc->user_heap_slot, proc->user_heap_base, proc->user_heap_limit);
@@ -2602,37 +3027,254 @@ void process_heap_cleanup(process_t *proc) {
     }
 }
 
-bool process_heap_can_expand(process_t *proc, uint32_t new_limit) {
-    if (!proc || new_limit <= proc->user_heap_limit) {
-        return true;
-    }
-    uint64_t total_ram = get_process_heap_capacity();
-    if (total_ram > 0 && (uint64_t)new_limit > total_ram) {
-        return false;
-    }
-    uint32_t check_base = proc->user_heap_limit;
-    uint32_t check_limit = new_limit;
+bool process_heap_chunk_can_expand(process_t *proc, uint32_t chunk_idx, uint32_t new_limit) {
+    if (!proc || !proc->heap_chunks || chunk_idx >= proc->heap_chunk_count) return false;
+    uint32_t cur_limit = proc->heap_chunks[chunk_idx].limit;
+    if (new_limit <= cur_limit) return true;
 
-    process_t *curr = process_list;
-    while (curr) {
-        if (curr != proc && curr->user_heap_base > 0) {
-            uint32_t curr_end = curr->user_heap_limit;
-            if (check_base < curr_end && check_limit > curr->user_heap_base) {
+    uint64_t total_ram = get_process_heap_capacity();
+    if (total_ram > 0 && (uint64_t)new_limit > total_ram) return false;
+    if ((uint64_t)new_limit > 0xB0000000ULL) return false;
+
+    /* Check other chunks of the SAME process */
+    for (uint32_t i = 0; i < proc->heap_chunk_count; i++) {
+        if (i == chunk_idx) continue;
+        uint32_t o_base = proc->heap_chunks[i].base;
+        uint32_t o_end = proc->heap_chunks[i].limit > o_base ?
+                         proc->heap_chunks[i].limit : (o_base + 4096u);
+        if (cur_limit < o_end && new_limit > o_base) {
+            return false;
+        }
+    }
+
+    /* Check against all OTHER processes */
+    for (process_t *curr = process_list; curr; curr = curr->next) {
+        if (curr == proc) continue;
+        /* Check other process binary */
+        if (curr->binary_base && curr->binary_size) {
+            uint32_t b_start = (uint32_t)(uintptr_t)curr->binary_base;
+            uint32_t b_end = (b_start + curr->binary_size + 0xFFFu) & ~0xFFFu;
+            if (cur_limit < b_end && new_limit > b_start) return false;
+        }
+        /* Check other process heap chunks */
+        if (curr->heap_chunks && curr->heap_chunk_count > 0) {
+            for (uint32_t i = 0; i < curr->heap_chunk_count; i++) {
+                uint32_t o_base = curr->heap_chunks[i].base;
+                uint32_t o_end = curr->heap_chunks[i].limit > o_base ?
+                                 curr->heap_chunks[i].limit : (o_base + 4096u);
+                if (cur_limit < o_end && new_limit > o_base) {
+                    return false;
+                }
+            }
+        } else if (curr->user_heap_base > 0) {
+            uint32_t o_base = curr->user_heap_base;
+            uint32_t o_end = curr->user_heap_limit > curr->user_heap_base ?
+                             curr->user_heap_limit : (o_base + 4096u);
+            if (cur_limit < o_end && new_limit > o_base) {
                 return false;
             }
         }
-        curr = curr->next;
     }
     return true;
 }
 
-/* =========================================================================
- * Process Demand / Lazy Loading
- *
- * Binaries are loaded on demand: initial execution starts immediately with
- * only headers + initial entry chunk (< 64KB). The remaining loadable
- * segments are streamed in the background during yields or as needed.
- * ========================================================================= */
+bool process_heap_can_expand(process_t *proc, uint32_t new_limit) {
+    if (!proc) return false;
+    uint32_t idx = proc->heap_chunk_count > 0 ? proc->heap_chunk_count - 1 : 0;
+    return process_heap_chunk_can_expand(proc, idx, new_limit);
+}
+
+uint32_t process_heap_allocate_new_chunk(process_t *proc, uint32_t needed_size) {
+    if (!proc || needed_size == 0) {
+        return 0;
+    }
+
+    bool reuse_empty_active = false;
+    uint32_t active_idx = 0;
+    if (proc->heap_chunks && proc->heap_chunk_count > 0) {
+        active_idx = proc->heap_chunk_count - 1;
+        if (proc->heap_chunks[active_idx].brk == proc->heap_chunks[active_idx].base &&
+            proc->heap_chunks[active_idx].limit == proc->heap_chunks[active_idx].base) {
+            reuse_empty_active = true;
+        }
+    }
+    uint32_t needed_slots = reuse_empty_active ? (active_idx + 1u) : (proc->heap_chunk_count + 1u);
+    if (!process_heap_ensure_capacity(proc, needed_slots)) {
+        return 0;
+    }
+
+    uint64_t total_ram = get_process_heap_capacity();
+    uint32_t heap_start = get_user_heap_start(total_ram);
+    uint32_t heap_end = ((total_ram > 0 && total_ram < 0xB0000000ULL)
+        ? (uint32_t)total_ram : 0x7FFE0000u) & ~0xFFFu;
+
+    mem_interval_t *occupied = NULL;
+    int occ_count = 0;
+    int occ_cap = 0;
+
+    for (process_t *curr = process_list; curr; curr = curr->next) {
+        /* Binary */
+        if (curr->binary_base && curr->binary_size) {
+            uint32_t b_start = (uint32_t)(uintptr_t)curr->binary_base;
+            uint32_t b_end = (b_start + curr->binary_size + 0xFFFu) & ~0xFFFu;
+            if (b_end > heap_start && b_start < heap_end) {
+                uint32_t s = b_start < heap_start ? heap_start : b_start;
+                uint32_t e = b_end > heap_end ? heap_end : b_end;
+                mem_interval_push(&occupied, &occ_count, &occ_cap, s, e);
+            }
+        }
+        /* Heap chunks */
+        if (curr->heap_chunks && curr->heap_chunk_count > 0) {
+            for (uint32_t i = 0; i < curr->heap_chunk_count; i++) {
+                if (curr == proc && reuse_empty_active && i == active_idx) {
+                    continue;
+                }
+                uint32_t c_base = curr->heap_chunks[i].base;
+                uint32_t c_end = curr->heap_chunks[i].limit > c_base ?
+                                 curr->heap_chunks[i].limit : (c_base + 4096u);
+                if (c_base > 0) {
+                    mem_interval_push(&occupied, &occ_count, &occ_cap, c_base, c_end);
+                }
+            }
+        } else if (curr->user_heap_base > 0 && !(curr == proc && reuse_empty_active)) {
+            uint32_t c_base = curr->user_heap_base;
+            uint32_t c_end = curr->user_heap_limit > curr->user_heap_base ?
+                             curr->user_heap_limit : (c_base + 4096u);
+            if (c_base > 0) {
+                mem_interval_push(&occupied, &occ_count, &occ_cap, c_base, c_end);
+            }
+        }
+    }
+
+    /* Sort occupied intervals by start address ascending */
+    for (int i = 0; i < occ_count - 1; i++) {
+        for (int j = i + 1; j < occ_count; j++) {
+            if (occupied[j].start < occupied[i].start) {
+                mem_interval_t tmp = occupied[i];
+                occupied[i] = occupied[j];
+                occupied[j] = tmp;
+            }
+        }
+    }
+
+    /* Merge overlapping/contiguous intervals dynamically */
+    mem_interval_t *merged = NULL;
+    int merged_count = 0;
+    int merged_cap = 0;
+    for (int i = 0; i < occ_count; i++) {
+        if (merged_count == 0) {
+            mem_interval_push(&merged, &merged_count, &merged_cap,
+                              occupied[i].start, occupied[i].end);
+        } else {
+            if (occupied[i].start <= merged[merged_count - 1].end) {
+                if (occupied[i].end > merged[merged_count - 1].end) {
+                    merged[merged_count - 1].end = occupied[i].end;
+                }
+            } else {
+                mem_interval_push(&merged, &merged_count, &merged_cap,
+                                  occupied[i].start, occupied[i].end);
+            }
+        }
+    }
+
+    uint32_t aligned_needed = (needed_size + 0xFFFu) & ~0xFFFu;
+    uint32_t current_chunk_end = 0;
+    if (proc->heap_chunks && proc->heap_chunk_count > 0) {
+        current_chunk_end = proc->heap_chunks[proc->heap_chunk_count - 1].limit;
+    }
+
+    uint32_t chosen_gap_start = 0;
+
+    /* Scan gaps after current chunk */
+    uint32_t cur_pos = heap_start;
+    for (int i = 0; i < merged_count; i++) {
+        if (merged[i].start > cur_pos) {
+            uint32_t gap_start = (cur_pos + 0xFFFu) & ~0xFFFu;
+            uint32_t gap_end = merged[i].start & ~0xFFFu;
+            if (gap_end > gap_start && (gap_end - gap_start) >= aligned_needed) {
+                if (gap_start >= current_chunk_end && chosen_gap_start == 0) {
+                    chosen_gap_start = gap_start;
+                    break;
+                }
+            }
+        }
+        if (merged[i].end > cur_pos) {
+            cur_pos = merged[i].end;
+        }
+    }
+
+    /* Check gap after last interval */
+    if (chosen_gap_start == 0 && heap_end > cur_pos) {
+        uint32_t gap_start = (cur_pos + 0xFFFu) & ~0xFFFu;
+        if (heap_end > gap_start && (heap_end - gap_start) >= aligned_needed &&
+            gap_start >= current_chunk_end) {
+            chosen_gap_start = gap_start;
+        }
+    }
+
+    /* If no gap found after current chunk, search anywhere from heap_start */
+    if (chosen_gap_start == 0) {
+        cur_pos = heap_start;
+        for (int i = 0; i < merged_count; i++) {
+            if (merged[i].start > cur_pos) {
+                uint32_t gap_start = (cur_pos + 0xFFFu) & ~0xFFFu;
+                uint32_t gap_end = merged[i].start & ~0xFFFu;
+                if (gap_end > gap_start && (gap_end - gap_start) >= aligned_needed) {
+                    chosen_gap_start = gap_start;
+                    break;
+                }
+            }
+            if (merged[i].end > cur_pos) {
+                cur_pos = merged[i].end;
+            }
+        }
+        if (chosen_gap_start == 0 && heap_end > cur_pos) {
+            uint32_t gap_start = (cur_pos + 0xFFFu) & ~0xFFFu;
+            if (heap_end > gap_start && (heap_end - gap_start) >= aligned_needed) {
+                chosen_gap_start = gap_start;
+            }
+        }
+    }
+
+    if (merged) kfree(merged);
+    if (occupied) kfree(occupied);
+
+    if (chosen_gap_start == 0) {
+        serial_printf("[process] Cannot allocate new heap chunk of size %u KiB for pid=%u (no free gap)\n",
+                      needed_size / 1024, proc->pid);
+        return 0;
+    }
+
+    /* Allocate new chunk (or reuse empty active chunk in place) */
+    uint32_t chunk_idx = reuse_empty_active ? active_idx : proc->heap_chunk_count;
+    uint32_t chunk_base = chosen_gap_start;
+    uint32_t chunk_limit = chunk_base + aligned_needed;
+
+    if (!process_update_memory_mappings(proc, chunk_base, aligned_needed, true)) {
+        serial_printf("[process] Failed to map new heap chunk at 0x%x for pid=%u\n",
+                      chunk_base, proc->pid);
+        return 0;
+    }
+
+    proc->heap_chunks[chunk_idx].base = chunk_base;
+    proc->heap_chunks[chunk_idx].limit = chunk_limit;
+    proc->heap_chunks[chunk_idx].brk = chunk_base + needed_size;
+    if (!reuse_empty_active) {
+        proc->heap_chunk_count++;
+    } else if (chunk_idx == 0) {
+        proc->user_heap_base = chunk_base;
+    }
+
+    proc->user_heap_break = proc->heap_chunks[chunk_idx].brk;
+    proc->user_heap_limit = proc->heap_chunks[chunk_idx].limit;
+
+    serial_printf("[process] Discontinuous heap chunk %u allocated for pid=%u: [0x%x - 0x%x] (+%u KiB, total_chunks=%u)\n",
+                  chunk_idx, proc->pid, chunk_base, chunk_limit, needed_size / 1024, proc->heap_chunk_count);
+
+    return chunk_base;
+}
+
+/* On-demand ELF segment loader: maps headers and initial chunk, streaming remaining pages on yields. */
 
 void process_demand_load_step(process_t *proc) {
     if (!proc || !proc->demand_loading) return;
@@ -2706,20 +3348,6 @@ static int add_memory_block(void *base, uint32_t size, uint32_t pid) {
     block_count++;
     
     return 0;
-}
-
-/**
- * Find and remove a memory block
- */
-static int remove_memory_block(void *base) {
-    for (int i = 0; i < block_count; i++) {
-        if (allocated_blocks[i].base == base) {
-            allocated_blocks[i] = allocated_blocks[block_count - 1];
-            block_count--;
-            return 0;
-        }
-    }
-    return -1;
 }
 
 void process_set_keep_alive(process_t *proc, int enabled) {
@@ -2909,7 +3537,17 @@ static void process_release_execution_memory(process_t *proc) {
         serial_printf("[process] failed to restore freed binary mapping for pid=%u\n",
                       proc->pid);
     }
-    if (proc->user_heap_limit > proc->user_heap_base) {
+    if (proc->heap_chunks && proc->heap_chunk_count > 0) {
+        for (uint32_t i = 0; i < proc->heap_chunk_count; i++) {
+            if (proc->heap_chunks[i].limit > proc->heap_chunks[i].base) {
+                uint32_t start = proc->heap_chunks[i].base & ~0xFFFu;
+                uint32_t end = (proc->heap_chunks[i].limit + 0xFFFu) & ~0xFFFu;
+                if (end > start) {
+                    process_update_memory_mappings(proc, start, end - start, false);
+                }
+            }
+        }
+    } else if (proc->user_heap_limit > proc->user_heap_base) {
         uint32_t start = proc->user_heap_base & ~0xFFFu;
         uint32_t end = (proc->user_heap_limit + 0xFFFu) & ~0xFFFu;
         if (end > start &&
@@ -2917,6 +3555,18 @@ static void process_release_execution_memory(process_t *proc) {
             serial_printf("[process] failed to restore freed heap mapping for pid=%u\n",
                           proc->pid);
         }
+    }
+    process_thread_cleanup(proc);
+
+    if (!proc->threads && proc->address_space && proc->stack_start) {
+        uint32_t phys = address_space_get_physical(proc->address_space, proc->stack_start);
+        address_space_unmap(proc->address_space, proc->stack_start);
+        if (phys) {
+            memory_page_free((void *)(uintptr_t)phys);
+        } else if (proc->stack_base) {
+            memory_page_free(proc->stack_base);
+        }
+        proc->stack_base = NULL;
     }
     if (proc->address_space) {
         if (!address_space_activate_kernel() ||
@@ -2927,7 +3577,6 @@ static void process_release_execution_memory(process_t *proc) {
             proc->address_space = NULL;
         }
     }
-    process_thread_cleanup(proc);
     if (proc->binary_storage) {
         kfree(proc->binary_storage);
         proc->binary_storage = NULL;
@@ -2936,55 +3585,47 @@ static void process_release_execution_memory(process_t *proc) {
         free_process_memory(proc, proc->binary_base, proc->binary_size);
         proc->binary_base = NULL;
     }
-    if (proc->stack_base) {
-        kfree(proc->stack_base);
-        proc->stack_base = NULL;
-        proc->stack_start = 0;
-        proc->stack_ptr = 0;
-    }
+    proc->stack_base = NULL;
+    proc->stack_start = 0;
+    proc->stack_ptr = 0;
     process_heap_cleanup(proc);
 }
 
-/**
- * setup_arguments - Sets the command line arguments and returns the address of argv
- */
 static int setup_arguments(process_t *proc, int argc, char **argv, uint32_t *argv_addr_out) {
-    if (argc == 0 || argv == NULL) {
+    if (argc <= 0 || argv == NULL) {
         proc->argc = 0;
         *argv_addr_out = 0;
         return 0;
     }
-    
-    // No hard argument-count cap: argv is sized to the caller-provided count.
-    char **argv_array = kmalloc((argc + 1) * sizeof(char *));
+
+    char **argv_array = kmalloc((size_t)(argc + 1) * sizeof(char *));
     if (!argv_array) {
         return -1;
     }
-    
-    // Copy the arguments and save their addresses
+
     for (int i = 0; i < argc; i++) {
         if (argv[i] == NULL) {
             argc = i;
             break;
         }
-        // Allocate memory for the argument string
         size_t arg_len = strlen(argv[i]) + 1;
         char *arg_copy = kmalloc(arg_len);
         if (!arg_copy) {
+            for (int k = 0; k < i; k++) {
+                kfree(argv_array[k]);
+            }
+            kfree(argv_array);
             return -1;
         }
         strcpy(arg_copy, argv[i]);
         argv_array[i] = arg_copy;
     }
     argv_array[argc] = 0;
-    
-    // Saving information
+
     proc->argc = argc;
-    *argv_addr_out = (uint32_t)argv_array;  // The address of the argv array in kernel memory
-    
-    // We save a copy in the process for cleaning
+    *argv_addr_out = (uint32_t)(uintptr_t)argv_array;
     proc->argv_kernel = argv_array;
-    
+
     return 0;
 }
 
@@ -2993,161 +3634,51 @@ static int setup_arguments(process_t *proc, int argc, char **argv, uint32_t *arg
  * Start with a modest reserve and let the app request more when it actually needs it.
  */
 static uint32_t setup_stack(process_t *proc) {
-    const uint32_t stack_size = 256u * 1024u;
+    if (!proc) return 0;
+    if (!proc->address_space) {
+        proc->address_space = address_space_create();
+        if (!proc->address_space) return 0;
+        if (!process_address_space_initialize(proc)) {
+            address_space_destroy(proc->address_space);
+            proc->address_space = NULL;
+            return 0;
+        }
+    }
 
-    proc->stack_base = kmalloc(stack_size);
-    if (proc->stack_base == NULL) {
+    uint32_t stack_top = 0xC0000000u;
+    uint32_t initial_page = stack_top - 4096u;
+    uint32_t guard_page = initial_page - 4096u;
+
+    void *frame = memory_page_alloc();
+    if (!frame) return 0;
+
+    if (!address_space_map(proc->address_space, initial_page,
+                           (uint32_t)(uintptr_t)frame,
+                           ADDRESS_SPACE_PAGE_PRESENT |
+                           ADDRESS_SPACE_PAGE_WRITABLE |
+                           ADDRESS_SPACE_PAGE_USER)) {
+        memory_page_free(frame);
         return 0;
     }
 
-    proc->stack_start = (uint32_t)proc->stack_base;
-    proc->stack_ptr = proc->stack_start + stack_size;
-    proc->stack_size = stack_size;
-    
+    address_space_unmap(proc->address_space, guard_page);
+
+    proc->stack_base = frame;
+    proc->stack_start = initial_page;
+    proc->stack_size = 4096u;
+    proc->stack_ptr = stack_top;
+
     return proc->stack_ptr;
 }
 
 int process_adjust_stack_size(process_t *proc, int32_t delta) {
-    if (proc == NULL || proc->stack_base == NULL) {
+    if (proc == NULL) {
         return -1;
     }
-
-    if (delta == 0) {
-        return (int32_t)proc->stack_size;
-    }
-
-    if (delta > 0) {
-        uint32_t grow = (uint32_t)delta;
-        uint32_t base = PROCESS_HEAP_START + (uint32_t)global_process_heap_used;
-        uint64_t total_ram = get_process_heap_capacity();
-
-        if (total_ram > 0 && ((uint64_t)base + grow) > total_ram) {
-            serial_printf("[process] stack grow rejected: physical RAM exhausted (need %llu, have %llu)\n",
-                         (uint64_t)base + grow, total_ram);
-            return -1;
-        }
-
-        void *extra = allocate_process_memory(proc, grow, PROT_READ | PROT_WRITE);
-        if (extra == NULL) {
-            return -1;
-        }
-
-        proc->stack_size += grow;
-        proc->stack_ptr = proc->stack_start + proc->stack_size;
-        serial_printf("[process] stack grown: pid=%u size=%u top=0x%x\n",
-                     proc->pid, proc->stack_size, proc->stack_ptr);
-        return (int32_t)proc->stack_size;
-    }
-
-    uint32_t shrink = (uint32_t)(-delta);
-    if (shrink > proc->stack_size) {
-        serial_printf("[process] stack shrink rejected: pid=%u try=%u current=%u\n",
-                     proc->pid, shrink, proc->stack_size);
-        return -1;
-    }
-
-    proc->stack_size -= shrink;
-    proc->stack_ptr = proc->stack_start + proc->stack_size;
-    if (global_process_heap_used >= shrink) {
-        global_process_heap_used -= shrink;
-    }
-
-    serial_printf("[process] stack shrunk: pid=%u size=%u top=0x%x\n",
-                 proc->pid, proc->stack_size, proc->stack_ptr);
+    (void)delta;
     return (int32_t)proc->stack_size;
 }
 
-static int process_call_entry(process_entry_t entry, int argc, char **argv,
-                              uint32_t stack_top) {
-    int result;
-    uint32_t old_stack;
-
-    __asm__ volatile(
-        "movl %%esp, %0\n"
-        "movl %5, %%esp\n"
-        "pushl %3\n"   /* argv */
-        "pushl %2\n"   /* argc */
-        "call *%4\n"
-        "addl $8, %%esp\n"
-        "movl %0, %%esp\n"
-        : "=m"(old_stack), "=a"(result)
-        : "r"(argc), "r"(argv), "r"(entry), "r"(stack_top)
-        : "ecx", "edx", "memory");
-
-    return result;
-}
-
-/**
- * load_binary_file - Reads an executable file image into memory
- */
-static int __attribute__((unused)) load_binary_file(const char *path, void **data_out) {
-    if (data_out == NULL) {
-        return -1;
-    }
-    
-    *data_out = NULL;
-    
-    // Checking the existence of a file
-    struct ipo_inode stat;
-    if (!ipo_fs_stat(path, &stat)) {
-        printf("File not found: %s\n", path);
-        process_set_last_exit_code(127);
-        return -1;  // File not found
-    }
-    
-    if ((stat.mode & IPO_INODE_TYPE_DIR) != 0) {
-        printf("Cannot execute '%s': is a directory\n", path);
-        process_set_last_exit_code(126);
-        return -1;  // Path is a directory
-    }
-    
-    if (stat.size == 0) {
-        printf("Cannot execute '%s': file is empty\n", path);
-        process_set_last_exit_code(126);
-        return -1;
-    }
-    
-    serial_printf("Loading binary file: %s, size: %d bytes\n", path, stat.size);
-    
-    // For large files, we use step-by-step loading.
-    void *binary_image = kmalloc(stat.size);
-    if (binary_image == NULL) {
-        printf("Memory allocation failed for size: %d\n", stat.size);
-        process_set_last_exit_code(126);
-        return -3;  // Memory allocation failed
-    }
-    
-    // Read the file in 64KB chunks directly using inode metadata
-    uint32_t total_read = 0;
-    uint32_t chunk_size = 64 * 1024;  // 64KB
-    
-    while (total_read < stat.size) {
-        uint32_t to_read = stat.size - total_read;
-        if (to_read > chunk_size) {
-            to_read = chunk_size;
-        }
-        
-        int bytes_read = inode_read_bytes(&stat, (uint8_t*)binary_image + total_read, to_read, total_read);
-        
-        if (bytes_read <= 0) {
-            kfree(binary_image);
-            printf("Read failed at offset %d, read %d bytes\n", total_read, bytes_read);
-            return -4;  // Read failed
-        }
-        
-        total_read += (uint32_t)bytes_read;
-        serial_printf("Read chunk: %d bytes, total: %d/%d\n", bytes_read, total_read, stat.size);
-    }
-
-    *data_out = binary_image;
-    serial_printf("File loaded successfully (%d bytes)\n", stat.size);
-    return (int)stat.size;
-}
-
-
-/**
- * process_cleanup - Frees up process resources
- */
 void process_cleanup(process_t *proc) {
     if (!proc) return;
     ipc_process_terminated(proc->pid);
@@ -3164,7 +3695,22 @@ void process_cleanup(process_t *proc) {
         proc->is_running = 0;
         return;
     }
+    wm_destroy_windows_for_pid(proc->pid);
+    utf_stream_free(&proc->utf_stream);
+    driver_unregister_by_owner(proc);
+    input_ext_cleanup_pid(proc->pid);
     process_thread_cleanup(proc);
+
+    if (!proc->threads && proc->address_space && proc->stack_start) {
+        uint32_t phys = address_space_get_physical(proc->address_space, proc->stack_start);
+        address_space_unmap(proc->address_space, proc->stack_start);
+        if (phys) {
+            memory_page_free((void *)(uintptr_t)phys);
+        } else if (proc->stack_base) {
+            memory_page_free(proc->stack_base);
+        }
+        proc->stack_base = NULL;
+    }
 
     if (proc->binary_base && proc->binary_size &&
         !process_update_memory_mappings(
@@ -3173,7 +3719,17 @@ void process_cleanup(process_t *proc) {
         serial_printf("[process] failed to restore cleaned binary mapping for pid=%u\n",
                       proc->pid);
     }
-    if (proc->user_heap_limit > proc->user_heap_base) {
+    if (proc->heap_chunks && proc->heap_chunk_count > 0) {
+        for (uint32_t i = 0; i < proc->heap_chunk_count; i++) {
+            if (proc->heap_chunks[i].limit > proc->heap_chunks[i].base) {
+                uint32_t start = proc->heap_chunks[i].base & ~0xFFFu;
+                uint32_t end = (proc->heap_chunks[i].limit + 0xFFFu) & ~0xFFFu;
+                if (end > start) {
+                    process_update_memory_mappings(proc, start, end - start, false);
+                }
+            }
+        }
+    } else if (proc->user_heap_limit > proc->user_heap_base) {
         uint32_t start = proc->user_heap_base & ~0xFFFu;
         uint32_t end = (proc->user_heap_limit + 0xFFFu) & ~0xFFFu;
         if (end > start &&
@@ -3210,10 +3766,7 @@ void process_cleanup(process_t *proc) {
         proc->binary_base = NULL;
     }
 
-    if (proc->stack_base) {
-        kfree(proc->stack_base);
-        proc->stack_base = NULL;
-    }
+    proc->stack_base = NULL;
 
     if (proc->name) {
         kfree(proc->name);
@@ -3225,32 +3778,43 @@ void process_cleanup(process_t *proc) {
         proc->return_format = NULL;
     }
 
-    if (proc->text_vram_backup) {
-        kfree(proc->text_vram_backup);
-        proc->text_vram_backup = NULL;
+    if (!proc->text_screen_shared) {
+        bool ownership_transferred = false;
+        if (proc->text_vram_backup) {
+            for (process_t *other = process_list; other; other = other->next) {
+                if (other != proc && other->text_screen_shared &&
+                    other->text_vram_backup == proc->text_vram_backup) {
+                    other->text_screen_shared = false;
+                    ownership_transferred = true;
+                    break;
+                }
+            }
+        }
+        if (!ownership_transferred) {
+            if (proc->text_vram_backup) {
+                kfree(proc->text_vram_backup);
+            }
+            if (proc->scroll_top_buffer) {
+                kfree(proc->scroll_top_buffer);
+            }
+            if (proc->scroll_bottom_buffer) {
+                kfree(proc->scroll_bottom_buffer);
+            }
+        }
     }
-
-    if (proc->scroll_top_buffer) {
-        kfree(proc->scroll_top_buffer);
-        proc->scroll_top_buffer = NULL;
-    }
-
-    if (proc->scroll_bottom_buffer) {
-        kfree(proc->scroll_bottom_buffer);
-        proc->scroll_bottom_buffer = NULL;
-    }
-    proc->scroll_top_count = 0;
-    proc->scroll_bottom_count = 0;
-
     if (proc->gfx_vram_backup) {
         kfree(proc->gfx_vram_backup);
-        proc->gfx_vram_backup = NULL;
     }
-
     if (proc->gfx_palette_backup) {
         kfree(proc->gfx_palette_backup);
-        proc->gfx_palette_backup = NULL;
     }
+    proc->text_vram_backup = NULL;
+    proc->scroll_top_buffer = NULL;
+    proc->scroll_bottom_buffer = NULL;
+    proc->scroll_top_count = 0;
+    proc->scroll_bottom_count = 0;
+    proc->gfx_vram_backup = NULL;
+    proc->gfx_palette_backup = NULL;
 
     if (proc->text_output_buf) {
         kfree(proc->text_output_buf);
@@ -3314,13 +3878,13 @@ void process_crash_exit(void) {
 
 void process_emergency_crash_exit(void) {
     __asm__ volatile("cli" ::: "memory");
+    extern uint8_t exception_stack_top[];
+    __asm__ volatile("movl %0, %%esp" : : "r"((uint32_t)(uintptr_t)exception_stack_top) : "memory");
+    address_space_force_unlock();
     process_t *proc = current_process;
     if (proc != NULL) {
-        if (proc->stack_start != 0 && proc->stack_size >= 64) {
-            uint32_t safe_esp = (proc->stack_start + proc->stack_size - 16) & ~0xFu;
-            __asm__ volatile("movl %0, %%esp" : : "r"(safe_esp) : "memory");
-        }
 
+        audio_cleanup_streams_for_owner(proc);
         wm_destroy_windows_for_pid(proc->pid);
         async_stop_tasks_by_owner(proc);
         proc->async_task_count = 0;
@@ -3349,7 +3913,11 @@ void process_emergency_crash_exit(void) {
 
         if (scheduler_esp != 0) {
             in_process_context = false;
-            process_switch_context(&proc->stack_ptr, scheduler_esp);
+            if (proc->current_thread) {
+                process_switch_context(&proc->current_thread->context_esp, scheduler_esp);
+            } else {
+                process_switch_context(&proc->stack_ptr, scheduler_esp);
+            }
         }
     }
 
@@ -3359,16 +3927,12 @@ void process_emergency_crash_exit(void) {
 }
 
 
-/* =========================================================================
- * Custom Binary Format Registry
- * ========================================================================= */
-
 typedef struct custom_binfmt {
-    char *name;                     /* Format name (kmalloc) */
-    uint8_t *magic;                 /* Magic header bytes (kmalloc) */
-    uint32_t magic_len;             /* Magic byte length (no static limit) */
-    uint32_t offset;                /* Offset of magic in file header */
-    char *runner_path;              /* Runner/interpreter command (kmalloc) */
+    char *name;
+    uint8_t *magic;
+    uint32_t magic_len;
+    uint32_t offset;
+    char *runner_path;
     struct custom_binfmt *next;     /* Dynamic linked list (no count limit) */
 } custom_binfmt_t;
 
@@ -3733,27 +4297,31 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
     }
  
     // Set up trampoline stack frame for cooperative multitasking
-    uint32_t *sp = (uint32_t *)proc->stack_ptr;
-    sp = (uint32_t *)((uint32_t)sp & ~15u);
-    sp[-1] = (uint32_t)process_trampoline;
-    sp[-2] = 0;       // ebp
-    sp[-3] = 0;       // ebx
-    sp[-4] = 0;       // esi
-    sp[-5] = 0;       // edi
-    sp[-6] = 0x02;    // eflags (reserved bit 1=1, IF=0)
-    proc->stack_ptr = (uint32_t)&sp[-6];
+    uint32_t *frame_sp = (uint32_t *)((uintptr_t)proc->stack_base + 4096u);
+    frame_sp = (uint32_t *)((uint32_t)frame_sp & ~15u);
+    frame_sp[-1] = (uint32_t)process_trampoline;
+    frame_sp[-2] = 0;       // ebp
+    frame_sp[-3] = 0;       // ebx
+    frame_sp[-4] = 0;       // esi
+    frame_sp[-5] = 0;       // edi
+    frame_sp[-6] = 0x02;    // eflags (reserved bit 1=1, IF=0)
+    uint32_t offset = (uint32_t)((uintptr_t)proc->stack_base + 4096u - (uintptr_t)&frame_sp[-6]);
+    proc->stack_ptr = 0xC0000000u - offset;
+
     if (!process_thread_init(proc)) {
         printf("Failed to initialize main thread\n");
         process_set_last_exit_code(126);
         process_cleanup(proc);
         return NULL;
     }
-    proc->address_space = address_space_create();
     if (!proc->address_space) {
-        printf("Failed to create address space for process\n");
-        process_set_last_exit_code(126);
-        process_cleanup(proc);
-        return NULL;
+        proc->address_space = address_space_create();
+        if (!proc->address_space) {
+            printf("Failed to create address space for process\n");
+            process_set_last_exit_code(126);
+            process_cleanup(proc);
+            return NULL;
+        }
     }
     if (!process_address_space_initialize(proc)) {
         printf("Failed to isolate process memory mappings\n");
@@ -3779,6 +4347,96 @@ int process_get_batch_exit_code(int idx) {
         return last_batch_exit_codes[idx];
     }
     return 0;
+}
+
+static process_t *process_terminate_workspace(int closing_wid, bool interrupt, bool *out_interrupted) {
+    if (!batch_active || !batch_procs || batch_proc_count <= 0) {
+        return NULL;
+    }
+
+    for (int i = 0; i < batch_proc_count; i++) {
+        process_t *p = batch_procs[i];
+        if (!p || p->window_id != closing_wid) continue;
+
+        if (p->is_running) {
+            p->is_running = 0;
+            if (interrupt) {
+                if (out_interrupted) *out_interrupted = true;
+                p->exit_code = 130;
+                process_return_val_reset(&p->return_val);
+                p->return_val.type = PROC_RET_INT;
+                process_return_val_set_type_name(&p->return_val, "int");
+                p->return_val.int_val = 130;
+                p->return_val.raw_eax = 130;
+                process_return_val_set_str(&p->return_val, "130");
+                process_return_val_add_arg(&p->return_val, "130");
+                last_exit_code = 130;
+            }
+        }
+        async_stop_tasks_by_owner(p);
+        p->async_task_count = 0;
+        /* Mark acknowledged before destroying WM windows so wm_handle_window_list_changed
+         * / process_on_wm_windows_empty cannot refocus this closing workspace. */
+        p->completed_and_acknowledged = true;
+        wm_destroy_windows_for_pid(p->pid);
+        process_release_execution_memory(p);
+        if (!p->text_screen_shared) {
+            if (p->text_vram_backup) kfree(p->text_vram_backup);
+            if (p->scroll_top_buffer) kfree(p->scroll_top_buffer);
+            if (p->scroll_bottom_buffer) kfree(p->scroll_bottom_buffer);
+        }
+        if (p->gfx_vram_backup) kfree(p->gfx_vram_backup);
+        if (p->gfx_palette_backup) kfree(p->gfx_palette_backup);
+        p->text_vram_backup = NULL;
+        p->scroll_top_buffer = NULL;
+        p->scroll_bottom_buffer = NULL;
+        p->scroll_top_count = 0;
+        p->scroll_bottom_count = 0;
+        p->gfx_vram_backup = NULL;
+        p->gfx_palette_backup = NULL;
+    }
+
+    for (int i = 0; i < batch_proc_count; i++) {
+        if (batch_procs[i] && process_is_active_or_has_windows(batch_procs[i])) {
+            return batch_procs[i];
+        }
+    }
+    return NULL;
+}
+
+bool process_close_current_workspace(void) {
+    if (!batch_active || !batch_separate_windows || !batch_procs || batch_proc_count <= 0) {
+        return false;
+    }
+
+    process_t *fg = process_get_displayed_foreground();
+    if (!fg) fg = process_get_foreground();
+    if (!fg) return false;
+
+    int closing_wid = fg->window_id;
+    process_t *next_fg = process_terminate_workspace(closing_wid, false, NULL);
+    if (next_fg) {
+        serial_printf("[proc] window %d closed by WM Close, auto-switching to %s\n",
+                      closing_wid, next_fg->name);
+        if (wm_session_active() && wm_get_window_count() == 0 &&
+            !batch_wm_was_active && !next_fg->is_wm_app &&
+            !workspace_has_wm_app(next_fg->window_id)) {
+            wm_session_stop();
+        }
+        process_set_foreground(next_fg);
+    } else {
+        batch_foreground_proc = NULL;
+        batch_displayed_fg = NULL;
+        process_shared_ctx_t *ctx = process_get_shared_context();
+        if (ctx && ctx->magic == PROCESS_SHARED_MAGIC) {
+            ctx->batch_displayed_fg = NULL;
+        }
+        process_sync_shared_context();
+        if (!batch_wm_was_active && wm_session_active() && wm_get_window_count() == 0) {
+            wm_session_stop();
+        }
+    }
+    return true;
 }
 
 /**
@@ -3834,16 +4492,16 @@ int process_run_batch_windows(process_t **procs, int count, const int *window_id
                 /* First process in this group — allocate its own text screen */
                 process_init_text_screen(procs[i]);
             } else {
-                /* Share buffers from the owner */
+                /* Share text buffers from the owner (graphics buffers remain private per process) */
                 procs[i]->text_vram_backup = owner->text_vram_backup;
-                procs[i]->gfx_vram_backup = owner->gfx_vram_backup;
-                procs[i]->gfx_palette_backup = owner->gfx_palette_backup;
                 procs[i]->text_cursor_pos = owner->text_cursor_pos;
                 procs[i]->text_cursor_visible = owner->text_cursor_visible;
                 procs[i]->scroll_top_buffer = owner->scroll_top_buffer;
                 procs[i]->scroll_bottom_buffer = owner->scroll_bottom_buffer;
                 procs[i]->scroll_top_count = owner->scroll_top_count;
                 procs[i]->scroll_bottom_count = owner->scroll_bottom_count;
+                procs[i]->scroll_top_capacity = owner->scroll_top_capacity;
+                procs[i]->scroll_bottom_capacity = owner->scroll_bottom_capacity;
                 procs[i]->text_screen_shared = true;
             }
         }
@@ -3879,15 +4537,21 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
     int old_batch_current_idx = batch_current_idx;
     bool old_batch_active = batch_active;
     bool old_batch_separate_windows = batch_separate_windows;
+    bool old_batch_shared_console_view = batch_shared_console_view;
+    bool old_batch_wm_was_active = batch_wm_was_active;
     process_t *old_batch_foreground_proc = batch_foreground_proc;
     uint32_t old_scheduler_esp = scheduler_esp;
     bool old_in_process_context = in_process_context;
+    uint32_t entry_flags = irq_save();
+    in_process_context = false;
 
     batch_procs = procs;
     batch_proc_count = count;
     batch_current_idx = 0;
     batch_active = true;
     batch_separate_windows = separate_windows;
+    batch_shared_console_view = false;
+    batch_wm_was_active = wm_session_active();
     batch_foreground_proc = NULL;
     batch_displayed_fg = NULL;
     process_sync_shared_context();
@@ -3902,19 +4566,19 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
         had_graphics = true;
     }
 
-    bool wm_was_active_before_batch = wm_session_active();
     bool batch_saved_was_text = !vga_is_graphics_mode() && !wm_session_active();
 
     /* Capture pristine text screen and cursor before any batch process alters them */
-    uint16_t *batch_saved_screen = (uint16_t *)kmalloc(80 * 25 * sizeof(uint16_t));
+    size_t vga_cells = (size_t)VGA_WIDTH * (size_t)VGA_HEIGHT;
+    uint16_t *batch_saved_screen = (uint16_t *)kmalloc(vga_cells * sizeof(uint16_t));
     uint16_t batch_saved_cursor = vga_get_cursor_position();
     bool batch_saved_cursor_visible = vga_is_cursor_visible();
     if (batch_saved_screen) {
         if (!batch_saved_was_text) {
-            for (int i = 0; i < 80 * 25; i++) batch_saved_screen[i] = 0x0720;
+            for (size_t i = 0; i < vga_cells; i++) batch_saved_screen[i] = 0x0720;
         } else {
-            memcpy(batch_saved_screen, (const void *)0xB8000, 80 * 25 * sizeof(uint16_t));
-            for (int i = 0; i < 80 * 25; i++) {
+            memcpy(batch_saved_screen, (const void *)VGA_MEMORY, vga_cells * sizeof(uint16_t));
+            for (size_t i = 0; i < vga_cells; i++) {
                 uint16_t ent = batch_saved_screen[i];
                 uint8_t attr = (uint8_t)(ent >> 8);
                 if (ent == 0xFFFF || attr == 0xFF) {
@@ -3947,11 +4611,13 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
     while (1) {
         keyboard_poll();
         process_t *fg = process_get_foreground();
-        bool fg_ws_has_wm = fg ? (fg->is_wm_app || (separate_windows && workspace_has_wm_app(fg->window_id))) : false;
-        bool fg_ws_wants_gfx = fg ? (fg->wants_graphics || fg->is_wm_app || (separate_windows && workspace_wants_graphics(fg->window_id))) : false;
+        bool fg_ws_has_wm = fg ? (workspace_has_wm_or_bridge(fg->window_id) ||
+                                  (fg->is_wm_app && process_proc_wants_active_gfx(fg))) : false;
+        bool fg_ws_wants_gfx = fg ? (process_proc_wants_active_gfx(fg) ||
+                                     workspace_wants_graphics(fg->window_id)) : false;
         bool fg_is_gfx = separate_windows
             ? (vga_is_graphics_mode() || fg_ws_wants_gfx)
-            : (wm_session_active() || vga_is_graphics_mode() || fg_ws_wants_gfx);
+            : (process_wm_has_focus() || vga_is_graphics_mode() || (!batch_shared_console_view && fg_ws_wants_gfx));
 
         int sch = serial_getc();
         if (sch == 0x03 && !fg_is_gfx) {
@@ -3972,58 +4638,7 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
                 /* Ctrl+C is ignored for graphical applications */
             } else if (separate_windows && fg) {
                 int closing_wid = fg->window_id;
-                for (int i = 0; i < count; i++) {
-                    if (procs[i] && procs[i]->window_id == closing_wid) {
-                        if (procs[i]->is_running) {
-                            was_interrupted = true;
-                            procs[i]->is_running = 0;
-                            procs[i]->exit_code = 130;
-                            process_return_val_reset(&procs[i]->return_val);
-                            procs[i]->return_val.type = PROC_RET_INT;
-                            process_return_val_set_type_name(&procs[i]->return_val, "int");
-                            procs[i]->return_val.int_val = 130;
-                            procs[i]->return_val.raw_eax = 130;
-                            process_return_val_set_str(&procs[i]->return_val, "130");
-                            process_return_val_add_arg(&procs[i]->return_val, "130");
-                            last_exit_code = 130;
-                        }
-                        async_stop_tasks_by_owner(procs[i]);
-                        procs[i]->async_task_count = 0;
-                        procs[i]->completed_and_acknowledged = true;
-                        process_release_execution_memory(procs[i]);
-                        if (!procs[i]->text_screen_shared) {
-                            if (procs[i]->text_vram_backup) {
-                                kfree(procs[i]->text_vram_backup);
-                            }
-                            if (procs[i]->scroll_top_buffer) {
-                                kfree(procs[i]->scroll_top_buffer);
-                            }
-                            if (procs[i]->scroll_bottom_buffer) {
-                                kfree(procs[i]->scroll_bottom_buffer);
-                            }
-                            if (procs[i]->gfx_vram_backup) {
-                                kfree(procs[i]->gfx_vram_backup);
-                            }
-                            if (procs[i]->gfx_palette_backup) {
-                                kfree(procs[i]->gfx_palette_backup);
-                            }
-                        }
-                        procs[i]->text_vram_backup = NULL;
-                        procs[i]->scroll_top_buffer = NULL;
-                        procs[i]->scroll_bottom_buffer = NULL;
-                        procs[i]->scroll_top_count = 0;
-                        procs[i]->scroll_bottom_count = 0;
-                        procs[i]->gfx_vram_backup = NULL;
-                        procs[i]->gfx_palette_backup = NULL;
-                    }
-                }
-                process_t *next_fg = NULL;
-                for (int i = 0; i < count; i++) {
-                    if (procs[i] && process_is_active_or_has_windows(procs[i])) {
-                        next_fg = procs[i];
-                        break;
-                    }
-                }
+                process_t *next_fg = process_terminate_workspace(closing_wid, true, &was_interrupted);
                 if (next_fg) {
                     serial_printf("[proc] window %d closed by Ctrl+C, auto-switching to %s\n", closing_wid, next_fg->name);
                     process_set_foreground(next_fg);
@@ -4068,7 +4683,10 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
 
             if (fg == NULL) {
                 keyboard_set_app_input_mode(false);
-                if (wm_session_active()) {
+                if (!old_batch_active && !batch_wm_was_active &&
+                    wm_session_active() && wm_get_window_count() == 0) {
+                    wm_session_stop();
+                } else if (process_wm_has_focus()) {
                     vga_set_mode_13h_hardware();
                     vga_gfx_init_default_palette();
                     mouse_set_bounds_from_display();
@@ -4080,17 +4698,17 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
             } else {
                 fg->waiting_for_input = false;
                 keyboard_set_app_input_mode(true);
-                if (wm_session_active()) {
-                    if (!process_get_separate_windows() || fg_ws_wants_gfx) {
-                        if (fg_ws_wants_gfx) {
-                            vga_set_mode_13h_hardware();
-                            vga_gfx_init_default_palette();
-                            mouse_set_bounds_from_display();
-                        }
-                        wm_focus_window_for_pid(fg->pid);
-                        wm_invalidate_all();
-                        wm_compositor_tick();
-                    }
+                if (process_wm_has_focus() && (fg_ws_has_wm || !process_get_separate_windows())) {
+                    vga_set_mode_13h_hardware();
+                    vga_gfx_init_default_palette();
+                    mouse_set_bounds_from_display();
+                    wm_focus_window_for_pid(fg->pid);
+                    wm_invalidate_all();
+                    wm_compositor_tick();
+                } else if (!fg_ws_wants_gfx && !process_wm_has_focus() && vga_is_graphics_mode()) {
+                    vga_set_mode_text_hardware();
+                    dynamic_keymap_reapply_fonts();
+                    mouse_set_bounds_from_display();
                 }
                 for (int i = 0; i < count; i++) {
                     if (procs[i] == fg) {
@@ -4100,30 +4718,52 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
                 }
             }
             last_fg = fg;
-        } else if (fg && fg_ws_wants_gfx && !vga_is_graphics_mode()) {
+        } else if (fg && fg_ws_wants_gfx && !vga_is_graphics_mode() &&
+                   (!batch_shared_console_view || separate_windows)) {
             /* If the foreground workspace transitioned into graphics/WM mode after
                initial launch (e.g. via elf_loader), switch VGA hardware now. */
             vga_set_mode_13h_hardware();
-            vga_gfx_init_default_palette();
-            mouse_set_bounds_from_display();
-            if (wm_session_active() && fg_ws_has_wm) {
+            if (fg_ws_has_wm || (!process_get_separate_windows() && process_wm_has_focus())) {
+                vga_gfx_init_default_palette();
+                mouse_set_bounds_from_display();
                 wm_focus_window_for_pid(fg->pid);
                 wm_invalidate_all();
                 wm_compositor_tick();
+            } else if (!fg->is_wm_app) {
+                if (fg->gfx_palette_backup) {
+                    for (int i = 0; i < 256; i++) {
+                        outb(0x3C8, (uint8_t)i);
+                        outb(0x3C9, fg->gfx_palette_backup[i * 3 + 0]);
+                        outb(0x3C9, fg->gfx_palette_backup[i * 3 + 1]);
+                        outb(0x3C9, fg->gfx_palette_backup[i * 3 + 2]);
+                    }
+                } else {
+                    vga_gfx_init_default_palette();
+                }
+                mouse_set_bounds_from_display();
+                if (fg->gfx_vram_backup &&
+                    fg->gfx_vram_backup_w > 0 &&
+                    fg->gfx_vram_backup_h > 0) {
+                    vga_gfx_blit_hardware(fg->gfx_vram_backup, true,
+                                          fg->gfx_vram_backup_w,
+                                          fg->gfx_vram_backup_h);
+                }
             }
         }
 
-        /* Release execution memory for any process that has stopped running,
-           and count remaining active processes/windows */
+        /* Release execution memory for any process that has stopped running */
         int active_count = 0;
         for (int i = 0; i < count; i++) {
-            if (procs[i]) {
-                if (!procs[i]->is_running) {
-                    process_release_execution_memory(procs[i]);
-                }
-                if (process_is_active_or_has_windows(procs[i])) {
-                    active_count++;
-                }
+            process_t *p = procs[i];
+            if (!p) continue;
+            if (!p->is_running) {
+                process_release_execution_memory(p);
+            }
+        }
+
+        for (int i = 0; i < count; i++) {
+            if (procs[i] && process_is_active_or_has_windows(procs[i])) {
+                active_count++;
             }
         }
 
@@ -4140,6 +4780,26 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
         if (separate_windows) {
             for (int i = 0; i < count; i++) {
                 if (procs[i] && !process_is_active_or_has_windows(procs[i])) {
+                    if (procs[i]->gfx_vram_backup) {
+                        kfree(procs[i]->gfx_vram_backup);
+                        procs[i]->gfx_vram_backup = NULL;
+                    }
+                    if (procs[i]->gfx_palette_backup) {
+                        kfree(procs[i]->gfx_palette_backup);
+                        procs[i]->gfx_palette_backup = NULL;
+                    }
+                    int wid = procs[i]->window_id;
+                    bool wid_still_active = false;
+                    for (int k = 0; k < count; k++) {
+                        if (procs[k] && procs[k]->window_id == wid &&
+                            process_is_active_or_has_windows(procs[k])) {
+                            wid_still_active = true;
+                            break;
+                        }
+                    }
+                    if (wid_still_active) {
+                        continue;
+                    }
                     if (!procs[i]->text_screen_shared) {
                         if (procs[i]->text_vram_backup) {
                             kfree(procs[i]->text_vram_backup);
@@ -4150,38 +4810,24 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
                         if (procs[i]->scroll_bottom_buffer) {
                             kfree(procs[i]->scroll_bottom_buffer);
                         }
-                        if (procs[i]->gfx_vram_backup) {
-                            kfree(procs[i]->gfx_vram_backup);
-                        }
-                        if (procs[i]->gfx_palette_backup) {
-                            kfree(procs[i]->gfx_palette_backup);
+                    }
+                    for (int k = 0; k < count; k++) {
+                        if (procs[k] && procs[k]->window_id == wid) {
+                            procs[k]->text_vram_backup = NULL;
+                            procs[k]->scroll_top_buffer = NULL;
+                            procs[k]->scroll_bottom_buffer = NULL;
+                            procs[k]->scroll_top_count = 0;
+                            procs[k]->scroll_bottom_count = 0;
                         }
                     }
-                    procs[i]->text_vram_backup = NULL;
-                    procs[i]->scroll_top_buffer = NULL;
-                    procs[i]->scroll_bottom_buffer = NULL;
-                    procs[i]->scroll_top_count = 0;
-                    procs[i]->scroll_bottom_count = 0;
-                    procs[i]->gfx_vram_backup = NULL;
-                    procs[i]->gfx_palette_backup = NULL;
                 }
             }
         }
 
         // Drive async tasks and WM compositor if active, in graphics mode, and not in raw fullscreen VGA graphics
         async_scheduler_tick();
-        bool should_tick_wm = false;
-        if (wm_session_active() && vga_is_graphics_mode()) {
-            if (process_get_separate_windows()) {
-                should_tick_wm = (fg == NULL || fg_ws_has_wm);
-            } else {
-                should_tick_wm = (!fg || fg->is_wm_app || !fg->wants_graphics);
-            }
-        }
-        if (should_tick_wm) {
+        if (process_wm_has_focus() && vga_is_graphics_mode()) {
             wm_compositor_tick();
-        } else if (vga_is_graphics_mode()) {
-            wm_raw_gfx_overlay_tick();
         }
 
         // Find next runnable process
@@ -4191,7 +4837,7 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
             process_t *p = procs[idx];
             if (p && p->is_running && !p->signal_stopped && !p->ipc_waiting &&
                 process_thread_has_runnable(p)) {
-                if (p->waiting_for_input && p != fg && !wm_session_active() && fg && fg->is_running) {
+                if (p->waiting_for_input && p != fg && (separate_windows || process_wm_has_focus()) && fg && fg->is_running) {
                     continue;
                 }
                 found = idx;
@@ -4256,15 +4902,18 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
         // Switch to process!
         process_switch_context(&scheduler_esp, selected_thread->context_esp);
         in_process_context = false;
+        process_t *ran_proc = current_process;
+        current_process = NULL;
+        process_sync_shared_context();
         if (old_address_space) {
             (void)address_space_activate(old_address_space);
         } else {
             (void)address_space_activate_kernel();
         }
         // Process yields back here
-        if (current_process && !current_process->is_running) {
-            ipc_process_terminated(current_process->pid);
-            process_release_execution_memory(current_process);
+        if (ran_proc && !ran_proc->is_running) {
+            ipc_process_terminated(ran_proc->pid);
+            process_release_execution_memory(ran_proc);
         }
     }
 
@@ -4278,8 +4927,28 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
     } else {
         (void)address_space_activate_kernel();
     }
+    bool cur_wm_was_active = batch_wm_was_active;
+    bool batch_had_terminal = false;
+    int batch_term_count = 0;
+    process_t *last_term_proc = NULL;
+    for (int i = 0; i < count; i++) {
+        if (procs[i] && !procs[i]->is_wm_app && !procs[i]->wants_graphics) {
+            batch_had_terminal = true;
+            batch_term_count++;
+            last_term_proc = procs[i];
+        }
+    }
+    bool last_displayed_was_term = (last_fg && !last_fg->is_wm_app && !last_fg->wants_graphics);
+
+    if (!old_batch_active && !cur_wm_was_active &&
+        wm_session_active() && wm_get_window_count() == 0) {
+        wm_session_stop();
+    }
+
     batch_active = old_batch_active;
     batch_separate_windows = old_batch_separate_windows;
+    batch_shared_console_view = old_batch_shared_console_view;
+    batch_wm_was_active = old_batch_wm_was_active;
     batch_foreground_proc = old_batch_foreground_proc;
     batch_procs = old_batch_procs;
     batch_proc_count = old_batch_proc_count;
@@ -4303,15 +4972,48 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
     keyboard_flush_app_queue();
     keyboard_clear_key_state();
 
-    if (was_interrupted || system_is_interrupted()) {
-        if (!wm_was_active_before_batch && wm_session_active()) {
-            wm_session_stop();
-        }
-        if (vga_is_graphics_mode() && !wm_session_active()) {
+    bool interrupted = (was_interrupted || system_is_interrupted());
+    /* Tear down any auto-started WM session once all batch windows have closed;
+     * explicit startwm sessions stay open and mixed batches restore terminal view cleanly. */
+    if (!wm_session_active()) {
+        if (vga_is_graphics_mode()) {
             vga_set_mode_text_hardware();
         }
-        if (batch_saved_screen && batch_saved_was_text && !wm_session_active()) {
-            memcpy((void *)0xB8000, batch_saved_screen, 80 * 25 * sizeof(uint16_t));
+        bool restore_saved = false;
+        if (!separate_windows) {
+            /* Shared-workspace batches already updated VGA / saved_text_vram live. */
+            restore_saved = (!batch_had_terminal && !vga_gfx_has_saved_text());
+        } else if (batch_had_terminal) {
+            bool batch_had_wm_end = false;
+            for (int i = 0; i < count; i++) {
+                if (procs[i] && procs[i]->is_wm_app) {
+                    batch_had_wm_end = true;
+                    break;
+                }
+            }
+            bool can_replay_buf = (last_term_proc && last_term_proc->text_output_buf &&
+                                   last_term_proc->text_output_len > 0u);
+            if (!batch_had_wm_end && batch_term_count == 1 &&
+                last_term_proc && last_term_proc->text_vram_backup) {
+                if (!last_displayed_was_term) {
+                    memcpy((void *)VGA_MEMORY, last_term_proc->text_vram_backup, vga_cells * sizeof(uint16_t));
+                    vga_set_cursor(last_term_proc->text_cursor_pos);
+                }
+            } else if (batch_had_wm_end && !can_replay_buf && batch_term_count == 1 &&
+                       last_term_proc && last_term_proc->text_vram_backup) {
+                if (!last_displayed_was_term) {
+                    memcpy((void *)VGA_MEMORY, last_term_proc->text_vram_backup, vga_cells * sizeof(uint16_t));
+                    vga_set_cursor(last_term_proc->text_cursor_pos);
+                }
+            } else {
+                restore_saved = true;
+            }
+        } else {
+            restore_saved = true;
+        }
+
+        if (restore_saved && batch_saved_screen && batch_saved_was_text) {
+            memcpy((void *)VGA_MEMORY, batch_saved_screen, vga_cells * sizeof(uint16_t));
             vga_set_cursor(batch_saved_cursor);
             if (batch_saved_cursor_visible) {
                 vga_show_cursor();
@@ -4324,42 +5026,12 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
         vga_cursor_reset();
         vga_sanitize_text_vram();
         vga_show_cursor();
-        if (!wm_session_active()) {
+        if (interrupted) {
             printf("Application stopped.\n");
         }
+    }
+    if (interrupted) {
         system_clear_interrupt();
-    } else {
-        if (!wm_was_active_before_batch && wm_session_active()) {
-            wm_session_stop();
-        }
-        if (!wm_session_active()) {
-            if (vga_is_graphics_mode()) {
-                vga_set_mode_text_hardware();
-            }
-            if ((had_graphics || separate_windows) && batch_saved_screen && batch_saved_was_text) {
-                memcpy((void *)0xB8000, batch_saved_screen, 80 * 25 * sizeof(uint16_t));
-                vga_set_cursor(batch_saved_cursor);
-                if (batch_saved_cursor_visible) {
-                    vga_show_cursor();
-                } else {
-                    vga_hide_cursor();
-                }
-
-                /* Replay stdout produced by text processes only for successful non-interactive single-workspace batches */
-                if (!separate_windows && !was_interrupted) {
-                    for (int i = 0; i < count; i++) {
-                        if (procs[i] && procs[i]->exit_code != 130 && procs[i]->text_output_buf && procs[i]->text_output_len > 0) {
-                            printf("%s", procs[i]->text_output_buf);
-                        }
-                    }
-                }
-            }
-            vga_font_set_app_mode(false);
-            dynamic_keymap_reapply_fonts();
-            vga_cursor_reset();
-            vga_sanitize_text_vram();
-            vga_show_cursor();
-        }
     }
 
     if (batch_saved_screen) {
@@ -4418,6 +5090,7 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
         }
     }
     log_process_heap_state("after cleanup");
+    irq_restore(entry_flags);
 
     return 0;
 }
@@ -4426,20 +5099,14 @@ int process_run_batch(process_t **procs, int count) {
     return process_run_batch_ex(procs, count, false);
 }
 
-/**
- * universal_process_execute - The single universal function for launching ANY program
- * regardless of file format, headers, or lack of headers.
- * If the file is not an executable file (plain text, empty, directory, invalid),
- * exits cleanly at the launch moment without hanging or crashing.
- */
 int universal_process_execute(const char *path, int argc, char **argv) {
     process_t *proc = process_spawn(path, argc, argv);
     if (!proc) {
         return -1;
     }
     uint32_t pid = proc->pid;
-    process_t *batch[1] = { proc };
-    process_run_batch(batch, 1);
+    process_t *single_proc = proc;
+    process_run_batch(&single_proc, 1);
     return (int)pid;
 }
 
@@ -4530,10 +5197,16 @@ void process_set_current_return_value(process_return_type_t type, const char *ty
     } else if (type == PROC_RET_CHAR) {
         proc->return_val.int_val = int_val;
         proc->return_val.raw_eax = (uint32_t)int_val;
-        char ch_str[4] = { '\'', (char)int_val, '\'', '\0' };
-        char ch_arg[2] = { (char)int_val, '\0' };
-        process_return_val_set_str(&proc->return_val, ch_str);
-        process_return_val_add_arg(&proc->return_val, ch_arg);
+        char *ch_str = format_char_dynamic((uint8_t)int_val);
+        char *ch_arg = format_char_arg_dynamic((uint8_t)int_val);
+        if (ch_str) {
+            process_return_val_set_str(&proc->return_val, ch_str);
+            kfree(ch_str);
+        }
+        if (ch_arg) {
+            process_return_val_add_arg(&proc->return_val, ch_arg);
+            kfree(ch_arg);
+        }
         proc->exit_code = int_val;
     } else if (type == PROC_RET_STRING) {
         proc->return_val.int_val = 0;

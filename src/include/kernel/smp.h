@@ -5,7 +5,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* Component status flags for honest architectural scaffolding evaluation */
+/* Architectural status flags for SMP subsystems */
 typedef enum {
     SMP_STATUS_INACTIVE = 0,
     SMP_STATUS_ACTIVE   = 1,
@@ -61,6 +61,27 @@ static inline bool spin_trylock(spinlock_t *sl) {
     return !__atomic_test_and_set(&sl->lock, __ATOMIC_ACQUIRE);
 }
 
+static inline uint32_t irq_save(void) {
+    uint32_t flags;
+    __asm__ volatile("pushfl; popl %0; cli" : "=r"(flags) : : "memory");
+    return flags;
+}
+
+static inline void irq_restore(uint32_t flags) {
+    __asm__ volatile("pushl %0; popfl" : : "r"(flags) : "memory", "cc");
+}
+
+static inline uint32_t spin_lock_irqsave(spinlock_t *sl) {
+    uint32_t flags = irq_save();
+    spin_lock(sl);
+    return flags;
+}
+
+static inline void spin_unlock_irqrestore(spinlock_t *sl, uint32_t flags) {
+    spin_unlock(sl);
+    irq_restore(flags);
+}
+
 /* SMP Subsystem API */
 void smp_init(void);
 uint32_t smp_get_cpu_count(void);
@@ -71,8 +92,9 @@ const smp_architecture_status_t *smp_get_architecture_status(void);
 uint32_t smp_get_lapic_base(void);
 void smp_print_summary(void);
 
+extern volatile uint32_t smp_lapic_base;
+
 /* Cross-Core Communication & Diagnostic APIs */
-void ap_main(uint32_t cpu_id);
 void smp_send_ipi(uint32_t target_lapic_id, uint8_t vector);
 void smp_send_broadcast_ipi(uint8_t vector);
 uint32_t smp_get_ipi_count(uint32_t cpu_id);

@@ -99,4 +99,11 @@ bool mouse_is_clicked_in_region(int32_t x, int32_t y, int32_t w, int32_t h, int 
  */
 bool mouse_check_click(int32_t x, int32_t y, int32_t w, int32_t h);
 
+/**
+ * Inject a synthetic pointer event (relative delta or absolute coordinates)
+ * into the core OS cursor state from a low-level or user-space HID driver.
+ */
+void mouse_inject_event(int32_t dx_or_x, int32_t dy_or_y, int32_t dz,
+                        uint32_t buttons_mask, bool is_absolute);
+
 #endif /* _MOUSE_H */

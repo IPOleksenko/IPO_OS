@@ -5,6 +5,7 @@ global smp_trampoline_start
 global smp_trampoline_end
 global smp_ipi_isr
 extern smp_ipi_handler
+extern smp_lapic_base
 
 smp_trampoline_start:
 bits 16
@@ -41,9 +42,9 @@ bits 32
     mov fs, ax
     mov gs, ax
 
-    ; Read stack pointer from 0x80F0
+    ; Read stack pointer from 0x80F0 and ensure 16-byte System V ABI alignment
     mov esp, [0x000080F0]
-    ; System V ABI 16-byte stack alignment: passing 1 4-byte argument requires 12 bytes padding
+    and esp, 0xFFFFFFF0
     sub esp, 12
     ; Read target cpu_id from 0x80F4
     mov ecx, [0x000080F4]
@@ -75,6 +76,7 @@ smp_trampoline_end:
 
 ; SMP IPI Interrupt Service Routine (vector 0xE0)
 smp_ipi_isr:
+    cld
     pusha
     push ds
     push es
@@ -85,15 +87,18 @@ smp_ipi_isr:
     mov ds, ax
     mov es, ax
     mov fs, ax
+    mov ax, 0x18
     mov gs, ax
 
-    ; 16-byte stack alignment for C handler
-    sub esp, 4
+    ; Align stack to 16-byte boundary before calling C handler
+    mov ebp, esp
+    and esp, 0xFFFFFFF0
     call smp_ipi_handler
-    add esp, 4
+    mov esp, ebp
 
-    ; Acknowledge interrupt to Local APIC (EOI register at 0xFEE000B0)
-    mov dword [0xFEE000B0], 0
+    ; Acknowledge interrupt to Local APIC (EOI offset 0xB0)
+    mov eax, [smp_lapic_base]
+    mov dword [eax + 0xB0], 0
 
     pop gs
     pop fs

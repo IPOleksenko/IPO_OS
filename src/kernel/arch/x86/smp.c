@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <ioport.h>
+#include <syscall.h>
 
 #define LAPIC_DEFAULT_BASE   0xFEE00000u
 #define LAPIC_ID_REG         0x0020u
@@ -28,13 +29,11 @@
 #define SMP_IPI_VECTOR       0xE0u
 
 /* Hardware on-wire descriptor sizes */
-#define ACPI_RSDP_HW_SIZE            36
 #define ACPI_RSDP_V1_HW_SIZE         20
 #define ACPI_SDT_HEADER_HW_SIZE      36
 #define ACPI_MADT_HW_SIZE            (ACPI_SDT_HEADER_HW_SIZE + 8)
 #define MP_FLOATING_POINTER_HW_SIZE  16
 
-/* Dynamic ACPI RSDP Descriptor (no fixed array limits) */
 typedef struct {
     char     *signature;
     size_t   signature_len;
@@ -52,9 +51,7 @@ typedef struct {
     size_t   reserved_len;
     size_t   reserved_cap;
 } acpi_rsdp_t;
-typedef acpi_rsdp_t acpi_rsdp_raw_t;
 
-/* Dynamic SDT Header (no fixed array limits) */
 typedef struct {
     char     *signature;
     size_t   signature_len;
@@ -72,17 +69,13 @@ typedef struct {
     uint32_t creator_id;
     uint32_t creator_revision;
 } acpi_sdt_header_t;
-typedef acpi_sdt_header_t acpi_sdt_header_raw_t;
 
-/* Dynamic ACPI MADT (no fixed array limits) */
 typedef struct {
     acpi_sdt_header_t header;
     uint32_t          lapic_addr;
     uint32_t          flags;
 } acpi_madt_t;
-typedef acpi_madt_t acpi_madt_raw_t;
 
-/* Dynamic MP Floating Pointer Structure (no fixed array limits) */
 typedef struct {
     char     *signature;
     size_t   signature_len;
@@ -95,7 +88,6 @@ typedef struct {
     size_t   feature_len;
     size_t   feature_cap;
 } mp_floating_pointer_t;
-typedef mp_floating_pointer_t mp_floating_pointer_raw_t;
 
 /* Helper to set dynamic strings */
 static int smp_dyn_str_set(char **dst, size_t *len, size_t *cap, const char *src, size_t max_src) {
@@ -126,15 +118,15 @@ static int smp_dyn_buf_set(uint8_t **dst, size_t *len, size_t *cap, const uint8_
     return 0;
 }
 
-void acpi_rsdp_init(acpi_rsdp_t *r) { if (r) memset(r, 0, sizeof(*r)); }
-void acpi_rsdp_free(acpi_rsdp_t *r) {
+static void acpi_rsdp_init(acpi_rsdp_t *r) { if (r) memset(r, 0, sizeof(*r)); }
+static void acpi_rsdp_free(acpi_rsdp_t *r) {
     if (!r) return;
     if (r->signature) kfree(r->signature);
     if (r->oem_id) kfree(r->oem_id);
     if (r->reserved) kfree(r->reserved);
     memset(r, 0, sizeof(*r));
 }
-void acpi_rsdp_from_raw(acpi_rsdp_t *dst, const void *raw_bytes) {
+static void acpi_rsdp_from_raw(acpi_rsdp_t *dst, const void *raw_bytes) {
     if (!dst || !raw_bytes) return;
     const uint8_t *b = (const uint8_t *)raw_bytes;
     smp_dyn_str_set(&dst->signature, &dst->signature_len, &dst->signature_cap, (const char *)(b + 0), 8);
@@ -155,15 +147,15 @@ void acpi_rsdp_from_raw(acpi_rsdp_t *dst, const void *raw_bytes) {
     }
 }
 
-void acpi_sdt_header_init(acpi_sdt_header_t *h) { if (h) memset(h, 0, sizeof(*h)); }
-void acpi_sdt_header_free(acpi_sdt_header_t *h) {
+static void acpi_sdt_header_init(acpi_sdt_header_t *h) { if (h) memset(h, 0, sizeof(*h)); }
+static void acpi_sdt_header_free(acpi_sdt_header_t *h) {
     if (!h) return;
     if (h->signature) kfree(h->signature);
     if (h->oem_id) kfree(h->oem_id);
     if (h->oem_table_id) kfree(h->oem_table_id);
     memset(h, 0, sizeof(*h));
 }
-void acpi_sdt_header_from_raw(acpi_sdt_header_t *dst, const void *raw_bytes) {
+static void acpi_sdt_header_from_raw(acpi_sdt_header_t *dst, const void *raw_bytes) {
     if (!dst || !raw_bytes) return;
     const uint8_t *b = (const uint8_t *)raw_bytes;
     smp_dyn_str_set(&dst->signature, &dst->signature_len, &dst->signature_cap, (const char *)(b + 0), 4);
@@ -177,17 +169,17 @@ void acpi_sdt_header_from_raw(acpi_sdt_header_t *dst, const void *raw_bytes) {
     dst->creator_revision = *(const uint32_t *)(b + 32);
 }
 
-void acpi_madt_init(acpi_madt_t *m) {
+static void acpi_madt_init(acpi_madt_t *m) {
     if (!m) return;
     memset(m, 0, sizeof(*m));
     acpi_sdt_header_init(&m->header);
 }
-void acpi_madt_free(acpi_madt_t *m) {
+static void acpi_madt_free(acpi_madt_t *m) {
     if (!m) return;
     acpi_sdt_header_free(&m->header);
     memset(m, 0, sizeof(*m));
 }
-void acpi_madt_from_raw(acpi_madt_t *dst, const void *raw_bytes) {
+static void acpi_madt_from_raw(acpi_madt_t *dst, const void *raw_bytes) {
     if (!dst || !raw_bytes) return;
     const uint8_t *b = (const uint8_t *)raw_bytes;
     acpi_sdt_header_from_raw(&dst->header, b);
@@ -195,14 +187,14 @@ void acpi_madt_from_raw(acpi_madt_t *dst, const void *raw_bytes) {
     dst->flags = *(const uint32_t *)(b + ACPI_SDT_HEADER_HW_SIZE + 4);
 }
 
-void mp_floating_pointer_init(mp_floating_pointer_t *mp) { if (mp) memset(mp, 0, sizeof(*mp)); }
-void mp_floating_pointer_free(mp_floating_pointer_t *mp) {
+static void mp_floating_pointer_init(mp_floating_pointer_t *mp) { if (mp) memset(mp, 0, sizeof(*mp)); }
+static void mp_floating_pointer_free(mp_floating_pointer_t *mp) {
     if (!mp) return;
     if (mp->signature) kfree(mp->signature);
     if (mp->feature) kfree(mp->feature);
     memset(mp, 0, sizeof(*mp));
 }
-void mp_floating_pointer_from_raw(mp_floating_pointer_t *dst, const void *raw_bytes) {
+static void mp_floating_pointer_from_raw(mp_floating_pointer_t *dst, const void *raw_bytes) {
     if (!dst || !raw_bytes) return;
     const uint8_t *b = (const uint8_t *)raw_bytes;
     smp_dyn_str_set(&dst->signature, &dst->signature_len, &dst->signature_cap, (const char *)(b + 0), 4);
@@ -213,12 +205,11 @@ void mp_floating_pointer_from_raw(mp_floating_pointer_t *dst, const void *raw_by
     smp_dyn_buf_set(&dst->feature, &dst->feature_len, &dst->feature_cap, b + 11, 5);
 }
 
-
+volatile uint32_t smp_lapic_base = LAPIC_DEFAULT_BASE;
 static cpu_info_t *cpus = NULL;
 static uint32_t cpu_count = 0;
 static uint32_t cpu_capacity = 0;
 static uint32_t active_cpu_count = 0;
-static uint32_t lapic_base_addr = LAPIC_DEFAULT_BASE;
 
 static volatile bool smp_running = true;
 static volatile uint32_t smp_ap_boot_done = 0;
@@ -252,13 +243,6 @@ static bool smp_add_cpu(uint32_t lapic_id, bool is_bsp) {
 
 extern uint8_t smp_trampoline_start[];
 extern uint8_t smp_trampoline_end[];
-
-static struct {
-    uint16_t limit;
-    uint32_t base;
-} __attribute__((packed)) s_bsp_idt_ptr;
-
-
 
 static smp_architecture_status_t arch_status = {0};
 
@@ -412,21 +396,33 @@ static bool parse_acpi_madt(void) {
     acpi_madt_from_raw(&madt, raw_madt);
 
     s_madt_addr = (uint32_t)(uintptr_t)raw_madt;
-    lapic_base_addr = madt.lapic_addr ? madt.lapic_addr : LAPIC_DEFAULT_BASE;
+    smp_lapic_base = madt.lapic_addr ? madt.lapic_addr : LAPIC_DEFAULT_BASE;
     serial_printf("[smp] Found ACPI MADT at 0x%x, LAPIC Base = 0x%x\n",
-                  (uint32_t)(uintptr_t)raw_madt, lapic_base_addr);
+                  (uint32_t)(uintptr_t)raw_madt, smp_lapic_base);
 
-    /* Enumerate MADT entries */
+    uint32_t bsp_lapic_id = 0;
+    bool have_bsp_id = false;
+    if (s_has_cpuid) {
+        uint32_t eax, ebx, ecx, edx;
+        cpuid(0, &eax, &ebx, &ecx, &edx);
+        if (eax >= 1) {
+            cpuid(1, &eax, &ebx, &ecx, &edx);
+            bsp_lapic_id = (ebx >> 24) & 0xFFu;
+            have_bsp_id = true;
+        }
+    }
+
     const uint8_t *ptr = (const uint8_t *)raw_madt + ACPI_MADT_HW_SIZE;
     const uint8_t *end = (const uint8_t *)raw_madt + madt.header.length;
     uint32_t prev_cpu_count = cpu_count;
+    bool found_bsp = false;
 
     while (ptr < end) {
         uint8_t type = ptr[0];
         uint8_t len = ptr[1];
         if (len < 2 || ptr + len > end) break;
 
-        if (type == 0 /* Processor Local APIC */) {
+        if (type == 0 && len >= 8) {
             uint8_t acpi_id = ptr[2];
             uint8_t apic_id = ptr[3];
             uint32_t flags = *(const uint32_t *)(ptr + 4);
@@ -436,10 +432,17 @@ static bool parse_acpi_madt(void) {
                           acpi_id, apic_id, enabled ? "yes" : "no");
 
             if (enabled) {
-                smp_add_cpu(apic_id, (cpu_count == 0));
+                bool is_bsp = have_bsp_id ? (apic_id == bsp_lapic_id) : (cpu_count == prev_cpu_count);
+                if (is_bsp) found_bsp = true;
+                smp_add_cpu(apic_id, is_bsp);
             }
         }
         ptr += len;
+    }
+
+    if (!found_bsp && cpu_count > prev_cpu_count) {
+        cpus[prev_cpu_count].is_bsp = true;
+        cpus[prev_cpu_count].is_online = true;
     }
 
     acpi_madt_free(&madt);
@@ -481,21 +484,30 @@ static bool parse_mp_table(void) {
     serial_printf("[smp] Found MP Floating Pointer at 0x%x\n", (uint32_t)(uintptr_t)raw_mp);
     if (mp.phys_addr != 0) {
         const uint8_t *cfg = (const uint8_t *)(uintptr_t)mp.phys_addr;
-        if (memcmp(cfg, "PCMP", 4) == 0) {
+        uint16_t cfg_len = *(const uint16_t *)(cfg + 4);
+        if (memcmp(cfg, "PCMP", 4) == 0 && cfg_len >= 44 &&
+            checksum_calc(cfg, cfg_len) == 0) {
             uint16_t count = *(const uint16_t *)(cfg + 34);
             const uint8_t *entry = cfg + 44;
+            const uint8_t *cfg_end = cfg + cfg_len;
             uint32_t prev_cpu_count = cpu_count;
-            for (uint16_t i = 0; i < count; i++) {
-                if (entry[0] == 0 /* Processor */) {
+            bool found_bsp = false;
+            for (uint16_t i = 0; i < count && entry < cfg_end; i++) {
+                size_t elen = (entry[0] == 0) ? 20u : 8u;
+                if ((size_t)(cfg_end - entry) < elen) break;
+                if (entry[0] == 0) {
                     uint8_t flags = entry[3];
-                    if (flags & 1 /* EN */) {
+                    if (flags & 1) {
                         bool is_bsp = (flags & 2) != 0;
+                        if (is_bsp) found_bsp = true;
                         smp_add_cpu(entry[1], is_bsp);
                     }
-                    entry += 20;
-                } else {
-                    entry += 8;
                 }
+                entry += elen;
+            }
+            if (!found_bsp && cpu_count > prev_cpu_count) {
+                cpus[prev_cpu_count].is_bsp = true;
+                cpus[prev_cpu_count].is_online = true;
             }
             if (cpu_count > prev_cpu_count) {
                 s_mp_table_enumerated = true;
@@ -525,15 +537,12 @@ static void probe_cpuid_capabilities(void) {
     uint32_t eax, ebx, ecx, edx;
     cpuid(0, &eax, &ebx, &ecx, &edx);
 
-    char *vbuf = (char *)kmalloc(16);
-    if (vbuf) {
-        *(uint32_t *)(vbuf + 0) = ebx;
-        *(uint32_t *)(vbuf + 4) = edx;
-        *(uint32_t *)(vbuf + 8) = ecx;
-        vbuf[12] = '\0';
-        smp_dyn_str_set(&s_cpu_vendor, &s_cpu_vendor_len, &s_cpu_vendor_cap, vbuf, 12);
-        kfree(vbuf);
-    }
+    char vbuf[13];
+    *(uint32_t *)(vbuf + 0) = ebx;
+    *(uint32_t *)(vbuf + 4) = edx;
+    *(uint32_t *)(vbuf + 8) = ecx;
+    vbuf[12] = '\0';
+    smp_dyn_str_set(&s_cpu_vendor, &s_cpu_vendor_len, &s_cpu_vendor_cap, vbuf, 12);
 
     if (eax >= 1) {
         cpuid(1, &eax, &ebx, &ecx, &edx);
@@ -604,22 +613,26 @@ static void verify_atomic_spinlocks(void) {
 }
 
 static void init_per_cpu_stacks(void) {
+    uint32_t ap_fallback_idx = 0;
     for (uint32_t i = 0; i < cpu_count; i++) {
-        /* Allocate a 16 KB stack for each CPU */
+        if (cpus[i].is_bsp) {
+            cpus[i].stack_base = 0x4FC000u;
+            cpus[i].stack_top = 0x500000u;
+            continue;
+        }
         void *stack = memory_map_alloc(16384, 4096);
         if (stack) {
             cpus[i].stack_base = (uint32_t)(uintptr_t)stack;
-            cpus[i].stack_top = cpus[i].stack_base + 16384;
+            cpus[i].stack_top = cpus[i].stack_base + 16384u;
         } else {
-            /* Fallback to static per-cpu offset if early memory exhausted */
-            cpus[i].stack_base = 0x500000 + i * 0x10000;
-            cpus[i].stack_top = cpus[i].stack_base + 0x10000;
+            cpus[i].stack_base = 0x500000u + ap_fallback_idx * 0x10000u;
+            cpus[i].stack_top = cpus[i].stack_base + 0x10000u;
+            ap_fallback_idx++;
         }
     }
 }
 
 static void smp_lapic_enable(void) {
-    /* 1. Ensure IA32_APIC_BASE MSR (0x1B) has bit 11 set */
     uint32_t lo, hi;
     cpu_get_msr(IA32_APIC_BASE_MSR, &lo, &hi);
     if (!(lo & APIC_BASE_ENABLE_BIT)) {
@@ -627,12 +640,10 @@ static void smp_lapic_enable(void) {
         cpu_set_msr(IA32_APIC_BASE_MSR, lo, hi);
     }
 
-    /* 2. Enable Local APIC in SVR (bit 8 = software enable, vector 0xFF) */
-    volatile uint32_t *svr = (volatile uint32_t *)(lapic_base_addr + LAPIC_SVR_REG);
+    volatile uint32_t *svr = (volatile uint32_t *)(smp_lapic_base + LAPIC_SVR_REG);
     *svr = (*svr & ~0xFFu) | 0x1FFu;
 
-    /* 3. Accept all interrupt priorities */
-    volatile uint32_t *tpr = (volatile uint32_t *)(lapic_base_addr + LAPIC_TPR_REG);
+    volatile uint32_t *tpr = (volatile uint32_t *)(smp_lapic_base + LAPIC_TPR_REG);
     *tpr = 0;
 }
 
@@ -646,51 +657,41 @@ static void smp_prepare_trampoline(void) {
     }
 }
 
-static spinlock_t s_ipi_lock = {0};
-
-void smp_send_ipi(uint32_t target_lapic_id, uint8_t vector) {
-    spin_lock(&s_ipi_lock);
-    volatile uint32_t *icr_high = (volatile uint32_t *)(lapic_base_addr + LAPIC_ICR_HIGH);
-    volatile uint32_t *icr_low  = (volatile uint32_t *)(lapic_base_addr + LAPIC_ICR_LOW);
-
-    /* Wait for any previous transmission to complete */
+static void smp_lapic_wait_icr(volatile uint32_t *icr_low) {
     uint32_t timeout = 50000;
     while ((*icr_low & (1u << 12)) && timeout > 0) {
         __builtin_ia32_pause();
         timeout--;
     }
+}
+
+static spinlock_t s_ipi_lock = {0};
+
+void smp_send_ipi(uint32_t target_lapic_id, uint8_t vector) {
+    uint32_t irq_flags = spin_lock_irqsave(&s_ipi_lock);
+    volatile uint32_t *icr_high = (volatile uint32_t *)(smp_lapic_base + LAPIC_ICR_HIGH);
+    volatile uint32_t *icr_low  = (volatile uint32_t *)(smp_lapic_base + LAPIC_ICR_LOW);
+
+    smp_lapic_wait_icr(icr_low);
 
     *icr_high = (target_lapic_id << 24);
     *icr_low  = (0x00004000u | vector);
 
-    timeout = 50000;
-    while ((*icr_low & (1u << 12)) && timeout > 0) {
-        __builtin_ia32_pause();
-        timeout--;
-    }
-    spin_unlock(&s_ipi_lock);
+    smp_lapic_wait_icr(icr_low);
+    spin_unlock_irqrestore(&s_ipi_lock, irq_flags);
 }
 
 void smp_send_broadcast_ipi(uint8_t vector) {
-    spin_lock(&s_ipi_lock);
-    volatile uint32_t *icr_low  = (volatile uint32_t *)(lapic_base_addr + LAPIC_ICR_LOW);
+    uint32_t irq_flags = spin_lock_irqsave(&s_ipi_lock);
+    volatile uint32_t *icr_low = (volatile uint32_t *)(smp_lapic_base + LAPIC_ICR_LOW);
 
-    /* Wait for any previous transmission to complete */
-    uint32_t timeout = 50000;
-    while ((*icr_low & (1u << 12)) && timeout > 0) {
-        __builtin_ia32_pause();
-        timeout--;
-    }
+    smp_lapic_wait_icr(icr_low);
 
-    /* Destination Shorthand: 11b (All excluding self: bits 18=1, 19=1 -> 0xC0000) */
+    /* Destination Shorthand 11b: all excluding self */
     *icr_low = (0x000C4000u | vector);
 
-    timeout = 50000;
-    while ((*icr_low & (1u << 12)) && timeout > 0) {
-        __builtin_ia32_pause();
-        timeout--;
-    }
-    spin_unlock(&s_ipi_lock);
+    smp_lapic_wait_icr(icr_low);
+    spin_unlock_irqrestore(&s_ipi_lock, irq_flags);
 }
 
 void smp_ipi_handler(void) {
@@ -705,7 +706,6 @@ uint32_t smp_get_ipi_count(uint32_t cpu_id) {
     return 0;
 }
 
-/* Cross-core task dispatch */
 typedef struct {
     volatile smp_task_fn_t fn;
     void *arg;
@@ -728,14 +728,14 @@ static void smp_check_and_execute_task(uint32_t cpu_id) {
 
 void smp_broadcast_task(smp_task_fn_t fn, void *arg) {
     if (!fn) return;
-    spin_lock(&s_task_lock);
+    uint32_t irq_flags = spin_lock_irqsave(&s_task_lock);
 
     if (cpu_count > s_broadcast_task.flags_cap || !s_broadcast_task.done_flags) {
         size_t new_cap = (s_broadcast_task.flags_cap == 0) ? 8 : s_broadcast_task.flags_cap;
         while (new_cap < cpu_count) new_cap *= 2;
         volatile uint8_t *new_f = (volatile uint8_t *)krealloc((void *)s_broadcast_task.done_flags, new_cap);
         if (!new_f) {
-            spin_unlock(&s_task_lock);
+            spin_unlock_irqrestore(&s_task_lock, irq_flags);
             return;
         }
         s_broadcast_task.done_flags = new_f;
@@ -747,11 +747,12 @@ void smp_broadcast_task(smp_task_fn_t fn, void *arg) {
     s_broadcast_task.arg = arg;
     __atomic_store_n(&s_broadcast_task.active, true, __ATOMIC_RELEASE);
 
-    /* Execute on BSP */
-    fn(0, arg);
-    __atomic_store_n(&s_broadcast_task.done_flags[0], 1, __ATOMIC_SEQ_CST);
+    uint32_t self_id = smp_get_current_cpu_id();
+    fn(self_id, arg);
+    if (self_id < cpu_count) {
+        __atomic_store_n(&s_broadcast_task.done_flags[self_id], 1, __ATOMIC_SEQ_CST);
+    }
 
-    /* Wait for all online APs to complete */
     uint32_t timeout = 100000;
     while (timeout > 0) {
         bool all_done = true;
@@ -768,58 +769,43 @@ void smp_broadcast_task(smp_task_fn_t fn, void *arg) {
 
     __atomic_store_n(&s_broadcast_task.active, false, __ATOMIC_RELEASE);
     s_broadcast_task.fn = NULL;
-    spin_unlock(&s_task_lock);
+    spin_unlock_irqrestore(&s_task_lock, irq_flags);
 }
 
-void smp_test_ipi(void) {
-    if (active_cpu_count <= 1) {
-        printf("SMP Test: Only 1 active CPU present, skipping cross-core IPI.\n");
-        return;
-    }
-    printf("SMP Test: Broadcasting test IPI to online secondary cores...\n");
-    smp_send_broadcast_ipi(SMP_IPI_VECTOR);
-}
-
-void ap_main(uint32_t cpu_id) {
-    if (cpu_id == 0 || cpu_id >= cpu_count) {
+static void ap_main(uint32_t cpu_id) {
+    if (cpu_id >= cpu_count || cpus[cpu_id].is_bsp) {
         while (1) { __asm__ volatile("cli; hlt"); }
     }
 
-    /* 1. Load exact BSP IDT on this core */
-    __asm__ volatile("lidt %0" : : "m"(s_bsp_idt_ptr));
+    if (!syscall_init_cpu(cpu_id)) {
+        while (1) { __asm__ volatile("cli; hlt"); }
+    }
 
-
-    /* 2. Enable Local APIC on this core */
     smp_lapic_enable();
 
-    /* Mask LINT0 and LINT1 so 8259 PIC IRQs never hit this AP */
-    volatile uint32_t *lint0 = (volatile uint32_t *)(lapic_base_addr + LAPIC_LINT0_REG);
-    volatile uint32_t *lint1 = (volatile uint32_t *)(lapic_base_addr + LAPIC_LINT1_REG);
+    /* Mask LINT0 and LINT1 so legacy 8259 PIC IRQs stay on the BSP */
+    volatile uint32_t *lint0 = (volatile uint32_t *)(smp_lapic_base + LAPIC_LINT0_REG);
+    volatile uint32_t *lint1 = (volatile uint32_t *)(smp_lapic_base + LAPIC_LINT1_REG);
     *lint0 = 0x00010000u;
     *lint1 = 0x00010000u;
 
-    /* 3. Read hardware LAPIC ID and verify against expected APIC ID */
-    volatile uint32_t *lapic_id_reg = (volatile uint32_t *)(lapic_base_addr + LAPIC_ID_REG);
-    uint32_t hw_lapic_id = (*lapic_id_reg >> 24) & 0xFF;
+    volatile uint32_t *lapic_id_reg = (volatile uint32_t *)(smp_lapic_base + LAPIC_ID_REG);
+    uint32_t hw_lapic_id = (*lapic_id_reg >> 24) & 0xFFu;
     if (cpus[cpu_id].lapic_id != hw_lapic_id) {
         while (1) { __asm__ volatile("cli; hlt"); }
     }
 
-    /* 4. Mark online and atomically increment active core counter */
     cpus[cpu_id].is_online = true;
     __atomic_fetch_add(&active_cpu_count, 1, __ATOMIC_SEQ_CST);
 
-    /* 5. Check in with BSP */
     *(volatile uint32_t *)SMP_BOOT_DONE_ADDR = 1;
     __atomic_store_n(&smp_ap_boot_done, 1, __ATOMIC_SEQ_CST);
 
     serial_printf("[smp] AP core %u online (LAPIC ID=%u, stack=0x%x)\n",
                   cpu_id, hw_lapic_id, cpus[cpu_id].stack_top);
 
-    /* 6. Enable interrupts so this core can receive IPIs */
     __asm__ volatile("sti");
 
-    /* 7. AP worker / diagnostic loop */
     while (smp_running) {
         __atomic_fetch_add(&cpus[cpu_id].ticks, 1, __ATOMIC_RELAXED);
 
@@ -842,65 +828,47 @@ static bool smp_boot_ap(uint32_t cpu_id) {
 
     *(volatile uint32_t *)SMP_BOOT_STACK_ADDR = cpus[cpu_id].stack_top;
     *(volatile uint32_t *)SMP_BOOT_CPUID_ADDR = cpu_id;
-    *(volatile uint32_t *)SMP_BOOT_FN_ADDR    = (uint32_t)ap_main;
+    *(volatile uint32_t *)SMP_BOOT_FN_ADDR    = (uint32_t)(uintptr_t)ap_main;
     *(volatile uint32_t *)SMP_BOOT_DONE_ADDR  = 0;
     smp_ap_boot_done = 0;
 
     serial_printf("[smp] Booting AP core %u (LAPIC ID=%u, stack=0x%x)...\n",
                   cpu_id, target_lapic, cpus[cpu_id].stack_top);
 
-    volatile uint32_t *icr_high = (volatile uint32_t *)(lapic_base_addr + LAPIC_ICR_HIGH);
-    volatile uint32_t *icr_low  = (volatile uint32_t *)(lapic_base_addr + LAPIC_ICR_LOW);
+    volatile uint32_t *icr_high = (volatile uint32_t *)(smp_lapic_base + LAPIC_ICR_HIGH);
+    volatile uint32_t *icr_low  = (volatile uint32_t *)(smp_lapic_base + LAPIC_ICR_LOW);
 
-    /* 1. Send INIT IPI (Assert, Level, delivery mode 101b = 0x4500) */
+    /* Assert INIT IPI */
     *icr_high = (target_lapic << 24);
     *icr_low  = 0x00004500u;
     smp_delay_us(200);
-    uint32_t wait_timeout = 50000;
-    while ((*icr_low & (1u << 12)) && wait_timeout > 0) {
-        __builtin_ia32_pause();
-        wait_timeout--;
-    }
+    smp_lapic_wait_icr(icr_low);
 
-    /* 2. Wait 10 ms */
     smp_delay_ms(10);
 
-    /* 3. De-assert INIT IPI (Level, delivery mode 101b = 0x8500) */
+    /* De-assert INIT IPI */
     *icr_high = (target_lapic << 24);
     *icr_low  = 0x00008500u;
     smp_delay_us(200);
-    wait_timeout = 50000;
-    while ((*icr_low & (1u << 12)) && wait_timeout > 0) {
-        __builtin_ia32_pause();
-        wait_timeout--;
-    }
+    smp_lapic_wait_icr(icr_low);
 
-    /* 4. First Startup IPI (vector 0x08 -> physical address 0x8000) */
+    /* First Startup IPI (vector 0x08 -> 0x8000) */
     *icr_high = (target_lapic << 24);
     *icr_low  = 0x00004608u;
     smp_delay_us(500);
-    wait_timeout = 50000;
-    while ((*icr_low & (1u << 12)) && wait_timeout > 0) {
-        __builtin_ia32_pause();
-        wait_timeout--;
-    }
+    smp_lapic_wait_icr(icr_low);
 
-    /* Wait up to 1 ms */
     for (int t = 0; t < 100; t++) {
         if (smp_ap_boot_done || *(volatile uint32_t *)SMP_BOOT_DONE_ADDR) break;
         smp_delay_us(10);
     }
 
-    /* 5. Second Startup IPI if needed */
+    /* Second Startup IPI if AP has not checked in yet */
     if (!smp_ap_boot_done && !(*(volatile uint32_t *)SMP_BOOT_DONE_ADDR)) {
         *icr_high = (target_lapic << 24);
         *icr_low  = 0x00004608u;
         smp_delay_us(500);
-        wait_timeout = 50000;
-        while ((*icr_low & (1u << 12)) && wait_timeout > 0) {
-            __builtin_ia32_pause();
-            wait_timeout--;
-        }
+        smp_lapic_wait_icr(icr_low);
 
         for (int t = 0; t < 5000; t++) {
             if (smp_ap_boot_done || *(volatile uint32_t *)SMP_BOOT_DONE_ADDR) break;
@@ -912,27 +880,23 @@ static bool smp_boot_ap(uint32_t cpu_id) {
         cpus[cpu_id].is_online = true;
         serial_printf("[smp] AP core %u successfully booted and verified ONLINE\n", cpu_id);
         return true;
-    } else {
-        serial_printf("[smp] AP core %u timed out during INIT-SIPI-SIPI sequence\n", cpu_id);
-        return false;
     }
+
+    serial_printf("[smp] AP core %u timed out during INIT-SIPI-SIPI sequence\n", cpu_id);
+    return false;
 }
 
 void smp_init(void) {
     cpu_count = 0;
-    active_cpu_count = 1; /* BSP always active */
+    active_cpu_count = 1;
 
-    /* 1. Dynamically probe CPU capabilities & atomic primitives */
     probe_cpuid_capabilities();
     verify_atomic_spinlocks();
 
-    /* 2. Try ACPI MADT enumeration */
     if (!parse_acpi_madt()) {
         arch_status.acpi_madt_enumeration = SMP_STATUS_INACTIVE;
-        /* Fallback to MP Table */
         if (!parse_mp_table()) {
             arch_status.mp_table_fallback = SMP_STATUS_INACTIVE;
-            /* Fallback to CPUID */
             detect_via_cpuid();
         }
     } else {
@@ -940,24 +904,24 @@ void smp_init(void) {
     }
 
     if (cpu_count == 0) {
-        /* Default single-core fallback */
         smp_add_cpu(0, true);
     }
 
-    /* 3. Initialize & dynamically verify per-CPU stacks */
     init_per_cpu_stacks();
     verify_per_cpu_stacks();
 
-    /* 4. Enable Local APIC on BSP and capture BSP IDTR */
-    smp_lapic_enable();
-    __asm__ volatile("sidt %0" : "=m"(s_bsp_idt_ptr));
+    if (!syscall_prepare_cpu_exceptions(cpu_count)) {
+        serial_printf("[smp] Failed to install per-CPU exception task gates\n");
+        return;
+    }
 
-    /* 5. Prepare AP trampoline at 0x8000 */
+    smp_lapic_enable();
     smp_prepare_trampoline();
 
-    /* 6. Boot AP cores (cores 1..cpu_count-1) */
-    for (uint32_t i = 1; i < cpu_count; i++) {
-        smp_boot_ap(i);
+    for (uint32_t i = 0; i < cpu_count; i++) {
+        if (!cpus[i].is_bsp) {
+            smp_boot_ap(i);
+        }
     }
 
     /* Recount active CPUs */
@@ -1009,9 +973,9 @@ const cpu_info_t *smp_get_cpu_info(uint32_t cpu_id) {
 }
 
 uint32_t smp_get_current_cpu_id(void) {
-    if (lapic_base_addr) {
-        volatile uint32_t *lapic_id_reg = (volatile uint32_t *)(lapic_base_addr + LAPIC_ID_REG);
-        uint32_t hw_id = (*lapic_id_reg >> 24) & 0xFF;
+    if (smp_lapic_base) {
+        volatile uint32_t *lapic_id_reg = (volatile uint32_t *)(smp_lapic_base + LAPIC_ID_REG);
+        uint32_t hw_id = (*lapic_id_reg >> 24) & 0xFFu;
         for (uint32_t i = 0; i < cpu_count; i++) {
             if (cpus[i].lapic_id == hw_id) return cpus[i].cpu_id;
         }
@@ -1024,14 +988,14 @@ const smp_architecture_status_t *smp_get_architecture_status(void) {
 }
 
 uint32_t smp_get_lapic_base(void) {
-    return lapic_base_addr;
+    return smp_lapic_base;
 }
 
 void smp_print_summary(void) {
     serial_printf("=== SMP Architectural & Capability Report ===\n");
     serial_printf("  Detected CPUs:             %u\n", cpu_count);
     serial_printf("  Active CPUs:               %u\n", active_cpu_count);
-    serial_printf("  LAPIC Base:                0x%x\n", lapic_base_addr);
+    serial_printf("  LAPIC Base:                0x%x\n", smp_lapic_base);
     serial_printf("  Subsystem Status:\n");
 
     /* CPU Capability */
@@ -1123,17 +1087,20 @@ void smp_get_cpu_vendor(char *buf, size_t max_len) {
         buf[max_len - 1] = '\0';
         return;
     }
+    if (s_cpu_vendor && s_cpu_vendor[0]) {
+        strncpy(buf, s_cpu_vendor, max_len - 1);
+        buf[max_len - 1] = '\0';
+        return;
+    }
     uint32_t eax, ebx, ecx, edx;
     cpuid(0, &eax, &ebx, &ecx, &edx);
-    char *vendor = (char *)kmalloc(16);
-    if (!vendor) return;
-    *(uint32_t *)(vendor + 0) = ebx;
-    *(uint32_t *)(vendor + 4) = edx;
-    *(uint32_t *)(vendor + 8) = ecx;
+    char vendor[13];
+    memcpy(vendor + 0, &ebx, 4);
+    memcpy(vendor + 4, &edx, 4);
+    memcpy(vendor + 8, &ecx, 4);
     vendor[12] = '\0';
     strncpy(buf, vendor[0] ? vendor : "Unknown", max_len - 1);
     buf[max_len - 1] = '\0';
-    kfree(vendor);
 }
 
 void smp_get_cpu_brand(char *buf, size_t max_len) {
@@ -1148,25 +1115,19 @@ void smp_get_cpu_brand(char *buf, size_t max_len) {
     uint32_t eax, ebx, ecx, edx;
     cpuid(0x80000000u, &eax, &ebx, &ecx, &edx);
     if (eax >= 0x80000004u) {
-        size_t brand_sz = 64;
-        char *brand = (char *)kmalloc(brand_sz);
-        if (brand) {
-            memset(brand, 0, brand_sz);
-            cpuid(0x80000002u, (uint32_t *)(brand + 0),  (uint32_t *)(brand + 4),  (uint32_t *)(brand + 8),  (uint32_t *)(brand + 12));
-            cpuid(0x80000003u, (uint32_t *)(brand + 16), (uint32_t *)(brand + 20), (uint32_t *)(brand + 24), (uint32_t *)(brand + 28));
-            cpuid(0x80000004u, (uint32_t *)(brand + 32), (uint32_t *)(brand + 36), (uint32_t *)(brand + 40), (uint32_t *)(brand + 44));
-            brand[48] = '\0';
+        char brand[49];
+        memset(brand, 0, sizeof(brand));
+        cpuid(0x80000002u, (uint32_t *)(brand + 0),  (uint32_t *)(brand + 4),  (uint32_t *)(brand + 8),  (uint32_t *)(brand + 12));
+        cpuid(0x80000003u, (uint32_t *)(brand + 16), (uint32_t *)(brand + 20), (uint32_t *)(brand + 24), (uint32_t *)(brand + 28));
+        cpuid(0x80000004u, (uint32_t *)(brand + 32), (uint32_t *)(brand + 36), (uint32_t *)(brand + 40), (uint32_t *)(brand + 44));
+        brand[48] = '\0';
 
-            /* Trim leading whitespace from CPU brand string */
-            const char *p = brand;
-            while (*p == ' ' || *p == '\t') p++;
-            if (*p != '\0') {
-                strncpy(buf, p, max_len - 1);
-                buf[max_len - 1] = '\0';
-                kfree(brand);
-                return;
-            }
-            kfree(brand);
+        const char *p = brand;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p != '\0') {
+            strncpy(buf, p, max_len - 1);
+            buf[max_len - 1] = '\0';
+            return;
         }
     }
 

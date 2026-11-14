@@ -2,24 +2,26 @@
 #include <net/tcp.h>
 #include <net/dns.h>
 #include <net/net.h>
+#include <driver/net/rtl8139.h>
 #include <system/timer.h>
 #include <system/state.h>
 #include <driver/input/keyboard.h>
 #include <driver/input/keymap/keymap.h>
+#include <vga.h>
+#include <wm.h>
 #include <memory/kmalloc.h>
 #include <ioport.h>
 #include <syscall.h>
 #include <string.h>
 #include <stdio.h>
 
-#define SOCKET_TABLE_INITIAL_CAP 16
-
 static socket_t **sock_table = NULL;
 static size_t     sock_table_cap = 0;
 
 void socket_subsystem_init(void) {
     if (!sock_table) {
-        sock_table_cap = SOCKET_TABLE_INITIAL_CAP;
+        sock_table_cap = rtl8139_get_hw_socket_capacity();
+        if (sock_table_cap == 0) sock_table_cap = 1;
         sock_table = (socket_t **)kmalloc(sizeof(socket_t *) * sock_table_cap);
         if (sock_table) {
             memset(sock_table, 0, sizeof(socket_t *) * sock_table_cap);
@@ -27,34 +29,43 @@ void socket_subsystem_init(void) {
     }
 }
 
+static bool socket_poll_interrupted(void) {
+    if (system_is_interrupted()) {
+        return true;
+    }
+    if (!keyboard_is_app_input_mode() && !wm_session_active() && !vga_is_graphics_mode()) {
+        keyboard_poll();
+        uint8_t sc = keyboard_get_scancode();
+        if (sc == 0x01 || sc == 0x10 || (sc == 0x2E && keyboard_is_ctrl_pressed())) {
+            system_request_interrupt();
+            return true;
+        }
+    }
+    return false;
+}
+
 static socket_t *alloc_socket(void) {
     socket_subsystem_init();
     if (!sock_table) return NULL;
 
-    /* 1. Look for free slot */
+    size_t idx = sock_table_cap;
     for (size_t i = 0; i < sock_table_cap; i++) {
         if (!sock_table[i]) {
-            socket_t *s = (socket_t *)kmalloc(sizeof(socket_t));
-            if (!s) return NULL;
-            memset(s, 0, sizeof(socket_t));
-            s->fd = (int)(i + 1);
-            s->in_use = true;
-            dyn_str_init(&s->remote_endpoint_str, NULL);
-            sock_table[i] = s;
-            return s;
+            idx = i;
+            break;
         }
     }
 
-    /* 2. Dynamically expand socket table if all slots are occupied */
-    size_t new_cap = sock_table_cap * 2;
-    socket_t **new_table = (socket_t **)krealloc(sock_table, sizeof(socket_t *) * new_cap);
-    if (!new_table) return NULL;
+    if (idx == sock_table_cap) {
+        if (sock_table_cap > SIZE_MAX / (2u * sizeof(socket_t *))) return NULL;
+        size_t new_cap = sock_table_cap * 2;
+        socket_t **new_table = (socket_t **)krealloc(sock_table, sizeof(socket_t *) * new_cap);
+        if (!new_table) return NULL;
 
-    memset(new_table + sock_table_cap, 0, sizeof(socket_t *) * (new_cap - sock_table_cap));
-    sock_table = new_table;
-
-    size_t idx = sock_table_cap;
-    sock_table_cap = new_cap;
+        memset(new_table + sock_table_cap, 0, sizeof(socket_t *) * (new_cap - sock_table_cap));
+        sock_table = new_table;
+        sock_table_cap = new_cap;
+    }
 
     socket_t *s = (socket_t *)kmalloc(sizeof(socket_t));
     if (!s) return NULL;
@@ -63,7 +74,6 @@ static socket_t *alloc_socket(void) {
     s->in_use = true;
     dyn_str_init(&s->remote_endpoint_str, NULL);
     sock_table[idx] = s;
-
     return s;
 }
 
@@ -110,9 +120,7 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 
     /* If port is 0, assign dynamic ephemeral port */
     if (s->bound_port == 0) {
-        static uint16_t ephem = 49152;
-        s->bound_port = ephem++;
-        if (ephem > 65000) ephem = 49152;
+        s->bound_port = tcp_alloc_ephemeral_port();
     }
 
     serial_printf("[socket] Bound socket %d to IP %x, port %u\n",
@@ -123,10 +131,15 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 int listen(int sockfd, int backlog) {
     socket_t *s = get_socket(sockfd);
     if (!s) return -1;
+    if (s->tcb && s->tcb->state != TCP_STATE_CLOSED && s->tcb->state != TCP_STATE_LISTEN) {
+        return -1;
+    }
+
+    uint16_t hw_mss = rtl8139_get_hw_mss();
 
     /* Allocate or re-use TCB */
     if (!s->tcb) {
-        s->tcb = tcp_alloc_tcb();
+        s->tcb = tcp_alloc_tcb(hw_mss, 1000u, 8000u, 5u, 2000u);
         if (!s->tcb) return -1;
     }
 
@@ -157,14 +170,7 @@ int accept_timeout(int sockfd, struct sockaddr *addr, socklen_t *addrlen, uint32
 
     /* Wait for completed connection in listener's backlog queue */
     while (s->tcb->next_pending == NULL) {
-        /* Check if user requested stop (ESC, 'q', Ctrl+C) */
-        if (system_is_interrupted()) {
-            return -1;
-        }
-        keyboard_poll();
-        uint8_t sc = keyboard_get_scancode();
-        if (sc == 0x01 || sc == 0x10 || (sc == 0x2E && keyboard_is_ctrl_pressed())) {
-            system_request_interrupt();
+        if (socket_poll_interrupted()) {
             return -1;
         }
 
@@ -172,7 +178,7 @@ int accept_timeout(int sockfd, struct sockaddr *addr, socklen_t *addrlen, uint32
 
         if (timeout_ms != 0xFFFFFFFFu) {
             if (timeout_ms == 0 || (timer_millis() - start_ms >= timeout_ms)) {
-                return -1; /* Timed out or non-blocking */
+                return -1;
             }
         }
 
@@ -201,7 +207,7 @@ int accept_timeout(int sockfd, struct sockaddr *addr, socklen_t *addrlen, uint32
     client_sock->tcb = child;
     child->sock = client_sock;
 
-    char ip_str[64];
+    char ip_str[32];
     ip_to_str(child->remote_ip, ip_str, sizeof(ip_str));
     dyn_str_set(&client_sock->remote_endpoint_str, ip_str);
 
@@ -229,13 +235,17 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     if (!s || !addr || addrlen < sizeof(struct sockaddr_in)) {
         return -1;
     }
+    if (s->tcb && s->tcb->state != TCP_STATE_CLOSED) {
+        return -1;
+    }
 
     const struct sockaddr_in *in = (const struct sockaddr_in *)addr;
     ip4_addr_t remote_ip = ntohl(in->sin_addr.s_addr);
     uint16_t remote_port = ntohs(in->sin_port);
+    uint16_t hw_mss = rtl8139_get_hw_mss();
 
     if (!s->tcb) {
-        s->tcb = tcp_alloc_tcb();
+        s->tcb = tcp_alloc_tcb(hw_mss, 1000u, 8000u, 5u, 2000u);
         if (!s->tcb) return -1;
     }
 
@@ -243,30 +253,23 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     s->tcb->local_ip = s->bound_ip;
     s->tcb->local_port = s->bound_port;
 
-    int res = tcp_active_open(s->tcb, remote_ip, remote_port);
+    int res = tcp_active_open(s->tcb, remote_ip, remote_port, hw_mss, 1000u, 8000u, 5u, 2000u);
     if (res < 0) return -1;
 
     /* Wait for handshake to complete (timeout: 5 seconds) */
     uint32_t start = timer_millis();
     while (s->tcb->state != TCP_STATE_ESTABLISHED) {
-        if (system_is_interrupted()) {
-            tcp_abort(s->tcb);
-            return -1;
-        }
-        keyboard_poll();
-        uint8_t sc = keyboard_get_scancode();
-        if (sc == 0x01 || sc == 0x10 || (sc == 0x2E && keyboard_is_ctrl_pressed())) {
-            system_request_interrupt();
+        if (socket_poll_interrupted()) {
             tcp_abort(s->tcb);
             return -1;
         }
         net_poll();
         if (s->tcb->state == TCP_STATE_CLOSED) {
-            return -1; /* Connection refused or reset */
+            return -1;
         }
         if (timer_millis() - start > 5000) {
             tcp_abort(s->tcb);
-            return -1; /* Connection timed out */
+            return -1;
         }
         ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
         io_wait();
@@ -318,34 +321,45 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
 
         /* TCP sliding-window flow control */
         uint32_t wait_start = timer_millis();
-        uint32_t wnd = s->tcb->snd_wnd ? s->tcb->snd_wnd : 1460;
+        uint16_t cur_mss = s->tcb->mss ? s->tcb->mss : rtl8139_get_hw_mss();
+        size_t max_tx_cap = s->tcb->max_tx_buf ? s->tcb->max_tx_buf : (rtl8139_get_hw_rx_ring_size() * 2u);
+        uint32_t wnd = s->tcb->snd_wnd ? s->tcb->snd_wnd : cur_mss;
         if ((flags & 0x40 /* MSG_DONTWAIT */) &&
-            ((s->tcb->tx_buf.size >= 16384) || ((s->tcb->snd_nxt - s->tcb->snd_una) >= wnd))) {
+            ((s->tcb->tx_buf.size >= max_tx_cap) || ((s->tcb->snd_nxt - s->tcb->snd_una) >= wnd))) {
             return (total_sent > 0) ? (ssize_t)total_sent : -1;
         }
 
-        while ((s->tcb->tx_buf.size >= 16384) || ((s->tcb->snd_nxt - s->tcb->snd_una) >= wnd)) {
+        while ((s->tcb->tx_buf.size >= max_tx_cap) || ((s->tcb->snd_nxt - s->tcb->snd_una) >= wnd)) {
             if (s->tcb->state != TCP_STATE_ESTABLISHED && s->tcb->state != TCP_STATE_CLOSE_WAIT) {
                 return (total_sent > 0) ? (ssize_t)total_sent : -1;
             }
             if (system_is_interrupted() || (timer_millis() - wait_start > 15000)) {
-                break;
+                return (total_sent > 0) ? (ssize_t)total_sent : -1;
             }
             net_poll();
-            wnd = s->tcb->snd_wnd ? s->tcb->snd_wnd : 1460;
+            wnd = s->tcb->snd_wnd ? s->tcb->snd_wnd : cur_mss;
             ipo_syscall(IPO_SYSCALL_PROCESS_YIELD, 0, NULL);
             io_wait();
         }
 
         size_t chunk = len - total_sent;
-        if (chunk > 1460) chunk = 1460;
+        if (chunk > cur_mss) chunk = cur_mss;
+        uint32_t in_flight = s->tcb->snd_nxt - s->tcb->snd_una;
+        if (s->tcb->snd_wnd > 0 && wnd > in_flight && chunk > (size_t)(wnd - in_flight)) {
+            chunk = (size_t)(wnd - in_flight);
+        }
 
         /* Append chunk to retransmission queue */
         if (!dyn_buf_append(&s->tcb->tx_buf, src + total_sent, chunk)) {
             break;
         }
 
-        int sent = tcp_send_segment(s->tcb, TCP_FLAG_ACK | TCP_FLAG_PSH, src + total_sent, (uint16_t)chunk);
+        int sent = tcp_send_segment(s->tcb, TCP_FLAG_ACK | TCP_FLAG_PSH, src + total_sent, (uint16_t)chunk,
+                                    cur_mss,
+                                    s->tcb->default_rto_ms ? s->tcb->default_rto_ms : 1000u,
+                                    s->tcb->max_rto_ms ? s->tcb->max_rto_ms : 8000u,
+                                    s->tcb->max_retries ? s->tcb->max_retries : 5u,
+                                    s->tcb->time_wait_duration_ms ? s->tcb->time_wait_duration_ms : 2000u);
         if (sent < 0) {
             if (s->tcb->tx_buf.size >= chunk) {
                 s->tcb->tx_buf.size -= chunk;
@@ -360,26 +374,38 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
     return (ssize_t)total_sent;
 }
 
+static ssize_t socket_pop_rx(socket_t *s, void *buf, size_t len, int flags) {
+    if (flags & 0x02 /* MSG_PEEK */) {
+        size_t peek_len = (len < s->tcb->rx_buf.size) ? len : s->tcb->rx_buf.size;
+        if (peek_len > 0 && s->tcb->rx_buf.data) {
+            memcpy(buf, s->tcb->rx_buf.data, peek_len);
+        }
+        return (ssize_t)peek_len;
+    }
+    size_t consumed = dyn_buf_consume(&s->tcb->rx_buf, buf, len);
+    uint32_t max_wnd = s->tcb->max_rcv_wnd ? s->tcb->max_rcv_wnd : rtl8139_get_hw_max_window();
+    uint32_t half_wnd = max_wnd >> 1;
+    if (s->tcb->rcv_wnd < half_wnd) {
+        uint32_t new_wnd = (s->tcb->rx_buf.size < max_wnd) ? (max_wnd - (uint32_t)s->tcb->rx_buf.size) : 0;
+        if (new_wnd > s->tcb->rcv_wnd) {
+            s->tcb->rcv_wnd = new_wnd;
+            tcp_send_ack(s->tcb);
+        }
+    }
+    return (ssize_t)consumed;
+}
+
 ssize_t recv(int sockfd, void *buf, size_t len, int flags) {
     socket_t *s = get_socket(sockfd);
     if (!s || !s->tcb || !buf || len == 0) return -1;
 
-    /* If data is available in self-expanding dynamic rx_buf, return it immediately */
+    if (s->tcb->rx_buf.size == 0) {
+        net_poll();
+    }
+
+    /* Return data immediately if already buffered in rx_buf */
     if (s->tcb->rx_buf.size > 0) {
-        if (flags & 0x02 /* MSG_PEEK */) {
-            size_t peek_len = (len < s->tcb->rx_buf.size) ? len : s->tcb->rx_buf.size;
-            memcpy(buf, s->tcb->rx_buf.data, peek_len);
-            return (ssize_t)peek_len;
-        }
-        size_t consumed = dyn_buf_consume(&s->tcb->rx_buf, buf, len);
-        if (s->tcb->rcv_wnd < 32768) {
-            uint32_t new_wnd = (s->tcb->rx_buf.size < 65535) ? (65535 - s->tcb->rx_buf.size) : 0;
-            if (new_wnd > s->tcb->rcv_wnd) {
-                s->tcb->rcv_wnd = new_wnd;
-                tcp_send_ack(s->tcb);
-            }
-        }
-        return (ssize_t)consumed;
+        return socket_pop_rx(s, buf, len, flags);
     }
 
     /* If non-blocking requested and no data available */
@@ -401,33 +427,14 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags) {
 
     /* Wait for data or EOF */
     while (s->tcb->rx_buf.size == 0) {
-        if (system_is_interrupted()) {
-            return -1;
-        }
-        keyboard_poll();
-        uint8_t sc = keyboard_get_scancode();
-        if (sc == 0x01 || sc == 0x10 || (sc == 0x2E && keyboard_is_ctrl_pressed())) {
-            system_request_interrupt();
+        if (socket_poll_interrupted()) {
             return -1;
         }
 
         net_poll();
 
         if (s->tcb->rx_buf.size > 0) {
-            if (flags & 0x02 /* MSG_PEEK */) {
-                size_t peek_len = (len < s->tcb->rx_buf.size) ? len : s->tcb->rx_buf.size;
-                memcpy(buf, s->tcb->rx_buf.data, peek_len);
-                return (ssize_t)peek_len;
-            }
-            size_t consumed = dyn_buf_consume(&s->tcb->rx_buf, buf, len);
-            if (s->tcb->rcv_wnd < 32768) {
-                uint32_t new_wnd = (s->tcb->rx_buf.size < 65535) ? (65535 - s->tcb->rx_buf.size) : 0;
-                if (new_wnd > s->tcb->rcv_wnd) {
-                    s->tcb->rcv_wnd = new_wnd;
-                    tcp_send_ack(s->tcb);
-                }
-            }
-            return (ssize_t)consumed;
+            return socket_pop_rx(s, buf, len, flags);
         }
 
         if (s->tcb->state == TCP_STATE_CLOSE_WAIT ||
@@ -448,9 +455,13 @@ int socket_close(int sockfd) {
     if (!s) return -1;
 
     if (s->tcb) {
-        tcp_close(s->tcb);
-        s->tcb->sock = NULL;
+        tcp_tcb_t *tcb = s->tcb;
         s->tcb = NULL;
+        tcb->sock = NULL;
+        tcp_close(tcb);
+        if (tcb->state == TCP_STATE_CLOSED) {
+            tcp_free_tcb(tcb);
+        }
     }
 
     dyn_str_free(&s->remote_endpoint_str);

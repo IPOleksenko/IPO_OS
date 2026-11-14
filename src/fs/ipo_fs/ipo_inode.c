@@ -1,4 +1,5 @@
 #include <file_system/ipo_fs.h>
+#include <memory/kmalloc.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -41,160 +42,75 @@ static bool find_dynamic_inode_location(uint64_t inode_no, uint64_t *out_block, 
     return false;
 }
 
+static bool locate_inode_slot(uint64_t inode_no, uint64_t *out_block, uint32_t *out_offset) {
+    if (inode_no == 0 || inode_no > sb.inode_count) {
+        return false;
+    }
+    if (inode_no <= sb.primary_inodes) {
+        uint64_t idx = inode_no - 1;
+        *out_block = sb.inode_table_start + (idx / INODES_PER_BLOCK);
+        *out_offset = (uint32_t)((idx % INODES_PER_BLOCK) * INODE_SIZE);
+        return true;
+    }
+    return find_dynamic_inode_location(inode_no, out_block, out_offset);
+}
+
 bool read_inode(uint64_t inode_no, struct ipo_inode *out) {
-    if (inode_no == 0 || inode_no > sb.inode_count || !out) {
+    if (!out) return false;
+    uint64_t block = 0;
+    uint32_t offset = 0;
+    if (!locate_inode_slot(inode_no, &block, &offset)) {
+        if (inode_no > sb.primary_inodes && inode_no <= sb.inode_count) {
+            serial_printf("[ipo_fs] read_inode(%llu) failed: dynamic inode not found in chunks\n", inode_no);
+        }
         return false;
     }
 
-    uint64_t block = 0;
-    uint32_t offset = 0;
-
-    if (inode_no <= sb.primary_inodes) {
-        uint64_t idx = inode_no - 1; /* 1-based */
-        block = sb.inode_table_start + (idx / INODES_PER_BLOCK);
-        offset = (uint32_t)((idx % INODES_PER_BLOCK) * INODE_SIZE);
-    } else {
-        if (!find_dynamic_inode_location(inode_no, &block, &offset)) {
-            serial_printf("[ipo_fs] read_inode(%llu) failed: dynamic inode not found in chunks\n", inode_no);
-            return false;
-        }
-    }
-
-    uint8_t buf[IPO_FS_BLOCK_SIZE];
+    uint8_t *buf = (uint8_t *)kmalloc(IPO_FS_BLOCK_SIZE);
+    if (!buf) return false;
     if (!block_read(block, buf)) {
         serial_printf("[ipo_fs] read_inode(%llu) failed: block_read(%llu) failed\n", inode_no, block);
+        kfree(buf);
         return false;
     }
     memcpy(out, buf + offset, sizeof(*out));
+    kfree(buf);
     return true;
 }
 
 bool write_inode(uint64_t inode_no, const struct ipo_inode *in) {
-    if (inode_no == 0 || inode_no > sb.inode_count || !in) {
-        return false;
-    }
-
+    if (!in) return false;
     uint64_t block = 0;
     uint32_t offset = 0;
-
-    if (inode_no <= sb.primary_inodes) {
-        uint64_t idx = inode_no - 1;
-        block = sb.inode_table_start + (idx / INODES_PER_BLOCK);
-        offset = (uint32_t)((idx % INODES_PER_BLOCK) * INODE_SIZE);
-    } else {
-        if (!find_dynamic_inode_location(inode_no, &block, &offset)) {
-            return false;
-        }
-    }
-
-    uint8_t buf[IPO_FS_BLOCK_SIZE];
-    if (!block_read(block, buf)) return false;
-    memcpy(buf + offset, in, sizeof(*in));
-    return block_write(block, buf);
-}
-
-int64_t allocate_contiguous_blocks(uint32_t count) {
-    if (count == 0 || sb.fs_size_blocks <= sb.data_blocks_start) {
-        ipo_fs_set_last_error(IPO_FS_ERR_NO_SPACE);
-        return -1;
-    }
-    uint64_t data_blocks_total = sb.fs_size_blocks - sb.data_blocks_start;
-    if (count > data_blocks_total) {
-        ipo_fs_set_last_error(IPO_FS_ERR_NO_SPACE);
-        return -1;
-    }
-
-    uint64_t bitmap_blocks = (data_blocks_total + (IPO_FS_BLOCK_SIZE * 8) - 1) / (IPO_FS_BLOCK_SIZE * 8);
-    uint8_t buf[IPO_FS_BLOCK_SIZE];
-
-    uint64_t current_streak = 0;
-    uint64_t streak_start_bit = 0;
-
-    for (uint64_t b = 0; b < bitmap_blocks; b++) {
-        uint64_t lba = sb.block_bitmap_start + b;
-        if (!block_read(lba, buf)) {
-            current_streak = 0;
-            continue;
-        }
-
-        uint32_t *words = (uint32_t *)buf;
-        int num_words = IPO_FS_BLOCK_SIZE / sizeof(uint32_t);
-
-        for (int w = 0; w < num_words; w++) {
-            uint32_t word = words[w];
-            if (word == 0xFFFFFFFFu) {
-                current_streak = 0;
-                continue;
-            }
-            for (int bit = 0; bit < 32; bit++) {
-                uint64_t bit_idx = (b * IPO_FS_BLOCK_SIZE * 8) + (w * 32) + bit;
-                if (bit_idx >= data_blocks_total) {
-                    ipo_fs_set_last_error(IPO_FS_ERR_NO_SPACE);
-                    return -1;
-                }
-                if ((word & (1u << bit)) == 0) {
-                    if (current_streak == 0) {
-                        streak_start_bit = bit_idx;
-                    }
-                    current_streak++;
-                    if (current_streak == count) {
-                        /* Mark bits as allocated */
-                        for (uint64_t i = 0; i < count; i++) {
-                            if (!bitmap_set(sb.block_bitmap_start, streak_start_bit + i, true)) {
-                                for (uint64_t r = 0; r < i; r++) {
-                                    bitmap_set(sb.block_bitmap_start, streak_start_bit + r, false);
-                                }
-                                ipo_fs_set_last_error(IPO_FS_ERR_IO);
-                                return -1;
-                            }
-                        }
-                        /* Zero allocated blocks */
-                        uint64_t phys_start = sb.data_blocks_start + streak_start_bit;
-                        static uint8_t zero_block[IPO_FS_BLOCK_SIZE];
-                        memset(zero_block, 0, sizeof(zero_block));
-                        for (uint64_t i = 0; i < count; i++) {
-                            if (!block_write(phys_start + i, zero_block)) {
-                                for (uint64_t r = 0; r < count; r++) {
-                                    bitmap_set(sb.block_bitmap_start, streak_start_bit + r, false);
-                                }
-                                ipo_fs_set_last_error(IPO_FS_ERR_IO);
-                                return -1;
-                            }
-                        }
-                        return (int64_t)phys_start;
-                    }
-                } else {
-                    current_streak = 0;
-                }
-            }
-        }
-    }
-    ipo_fs_set_last_error(IPO_FS_ERR_NO_SPACE);
-    return -1;
-}
-
-int64_t allocate_block(void) {
-    return allocate_contiguous_blocks(1);
-}
-
-bool free_block(uint64_t phys_block) {
-    if (phys_block < sb.data_blocks_start || phys_block >= sb.fs_size_blocks) {
+    if (!locate_inode_slot(inode_no, &block, &offset)) {
         return false;
     }
-    uint64_t i = phys_block - sb.data_blocks_start;
-    return bitmap_set(sb.block_bitmap_start, i, false);
+
+    uint8_t *buf = (uint8_t *)kmalloc(IPO_FS_BLOCK_SIZE);
+    if (!buf) return false;
+    if (!block_read(block, buf)) {
+        kfree(buf);
+        return false;
+    }
+    memcpy(buf + offset, in, sizeof(*in));
+    bool ok = block_write(block, buf);
+    kfree(buf);
+    return ok;
 }
 
 static int64_t expand_and_allocate_inode(void) {
     uint64_t target_node_blk = 0;
+    uint64_t prev_node_blk = 0;
     struct ipo_inode_chunk_node target_node;
+    struct ipo_inode_chunk_node prev_node;
     memset(&target_node, 0, sizeof(target_node));
+    memset(&prev_node, 0, sizeof(prev_node));
 
     uint64_t last_chunk_end_ino = (sb.primary_inodes > 0) ? sb.primary_inodes : 0;
     bool created_new_node = false;
+    bool need_chain_link = false;
 
     if (sb.dynamic_chunk_tree == 0) {
-        /* Allocate first chunk node */
         int64_t blk = allocate_block();
         if (blk < 0) {
             ipo_fs_set_last_error(IPO_FS_ERR_NO_SPACE);
@@ -202,60 +118,40 @@ static int64_t expand_and_allocate_inode(void) {
             return -1;
         }
         target_node_blk = (uint64_t)blk;
-        target_node.count = 0;
-        target_node.flags = 0;
-        target_node.next_node = 0;
         created_new_node = true;
     } else {
         uint64_t curr = sb.dynamic_chunk_tree;
-        uint64_t prev = 0;
         while (curr != 0) {
             if (!block_read(curr, &target_node)) {
                 ipo_fs_set_last_error(IPO_FS_ERR_IO);
                 return -1;
             }
-            if (target_node.count > 0) {
+            if (target_node.count > 0 && target_node.count <= IPO_CHUNK_NODE_CHUNKS) {
                 struct ipo_inode_chunk_desc *last_c = &target_node.chunks[target_node.count - 1];
                 last_chunk_end_ino = last_c->start_inode + last_c->inode_count - 1;
             }
-            prev = curr;
+            prev_node_blk = curr;
             curr = target_node.next_node;
         }
         if (target_node.count < IPO_CHUNK_NODE_CHUNKS) {
-            target_node_blk = prev;
+            target_node_blk = prev_node_blk;
         } else {
-            /* Last chunk node is full, allocate new chained node */
             int64_t blk = allocate_block();
             if (blk < 0) {
                 ipo_fs_set_last_error(IPO_FS_ERR_NO_SPACE);
                 serial_printf("[ipo_fs] Inode expansion FAILED: cannot allocate chained chunk node (volume full)\n");
                 return -1;
             }
-            uint64_t new_node_blk = (uint64_t)blk;
-            struct ipo_inode_chunk_node new_node;
-            memset(&new_node, 0, sizeof(new_node));
-            new_node.count = 0;
-            new_node.flags = 0;
-            new_node.next_node = 0;
-            if (!block_write(new_node_blk, &new_node)) {
-                free_block(new_node_blk);
-                ipo_fs_set_last_error(IPO_FS_ERR_IO);
-                return -1;
-            }
-            target_node.next_node = new_node_blk;
-            if (!block_write(prev, &target_node)) {
-                free_block(new_node_blk);
-                ipo_fs_set_last_error(IPO_FS_ERR_IO);
-                return -1;
-            }
-            target_node_blk = new_node_blk;
-            target_node = new_node;
+            prev_node = target_node;
+            memset(&target_node, 0, sizeof(target_node));
+            target_node_blk = (uint64_t)blk;
             created_new_node = true;
+            need_chain_link = true;
         }
     }
 
-    /* Allocate blocks for the chunk table: try 16, 8, 4, 2, 1 blocks */
-    uint32_t blocks_to_alloc = 16; /* 64 inodes */
+    /* Allocate inode table blocks (16 down to 1 block) before linking metadata on disk */
+    uint32_t blocks_to_alloc = 16;
     int64_t table_phys = -1;
     while (blocks_to_alloc >= 1) {
         table_phys = allocate_contiguous_blocks(blocks_to_alloc);
@@ -264,7 +160,6 @@ static int64_t expand_and_allocate_inode(void) {
     }
 
     if (table_phys < 0) {
-        /* No space for inode table blocks: rollback new node block if allocated */
         if (created_new_node) {
             free_block(target_node_blk);
         }
@@ -280,9 +175,8 @@ static int64_t expand_and_allocate_inode(void) {
     desc->start_inode = start_inode;
     desc->table_block = (uint64_t)table_phys;
     desc->inode_count = chunk_inodes;
-    desc->free_inodes = chunk_inodes - 1; /* first inode allocated immediately */
+    desc->free_inodes = chunk_inodes - 1;
     desc->bitmap = 1ULL;
-
     target_node.count++;
 
     if (!block_write(target_node_blk, &target_node)) {
@@ -292,6 +186,17 @@ static int64_t expand_and_allocate_inode(void) {
         return -1;
     }
 
+    if (need_chain_link) {
+        prev_node.next_node = target_node_blk;
+        if (!block_write(prev_node_blk, &prev_node)) {
+            for (uint32_t b = 0; b < blocks_to_alloc; b++) free_block((uint64_t)table_phys + b);
+            free_block(target_node_blk);
+            ipo_fs_set_last_error(IPO_FS_ERR_IO);
+            return -1;
+        }
+    }
+
+    uint64_t prev_tree = sb.dynamic_chunk_tree;
     if (sb.dynamic_chunk_tree == 0) {
         sb.dynamic_chunk_tree = target_node_blk;
     }
@@ -301,6 +206,21 @@ static int64_t expand_and_allocate_inode(void) {
     sb.inode_count = sb.primary_inodes + sb.dynamic_inodes_count;
 
     if (!block_write(0, &sb)) {
+        sb.dynamic_chunk_tree = prev_tree;
+        sb.dynamic_chunks_count--;
+        sb.dynamic_inodes_count -= chunk_inodes;
+        sb.dynamic_inodes_used--;
+        sb.inode_count = sb.primary_inodes + sb.dynamic_inodes_count;
+        if (need_chain_link) {
+            prev_node.next_node = 0;
+            block_write(prev_node_blk, &prev_node);
+        } else if (!created_new_node) {
+            target_node.count--;
+            memset(&target_node.chunks[target_node.count], 0, sizeof(target_node.chunks[0]));
+            block_write(target_node_blk, &target_node);
+        }
+        for (uint32_t b = 0; b < blocks_to_alloc; b++) free_block((uint64_t)table_phys + b);
+        if (created_new_node) free_block(target_node_blk);
         ipo_fs_set_last_error(IPO_FS_ERR_IO);
         return -1;
     }
@@ -308,7 +228,6 @@ static int64_t expand_and_allocate_inode(void) {
     cached_chunk = *desc;
     cached_chunk_valid = true;
 
-    /* Zero the first inode */
     struct ipo_inode zero;
     memset(&zero, 0, sizeof(zero));
     write_inode(start_inode, &zero);
@@ -326,10 +245,14 @@ int64_t allocate_inode(void) {
         return -1;
     }
 
-    /* 1. Try primary inode bitmap */
+    /* Try primary inode bitmap */
     if (sb.primary_inodes > 0) {
         uint64_t bitmap_blocks = (sb.primary_inodes + (IPO_FS_BLOCK_SIZE * 8) - 1) / (IPO_FS_BLOCK_SIZE * 8);
-        uint8_t buf[IPO_FS_BLOCK_SIZE];
+        uint8_t *buf = (uint8_t *)kmalloc(IPO_FS_BLOCK_SIZE);
+        if (!buf) {
+            ipo_fs_set_last_error(IPO_FS_ERR_IO);
+            return -1;
+        }
 
         for (uint64_t b = 0; b < bitmap_blocks; b++) {
             uint64_t lba = sb.inode_bitmap_start + b;
@@ -346,9 +269,11 @@ int64_t allocate_inode(void) {
                             if (bit_idx < sb.primary_inodes) {
                                 words[w] |= (1u << bit);
                                 if (!block_write(lba, buf)) {
+                                    kfree(buf);
                                     ipo_fs_set_last_error(IPO_FS_ERR_IO);
                                     return -1;
                                 }
+                                kfree(buf);
 
                                 uint64_t ino = bit_idx + 1;
                                 struct ipo_inode zero;
@@ -362,9 +287,10 @@ int64_t allocate_inode(void) {
                 }
             }
         }
+        kfree(buf);
     }
 
-    /* 2. Try existing dynamic chunks */
+    /* Try existing dynamic chunks */
     if (sb.dynamic_chunk_tree != 0) {
         uint64_t curr_node_blk = sb.dynamic_chunk_tree;
         while (curr_node_blk != 0) {
@@ -399,7 +325,7 @@ int64_t allocate_inode(void) {
         }
     }
 
-    /* 3. Primary and existing chunks full: dynamically expand! */
+    /* Primary and existing chunks full: expand chunk tree */
     return expand_and_allocate_inode();
 }
 
@@ -478,7 +404,7 @@ int64_t get_contiguous_data_blocks_for_inode(struct ipo_inode *inode, uint64_t l
     if (!inode) return -1;
     if (out_count) *out_count = 1;
 
-    /* 1. Search embedded primary extents */
+    /* Search embedded primary extents */
     for (int i = 0; i < IPO_INODE_EXTENTS; i++) {
         struct ipo_extent *e = &inode->extents[i];
         if (e->block_count > 0) {
@@ -490,7 +416,7 @@ int64_t get_contiguous_data_blocks_for_inode(struct ipo_inode *inode, uint64_t l
         }
     }
 
-    /* 2. Search chained extent nodes */
+    /* Search chained extent nodes */
     uint64_t curr_node_blk = inode->next_extent_node;
     while (curr_node_blk != 0) {
         struct ipo_extent_node enode;
@@ -517,7 +443,7 @@ int64_t get_data_block_for_inode(struct ipo_inode *inode, uint64_t logical_index
     if (existing >= 0) return existing;
     if (!alloc) return -1;
 
-    /* 2. Traverse chained extent nodes to find the last node for extension */
+    /* Traverse chained extent nodes to locate the tail node */
     uint64_t curr_node_blk = inode->next_extent_node;
     uint64_t last_node_blk = 0;
     struct ipo_extent_node last_enode;
@@ -532,11 +458,10 @@ int64_t get_data_block_for_inode(struct ipo_inode *inode, uint64_t logical_index
         curr_node_blk = enode.next_node;
     }
 
-    /* 3. Allocate a new physical block */
     int64_t new_phys = allocate_block();
     if (new_phys < 0) return -1;
 
-    /* Check if we can extend the last primary extent */
+    /* Extend last primary extent if physically contiguous */
     for (int i = 0; i < IPO_INODE_EXTENTS; i++) {
         struct ipo_extent *e = &inode->extents[i];
         if (e->block_count > 0 &&
@@ -547,7 +472,6 @@ int64_t get_data_block_for_inode(struct ipo_inode *inode, uint64_t logical_index
         }
     }
 
-    /* Check if there is an empty slot in primary extents */
     for (int i = 0; i < IPO_INODE_EXTENTS; i++) {
         struct ipo_extent *e = &inode->extents[i];
         if (e->block_count == 0) {
@@ -559,29 +483,35 @@ int64_t get_data_block_for_inode(struct ipo_inode *inode, uint64_t logical_index
         }
     }
 
-    /* If last chained node can extend its last extent */
+    /* Extend or append in the last chained extent node */
     if (last_node_blk != 0 && last_enode.count > 0) {
         struct ipo_extent *last_e = &last_enode.extents[last_enode.count - 1];
         if (last_e->logical_block + last_e->block_count == logical_index &&
             last_e->physical_block + last_e->block_count == (uint64_t)new_phys) {
             last_e->block_count++;
-            block_write(last_node_blk, &last_enode);
+            if (!block_write(last_node_blk, &last_enode)) {
+                last_e->block_count--;
+                free_block((uint64_t)new_phys);
+                return -1;
+            }
             return new_phys;
         }
 
-        /* If last node has space for a new extent */
         if (last_enode.count < IPO_EXTENT_NODE_EXTENTS) {
             struct ipo_extent *new_e = &last_enode.extents[last_enode.count++];
             new_e->logical_block = logical_index;
             new_e->physical_block = (uint64_t)new_phys;
             new_e->block_count = 1;
             new_e->flags = 0;
-            block_write(last_node_blk, &last_enode);
+            if (!block_write(last_node_blk, &last_enode)) {
+                last_enode.count--;
+                free_block((uint64_t)new_phys);
+                return -1;
+            }
             return new_phys;
         }
     }
 
-    /* Need a new chained extent node block */
     int64_t new_node_blk = allocate_block();
     if (new_node_blk < 0) {
         free_block((uint64_t)new_phys);
@@ -596,11 +526,19 @@ int64_t get_data_block_for_inode(struct ipo_inode *inode, uint64_t logical_index
     new_enode.extents[0].physical_block = (uint64_t)new_phys;
     new_enode.extents[0].block_count = 1;
     new_enode.extents[0].flags = 0;
-    block_write((uint64_t)new_node_blk, &new_enode);
+    if (!block_write((uint64_t)new_node_blk, &new_enode)) {
+        free_block((uint64_t)new_node_blk);
+        free_block((uint64_t)new_phys);
+        return -1;
+    }
 
     if (last_node_blk != 0) {
         last_enode.next_node = (uint64_t)new_node_blk;
-        block_write(last_node_blk, &last_enode);
+        if (!block_write(last_node_blk, &last_enode)) {
+            free_block((uint64_t)new_node_blk);
+            free_block((uint64_t)new_phys);
+            return -1;
+        }
     } else {
         inode->next_extent_node = (uint64_t)new_node_blk;
     }
@@ -608,43 +546,175 @@ int64_t get_data_block_for_inode(struct ipo_inode *inode, uint64_t logical_index
     return new_phys;
 }
 
-bool ipo_fs_get_inode_stats(uint64_t *out_total, uint64_t *out_used, uint64_t *out_free, uint64_t *out_dynamic_chunks) {
-    if (!fs_mounted) {
-        if (out_total) *out_total = 0;
-        if (out_used) *out_used = 0;
-        if (out_free) *out_free = 0;
-        if (out_dynamic_chunks) *out_dynamic_chunks = 0;
-        return false;
+int inode_read_bytes(struct ipo_inode *inode, void *buffer, uint32_t size, uint64_t offset) {
+    if (!inode || !buffer || size == 0) return 0;
+    if (offset >= inode->size) return 0;
+    if (offset + size > inode->size) size = (uint32_t)(inode->size - offset);
+
+    uint64_t first_block = offset / IPO_FS_BLOCK_SIZE;
+    uint64_t last_block = (offset + size - 1) / IPO_FS_BLOCK_SIZE;
+    uint8_t *tmp = (uint8_t *)kmalloc(IPO_FS_BLOCK_SIZE);
+    if (!tmp) return 0;
+    uint32_t copied = 0;
+
+    uint64_t b = first_block;
+    while (b <= last_block && copied < size) {
+        uint64_t max_contig = 1;
+        int64_t phys = get_contiguous_data_blocks_for_inode(inode, b, &max_contig);
+        if (phys < 0) break;
+
+        uint64_t blocks_remaining = last_block - b + 1;
+        if (max_contig > blocks_remaining) max_contig = blocks_remaining;
+
+        uint32_t block_offset = (b == first_block) ? (uint32_t)(offset % IPO_FS_BLOCK_SIZE) : 0u;
+
+        if (block_offset != 0) {
+            if (!block_read((uint64_t)phys, tmp)) break;
+            uint32_t tocopy = IPO_FS_BLOCK_SIZE - block_offset;
+            if (tocopy > size - copied) tocopy = size - copied;
+            memcpy((uint8_t *)buffer + copied, tmp + block_offset, tocopy);
+            copied += tocopy;
+            b++;
+            continue;
+        }
+
+        uint64_t full_blocks = (size - copied) / IPO_FS_BLOCK_SIZE;
+        uint64_t batch_blocks = (max_contig < full_blocks) ? max_contig : full_blocks;
+        if (batch_blocks > 128) batch_blocks = 128;
+
+        if (batch_blocks > 0) {
+            if (!block_read_multi((uint64_t)phys, (uint16_t)batch_blocks, (uint8_t *)buffer + copied)) {
+                break;
+            }
+            copied += (uint32_t)(batch_blocks * IPO_FS_BLOCK_SIZE);
+            b += batch_blocks;
+            continue;
+        }
+
+        if (!block_read((uint64_t)phys, tmp)) break;
+        uint32_t tocopy = size - copied;
+        if (tocopy > IPO_FS_BLOCK_SIZE) tocopy = IPO_FS_BLOCK_SIZE;
+        memcpy((uint8_t *)buffer + copied, tmp, tocopy);
+        copied += tocopy;
+        b++;
     }
-
-    uint64_t total = sb.inode_count;
-    uint64_t primary_used = (sb.primary_inodes > 0) ? bitmap_count_set(sb.inode_bitmap_start, sb.primary_inodes) : 0;
-    uint64_t dynamic_used = sb.dynamic_inodes_used;
-    uint64_t used = primary_used + dynamic_used;
-    uint64_t free_cnt = (total >= used) ? (total - used) : 0;
-
-    if (out_total) *out_total = total;
-    if (out_used) *out_used = used;
-    if (out_free) *out_free = free_cnt;
-    if (out_dynamic_chunks) *out_dynamic_chunks = sb.dynamic_chunks_count;
-    return true;
+    kfree(tmp);
+    return (int)copied;
 }
 
-bool ipo_fs_get_block_stats(uint64_t *out_total, uint64_t *out_used, uint64_t *out_free) {
-    if (!fs_mounted) {
-        if (out_total) *out_total = 0;
-        if (out_used) *out_used = 0;
-        if (out_free) *out_free = 0;
-        return false;
+int inode_write_bytes(uint64_t inode_no, struct ipo_inode *inode, const void *buffer, uint32_t size, uint64_t offset) {
+    if (!inode || !buffer || size == 0) return 0;
+
+    uint64_t first_block = offset / IPO_FS_BLOCK_SIZE;
+    uint64_t last_block = (offset + size - 1) / IPO_FS_BLOCK_SIZE;
+    uint8_t *tmp = (uint8_t *)kmalloc(IPO_FS_BLOCK_SIZE);
+    if (!tmp) return 0;
+    uint32_t written = 0;
+    bool inode_dirty = false;
+
+    for (uint64_t b = first_block; b <= last_block; b++) {
+        int64_t existing = get_contiguous_data_blocks_for_inode(inode, b, NULL);
+        int64_t phys = existing;
+        if (phys < 0) {
+            phys = get_data_block_for_inode(inode, b, true);
+            if (phys < 0) break;
+            inode_dirty = true;
+        }
+        uint32_t block_offset = (b == first_block) ? (uint32_t)(offset % IPO_FS_BLOCK_SIZE) : 0u;
+        uint32_t towrite = IPO_FS_BLOCK_SIZE - block_offset;
+        if (towrite > size - written) towrite = size - written;
+
+        if (block_offset != 0 || towrite < IPO_FS_BLOCK_SIZE) {
+            if (existing < 0) {
+                memset(tmp, 0, IPO_FS_BLOCK_SIZE);
+            } else if (!block_read((uint64_t)phys, tmp)) {
+                break;
+            }
+        }
+        memcpy(tmp + block_offset, (const uint8_t *)buffer + written, towrite);
+        if (!block_write((uint64_t)phys, tmp)) break;
+        written += towrite;
     }
 
-    uint64_t data_start = sb.data_blocks_start;
-    uint64_t total = (sb.fs_size_blocks > data_start) ? (sb.fs_size_blocks - data_start) : 0;
-    uint64_t used = (total > 0) ? bitmap_count_set(sb.block_bitmap_start, total) : 0;
-    uint64_t free_cnt = (total >= used) ? (total - used) : 0;
+    kfree(tmp);
+    if (offset + written > inode->size) {
+        inode->size = offset + written;
+        inode_dirty = true;
+    }
+    if ((written > 0 || inode_dirty) && inode_no > 0) {
+        write_inode(inode_no, inode);
+    }
+    return (int)written;
+}
 
-    if (out_total) *out_total = total;
-    if (out_used) *out_used = used;
-    if (out_free) *out_free = free_cnt;
+static void trim_extent_to_blocks(struct ipo_extent *e, uint64_t keep_blocks) {
+    if (!e || e->block_count == 0) return;
+    uint64_t end = e->logical_block + e->block_count;
+    if (end <= keep_blocks) return;
+
+    if (e->logical_block >= keep_blocks) {
+        free_extent_blocks(e);
+        memset(e, 0, sizeof(*e));
+        return;
+    }
+
+    uint32_t keep_cnt = (uint32_t)(keep_blocks - e->logical_block);
+    for (uint32_t b = keep_cnt; b < e->block_count; b++) {
+        free_block(e->physical_block + b);
+    }
+    e->block_count = keep_cnt;
+}
+
+bool inode_truncate_blocks(uint64_t inode_no, struct ipo_inode *inode, uint64_t new_size) {
+    if (!inode) return false;
+    uint64_t keep_blocks = (new_size == 0) ? 0 : ((new_size + IPO_FS_BLOCK_SIZE - 1) / IPO_FS_BLOCK_SIZE);
+
+    for (int i = 0; i < IPO_INODE_EXTENTS; i++) {
+        trim_extent_to_blocks(&inode->extents[i], keep_blocks);
+    }
+
+    uint64_t curr_node_blk = inode->next_extent_node;
+    uint64_t prev_node_blk = 0;
+    struct ipo_extent_node prev_enode;
+    memset(&prev_enode, 0, sizeof(prev_enode));
+
+    while (curr_node_blk != 0) {
+        struct ipo_extent_node enode;
+        if (!block_read(curr_node_blk, &enode)) break;
+        uint64_t next_blk = enode.next_node;
+
+        uint32_t live = 0;
+        for (uint32_t i = 0; i < enode.count && i < IPO_EXTENT_NODE_EXTENTS; i++) {
+            trim_extent_to_blocks(&enode.extents[i], keep_blocks);
+            if (enode.extents[i].block_count > 0) {
+                if (live != i) {
+                    enode.extents[live] = enode.extents[i];
+                    memset(&enode.extents[i], 0, sizeof(enode.extents[i]));
+                }
+                live++;
+            }
+        }
+        enode.count = live;
+
+        if (live == 0) {
+            if (prev_node_blk == 0) {
+                inode->next_extent_node = next_blk;
+            } else {
+                prev_enode.next_node = next_blk;
+                block_write(prev_node_blk, &prev_enode);
+            }
+            free_block(curr_node_blk);
+        } else {
+            block_write(curr_node_blk, &enode);
+            prev_node_blk = curr_node_blk;
+            prev_enode = enode;
+        }
+        curr_node_blk = next_blk;
+    }
+
+    inode->size = new_size;
+    if (inode_no > 0) {
+        return write_inode(inode_no, inode);
+    }
     return true;
 }

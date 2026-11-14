@@ -252,14 +252,15 @@ static int ipc_pipe_open(const char *user_name, uint32_t rights) {
         spin_unlock(&ipc_stream_lock);
         return IPO_IPC_ERR_NOT_FOUND;
     }
-    if ((rights & pipe->public_rights) != rights) {
-        spin_unlock(&ipc_stream_lock);
-        return IPO_IPC_ERR_PERMISSION;
-    }
     if (pipe->owner_pid == proc->pid) {
+        pipe->owner_rights |= rights;
         uint32_t id = pipe->id;
         spin_unlock(&ipc_stream_lock);
         return (int)id;
+    }
+    if ((rights & pipe->public_rights) != rights) {
+        spin_unlock(&ipc_stream_lock);
+        return IPO_IPC_ERR_PERMISSION;
     }
 
     ipc_pipe_client_t *free_client = NULL;
@@ -716,55 +717,46 @@ void ipc_stream_process_terminated(uint32_t pid) {
     spin_unlock(&ipc_stream_lock);
 }
 
-static bool ipc_stream_copy_args(uint32_t argc, uint32_t *argv,
-                                 uint32_t required, uint32_t *out) {
-    if (argc < required ||
-        !ipc_user_range(argv, required * sizeof(uint32_t)))
-        return false;
-    memcpy(out, argv, required * sizeof(uint32_t));
-    return true;
-}
-
 uint32_t ipc_stream_syscall_handler(uint32_t num, uint32_t argc,
                                     uint32_t *argv) {
     if (!ipc_stream_ready) return (uint32_t)IPO_IPC_ERR_NO_SPACE;
     uint32_t args[4] = {0};
     switch (num) {
         case IPO_SYSCALL_IPC_PIPE_CREATE:
-            if (!ipc_stream_copy_args(argc, argv, 3u, args))
+            if (!ipc_copy_syscall_args(argc, argv, 3u, args))
                 return (uint32_t)IPO_IPC_ERR_INVALID;
             return (uint32_t)ipc_pipe_create(
                 (const char *)(uintptr_t)args[0], args[1],
                 (uint32_t *)(uintptr_t)args[2]);
         case IPO_SYSCALL_IPC_PIPE_OPEN:
-            if (!ipc_stream_copy_args(argc, argv, 2u, args))
+            if (!ipc_copy_syscall_args(argc, argv, 2u, args))
                 return (uint32_t)IPO_IPC_ERR_INVALID;
             return (uint32_t)ipc_pipe_open(
                 (const char *)(uintptr_t)args[0], args[1]);
         case IPO_SYSCALL_IPC_PIPE_CLOSE:
-            if (!ipc_stream_copy_args(argc, argv, 2u, args))
+            if (!ipc_copy_syscall_args(argc, argv, 2u, args))
                 return (uint32_t)IPO_IPC_ERR_INVALID;
             return (uint32_t)ipc_pipe_close(args[0], args[1]);
         case IPO_SYSCALL_IPC_PIPE_DESTROY:
-            if (!ipc_stream_copy_args(argc, argv, 1u, args))
+            if (!ipc_copy_syscall_args(argc, argv, 1u, args))
                 return (uint32_t)IPO_IPC_ERR_INVALID;
             return (uint32_t)ipc_pipe_destroy(args[0]);
         case IPO_SYSCALL_IPC_PIPE_READ:
-            if (!ipc_stream_copy_args(argc, argv, 4u, args))
+            if (!ipc_copy_syscall_args(argc, argv, 4u, args))
                 return (uint32_t)IPO_IPC_ERR_INVALID;
             return (uint32_t)ipc_pipe_read(
                 args[0], (uint8_t *)(uintptr_t)args[1], args[2], args[3]);
         case IPO_SYSCALL_IPC_PIPE_WRITE:
-            if (!ipc_stream_copy_args(argc, argv, 4u, args))
+            if (!ipc_copy_syscall_args(argc, argv, 4u, args))
                 return (uint32_t)IPO_IPC_ERR_INVALID;
             return (uint32_t)ipc_pipe_write(
                 args[0], (const uint8_t *)(uintptr_t)args[1], args[2], args[3]);
         case IPO_SYSCALL_IPC_NOTIFY_SEND:
-            if (!ipc_stream_copy_args(argc, argv, 3u, args))
+            if (!ipc_copy_syscall_args(argc, argv, 3u, args))
                 return (uint32_t)IPO_IPC_ERR_INVALID;
             return (uint32_t)ipc_notify_send(args[0], args[1], args[2]);
         case IPO_SYSCALL_IPC_NOTIFY_WAIT:
-            if (!ipc_stream_copy_args(argc, argv, 2u, args))
+            if (!ipc_copy_syscall_args(argc, argv, 2u, args))
                 return (uint32_t)IPO_IPC_ERR_INVALID;
             return (uint32_t)ipc_notify_wait(
                 (ipo_ipc_notification_t *)(uintptr_t)args[0], args[1]);

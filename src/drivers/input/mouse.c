@@ -5,7 +5,9 @@
 #include <string.h>
 #include <memory/kmalloc.h>
 #include <kernel/driver.h>
+#include <kernel/process.h>
 #include <wm.h>
+#include <vga.h>
 #include <vga_gfx.h>
 
 #define KBD_DATA_PORT    0x60
@@ -17,16 +19,16 @@
 #define KBD_STATUS_AUX   0x20  /* Auxiliary (Mouse) data in 0x60 */
 
 static mouse_state_t current_mouse_state = {
-    .x = 320,
-    .y = 200,
-    .col = 40,
-    .row = 12,
+    .x = 0,
+    .y = 0,
+    .col = 0,
+    .row = 0,
     .dx = 0,
     .dy = 0,
     .dz = 0,
     .scroll_pos = 0,
-    .max_x = 640,
-    .max_y = 400,
+    .max_x = 0,
+    .max_y = 0,
     .left_button = false,
     .right_button = false,
     .middle_button = false,
@@ -45,14 +47,29 @@ static uint8_t mouse_device_id = 0;
 static bool mouse_has_wheel = false;
 static bool mouse_initialized = false;
 
-static void mouse_packet_ensure_capacity(size_t needed) {
-    if (needed < mouse_packet_cap && mouse_packet != NULL) return;
+static bool mouse_packet_ensure_capacity(size_t needed) {
+    if (needed <= mouse_packet_cap && mouse_packet != NULL) return true;
     size_t new_cap = (mouse_packet_cap == 0) ? 8 : (mouse_packet_cap * 2);
-    while (new_cap <= needed) new_cap *= 2;
+    while (new_cap < needed) new_cap *= 2;
     uint8_t *new_buf = (uint8_t *)krealloc(mouse_packet, new_cap);
-    if (!new_buf) return;
+    if (!new_buf) return false;
     mouse_packet = new_buf;
     mouse_packet_cap = new_cap;
+    return true;
+}
+
+static inline void mouse_poll_if_unmanaged(void) {
+    if (!wm_session_active()) {
+        mouse_poll();
+    }
+}
+
+static inline int32_t mouse_sign_extend_z4(uint8_t raw) {
+    int8_t z4 = (int8_t)(raw & 0x0Fu);
+    if (z4 & 0x08) {
+        z4 |= (int8_t)0xF0;
+    }
+    return (int32_t)z4;
 }
 
 static void mouse_wait_write(void) {
@@ -153,7 +170,8 @@ void mouse_init(void) {
         current_mouse_state.dev_id = dev_id;
         current_mouse_state.packet_size = 4;
         printf("[mouse] PS/2 extended protocol enabled (wheel, 4-byte packets, ID=0x%02x)\n",
-       (unsigned int)dev_id);    } else {
+               (unsigned int)dev_id);
+    } else {
         mouse_packet_size = 3;
         mouse_has_wheel = false;
         current_mouse_state.has_wheel = false;
@@ -180,6 +198,26 @@ void mouse_init(void) {
     mouse_initialized = true;
     mouse_set_bounds_from_display();
     printf("[mouse] PS/2 mouse initialization complete.\n");
+}
+
+static void mouse_clamp_and_update_cells(void) {
+    if (current_mouse_state.max_x <= 0) current_mouse_state.max_x = VGA_GFX_WIDTH;
+    if (current_mouse_state.max_y <= 0) current_mouse_state.max_y = VGA_GFX_HEIGHT;
+    if (current_mouse_state.x < 0) current_mouse_state.x = 0;
+    if (current_mouse_state.x >= current_mouse_state.max_x) current_mouse_state.x = current_mouse_state.max_x - 1;
+    if (current_mouse_state.y < 0) current_mouse_state.y = 0;
+    if (current_mouse_state.y >= current_mouse_state.max_y) current_mouse_state.y = current_mouse_state.max_y - 1;
+
+    int32_t vga_w = (int32_t)VGA_WIDTH;
+    int32_t vga_h = (int32_t)VGA_HEIGHT;
+    if (vga_w <= 0) vga_w = 1;
+    if (vga_h <= 0) vga_h = 1;
+    current_mouse_state.col = (current_mouse_state.x * vga_w) / current_mouse_state.max_x;
+    current_mouse_state.row = (current_mouse_state.y * vga_h) / current_mouse_state.max_y;
+    if (current_mouse_state.col < 0) current_mouse_state.col = 0;
+    if (current_mouse_state.col >= vga_w) current_mouse_state.col = vga_w - 1;
+    if (current_mouse_state.row < 0) current_mouse_state.row = 0;
+    if (current_mouse_state.row >= vga_h) current_mouse_state.row = vga_h - 1;
 }
 
 static void mouse_process_packet(void) {
@@ -210,25 +248,12 @@ static void mouse_process_packet(void) {
     int32_t dz = 0;
     if (mouse_packet_size >= 4 && mouse_has_wheel) {
         int8_t z_raw = (int8_t)mouse_packet[3];
-        if (mouse_device_id == 0x04) {
-            int8_t z_4bit = (int8_t)(mouse_packet[3] & 0x0F);
-            if (z_4bit & 0x08) {
-                z_4bit |= (int8_t)0xF0;
-            }
-            dz = (int32_t)z_4bit;
+        if (mouse_device_id != 0x04 && z_raw >= -8 && z_raw <= 8) {
+            dz = (int32_t)z_raw;
         } else {
-            if (z_raw >= -8 && z_raw <= 8) {
-                dz = (int32_t)z_raw;
-            } else {
-                int8_t z_4bit = (int8_t)(mouse_packet[3] & 0x0F);
-                if (z_4bit & 0x08) {
-                    z_4bit |= (int8_t)0xF0;
-                }
-                dz = (int32_t)z_4bit;
-            }
+            dz = mouse_sign_extend_z4(mouse_packet[3]);
         }
-        /* Hardware/emulator reports negative when rolling forward (UP) and positive when rolling backward (DOWN).
-         * Invert dz so that positive dz (+1) is SCROLL UP and negative dz (-1) is SCROLL DOWN. */
+        /* Invert dz so positive is scroll up and negative is scroll down */
         dz = -dz;
     }
 
@@ -242,20 +267,7 @@ static void mouse_process_packet(void) {
     current_mouse_state.x += dx;
     current_mouse_state.y += dy;
 
-    // Clamp to screen bounds
-    if (current_mouse_state.x < 0) current_mouse_state.x = 0;
-    if (current_mouse_state.x >= current_mouse_state.max_x) current_mouse_state.x = current_mouse_state.max_x - 1;
-
-    if (current_mouse_state.y < 0) current_mouse_state.y = 0;
-    if (current_mouse_state.y >= current_mouse_state.max_y) current_mouse_state.y = current_mouse_state.max_y - 1;
-
-    // Update text mode coordinates (80x25 for standard VGA 640x400)
-    current_mouse_state.col = (current_mouse_state.x * 80) / current_mouse_state.max_x;
-    current_mouse_state.row = (current_mouse_state.y * 25) / current_mouse_state.max_y;
-    if (current_mouse_state.col < 0) current_mouse_state.col = 0;
-    if (current_mouse_state.col >= 80) current_mouse_state.col = 79;
-    if (current_mouse_state.row < 0) current_mouse_state.row = 0;
-    if (current_mouse_state.row >= 25) current_mouse_state.row = 24;
+    mouse_clamp_and_update_cells();
 
     current_mouse_state.left_button = (flags & 0x01) != 0;
     current_mouse_state.right_button = (flags & 0x02) != 0;
@@ -278,8 +290,7 @@ static void mouse_process_packet(void) {
 }
 
 void mouse_handle_byte(uint8_t data) {
-    mouse_packet_ensure_capacity(mouse_cycle + 1);
-    if (!mouse_packet) return;
+    if (!mouse_packet_ensure_capacity((size_t)mouse_cycle + 1u) || !mouse_packet) return;
 
     if (mouse_cycle == 0) {
         // Bit 3 of byte 0 must be 1, and bits 6 & 7 (overflow) must be 0 in valid PS/2 packets
@@ -312,26 +323,38 @@ void mouse_poll(void) {
 
 void mouse_get_state(mouse_state_t *out_state) {
     if (!out_state) return;
-    if (!wm_session_active()) {
-        mouse_poll();
-    }
+    mouse_poll_if_unmanaged();
     *out_state = current_mouse_state;
 }
 
 void mouse_get_cumulative_motion(int64_t *out_x, int64_t *out_y) {
-    if (!wm_session_active()) {
-        mouse_poll();
-    }
+    mouse_poll_if_unmanaged();
     if (out_x) *out_x = cumulative_motion_x;
     if (out_y) *out_y = cumulative_motion_y;
 }
 
+static void mouse_get_display_bounds(int *out_w, int *out_h) {
+    int w = 0;
+    int h = 0;
+    if (process_wm_has_focus()) {
+        w = VGA_GFX_WIDTH;
+        h = VGA_GFX_HEIGHT;
+    } else if (vga_is_graphics_mode()) {
+        vga_gfx_get_screen_bounds(&w, &h);
+    } else {
+        w = (int)VGA_TEXT_PIXEL_WIDTH;
+        h = (int)VGA_TEXT_PIXEL_HEIGHT;
+    }
+    if (w <= 0) w = VGA_GFX_WIDTH;
+    if (h <= 0) h = VGA_GFX_HEIGHT;
+    if (out_w) *out_w = w;
+    if (out_h) *out_h = h;
+}
+
 void mouse_set_bounds(int32_t max_x, int32_t max_y) {
     if (max_x <= 0 || max_y <= 0) {
-        int w = VGA_TEXT_PIXEL_WIDTH, h = VGA_TEXT_PIXEL_HEIGHT;
-        vga_gfx_get_screen_bounds(&w, &h);
-        if (w <= 0) w = VGA_GFX_WIDTH;
-        if (h <= 0) h = VGA_GFX_HEIGHT;
+        int w = 0, h = 0;
+        mouse_get_display_bounds(&w, &h);
         if (max_x <= 0) max_x = w;
         if (max_y <= 0) max_y = h;
     }
@@ -343,24 +366,14 @@ void mouse_set_bounds(int32_t max_x, int32_t max_y) {
     current_mouse_state.max_y = max_y;
 
     if (old_max_x > 0 && old_max_y > 0) {
-        current_mouse_state.x = (current_mouse_state.x * max_x) / old_max_x;
-        current_mouse_state.y = (current_mouse_state.y * max_y) / old_max_y;
+        current_mouse_state.x = (int32_t)(((int64_t)current_mouse_state.x * max_x) / old_max_x);
+        current_mouse_state.y = (int32_t)(((int64_t)current_mouse_state.y * max_y) / old_max_y);
     } else {
         current_mouse_state.x = max_x / 2;
         current_mouse_state.y = max_y / 2;
     }
 
-    if (current_mouse_state.x < 0) current_mouse_state.x = 0;
-    if (current_mouse_state.x >= max_x) current_mouse_state.x = max_x - 1;
-    if (current_mouse_state.y < 0) current_mouse_state.y = 0;
-    if (current_mouse_state.y >= max_y) current_mouse_state.y = max_y - 1;
-
-    current_mouse_state.col = (current_mouse_state.x * 80) / current_mouse_state.max_x;
-    current_mouse_state.row = (current_mouse_state.y * 25) / current_mouse_state.max_y;
-    if (current_mouse_state.col < 0) current_mouse_state.col = 0;
-    if (current_mouse_state.col >= 80) current_mouse_state.col = 79;
-    if (current_mouse_state.row < 0) current_mouse_state.row = 0;
-    if (current_mouse_state.row >= 25) current_mouse_state.row = 24;
+    mouse_clamp_and_update_cells();
 
     serial_printf("[mouse] bounds updated: %dx%d (pos: %d,%d, cell: %d,%d)\n",
                   (int)current_mouse_state.max_x, (int)current_mouse_state.max_y,
@@ -369,11 +382,10 @@ void mouse_set_bounds(int32_t max_x, int32_t max_y) {
 }
 
 void mouse_set_bounds_from_display(void) {
-    if (wm_session_active()) {
-        mouse_set_bounds(VGA_GFX_WIDTH, VGA_GFX_HEIGHT);
-    } else {
-        mouse_set_bounds(0, 0);
-    }
+    int w = 0;
+    int h = 0;
+    mouse_get_display_bounds(&w, &h);
+    mouse_set_bounds(w, h);
 }
 
 void mouse_get_bounds(int32_t *out_x, int32_t *out_y) {
@@ -382,17 +394,13 @@ void mouse_get_bounds(int32_t *out_x, int32_t *out_y) {
 }
 
 void mouse_get_position(int32_t *out_x, int32_t *out_y) {
-    if (!wm_session_active()) {
-        mouse_poll();
-    }
+    mouse_poll_if_unmanaged();
     if (out_x) *out_x = current_mouse_state.x;
     if (out_y) *out_y = current_mouse_state.y;
 }
 
 bool mouse_is_pressed(int button) {
-    if (!wm_session_active()) {
-        mouse_poll();
-    }
+    mouse_poll_if_unmanaged();
     if (button == MOUSE_BTN_LEFT) return current_mouse_state.left_button;
     if (button == MOUSE_BTN_RIGHT) return current_mouse_state.right_button;
     if (button == MOUSE_BTN_MIDDLE) return current_mouse_state.middle_button;
@@ -400,12 +408,11 @@ bool mouse_is_pressed(int button) {
 }
 
 bool mouse_is_in_region(int32_t x, int32_t y, int32_t w, int32_t h) {
-    if (!wm_session_active()) {
-        mouse_poll();
-    }
+    if (w <= 0 || h <= 0) return false;
+    mouse_poll_if_unmanaged();
     int32_t mx = current_mouse_state.x;
     int32_t my = current_mouse_state.y;
-    return (mx >= x && mx < (x + w) && my >= y && my < (y + h));
+    return (mx >= x && (mx - x) < w && my >= y && (my - y) < h);
 }
 
 bool mouse_is_clicked_in_region(int32_t x, int32_t y, int32_t w, int32_t h, int button) {
@@ -414,4 +421,32 @@ bool mouse_is_clicked_in_region(int32_t x, int32_t y, int32_t w, int32_t h, int 
 
 bool mouse_check_click(int32_t x, int32_t y, int32_t w, int32_t h) {
     return mouse_is_clicked_in_region(x, y, w, h, MOUSE_BTN_LEFT);
+}
+
+void mouse_inject_event(int32_t dx_or_x, int32_t dy_or_y, int32_t dz,
+                        uint32_t buttons_mask, bool is_absolute) {
+    int32_t prev_x = current_mouse_state.x;
+    int32_t prev_y = current_mouse_state.y;
+    if (is_absolute) {
+        current_mouse_state.x = dx_or_x;
+        current_mouse_state.y = dy_or_y;
+    } else {
+        current_mouse_state.x += dx_or_x;
+        current_mouse_state.y += dy_or_y;
+    }
+    mouse_clamp_and_update_cells();
+
+    int32_t eff_dx = is_absolute ? (current_mouse_state.x - prev_x) : dx_or_x;
+    int32_t eff_dy = is_absolute ? (current_mouse_state.y - prev_y) : dy_or_y;
+    current_mouse_state.dx = eff_dx;
+    current_mouse_state.dy = eff_dy;
+    cumulative_motion_x += eff_dx;
+    cumulative_motion_y += eff_dy;
+    current_mouse_state.dz = dz;
+    current_mouse_state.scroll_pos += dz;
+    current_mouse_state.left_button = (buttons_mask & (uint32_t)MOUSE_BTN_LEFT) != 0u;
+    current_mouse_state.right_button = (buttons_mask & (uint32_t)MOUSE_BTN_RIGHT) != 0u;
+    current_mouse_state.middle_button = (buttons_mask & (uint32_t)MOUSE_BTN_MIDDLE) != 0u;
+    current_mouse_state.buttons = buttons_mask;
+    current_mouse_state.event_count++;
 }

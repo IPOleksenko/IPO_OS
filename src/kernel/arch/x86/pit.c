@@ -10,10 +10,17 @@ uint16_t pit_get_divisor(uint32_t hz) {
     return (uint16_t)d;
 }
 
-static uint32_t s_pit_programmed_hz[3];
+static uint32_t s_pit0_hz = 0;
+static uint32_t s_pit1_hz = 0;
+static uint32_t s_pit2_hz = 0;
 
 uint32_t pit_get_frequency(uint8_t counter) {
-    return counter < 3 ? s_pit_programmed_hz[counter] : 0;
+    switch (counter) {
+        case 0: return s_pit0_hz;
+        case 1: return s_pit1_hz;
+        case 2: return s_pit2_hz;
+        default: return 0;
+    }
 }
 
 void pit_set_frequency(uint8_t counter, uint32_t hz) {
@@ -21,7 +28,10 @@ void pit_set_frequency(uint8_t counter, uint32_t hz) {
         return;
     
     uint16_t divisor = pit_get_divisor(hz);
-    if (counter < 3) s_pit_programmed_hz[counter] = PIT_FREQUENCY / divisor;
+    uint32_t programmed = PIT_FREQUENCY / divisor;
+    if (counter == 0) s_pit0_hz = programmed;
+    else if (counter == 1) s_pit1_hz = programmed;
+    else if (counter == 2) s_pit2_hz = programmed;
     
     /* Select counter and set up control word */
     uint8_t counter_select = 0;

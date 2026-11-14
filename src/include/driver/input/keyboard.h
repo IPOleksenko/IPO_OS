@@ -19,6 +19,12 @@ void keyboard_poll(void);
 uint8_t keyboard_get_scancode(void);
 
 /**
+ * Non-blocking direct hardware/queue pop bypassing WM per-window routing.
+ * Used internally by the WM compositor to avoid recursion.
+ */
+uint8_t keyboard_get_scancode_raw(void);
+
+/**
  * Blocking: wait until next scancode is available from the active queue.
  */
 uint8_t keyboard_wait_scancode(void);

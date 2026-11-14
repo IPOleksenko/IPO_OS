@@ -28,7 +28,7 @@ typedef struct {
     uint32_t address;
 } __attribute__((packed)) kmod_raw_sym_t;
 
-/* Dynamic Symbol Reference (self-expanding in memory) */
+/* Symbol Reference */
 typedef struct {
     char     *name;
     size_t   name_len;
@@ -36,13 +36,10 @@ typedef struct {
     uint32_t address;
 } kmod_sym_t;
 
-/* Dynamic kmod_sym_t lifecycle methods */
 void kmod_sym_init(kmod_sym_t *sym);
 void kmod_sym_free(kmod_sym_t *sym);
 int  kmod_sym_set_name(kmod_sym_t *sym, const char *name);
-int  kmod_sym_copy(kmod_sym_t *dst, const kmod_sym_t *src);
 void kmod_sym_from_raw(kmod_sym_t *dst, const kmod_raw_sym_t *raw);
-void kmod_sym_to_raw(const kmod_sym_t *src, kmod_raw_sym_t *raw);
 
 /* Exported Kernel Symbols Table */
 typedef struct {
@@ -74,7 +71,7 @@ typedef struct {
     uint32_t checksum;             /* CRC32 of payload */
 } __attribute__((packed)) kmod_raw_header_t;
 
-/* Dynamic In-Memory Module Header (self-expanding, no fixed array limits) */
+/* In-Memory Module Header */
 typedef struct {
     uint32_t magic;
     uint16_t abi_version;
@@ -110,7 +107,6 @@ int  kmod_header_set_author(kmod_header_t *h, const char *author);
 int  kmod_header_set_version(kmod_header_t *h, const char *version);
 int  kmod_header_set_description(kmod_header_t *h, const char *desc);
 void kmod_header_from_raw(kmod_header_t *dst, const kmod_raw_header_t *raw);
-void kmod_header_to_raw(const kmod_header_t *src, kmod_raw_header_t *raw);
 
 /* Runtime module descriptor */
 typedef struct kmod {
@@ -141,11 +137,9 @@ int  kmod_unload_by_name(const char *name);
 
 kmod_t *kmod_find_by_id(uint32_t id);
 kmod_t *kmod_find_by_name(const char *name);
-const kmod_t *kmod_get_list(void);
 uint32_t kmod_count(void);
 
 void kmod_print_list(void);
-int  kmod_device_firmware_probe(const void *rom_data, size_t rom_size, const char *dev_name);
 
 #endif /* _KMOD_H */
 

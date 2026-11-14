@@ -22,9 +22,6 @@
 #define STORAGE_POOL_EXT_MAGIC           0x58544D42 /* 'XTMB' */
 #define STORAGE_POOL_MEMBERS_PER_EXT_SEC 10
 
-/* Default Primary Superblock LBA */
-#define STORAGE_POOL_SB_LBA              STORAGE_POOL_PRIMARY_SB_LBA
-
 #define STORAGE_JOURNAL_ENTRY_MAGIC 0x54584E4C /* 'TXNL' */
 
 typedef enum {
@@ -164,11 +161,10 @@ typedef struct __attribute__((packed)) {
     uint32_t count;                    /* 4 bytes: Sector count */
     uint32_t timestamp;                /* 4 bytes: Milliseconds tick */
     uint32_t data_crc;                 /* 4 bytes: CRC32 of data written */
-    uint32_t entry_crc;                /* 4 bytes: CRC32 of first 28 bytes */
+    uint32_t entry_crc;                /* 4 bytes: CRC32 of first 32 bytes */
     uint8_t  reserved[28];             /* 28 bytes: Padding */
 } storage_raw_disk_tx_entry_t;
 
-/* Dynamic In-Memory Disk Journal / WAL Entry (self-expanding, no fixed array limits) */
 typedef struct {
     uint32_t magic;
     uint32_t tx_id;
@@ -184,14 +180,12 @@ typedef struct {
     size_t   reserved_cap;
 } storage_disk_tx_entry_t;
 
-/* Dynamic storage_disk_tx_entry_t lifecycle methods */
 void storage_disk_tx_entry_init(storage_disk_tx_entry_t *e);
 void storage_disk_tx_entry_free(storage_disk_tx_entry_t *e);
 int  storage_disk_tx_entry_set_reserved(storage_disk_tx_entry_t *e, const uint8_t *data, size_t len);
 void storage_disk_tx_entry_from_raw(storage_disk_tx_entry_t *e, const storage_raw_disk_tx_entry_t *raw);
 void storage_disk_tx_entry_to_raw(const storage_disk_tx_entry_t *e, storage_raw_disk_tx_entry_t *raw);
 
-/* Dynamic In-Memory Transaction Entry (self-expanding, no fixed array limits) */
 typedef struct {
     uint32_t     tx_id;
     tx_op_type_t op;
@@ -206,16 +200,11 @@ typedef struct {
     size_t       extra_data_cap;
 } storage_tx_entry_t;
 
-/* Dynamic storage_tx_entry_t lifecycle methods */
 void storage_tx_entry_init(storage_tx_entry_t *e);
 void storage_tx_entry_free(storage_tx_entry_t *e);
-int  storage_tx_entry_set_extra_data(storage_tx_entry_t *e, const uint8_t *data, size_t len);
-int  storage_tx_entry_copy(storage_tx_entry_t *dst, const storage_tx_entry_t *src);
 
-/* In-Memory Journal Structure (self-expanding, no fixed array limits) */
 typedef struct {
     uint32_t           head;
-    uint32_t           tail;
     uint32_t           total_tx_count;
     uint32_t           active_tx_count;
     storage_tx_entry_t *entries;
@@ -223,7 +212,6 @@ typedef struct {
     size_t             entries_cap;
 } storage_journal_t;
 
-/* In-Memory Pool Member (self-expanding, no fixed array limits) */
 typedef struct {
     char            *bdev_name;
     size_t          bdev_name_len;
@@ -242,7 +230,6 @@ void pool_member_free(pool_member_t *m);
 int  pool_member_set_name(pool_member_t *m, const char *name);
 int  pool_member_set_uuid(pool_member_t *m, const uint8_t *uuid, size_t len);
 
-/* In-Memory Storage Pool Runtime State (self-expanding, no fixed array limits) */
 typedef struct {
     uint32_t             magic;
     uint8_t              *pool_uuid;
@@ -263,7 +250,6 @@ typedef struct {
     uint64_t             backup_sb_lba;
 } storage_pool_t;
 
-/* Storage Pool Public API */
 int  storage_pool_init(void);
 bool storage_pool_is_initialized(void);
 storage_pool_state_t storage_pool_get_state(void);
@@ -272,7 +258,6 @@ uint64_t storage_pool_get_capacity(void);
 uint64_t storage_pool_get_used(void);
 uint64_t storage_pool_get_free(void);
 uint32_t storage_pool_get_member_count(void);
-const storage_pool_t *storage_pool_get_info(void);
 
 bool storage_pool_read(uint64_t pool_lba, uint16_t count, void *buf);
 bool storage_pool_write(uint64_t pool_lba, uint16_t count, const void *buf);
@@ -287,6 +272,5 @@ int  storage_pool_create(const char *pool_uuid);
 int  storage_pool_create_ex(const char *pool_uuid, const char *bdev_name);
 int  storage_pool_recover(void);
 int  storage_pool_save_metadata(void);
-int  storage_pool_load_metadata(void);
 
 #endif /* _STORAGE_POOL_H */

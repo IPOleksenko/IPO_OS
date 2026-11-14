@@ -1,13 +1,15 @@
 #include <net/udp.h>
 #include <net/net_state.h>
 #include <net/ipv4.h>
+#include <net/dns.h>
+#include <net/dhcp.h>
+#include <driver/net/rtl8139.h>
 #include <string.h>
 #include <memory/kmalloc.h>
-#include <stdio.h>
 
 void udp_init(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
-    if (ctx->udp_table_capacity > 0) {
+    if (ctx->udp_table_capacity > 0 && ctx->udp_table) {
         memset(ctx->udp_table, 0, ctx->udp_table_capacity * sizeof(*ctx->udp_table));
     }
 }
@@ -15,7 +17,8 @@ void udp_init(void) {
 bool udp_bind(uint16_t port, udp_callback_t callback) {
     net_shared_ctx_t *ctx = net_get_shared_context();
     if (ctx->udp_table_capacity == 0 || !ctx->udp_table) {
-        size_t init_cap = 16;
+        size_t init_cap = rtl8139_get_hw_socket_capacity();
+        if (init_cap == 0) init_cap = 1;
         udp_socket_t *init_tbl = (udp_socket_t *)kmalloc(init_cap * sizeof(udp_socket_t));
         if (!init_tbl) return false;
         memset(init_tbl, 0, init_cap * sizeof(udp_socket_t));
@@ -40,7 +43,7 @@ bool udp_bind(uint16_t port, udp_callback_t callback) {
     }
 
     /* Dynamically expand UDP table when capacity is reached */
-    size_t new_cap = (ctx->udp_table_capacity == 0) ? 16 : (ctx->udp_table_capacity * 2);
+    size_t new_cap = (ctx->udp_table_capacity == 0) ? rtl8139_get_hw_socket_capacity() : (ctx->udp_table_capacity * 2);
     if (new_cap > ctx->udp_table_capacity && new_cap <= (SIZE_MAX / sizeof(udp_socket_t))) {
         udp_socket_t *new_table = (udp_socket_t *)krealloc(ctx->udp_table, new_cap * sizeof(udp_socket_t));
         if (new_table) {
@@ -71,6 +74,13 @@ void udp_unbind(uint16_t port) {
 }
 
 int udp_send(ip4_addr_t dst_ip, uint16_t src_port, uint16_t dst_port, const void *payload, uint16_t len) {
+    if (!payload && len > 0) {
+        return -1;
+    }
+    if ((size_t)len > 65535u - sizeof(udp_header_t)) {
+        return -1;
+    }
+
     uint16_t total_len = (uint16_t)(sizeof(udp_header_t) + len);
     uint8_t *tx_buf = (uint8_t *)kmalloc(total_len);
     if (!tx_buf) {
@@ -91,10 +101,6 @@ int udp_send(ip4_addr_t dst_ip, uint16_t src_port, uint16_t dst_port, const void
     kfree(tx_buf);
     return ret;
 }
-
-/* Forward declaration for central DNS & DHCP response processing */
-void dns_process_response_packet(const void *data, uint16_t len);
-void dhcp_process_packet(const void *data, uint16_t len);
 
 void udp_receive(ip4_addr_t src_ip, const void *data, uint16_t len) {
     if (!data || len < sizeof(udp_header_t)) {

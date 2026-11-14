@@ -2,17 +2,8 @@
 #include <driver/net/rtl8139.h>
 #include <net/arp.h>
 #include <net/ipv4.h>
-#include <string.h>
-
 #include <memory/kmalloc.h>
-
-#include <net/ethernet.h>
-#include <driver/net/rtl8139.h>
-#include <net/arp.h>
-#include <net/ipv4.h>
 #include <string.h>
-#include <stdio.h>
-#include <memory/kmalloc.h>
 
 void eth_header_init(eth_header_t *frame) {
     if (!frame) return;
@@ -30,18 +21,8 @@ void eth_header_free(eth_header_t *frame) {
     frame->type = 0;
 }
 
-size_t net_get_hw_addr_len(void) {
-    net_if_t *netif = net_get_interface();
-    if (netif && mac_get_len(&netif->mac) > 0) {
-        return mac_get_len(&netif->mac);
-    }
-    size_t hw_len = rtl8139_get_mac_len();
-    if (hw_len > 0) return hw_len;
-    return 6; /* Probed from hardware */
-}
-
 int eth_send(const mac_addr_t *dest, uint16_t ethertype, const void *payload, uint16_t len) {
-    if (!dest || !payload) {
+    if (!dest || (!payload && len > 0)) {
         return -1;
     }
 
@@ -58,6 +39,9 @@ int eth_send(const mac_addr_t *dest, uint16_t ethertype, const void *payload, ui
     /* Wire header: [destination MAC: dest_l bytes] [source MAC: src_l bytes] [EtherType: 2 bytes] */
     size_t wire_hdr_len = dest_l + src_l + sizeof(uint16_t);
     size_t total_len = wire_hdr_len + len;
+    if (total_len > 65535u) {
+        return -1;
+    }
 
     uint8_t *tx_frame = (uint8_t *)kmalloc(total_len);
     if (!tx_frame) {
@@ -81,7 +65,9 @@ int eth_send(const mac_addr_t *dest, uint16_t ethertype, const void *payload, ui
     uint16_t net_type = htons(ethertype);
     memcpy(tx_frame + dest_l + src_l, &net_type, sizeof(uint16_t));
 
-    memcpy(tx_frame + wire_hdr_len, payload, len);
+    if (payload && len > 0) {
+        memcpy(tx_frame + wire_hdr_len, payload, len);
+    }
 
     int res = rtl8139_send_packet(tx_frame, (uint16_t)total_len);
     kfree(tx_frame);
@@ -111,7 +97,8 @@ void eth_receive(const void *frame, uint16_t len) {
     }
 
     const uint8_t *my_mac = mac_get_bytes(&netif->mac);
-    bool is_unicast = (my_mac && memcmp(dest_bytes, my_mac, hw_len) == 0);
+    bool is_unicast = (my_mac && mac_get_len(&netif->mac) >= hw_len &&
+                       memcmp(dest_bytes, my_mac, hw_len) == 0);
 
     uint16_t wire_type;
     memcpy(&wire_type, wire + hw_len * 2, sizeof(uint16_t));

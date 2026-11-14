@@ -65,6 +65,9 @@ int block_dev_register(block_device_t *bdev) {
     }
     memcpy(node->name, bdev->name, name_len + 1u);
     node->id = (bdev->id != 0) ? bdev->id : s_next_bdev_id++;
+    if (bdev->id >= s_next_bdev_id) {
+        s_next_bdev_id = bdev->id + 1u;
+    }
     if (node->sector_size == 0) node->sector_size = 512;
     node->next = NULL;
 
@@ -141,7 +144,7 @@ block_device_t *block_dev_get(const char *name) {
         uint32_t idx = 0;
         bool valid_num = true;
         for (size_t i = 0; num_str[i] != '\0'; i++) {
-            if (num_str[i] < '0' || num_str[i] > '9') {
+            if (num_str[i] < '0' || num_str[i] > '9' || idx > (UINT32_MAX - 9u) / 10u) {
                 valid_num = false;
                 break;
             }
@@ -196,15 +199,16 @@ uint32_t block_dev_count(void) {
 }
 
 bool block_dev_read(block_device_t *bdev, uint64_t lba, uint16_t count, void *buf) {
-    if (!bdev || count == 0 || !buf) return false;
-    if (!bdev->ops || !bdev->ops->read_sectors) return false;
     if (!bdev) { serial_printf("bdev_read: bdev NULL\n"); return false; }
     if (count == 0) { serial_printf("bdev_read: count 0\n"); return false; }
     if (!buf) { serial_printf("bdev_read: buf NULL\n"); return false; }
-    if (!bdev->ops) { serial_printf("bdev_read: ops NULL\n"); return false; }
-    if (!bdev->ops->read_sectors) { serial_printf("bdev_read: read_sectors NULL\n"); return false; }
+    if (!bdev->ops || !bdev->ops->read_sectors) {
+        serial_printf("bdev_read: ops/read_sectors NULL\n");
+        return false;
+    }
 
-    if (bdev->total_sectors > 0 && (lba + (uint64_t)count > bdev->total_sectors)) {
+    if (bdev->total_sectors > 0 &&
+        ((uint64_t)count > bdev->total_sectors || lba > bdev->total_sectors - (uint64_t)count)) {
         serial_printf("[block_dev] Read out of bounds: lba=%llu count=%u total=%llu\n",
                       lba, count, bdev->total_sectors);
         return false;
@@ -221,7 +225,8 @@ bool block_dev_write(block_device_t *bdev, uint64_t lba, uint16_t count, const v
     }
     if (!bdev->ops || !bdev->ops->write_sectors) return false;
 
-    if (bdev->total_sectors > 0 && (lba + (uint64_t)count > bdev->total_sectors)) {
+    if (bdev->total_sectors > 0 &&
+        ((uint64_t)count > bdev->total_sectors || lba > bdev->total_sectors - (uint64_t)count)) {
         serial_printf("[block_dev] Write out of bounds: lba=%llu count=%u total=%llu\n",
                       lba, count, bdev->total_sectors);
         return false;

@@ -1,7 +1,6 @@
 #include <driver/net/pci.h>
 #include <ioport.h>
 #include <memory/kmalloc.h>
-#include <stdio.h>
 #include <string.h>
 
 static pci_device_t *s_pci_devices = NULL;
@@ -119,6 +118,7 @@ static void pci_parse_vpd_bytes(const uint8_t *vpd, size_t len, pci_device_t *de
             pos += item_len;
         } else {
             uint8_t item_len = tag & 0x07;
+            if (pos + 1 + item_len > len) break;
             pos += 1 + item_len;
         }
     }
@@ -194,7 +194,7 @@ static void pci_parse_rom_image(const uint8_t *rom, size_t max_len, pci_device_t
 
     if (!matches) return;
 
-    /* 1. Extract strings from $PnP Expansion Header if present (PnP BIOS Spec v1.0A Table 3-3: 0x0E=Mfg, 0x10=Product) */
+    /* Extract strings from $PnP Expansion Header if present (PnP BIOS Spec v1.0A Table 3-3: 0x0E=Mfg, 0x10=Product) */
     if (pnp_off >= 0x1C && (size_t)pnp_off + 0x14 <= rom_len &&
         memcmp(rom + pnp_off, "$PnP", 4) == 0) {
         uint16_t mfg_off = *(const uint16_t *)(rom + pnp_off + 0x0E);
@@ -207,12 +207,12 @@ static void pci_parse_rom_image(const uint8_t *rom, size_t max_len, pci_device_t
         }
     }
 
-    /* 2. Extract strings from ROM VPD if present */
+    /* Extract strings from ROM VPD if present */
     if (vpd_off > 0 && vpd_off < rom_len) {
         pci_parse_vpd_bytes(rom + vpd_off, rom_len - vpd_off, dev);
     }
 
-    /* 3. For VGA/Display Option ROMs, extract VBE 2.0 OemVendorNamePtr (0x16), OemProductNamePtr (0x1A), and OemStringPtr (0x06) */
+    /* For VGA/Display Option ROMs, extract VBE 2.0 OemVendorNamePtr (0x16), OemProductNamePtr (0x1A), and OemStringPtr (0x06) */
     if (dev->class_code == 0x03 && (!dev->vendor_name || !dev->device_name)) {
         for (size_t i = 0; i + 16 < rom_len; i++) {
             if (rom[i] == 'V' && rom[i + 1] == 'E' && rom[i + 2] == 'S' && rom[i + 3] == 'A') {
@@ -245,7 +245,7 @@ static void pci_parse_rom_image(const uint8_t *rom, size_t max_len, pci_device_t
         }
     }
 
-    /* 4. If device_name is still unknown, scan the early ROM header (0x1E..0x180) for an ASCII banner */
+    /* If device_name is still unknown, scan the early ROM header (0x1E..0x180) for an ASCII banner */
     if (!dev->device_name) {
         size_t scan_limit = (rom_len < 0x180) ? rom_len : 0x180;
         for (size_t i = 0x1E; i + 8 < scan_limit; i++) {
@@ -270,7 +270,7 @@ static void pci_parse_rom_image(const uint8_t *rom, size_t max_len, pci_device_t
 
 /* Probe shadowed Option ROMs in physical 0xC0000..0xEFFFF and the device's own Expansion ROM BAR */
 static void pci_probe_option_roms(pci_device_t *dev) {
-    /* 1. Check shadowed Option ROM region 0xC0000 - 0xEFFFF */
+    /* Check shadowed Option ROM region 0xC0000 - 0xEFFFF */
     for (uint32_t addr = 0xC0000u; addr < 0xF0000u; addr += 0x800u) {
         const uint8_t *rom = (const uint8_t *)(uintptr_t)addr;
         if (rom[0] == 0x55 && rom[1] == 0xAA) {
@@ -279,7 +279,7 @@ static void pci_probe_option_roms(pci_device_t *dev) {
         }
     }
 
-    /* 2. Check the PCI device's own Expansion ROM BAR directly in hardware */
+    /* Check the PCI device's own Expansion ROM BAR directly in hardware */
     uint8_t hdr = dev->header_type & 0x7Fu;
     uint8_t rom_reg = (hdr == 0x00) ? 0x30 : ((hdr == 0x01) ? 0x38 : 0);
     if (rom_reg == 0) return;
@@ -326,7 +326,7 @@ static void pci_probe_smbios(pci_device_t *dev) {
         uint16_t tbl_len = *(const uint16_t *)(p + 0x16);
         uint32_t tbl_addr = *(const uint32_t *)(p + 0x18);
         uint16_t num_structs = *(const uint16_t *)(p + 0x1C);
-        if (tbl_addr == 0 || tbl_len == 0) break;
+        if (tbl_addr == 0 || tbl_len == 0 || tbl_addr > UINT32_MAX - tbl_len) break;
 
         const uint8_t *cur = (const uint8_t *)(uintptr_t)tbl_addr;
         const uint8_t *end = cur + tbl_len;
@@ -337,6 +337,7 @@ static void pci_probe_smbios(pci_device_t *dev) {
             const uint8_t *str_area = cur + hlen;
             const uint8_t *next = str_area;
             while (next + 1 < end && !(next[0] == 0 && next[1] == 0)) next++;
+            if (next + 1 >= end) break;
             next += 2;
 
             if (type == 41 && hlen >= 11) {
@@ -468,10 +469,14 @@ uint32_t pci_scan_all(void (*callback)(const pci_device_t *dev, void *user_data)
                 dev.irq = pci_read_byte((uint8_t)bus, slot, func, 0x3C);
 
                 pci_probe_hardware_strings(&dev);
-                pci_store_device(&dev);
-
-                if (callback) {
-                    callback(&dev, user_data);
+                if (pci_store_device(&dev)) {
+                    if (callback) {
+                        callback(&dev, user_data);
+                    }
+                } else {
+                    if (dev.vendor_name) kfree(dev.vendor_name);
+                    if (dev.device_name) kfree(dev.device_name);
+                    if (dev.bar) kfree(dev.bar);
                 }
             }
         }

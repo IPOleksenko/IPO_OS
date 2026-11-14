@@ -23,14 +23,7 @@ char *strstr(const char *haystack, const char *needle);
 int atoi(const char *str);
 int memcmp(const void *a, const void *b, size_t n);
 
-/**
- * Common shared formatting and parsing utilities (deduplicated)
- */
 void print_padded(const char *s, int width);
-char *str_trim(char *str);
-int parse_int(const char *str, int *out_val);
-int parse_uint(const char *str, uint32_t *out_val);
-int parse_hex(const char *str, uint32_t *out_val);
 int format_size(uint64_t bytes, char *buf, size_t buf_size);
 char *format_size_dynamic(uint64_t bytes);
 

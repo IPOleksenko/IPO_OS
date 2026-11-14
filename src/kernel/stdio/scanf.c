@@ -85,6 +85,24 @@ int scanf(const char *format, ...) {
                 break;
             }
 
+            if (*pattern == '%') {
+                if (*text != '%') {
+                    break;
+                }
+                text++;
+                pattern++;
+                continue;
+            }
+
+            size_t max_width = 0;
+            while (*pattern >= '0' && *pattern <= '9') {
+                max_width = max_width * 10u + (size_t)(*pattern - '0');
+                pattern++;
+            }
+            if (*pattern == '\0') {
+                break;
+            }
+
             if (*pattern != 'c' && *pattern != '[') {
                 text = skip_spaces(text);
             }
@@ -93,19 +111,23 @@ int scanf(const char *format, ...) {
                 int sign = 1;
                 int value = 0;
                 int digits = 0;
+                size_t rem = max_width ? max_width : (size_t)-1;
                 int *output = va_arg(args, int *);
 
-                if (*text == '-') {
+                if (rem > 0 && *text == '-') {
                     sign = -1;
                     text++;
-                } else if (*text == '+') {
+                    rem--;
+                } else if (rem > 0 && *text == '+') {
                     text++;
+                    rem--;
                 }
 
-                while (*text >= '0' && *text <= '9') {
+                while (rem > 0 && *text >= '0' && *text <= '9') {
                     value = value * 10 + (*text - '0');
                     text++;
                     digits++;
+                    rem--;
                 }
 
                 if (digits == 0) {
@@ -119,12 +141,14 @@ int scanf(const char *format, ...) {
             } else if (*pattern == 'u') {
                 uint32_t value = 0;
                 int digits = 0;
+                size_t rem = max_width ? max_width : (size_t)-1;
                 unsigned int *output = va_arg(args, unsigned int *);
 
-                while (*text >= '0' && *text <= '9') {
+                while (rem > 0 && *text >= '0' && *text <= '9') {
                     value = value * 10u + (uint32_t)(*text - '0');
                     text++;
                     digits++;
+                    rem--;
                 }
 
                 if (digits == 0) {
@@ -139,29 +163,35 @@ int scanf(const char *format, ...) {
                 double sign = 1.0;
                 double value = 0.0;
                 int digits = 0;
+                size_t rem = max_width ? max_width : (size_t)-1;
                 float *output = va_arg(args, float *);
 
-                if (*text == '-') {
+                if (rem > 0 && *text == '-') {
                     sign = -1.0;
                     text++;
-                } else if (*text == '+') {
+                    rem--;
+                } else if (rem > 0 && *text == '+') {
                     text++;
+                    rem--;
                 }
 
-                while (*text >= '0' && *text <= '9') {
+                while (rem > 0 && *text >= '0' && *text <= '9') {
                     value = value * 10.0 + (double)(*text - '0');
                     text++;
                     digits++;
+                    rem--;
                 }
 
-                if (*text == '.') {
+                if (rem > 0 && *text == '.') {
                     text++;
+                    rem--;
                     double frac = 0.1;
-                    while (*text >= '0' && *text <= '9') {
+                    while (rem > 0 && *text >= '0' && *text <= '9') {
                         value += (double)(*text - '0') * frac;
                         frac *= 0.1;
                         text++;
                         digits++;
+                        rem--;
                     }
                 }
 
@@ -176,15 +206,13 @@ int scanf(const char *format, ...) {
             } else if (*pattern == 's') {
                 char *output = va_arg(args, char *);
                 size_t copied = 0u;
+                size_t limit = max_width ? max_width : (size_t)-1;
                 bool more = has_more_conversions(pattern + 1);
 
                 if (more) {
-                    /* If more specifiers follow, read one token delimited by whitespace */
-                    while (*text != '\0' &&
-                           *text != ' ' &&
-                           *text != '\t' &&
-                           *text != '\n' &&
-                           *text != '\r') {
+                    while (copied < limit && *text != '\0' &&
+                           *text != ' ' && *text != '\t' &&
+                           *text != '\n' && *text != '\r') {
                         if (output != NULL) {
                             output[copied] = *text;
                         }
@@ -192,10 +220,8 @@ int scanf(const char *format, ...) {
                         text++;
                     }
                 } else {
-                    /* Last/only specifier: read entire line including words, spaces, tabs */
-                    while (*text != '\0' &&
-                           *text != '\n' &&
-                           *text != '\r') {
+                    while (copied < limit && *text != '\0' &&
+                           *text != '\n' && *text != '\r') {
                         if (output != NULL) {
                             output[copied] = *text;
                         }
@@ -214,16 +240,22 @@ int scanf(const char *format, ...) {
                 }
             } else if (*pattern == 'c') {
                 char *output = va_arg(args, char *);
+                size_t count = max_width ? max_width : 1u;
+                size_t copied = 0u;
 
-                if (*text == '\0') {
+                while (copied < count && *text != '\0') {
+                    if (output != NULL) {
+                        output[copied] = *text;
+                    }
+                    text++;
+                    copied++;
+                }
+                if (copied < count) {
                     break;
                 }
-
                 if (output != NULL) {
-                    *output = *text;
                     assigned++;
                 }
-                text++;
             } else if (*pattern == '[') {
                 pattern++;
                 bool invert = false;
@@ -231,20 +263,23 @@ int scanf(const char *format, ...) {
                     invert = true;
                     pattern++;
                 }
-                uint8_t *set_chars = (uint8_t *)kmalloc(256);
-                if (!set_chars) break;
-                memset(set_chars, 0, 256);
+                uint8_t set_chars[256];
+                memset(set_chars, 0, sizeof(set_chars));
+                if (*pattern == ']') {
+                    set_chars[(unsigned char)']'] = 1;
+                    pattern++;
+                }
                 while (*pattern != ']' && *pattern != '\0') {
                     set_chars[(unsigned char)*pattern] = 1;
                     pattern++;
                 }
                 if (*pattern != ']') {
-                    kfree(set_chars);
                     break;
                 }
                 char *output = va_arg(args, char *);
                 size_t copied = 0u;
-                while (*text != '\0' && *text != '\n' && *text != '\r') {
+                size_t limit = max_width ? max_width : (size_t)-1;
+                while (copied < limit && *text != '\0' && *text != '\n' && *text != '\r') {
                     bool in_set = (set_chars[(unsigned char)*text] != 0);
                     if (invert ? in_set : !in_set) {
                         break;
@@ -255,7 +290,6 @@ int scanf(const char *format, ...) {
                     copied++;
                     text++;
                 }
-                kfree(set_chars);
                 if (copied == 0u) {
                     break;
                 }

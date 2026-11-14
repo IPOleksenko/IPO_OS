@@ -1,12 +1,18 @@
 #include <net/loopback.h>
 #include <net/net_state.h>
 #include <net/ipv4.h>
+#include <driver/net/rtl8139.h>
 #include <memory/kmalloc.h>
 #include <string.h>
 
 void loopback_init(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
-    if (ctx->loopback_queue_capacity > 0) {
+    if (ctx->loopback_queue_capacity > 0 && ctx->loop_slots) {
+        for (size_t i = 0; i < ctx->loopback_queue_capacity; i++) {
+            if (ctx->loop_slots[i].data) {
+                kfree(ctx->loop_slots[i].data);
+            }
+        }
         memset(ctx->loop_slots, 0, ctx->loopback_queue_capacity * sizeof(*ctx->loop_slots));
     }
     ctx->loop_head_idx = 0;
@@ -20,7 +26,8 @@ int loopback_send(const void *packet, uint16_t len) {
 
     net_shared_ctx_t *ctx = net_get_shared_context();
     if (ctx->loopback_queue_capacity == 0 || !ctx->loop_slots) {
-        size_t init_cap = 16;
+        size_t init_cap = rtl8139_get_hw_socket_capacity();
+        if (init_cap == 0) init_cap = 1;
         loopback_slot_t *init_slots = (loopback_slot_t *)kmalloc(init_cap * sizeof(loopback_slot_t));
         if (!init_slots) return -1;
         memset(init_slots, 0, init_cap * sizeof(loopback_slot_t));
@@ -31,9 +38,10 @@ int loopback_send(const void *packet, uint16_t len) {
     }
 
     if (ctx->loop_slots[ctx->loop_tail_idx].valid) {
-        /* Queue full -> dynamically double capacity and linearize existing slots */
+        /* Queue full -> double capacity and linearize existing slots */
         size_t old_cap = ctx->loopback_queue_capacity;
-        size_t new_cap = (old_cap == 0) ? 8 : (old_cap * 2);
+        size_t new_cap = (old_cap == 0) ? rtl8139_get_hw_socket_capacity() : (old_cap * 2);
+        if (new_cap == 0) new_cap = 1;
         if (new_cap > old_cap && new_cap <= (SIZE_MAX / sizeof(loopback_slot_t))) {
             loopback_slot_t *new_slots = (loopback_slot_t *)kmalloc(new_cap * sizeof(loopback_slot_t));
             if (new_slots) {
@@ -49,7 +57,6 @@ int loopback_send(const void *packet, uint16_t len) {
             }
         }
         if (ctx->loop_slots[ctx->loop_tail_idx].valid) {
-            /* Fallback only if memory allocation failed */
             return -1;
         }
     }
@@ -57,7 +64,6 @@ int loopback_send(const void *packet, uint16_t len) {
     size_t next_tail = (ctx->loop_tail_idx + 1) % ctx->loopback_queue_capacity;
     size_t idx = ctx->loop_tail_idx;
 
-    /* Auto-expand packet buffer dynamically via krealloc */
     if (len > ctx->loop_slots[idx].capacity || !ctx->loop_slots[idx].data) {
         uint8_t *new_buf = (uint8_t *)krealloc(ctx->loop_slots[idx].data, len);
         if (!new_buf) return -1;
@@ -75,18 +81,28 @@ int loopback_send(const void *packet, uint16_t len) {
 
 void loopback_poll(void) {
     net_shared_ctx_t *ctx = net_get_shared_context();
-    if (ctx->loopback_queue_capacity == 0) {
+    if (ctx->loopback_queue_capacity == 0 || !ctx->loop_slots) {
         return;
     }
 
+    /* Detach queued buffer before dispatching so nested loopback_send/reallocation is safe */
     while (ctx->loop_slots[ctx->loop_head_idx].valid) {
         size_t idx = ctx->loop_head_idx;
         uint16_t len = ctx->loop_slots[idx].len;
-        if (len > 0 && ctx->loop_slots[idx].data) {
-            ip4_receive(ctx->loop_slots[idx].data, len);
-        }
+        uint8_t *pkt = ctx->loop_slots[idx].data;
+
+        ctx->loop_slots[idx].data = NULL;
+        ctx->loop_slots[idx].capacity = 0;
+        ctx->loop_slots[idx].len = 0;
         ctx->loop_slots[idx].valid = false;
         ctx->loop_head_idx = (ctx->loop_head_idx + 1) % ctx->loopback_queue_capacity;
+
+        if (len > 0 && pkt) {
+            ip4_receive(pkt, len);
+        }
+        if (pkt) {
+            kfree(pkt);
+        }
     }
 }
 
@@ -95,7 +111,7 @@ bool loopback_get_info(uint16_t *mtu, size_t *queue_capacity) {
     if (!ctx || ctx->magic != NET_SHARED_MAGIC || ctx->loopback_queue_capacity == 0) {
         return false;
     }
-    if (mtu) *mtu = 65535;
+    if (mtu) *mtu = (uint16_t)rtl8139_get_hw_max_window();
     if (queue_capacity) *queue_capacity = ctx->loopback_queue_capacity;
     return true;
 }

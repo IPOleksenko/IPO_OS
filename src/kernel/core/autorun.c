@@ -9,18 +9,14 @@
 #define AUTORUN_PATH "/autorun"
 
 
-/**
- * Skip rest of line
- */
-static const char* skip_line(const char *line) {
-    while (*line && *line != '\n') line++;
+static const char *skip_line(const char *line) {
+    while (*line && *line != '\n' && *line != '\r') line++;
+    if (*line == '\r') line++;
     if (*line == '\n') line++;
     return line;
 }
 
-/**
- * Execute autorun file
- */
+/* Execute commands listed in /autorun at boot */
 void autorun_init(void) {
     serial_printf("[autorun] Starting autorun system\n");
     
@@ -35,14 +31,12 @@ void autorun_init(void) {
         return;
     }
     
-    // Allocate buffer for autorun file
     char *autorun_buf = kmalloc(stat.size + 1);
     if (!autorun_buf) {
         serial_printf("[autorun] Memory allocation failed\n");
         return;
     }
     
-    // Read autorun file
     int fd = ipo_fs_open(AUTORUN_PATH);
     if (fd < 0) {
         serial_printf("[autorun] Failed to open /autorun\n");
@@ -60,25 +54,22 @@ void autorun_init(void) {
     
     autorun_buf[stat.size] = '\0';
     
-    // Process each line
     const char *ptr = autorun_buf;
     int line_num = 0;
     
     while (*ptr) {
         line_num++;
         
-        // Skip leading whitespace and comments
         while (*ptr && (*ptr == ' ' || *ptr == '\t')) ptr++;
         
         if (*ptr == '#') {
-            // Comment line
             ptr = skip_line(ptr);
             continue;
         }
         
-        if (*ptr == '\n') {
-            // Empty line
-            ptr++;
+        if (*ptr == '\r' || *ptr == '\n') {
+            if (*ptr == '\r') ptr++;
+            if (*ptr == '\n') ptr++;
             continue;
         }
         
@@ -86,26 +77,25 @@ void autorun_init(void) {
             break;
         }
         
-        // Extract full line (command + arguments)
         const char *line_start = ptr;
-        while (*ptr && *ptr != '\n') {
+        while (*ptr && *ptr != '\n' && *ptr != '\r') {
             ptr++;
         }
         int line_len = (int)(ptr - line_start);
         char *full_line = kmalloc(line_len + 1);
         if (!full_line) {
+            if (*ptr == '\r') ptr++;
             if (*ptr == '\n') ptr++;
             continue;
         }
         memcpy(full_line, line_start, line_len);
         full_line[line_len] = '\0';
         
-        // Skip newline
+        if (*ptr == '\r') ptr++;
         if (*ptr == '\n') ptr++;
         
         serial_printf("[autorun] Line %d: executing '%s'\n", line_num, full_line);
         
-        // Try to execute with full line (including arguments)
         int exec_result = try_execute_command(full_line);
         if (exec_result == 0) {
             serial_printf("[autorun] Command not found\n");
