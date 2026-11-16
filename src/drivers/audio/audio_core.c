@@ -1,4 +1,5 @@
 #include <driver/audio_core.h>
+#include <arch/cpu_regs.h>
 #include <driver/sound.h>
 #include <system/timer.h>
 #include <kernel/irq.h>
@@ -20,10 +21,10 @@
 
 #define SB16_DMA_BUFFER_ADDR 0x600000
 #define SB16_SAMPLE_RATE     22050
-#define SB16_HALF_SAMPLES    256  /* 256 stereo frames = 1024 bytes (~11.6 ms per chunk) */
+#define SB16_HALF_SAMPLES    256  /* 256 stereo frames = 1024 B (~11.6 ms per chunk) */
 #define SB16_TOTAL_SAMPLES   (SB16_HALF_SAMPLES * 2)
-#define SB16_HALF_BYTES      (SB16_HALF_SAMPLES * 4) /* 1024 bytes */
-#define SB16_TOTAL_BYTES     (SB16_TOTAL_SAMPLES * 4) /* 2048 bytes */
+#define SB16_HALF_BYTES      (SB16_HALF_SAMPLES * 4)
+#define SB16_TOTAL_BYTES     (SB16_TOTAL_SAMPLES * 4)
 #define SB16_TOTAL_WORDS     (SB16_TOTAL_BYTES / 2)   /* 1024 16-bit words */
 #define SB16_HALF_WORDS      (SB16_HALF_BYTES / 2)    /* 512 16-bit words */
 #define SB16_LEAD_MS         22u
@@ -102,16 +103,6 @@ static void sb16_dsp_write(uint8_t val) {
     }
 }
 
-static uint8_t sb16_dsp_read(void) {
-    for (int i = 0; i < 20000; i++) {
-        if (inb(SB16_READ_STATUS) & 0x80) {
-            return inb(SB16_READ_DATA_PORT);
-        }
-        io_wait();
-    }
-    return 0;
-}
-
 static bool sb16_reset(void) {
     outb(SB16_RESET_PORT, 1);
     for (volatile int i = 0; i < 1000; i++) io_wait();
@@ -146,20 +137,9 @@ static void sb16_irq_handler(uint8_t irq, void *ctx) {
     }
 }
 
-bool sb16_get_dsp_version(uint8_t *major, uint8_t *minor) {
-    if (g_active_backend != AUDIO_BACKEND_SB16) return false;
-    sb16_dsp_write(0xE1);
-    uint8_t maj = sb16_dsp_read();
-    uint8_t min = sb16_dsp_read();
-    if (major) *major = maj;
-    if (minor) *minor = min;
-    return true;
-}
-
 void sb16_stop(void) {
     if (g_active_backend == AUDIO_BACKEND_SB16) {
-        uint32_t eflags;
-        __asm__ volatile("pushfl; popl %0; cli" : "=r"(eflags) : : "memory");
+        ipo_reg_t eflags = arch_irq_save_regs();
         if (s_sb16_running || s_sb16_in_flight) {
             outb(0xD4, 0x05);      /* Mask DMA Ch 5 */
             sb16_dsp_write(0xD5);  /* Pause 16-bit DMA */
@@ -178,7 +158,7 @@ void sb16_stop(void) {
         s_sb16_pace_ms = 0;
         s_sb16_pace_frac = 0;
         s_silence_halves = 0;
-        __asm__ volatile("pushl %0; popfl" : : "r"(eflags) : "memory", "cc");
+        arch_irq_restore_regs(eflags);
     }
 }
 
@@ -205,11 +185,11 @@ bool audio_init(void) {
         s_audio_tramp_stack_top = address_space_get_audio_tramp_stack_top();
     }
 
-    /* Try Sound Blaster 16 on standard I/O port 0x220 */
+    /* Probe ISA DMA audio at port 0x220 */
     if (sb16_reset()) {
         s_sb16_rate_configured = false;
         g_active_backend = AUDIO_BACKEND_SB16;
-        /* Set mixer volumes to maximum */
+        /* Max master and voice mixer volume */
         outb(SB16_MIXER_ADDR, 0x22); outb(SB16_MIXER_DATA, 0xFF);
         outb(SB16_MIXER_ADDR, 0x04); outb(SB16_MIXER_DATA, 0xFF);
         irq_register_handler(5u, sb16_irq_handler, NULL, 0u);
@@ -218,7 +198,7 @@ bool audio_init(void) {
         return true;
     }
 
-    /* Fallback to PC Speaker PWM */
+    /* Fall back to PC speaker PWM */
     sound_init();
     g_active_backend = AUDIO_BACKEND_PC_SPEAKER;
     return true;
@@ -292,7 +272,7 @@ static void audio_stop_if_idle_locked(void) {
     for (audio_stream_t *s = g_stream_list; s; s = s->next) {
         if (s->is_playing) return;
     }
-    /* Keep SB16 DMA running through its grace window; audio_poll() auto-stops after idle silence. */
+    /* Let ISA DMA audio drain its grace window; audio_poll() stops it after idle silence. */
     sound_stop();
 }
 
@@ -569,7 +549,7 @@ static void sb16_mix_stream_tramp(void *raw_ctx) {
     uint64_t fallback_pos = 0;
     uint64_t *pos_16 = priv ? &priv->pos_16 : &fallback_pos;
 
-    /* Fast path: S16 stereo/mono at native mixer sample rate (pure integer, 0 FPU) */
+    /* Fast path: S16 mono/stereo at native mixer rate (integer-only, no FPU) */
     if (s->format == AUDIO_FORMAT_S16 && (s->channels == 1 || s->channels == 2) && s->sample_rate == rate) {
         const int16_t *src = (const int16_t *)stream_data;
         bool stereo = (s->channels == 2);
@@ -649,7 +629,7 @@ static void sb16_mix_stream_tramp(void *raw_ctx) {
         return;
     }
 
-    /* Generic path for arbitrary formats and fixed-point resampling */
+    /* Generic resampling path */
     size_t limit_samples = (s->ring_size > 0) ? s->ring_size : total_samples;
     size_t ch = (size_t)s->channels;
     if (s->format != AUDIO_FORMAT_F32) {
@@ -696,10 +676,10 @@ static void sb16_mix_stream_tramp(void *raw_ctx) {
     }
 }
 
-/* Mix active streams into half-buffer index 0 or 1. Returns number of contributing streams. */
+/* Mix active streams into half-buffer 0 or 1; returns active stream count. */
 static int sb16_mix_half(int half_idx) {
-    uint32_t phys_addr = SB16_DMA_BUFFER_ADDR + (half_idx * SB16_HALF_BYTES);
-    int16_t *buf = (int16_t *)phys_addr;
+    ipo_paddr_t phys_addr = (ipo_paddr_t)SB16_DMA_BUFFER_ADDR + (ipo_paddr_t)(half_idx * SB16_HALF_BYTES);
+    int16_t *buf = (int16_t *)(ipo_vaddr_t)phys_addr;
     memset(buf, 0, SB16_HALF_BYTES);
 
     uint32_t block_samples = SB16_HALF_SAMPLES;
@@ -758,13 +738,12 @@ static void sb16_submit_chunk(int buf_idx, uint32_t now) {
     uint32_t word_addr = phys_addr >> 1;
     uint16_t word_len = (uint16_t)(SB16_HALF_WORDS - 1);
 
-    uint32_t eflags;
-    __asm__ volatile("pushfl; popl %0; cli" : "=r"(eflags) : : "memory");
+    ipo_reg_t eflags = arch_irq_save_regs();
 
-    /* Program DMA Channel 5 for Single-Cycle Read (releases DREQ on terminal count) */
+    /* Program DMA channel 5 for single-cycle read (releases DREQ on terminal count) */
     outb(0xD4, 0x05); /* Mask Ch 5 */
     outb(0xD8, 0x00); /* Clear flip-flop */
-    outb(0xD6, 0x49); /* Single-mode, Single-cycle, Read transfer (0x40 | 0x08 | 0x01) */
+    outb(0xD6, 0x49); /* Single-mode, single-cycle read (0x40 | 0x08 | 0x01) */
     outb(0xC4, (uint8_t)(word_addr & 0xFF));
     outb(0xC4, (uint8_t)((word_addr >> 8) & 0xFF));
     outb(0x8B, (uint8_t)((phys_addr >> 16) & 0xFE));
@@ -788,13 +767,13 @@ static void sb16_submit_chunk(int buf_idx, uint32_t now) {
     s_sb16_dma_masked = false;
     s_sb16_submit_ms = now;
 
-    /* Start DSP 16-bit single-cycle signed stereo playback (non-FIFO). */
+    /* Start 16-bit single-cycle signed stereo DSP transfer (non-FIFO). */
     sb16_dsp_write(0xB0);
     sb16_dsp_write(0x30);
     sb16_dsp_write((uint8_t)(word_len & 0xFF));
     sb16_dsp_write((uint8_t)((word_len >> 8) & 0xFF));
 
-    __asm__ volatile("pushl %0; popfl" : : "r"(eflags) : "memory", "cc");
+    arch_irq_restore_regs(eflags);
 
     sb16_advance_pace(now);
 }
@@ -862,7 +841,7 @@ void audio_poll(void) {
         audio_init();
     }
 
-    /* Non-blocking atomic guard for ISR re-entrancy */
+    /* Non-blocking lock for ISR re-entrancy */
     if (__sync_lock_test_and_set(&s_audio_lock, 1)) {
         return;
     }
@@ -887,21 +866,20 @@ void audio_poll(void) {
 
         if (s_sb16_in_flight) {
             if (!s_sb16_chunk_done) {
-                uint32_t eflags;
-                __asm__ volatile("pushfl; popl %0; cli" : "=r"(eflags) : : "memory");
+                ipo_reg_t eflags = arch_irq_save_regs();
                 if (!s_sb16_chunk_done && (sb16_read_irq_status() & 0x02u)) {
                     (void)inb(SB16_ACK_16BIT);
                     s_sb16_chunk_done = true;
                 }
-                __asm__ volatile("pushl %0; popfl" : : "r"(eflags) : "memory", "cc");
+                arch_irq_restore_regs(eflags);
             }
 
             if (s_sb16_chunk_done) {
                 s_sb16_in_flight = false;
                 s_sb16_dma_masked = false;
             } else {
-                /* If QEMU/backend FIFO temporarily filled up, mask DMA Ch5 for ~8 ms
-                 * so i8257 does not spin main_loop_wait while audio_free is 0. */
+                /* Back off DMA Ch 5 for ~8 ms if the audio FIFO fills up so the
+                 * ISA DMA controller does not spin polling for space. */
                 if (!s_sb16_dma_masked && (uint32_t)(now - s_sb16_submit_ms) >= 1u) {
                     outb(0xD4, 0x05);
                     s_sb16_dma_masked = true;
@@ -951,7 +929,6 @@ void audio_poll(void) {
         static uint32_t s_pcspk_silence_ms = 0;
         static bool s_pcspk_hw_active = false;
 
-        /* Fast exit when no audio streams exist at all. */
         if (!g_stream_list) {
             if (s_pcspk_hw_active) {
                 sound_stop();
@@ -1051,16 +1028,16 @@ void audio_poll(void) {
             if (s_pcspk_last_freq == 0) {
                 s_pcspk_last_freq = target_freq;
             } else {
-                /* Smooth frequency changes to prevent jarring jumps */
+                /* Low-pass filter frequency jumps */
                 s_pcspk_last_freq = (s_pcspk_last_freq * 3 + target_freq) / 4;
             }
             sound_play(s_pcspk_last_freq);
             s_pcspk_hw_active = true;
             s_pcspk_silence_ms = 0;
         } else if (active_count > 0) {
-            /* Active streams exist, but momentarily zero amplitude or no zero-crossings */
+            /* Stream active, but current window is silent or below threshold */
             s_pcspk_silence_ms += elapsed_ms;
-            /* Only turn off speaker if silence persists for more than 100ms */
+            /* Hold speaker gate briefly across silent gaps */
             if (s_pcspk_silence_ms >= 100) {
                 if (s_pcspk_hw_active) {
                     sound_stop();

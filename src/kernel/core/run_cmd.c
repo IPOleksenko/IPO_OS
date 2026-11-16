@@ -241,8 +241,8 @@ static bool cmd_prepend_return_args(run_cmd_t *cmd,
 
     uint32_t pass_count = 0;
     char **pass_args = NULL;
-    char exit_buf[16];
-    char *exit_ptr = exit_buf;
+    char *exit_buf = NULL;
+    char *exit_ptr = NULL;
 
     if (last_val && last_val->arg_count > 0 && last_val->arg_vals) {
         pass_count = last_val->arg_count;
@@ -251,15 +251,27 @@ static bool cmd_prepend_return_args(run_cmd_t *cmd,
         pass_count = 1;
         pass_args = (char **)&last_val->str_val;
     } else {
-        snprintf(exit_buf, sizeof(exit_buf), "%d", last_exit_code);
+        int need = snprintf(NULL, 0, "%d", last_exit_code);
+        if (need >= 0) {
+            exit_buf = kmalloc((size_t)need + 1u);
+            if (!exit_buf) return false;
+            snprintf(exit_buf, (size_t)need + 1u, "%d", last_exit_code);
+            exit_ptr = exit_buf;
+        }
         pass_count = 1;
         pass_args = &exit_ptr;
     }
 
-    if (pass_count > (uint32_t)(INT_MAX - cmd->argc - 1)) return false;
+    if (pass_count > (uint32_t)(INT_MAX - cmd->argc - 1)) {
+        if (exit_buf) kfree(exit_buf);
+        return false;
+    }
     int new_argc = cmd->argc + (int)pass_count;
     char **new_argv = kmalloc((size_t)(new_argc + 1) * sizeof(char *));
-    if (!new_argv) return false;
+    if (!new_argv) {
+        if (exit_buf) kfree(exit_buf);
+        return false;
+    }
 
     new_argv[0] = cmd->argv[0];
     for (uint32_t k = 0; k < pass_count; k++) {
@@ -267,6 +279,7 @@ static bool cmd_prepend_return_args(run_cmd_t *cmd,
         size_t slen = strlen(src);
         char *copy = kmalloc(slen + 1);
         if (!copy) {
+            if (exit_buf) kfree(exit_buf);
             for (uint32_t r = 0; r < k; r++) kfree(new_argv[1 + r]);
             kfree(new_argv);
             return false;
@@ -274,6 +287,7 @@ static bool cmd_prepend_return_args(run_cmd_t *cmd,
         memcpy(copy, src, slen + 1);
         new_argv[1 + k] = copy;
     }
+    if (exit_buf) kfree(exit_buf);
     for (int j = 1; j < cmd->argc; j++) {
         new_argv[pass_count + (uint32_t)j] = cmd->argv[j];
     }

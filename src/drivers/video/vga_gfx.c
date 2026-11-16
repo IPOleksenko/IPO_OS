@@ -1,8 +1,4 @@
-/**
- * vga_gfx.c - VGA Graphics Engine (Mode 13h: 320x200 256 colors) for IPO_OS
- *
- * Direct hardware register programming with clean Plane 2 font and register restoration.
- */
+/* VGA Mode 13h and DISPI linear framebuffer graphics driver. */
 
 #include <vga_gfx.h>
 #include <stdio.h>
@@ -335,20 +331,18 @@ static inline void ac_write(uint8_t index, uint8_t val) {
 }
 
 void vga_save_text_state(void) {
-    /* If graphics mode is active or text VRAM was already saved, NEVER read 0xB8000!
-     * In Mode 13h, 0xB8000 is unmapped by hardware and reading it yields 0x2020 bus float. */
+    /* Do not read 0xB8000 in graphics mode or after saving; Mode 13h unmaps it
+     * so reads return floating bus data. */
     if (vga_is_graphics_mode() || has_saved_text_vram) {
         return;
     }
 
-    /* Capture true hardware cursor position and visibility */
     saved_cursor_pos = vga_get_cursor_position();
     saved_cursor_visible = vga_is_cursor_visible();
 
-    /* Erase any active cursor so text VRAM contains the true character */
+    /* Remove software cursor glyph before snapshotting text VRAM */
     vga_hide_cursor();
 
-    /* Save text screen buffer from hardware-probed VGA text aperture */
     vga_probe_text_hardware();
     volatile uint16_t *text_vram = VGA_MEMORY;
     int text_cells = (int)VGA_WIDTH * (int)VGA_HEIGHT;
@@ -363,28 +357,23 @@ void vga_save_text_state(void) {
 
     if (text_state_saved) return;
 
-    /* Misc Output */
     saved_misc = inb(0x3CC);
 
-    /* Sequencer */
     for (uint8_t i = 0; i < 5; i++) {
         outb(0x3C4, i);
         vga_dynbuf8_set(&saved_seq, i, inb(0x3C5));
     }
 
-    /* CRTC */
     for (uint8_t i = 0; i < 25; i++) {
         outb(0x3D4, i);
         vga_dynbuf8_set(&saved_crtc, i, inb(0x3D5));
     }
 
-    /* Graphics Controller */
     for (uint8_t i = 0; i < 9; i++) {
         outb(0x3CE, i);
         vga_dynbuf8_set(&saved_gc, i, inb(0x3CF));
     }
 
-    /* Attribute Controller */
     for (uint8_t i = 0; i < 21; i++) {
         inb(0x3DA);
         outb(0x3C0, i);
@@ -393,7 +382,6 @@ void vga_save_text_state(void) {
     inb(0x3DA);
     outb(0x3C0, 0x20);
 
-    /* DAC Palette (all 256 colors) */
     for (int i = 0; i < 256; i++) {
         outb(0x3C7, (uint8_t)i);
         uint8_t r = inb(0x3C9);
@@ -402,7 +390,7 @@ void vga_save_text_state(void) {
         vga_dyndac_set(&saved_dac, i, r, g, b);
     }
 
-    /* Save Plane 2 Font (8KB: 256 glyphs * 32 bytes) */
+    /* Save Plane 2 font (8 KiB: 256 glyphs * 32 B) */
     uint32_t font_flags = vga_plane2_font_enter();
     volatile uint8_t *font_vram = (volatile uint8_t *)0xA0000;
     for (int i = 0; i < 8192; i++) {
@@ -424,9 +412,8 @@ static bool vga_bga_matches_request(int req_w, int req_h) {
 
 void vga_set_mode_13h_hardware(void) {
     serial_printf("[vga] 13h hardware mode set (is_gfx=%d)\n", (int)is_gfx);
-    /* Always capture text-mode DAC/font/VRAM before leaving text mode, also
-     * on the BGA path; otherwise returning to text mode wipes the palette
-     * and the Plane 2 font. */
+    /* Snapshot text DAC, Plane 2 font, and VRAM before any mode switch;
+     * DISPI mode switches otherwise wipe palette and font RAM. */
     vga_save_text_state();
     bool bga_attempted = false;
     if (vbe_bga_is_available()) {
@@ -457,8 +444,8 @@ void vga_set_mode_13h_hardware(void) {
     if (vbe_bga_is_enabled()) {
         vbe_bga_disable();
     }
-    /* Never skip Mode 13h programming if BGA registers were just touched:
-     * an aborted BGA attempt leaves dirty GC[6]/CRTC registers behind. */
+    /* Do not skip Mode 13h programming after a failed DISPI attempt,
+     * which leaves GC[6] and CRTC registers dirty. */
     if (!bga_attempted && is_gfx && vga_is_graphics_mode()) {
         return;
     }
@@ -514,7 +501,7 @@ void vga_set_mode_13h_hardware(void) {
     gc_write(0x03, 0x00);
     gc_write(0x04, 0x00);
     gc_write(0x05, 0x40); /* 256 colors */
-    gc_write(0x06, 0x05); /* 0xA0000 64KB */
+    gc_write(0x06, 0x05); /* 0xA0000 64 KiB */
     gc_write(0x07, 0x0F);
     gc_write(0x08, 0xFF);
 
@@ -528,11 +515,10 @@ void vga_set_mode_13h_hardware(void) {
     ac_write(0x13, 0x00);
     ac_write(0x14, 0x00);
 
-    /* Re-enable video */
+    /* Unblank video */
     inb(0x3DA);
     outb(0x3C0, 0x20);
 
-    /* Probe active hardware Mode 13h dimensions & clear framebuffer */
     vga_probe_gfx_hardware();
     vga_gfx_init_default_palette();
     int hw_w = vga_gfx_get_mode13h_width();
@@ -548,12 +534,11 @@ void vga_set_mode_text_hardware(void) {
     bool was_gfx = is_gfx || vbe_bga_is_enabled();
     serial_printf("[vga] text hardware mode set (is_gfx=%d)\n", (int)is_gfx);
     vbe_bga_disable();
-    /* Always restore hardware text mode registers, sequencer, CRTC, GC, AC, DAC and font */
 
-    /* Misc */
+    /* Misc Output */
     outb(0x3C2, 0x67);
 
-    /* Sequencer (Standard Mode 03h) */
+    /* Sequencer (Mode 03h) */
     static const uint8_t *text_seq = (const uint8_t *)"\x03\x00\x03\x00\x02";
     for (uint8_t i = 0; i < 5; i++) {
         seq_write(i, text_seq[i]);
@@ -565,7 +550,7 @@ void vga_set_mode_text_hardware(void) {
 
     uint16_t saved_cur_pos = vga_get_cursor_position();
 
-    /* CRTC (Standard 80x25 text mode) */
+    /* CRTC (80x25 text mode) */
     static const uint8_t *text_crtc = (const uint8_t *)
         "\x5F\x4F\x50\x82\x55\x81\xBF\x1F"
         "\x00\x4F\x0D\x0E\x00\x00\x00\x00"
@@ -580,13 +565,13 @@ void vga_set_mode_text_hardware(void) {
         }
     }
 
-    /* GC (Standard text mode) */
+    /* Graphics Controller */
     static const uint8_t *text_gc = (const uint8_t *)"\x00\x00\x00\x00\x00\x10\x0E\x00\xFF";
     for (uint8_t i = 0; i < 9; i++) {
         gc_write(i, text_gc[i]);
     }
 
-    /* AC (Standard text mode) */
+    /* Attribute Controller */
     static const uint8_t *text_ac = (const uint8_t *)
         "\x00\x01\x02\x03\x04\x05\x14\x07"
         "\x38\x39\x3A\x3B\x3C\x3D\x3E\x3F"
@@ -597,7 +582,7 @@ void vga_set_mode_text_hardware(void) {
     inb(0x3DA);
     outb(0x3C0, 0x20);
 
-    /* DAC (all 256 colors) */
+    /* DAC palette */
     size_t dac_count = saved_dac.count;
     for (size_t i = 0; i < dac_count; i++) {
         uint8_t r = 0, g = 0, b = 0;
@@ -608,7 +593,7 @@ void vga_set_mode_text_hardware(void) {
         outb(0x3C9, b);
     }
 
-    /* Restore Plane 2 Font */
+    /* Plane 2 font */
     uint32_t font_flags = vga_plane2_font_enter();
     volatile uint8_t *dest = (volatile uint8_t *)0xA0000;
     size_t font_count = saved_font_plane2.count;
@@ -617,11 +602,11 @@ void vga_set_mode_text_hardware(void) {
     }
     vga_plane2_font_exit(font_flags);
 
-    /* Re-apply active custom glyphs directly from source bitmaps to eliminate any mode 13h residues */
+    /* Re-upload custom glyphs over any Mode 13h Plane 2 corruption */
     vga_font_reapply_active();
     dynamic_keymap_reapply_fonts();
 
-    /* Drain keyboard controller buffer */
+    /* Flush stale 8042 bytes */
     for (int d = 0; d < 16 && (inb(0x64) & 0x01); d++) {
         (void)inb(0x60);
     }

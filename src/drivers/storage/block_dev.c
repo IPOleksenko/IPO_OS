@@ -29,11 +29,9 @@ int block_dev_register(block_device_t *bdev) {
 
     spin_lock(&s_block_dev_lock);
 
-    /* Check if already registered */
     block_device_t *curr = s_block_dev_head;
     while (curr) {
         if (curr->name && strcmp(curr->name, bdev->name) == 0) {
-            /* Update existing entry */
             curr->total_sectors = bdev->total_sectors;
             curr->sector_size = (bdev->sector_size > 0) ? bdev->sector_size : 512;
             curr->flags = bdev->flags;
@@ -48,7 +46,6 @@ int block_dev_register(block_device_t *bdev) {
         curr = curr->next;
     }
 
-    /* Allocate device entry */
     block_device_t *node = (block_device_t *)kmalloc(sizeof(block_device_t));
     if (!node) {
         spin_unlock(&s_block_dev_lock);
@@ -71,7 +68,6 @@ int block_dev_register(block_device_t *bdev) {
     if (node->sector_size == 0) node->sector_size = 512;
     node->next = NULL;
 
-    /* Append to tail */
     if (!s_block_dev_head) {
         s_block_dev_head = node;
     } else {

@@ -40,25 +40,20 @@ void vga_get_text_mode_info(uint16_t *out_w, uint16_t *out_h, uint32_t *out_vram
 
 #define VGA_START_CURSOR_POSITION (VGA_WIDTH * 2)
 
-// Creates a 16-bit value of a character + attribute
 static inline uint16_t vga_entry(unsigned char c, enum vga_color fg, enum vga_color bg) {
     return (uint16_t)c | ((bg << 4 | fg) << 8);
 }
 
-// Sets the cursor position
-// offset = row * VGA_WIDTH + col
+/* offset = row * VGA_WIDTH + col */
 void vga_set_cursor(uint16_t offset);
 
-// Shows the cursor
 void vga_show_cursor(void);
 
-// Hides the cursor
 void vga_hide_cursor(void);
 
-// Clears the VGA screen with specified foreground and background colors and cursor settings
 void vga_clear(enum vga_color fg, enum vga_color bg, bool show_cursor, int cursor_position);
 
-// Sanitizes text VRAM at 0xB8000 to eliminate any leftover unmapped bus garbage or green artifacts
+/* Scrub 0xB8000 text VRAM to drop stale boot/unmapped bus artifacts */
 void vga_sanitize_text_vram(void);
 
 #define VGA_CURSOR_GLYPH_SLOT 0x1F
@@ -79,20 +74,23 @@ void vga_cursor_reset_blink(void);
 
 void vga_cursor_reset(void);
 
-extern const uint8_t vga_default_font_data[256][16];
+const uint8_t *vga_default_font_get_glyph(uint8_t char_code);
+void vga_default_font_copy_all(uint8_t *dst_4096);
 const uint8_t* vga_font_get_cached_glyph(uint8_t char_code);
 void vga_init_font_cache(void);
 
 typedef struct {
-    uint32_t codepoint;    /* Unicode codepoint (e.g. 0x0410, 0x4E2D, 0x03B1) */
-    uint8_t  width;        /* Glyph width in pixels */
-    uint8_t  height;       /* Glyph height in pixels */
-    const uint8_t *bitmap; /* 1-bit font bitmap of variable length */
+    uint32_t codepoint;
+    uint8_t  width;
+    uint8_t  height;
+    const uint8_t *bitmap; /* 1-bit packed bitmap */
 } dynamic_glyph_def_t;
 
 void vga_load_font(uint8_t start_code, uint32_t count, const uint8_t *glyphs);
-uint32_t vga_plane2_font_enter(void);
-void vga_plane2_font_exit(uint32_t saved_flags);
+#include <types.h>
+
+ipo_reg_t vga_plane2_font_enter(void);
+void vga_plane2_font_exit(ipo_reg_t saved_flags);
 int vga_font_load(const char *path);
 int vga_load_cyrillic_font(const char *path);
 int vga_font_load_database(const char *path);

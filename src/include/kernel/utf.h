@@ -38,7 +38,6 @@ typedef struct utf_codec {
     utf_decode_fn_t decode;
 } utf_codec_t;
 
-/* Growable byte buffer for streaming multi-byte UTF sequences. */
 typedef struct utf_stream {
     uint8_t *buf;
     size_t   len;
@@ -53,10 +52,10 @@ uint32_t utf_get_default_encoding(void);
 
 void utf_stream_free(utf_stream_t *stream);
 
-/* Feed one byte into stream; returns true once a full codepoint is ready (or U+FFFD on invalid input). */
+/* Returns true once a codepoint (or U+FFFD) is decoded */
 bool utf_stream_push_byte(utf_stream_t *stream, uint8_t byte, uint64_t *out_codepoint);
 
-/* Drain any buffered codepoint remaining after an AUTO BOM mismatch. */
+/* Drain buffered codepoint after an AUTO BOM mismatch */
 bool utf_stream_flush_next(utf_stream_t *stream, uint64_t *out_codepoint);
 
 utf_decode_status_t utf_decode_next(uint32_t encoding_id,
@@ -64,7 +63,7 @@ utf_decode_status_t utf_decode_next(uint32_t encoding_id,
                                     uint64_t *out_codepoint,
                                     size_t *out_consumed);
 
-/* Implemented in vga_cyrillic_font.c. */
+/* Defined in vga_cyrillic_font.c */
 uint8_t utf_codepoint_to_vga_glyph(uint64_t codepoint);
 
 #endif /* KERNEL_UTF_H */

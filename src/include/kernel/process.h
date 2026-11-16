@@ -3,22 +3,21 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <types.h>
+#include <arch/context.h>
 #include <file_system/ipo_fs.h>
 #include <kernel/utf.h>
 
 typedef struct address_space address_space_t;
 
-// Dynamic memory allocation for processes
-#define PROCESS_HEAP_START       0x00800000u  // Start of process heap area (8 MiB)
-#define USER_HEAP_START          0x10000000u  // Start of isolated user process heaps (256 MiB)
-#define USER_HEAP_PROCESS_STRIDE 0x10000000u  // Dynamic stride between process heaps (256 MiB)
+#define PROCESS_HEAP_START       0x00800000u  /* 8 MiB */
+#define USER_HEAP_START          0x10000000u  /* 256 MiB */
+#define USER_HEAP_PROCESS_STRIDE 0x10000000u  /* 256 MiB per-process stride */
 
-// Protection flags
 #define PROT_READ  1
 #define PROT_WRITE 2
 #define PROT_EXEC  4
 
-// Return types and structure
 typedef enum {
     PROC_RET_INT = 0,
     PROC_RET_CHAR,
@@ -30,72 +29,65 @@ typedef enum {
 typedef struct {
     process_return_type_t type;
     int32_t int_val;
-    uint32_t raw_eax;
-    uint32_t raw_edx;
+    ipo_reg_t raw_eax;
+    ipo_reg_t raw_edx;
 
-    /* Self-expanding type name (no fixed 32-byte limit) */
     char *type_name;
     uint32_t type_name_len;
     uint32_t type_name_cap;
 
-    /* Self-expanding formatted universal output string (no fixed 256-byte limit) */
     char *str_val;
     uint32_t str_val_len;
     uint32_t str_val_cap;
 
-    /* Self-expanding raw struct/binary data (no fixed 64-byte limit) */
     uint8_t *struct_data;
     uint32_t struct_size;
     uint32_t struct_data_cap;
 
-    /* Self-expanding argument array for pipeline execution via run */
+    /* Pipeline arguments passed via `run` */
     char **arg_vals;
     uint32_t arg_count;
     uint32_t arg_cap;
 } process_return_value_t;
 
 typedef struct process_heap_chunk {
-    uint32_t base;
-    uint32_t limit;
-    uint32_t brk;
+    ipo_vaddr_t base;
+    ipo_vaddr_t limit;
+    ipo_vaddr_t brk;
 } process_heap_chunk_t;
 
-// Process structure
 typedef struct process_thread process_thread_t;
 
 typedef struct process {
     uint32_t pid;
     
-    // Process memory
-    void *binary_base;      // Base address of the loaded binary
-    uint32_t binary_size;   // Binary size
-    uint32_t entry_point;   // Absolute entry point address
-    void *binary_storage;   // Dedicated storage buffer when swapped out
-    uint32_t data_offset;   // Offset where writeable data/bss begins
-    uint32_t data_size;     // Size of writeable data/bss
-    bool code_mapped;       // True if code segment has been loaded into 0x800000
+    void *binary_base;
+    ipo_size_t binary_size;
+    ipo_vaddr_t entry_point;
+    void *binary_storage;   /* backing buffer when swapped out */
+    ipo_size_t data_offset;   /* writable data/bss offset */
+    ipo_size_t data_size;     /* writable data/bss size */
+    bool code_mapped;       /* true once mapped at 0x800000 */
     
-    // Stack
-    void *stack_base;       // Allocated process stack
-    uint32_t stack_ptr;     // Current stack pointer
-    uint32_t stack_start;   // Start of the stack region
-    uint32_t stack_size;    // Stack size
+    void *stack_base;
+    ipo_vaddr_t stack_ptr;
+    ipo_vaddr_t stack_start;
+    ipo_size_t stack_size;
+    arch_context_t arch_ctx;
     process_thread_t *threads;
     process_thread_t *current_thread;
     uint32_t next_thread_id;
     address_space_t *address_space;
     
-    // Arguments
-    int argc;               // Number of arguments
-    uint32_t argv_addr;     // Address of argv array in process space
-    char **argv_kernel;     // Copy of argv in kernel space (for debugging)
+    int argc;
+    ipo_vaddr_t argv_addr;
+    char **argv_kernel;     /* kernel copy for diagnostics */
     
-    // State
-    int exit_code;          // Exit code
-    process_return_value_t return_val; // Full typed return value
-    bool return_val_explicit; // True if process explicitly set custom return value
-    uint8_t is_running;     // Running flag
-    bool waiting_for_input; // Blocked waiting for user input
+    int exit_code;
+    process_return_value_t return_val;
+    bool return_val_explicit;
+    uint8_t is_running;
+    bool waiting_for_input;
     bool ipc_waiting;
     bool ipc_wait_cancelled;
     uint32_t ipc_wait_endpoint;
@@ -107,58 +99,54 @@ typedef struct process {
     uint32_t signal_action_capacity;
     bool signal_stopped;
     bool signal_delivering;
-    bool wants_graphics;    // Process requested VGA graphics mode (Mode 13h)
-    uint32_t gfx_overlay_flags; // Flags for raw VGA overlay (VGA_OVERLAY_HIDE_BUTTON, etc.)
-    bool is_wm_app;         // Process created a Window Manager window
-    uint32_t async_task_count; // number of active async tasks owned by this process
-    uint32_t user_heap_base;   // Per-process isolated heap start address
-    uint32_t user_heap_break;  // Per-process sbrk break point
-    uint32_t user_heap_limit;  // Per-process isolated heap limit address
-    int32_t  user_heap_slot;   // Dynamic slot index (-1 if none)
-    uint32_t heap_chunk_count; // Number of allocated discontinuous heap chunks
-    uint32_t heap_chunk_cap;   // Dynamically allocated capacity of heap_chunks
-    process_heap_chunk_t *heap_chunks; // Self-expanding discontinuous chunks
+    bool wants_graphics;    /* VGA Mode 13h requested */
+    uint32_t gfx_overlay_flags; /* VGA_OVERLAY_* */
+    bool is_wm_app;
+    uint32_t async_task_count;
+    ipo_vaddr_t user_heap_base;
+    ipo_vaddr_t user_heap_break;
+    ipo_vaddr_t user_heap_limit;
+    int32_t  user_heap_slot;   /* -1 if unassigned */
+    uint32_t heap_chunk_count;
+    uint32_t heap_chunk_cap;
+    process_heap_chunk_t *heap_chunks;
 
-    // Demand Loading
-    struct ipo_inode exec_inode;        // Executable inode for on-demand progressive loading
-    bool     demand_loading;            // True if executable is being loaded on demand
-    uint32_t demand_file_offset;        // Current offset in binary on disk
-    uint32_t demand_mem_offset;         // Current offset in process memory
-    uint32_t demand_loaded_bytes;       // Bytes loaded into memory so far
-    uint32_t demand_total_bytes;        // Total bytes of loadable segments
+    struct ipo_inode exec_inode;
+    bool     demand_loading;
+    ipo_size_t demand_file_offset;
+    ipo_size_t demand_mem_offset;
+    ipo_size_t demand_loaded_bytes;
+    ipo_size_t demand_total_bytes;
 
-    uint16_t *text_vram_backup; // Backup of text VRAM when swapped to background
-    uint8_t *gfx_vram_backup;   // Backup of raw graphics VRAM when swapped to background
-    int      gfx_vram_backup_w; // Width of gfx_vram_backup buffer
-    int      gfx_vram_backup_h; // Height of gfx_vram_backup buffer
-    uint8_t *gfx_palette_backup; // Backup of 256-color DAC palette (768 bytes) when swapped to background
-    uint16_t text_cursor_pos;   // Saved cursor position in text mode
-    bool text_cursor_visible;   // Saved cursor visibility in text mode
-    bool completed_and_acknowledged; // Process completed execution and was acknowledged / closed
+    uint16_t *text_vram_backup;
+    uint8_t *gfx_vram_backup;
+    int      gfx_vram_backup_w;
+    int      gfx_vram_backup_h;
+    uint8_t *gfx_palette_backup; /* 768 B 256-color DAC palette backup */
+    uint16_t text_cursor_pos;
+    bool text_cursor_visible;
+    bool completed_and_acknowledged;
 
-    uint16_t *scroll_top_buffer;    // Workspace top scrollback buffer
-    int scroll_top_capacity;        // Allocated capacity in lines
-    uint16_t *scroll_bottom_buffer; // Workspace bottom scrollback buffer
-    int scroll_bottom_capacity;     // Allocated capacity in lines
-    int scroll_top_count;           // Number of scrolled top lines
-    int scroll_bottom_count;        // Number of scrolled bottom lines
-    int window_id;                  // Workspace / window group ID in batch mode
-    bool text_screen_shared;        // True if text/gfx buffers are shared with another process in same window
+    uint16_t *scroll_top_buffer;
+    int scroll_top_capacity;        /* in lines */
+    uint16_t *scroll_bottom_buffer;
+    int scroll_bottom_capacity;     /* in lines */
+    int scroll_top_count;
+    int scroll_bottom_count;
+    int window_id;                  /* workspace ID in batch mode */
+    bool text_screen_shared;        /* buffers shared within same window */
 
-    char *text_output_buf;      // Captured stdout text for replay
+    char *text_output_buf;      /* stdout capture for replay */
     uint32_t text_output_len;
     uint32_t text_output_cap;
-    uint32_t text_vga_written_len; // Bytes already emitted directly to live VGA text mode
+    uint32_t text_vga_written_len; /* bytes already written to live VGA text memory */
 
-    // Per-process dynamic UTF streaming state for putchar (supports any UTF codec)
     utf_stream_t utf_stream;
 
-    // Debugging and Reflection
-    char *name;             // Process name (dynamically allocated)
-    char *return_format;    // Format descriptor for returned data (int, string, struct, etc.)
+    char *name;
+    char *return_format;    /* "int", "string", "struct", etc. */
     
-    // Links
-    struct process *next;   // For process list
+    struct process *next;
 } process_t;
 
 typedef enum {
@@ -169,9 +157,10 @@ typedef enum {
 
 struct process_thread {
     uint32_t id;
-    uint32_t context_esp;
+    ipo_vaddr_t context_sp;
+    arch_context_t arch_ctx;
     void *stack_base;
-    uint32_t stack_size;
+    ipo_size_t stack_size;
     void *(*entry)(void *);
     void *argument;
     void *result;
@@ -185,14 +174,14 @@ struct process_thread {
     uint32_t ipc_wait_endpoint;
     uint8_t ipc_wait_kind;
     uint64_t signal_mask;
-    uint32_t signal_altstack_base;
-    uint32_t signal_altstack_size;
+    ipo_vaddr_t signal_altstack_base;
+    ipo_size_t signal_altstack_size;
     uint32_t signal_altstack_flags;
     bool signal_altstack_active;
-    uint32_t stack_virtual_top;
-    uint32_t stack_virtual_bottom;
-    uint32_t guard_page_addr;
-    uint32_t stack_allocated_pages;
+    ipo_vaddr_t stack_virtual_top;
+    ipo_vaddr_t stack_virtual_bottom;
+    ipo_vaddr_t guard_page_addr;
+    ipo_size_t stack_allocated_pages;
     process_thread_t *next;
 };
 
@@ -218,10 +207,8 @@ void process_workspace_auto_scroll(process_t *proc);
 void process_sync_workspace_text_state(process_t *proc);
 uintptr_t process_current_context_token(void);
 
-// Entry point signature with arguments
 typedef int (*process_entry_t)(int argc, char **argv);
 
-// Function prototypes
 void process_init(void);
 int universal_process_execute(const char *path, int argc, char **argv);
 int process_exec(const char *path, int argc, char **argv);
@@ -249,8 +236,8 @@ void process_list_print(void);
 int process_kill_by_pid(uint32_t pid);
 int process_kill_all(void);
 bool process_is_alive(uint32_t pid); /* true while PID is in the process list */
-uint32_t process_signal_syscall_handler(uint32_t num, uint32_t argc,
-                                        uint32_t *argv);
+ipo_uarg_t process_signal_syscall_handler(ipo_uarg_t num, ipo_uarg_t argc,
+                                          ipo_uarg_t *argv);
 void process_signal_deliver_pending(void);
 void process_signal_cleanup(uint32_t pid);
 
@@ -261,16 +248,16 @@ bool process_thread_init(process_t *proc);
 bool process_thread_has_runnable(process_t *proc);
 process_thread_t *process_thread_pick_next(process_t *proc);
 void process_thread_cleanup(process_t *proc);
-bool process_update_memory_mappings(process_t *proc, uint32_t address,
-                                    uint32_t length, bool allocated);
+bool process_update_memory_mappings(process_t *proc, ipo_vaddr_t address,
+                                    ipo_size_t length, bool allocated);
 void process_thread_main_exit(process_t *proc);
-uint32_t process_thread_syscall_handler(uint32_t num, uint32_t argc,
-                                        uint32_t *argv);
+ipo_uarg_t process_thread_syscall_handler(ipo_uarg_t num, ipo_uarg_t argc,
+                                          ipo_uarg_t *argv);
 bool process_thread_handle_stack_fault(process_t *proc,
                                        process_thread_t *thread,
-                                       uint32_t fault_address,
-                                       uint32_t error_code,
-                                       uint32_t saved_esp);
+                                       ipo_vaddr_t fault_address,
+                                       ipo_reg_t error_code,
+                                       ipo_vaddr_t saved_sp);
 void process_ipc_set_waiting(process_t *proc, uint32_t endpoint_id, uint8_t wait_kind);
 void process_ipc_wake_waiters(uint32_t endpoint_id, uint8_t wait_kind);
 void process_ipc_cancel_batch_waiters(void);
@@ -308,22 +295,19 @@ bool process_is_valid(process_t *proc);
 void process_crash_exit(void);
 void process_emergency_crash_exit(void);
 
-/* Process isolated heap management (dynamic on-demand, discontinuous chunks) */
+/* Discontinuous on-demand user heap chunks */
 bool process_heap_init(process_t *proc);
 void process_heap_cleanup(process_t *proc);
-bool process_heap_can_expand(process_t *proc, uint32_t new_limit);
-bool process_heap_chunk_can_expand(process_t *proc, uint32_t chunk_idx, uint32_t new_limit);
-uint32_t process_heap_allocate_new_chunk(process_t *proc, uint32_t needed_size);
+bool process_heap_can_expand(process_t *proc, ipo_vaddr_t new_limit);
+bool process_heap_chunk_can_expand(process_t *proc, uint32_t chunk_idx, ipo_vaddr_t new_limit);
+ipo_vaddr_t process_heap_allocate_new_chunk(process_t *proc, ipo_size_t needed_size);
 
-/* Demand / Lazy Loading */
 void process_demand_load_step(process_t *proc);
 void process_demand_load_finish(process_t *proc);
 
-/* Return Reflection */
 void process_set_return_format(process_t *proc, const char *fmt);
 const char *process_get_return_format(const process_t *proc);
 
-/* Custom Binary Format Registry */
 int binfmt_register(const char *name, const uint8_t *magic, uint32_t magic_len, uint32_t offset, const char *runner_path);
 int binfmt_unregister(const char *name);
 void binfmt_list(void);

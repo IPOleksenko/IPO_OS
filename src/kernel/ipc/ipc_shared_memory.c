@@ -29,22 +29,22 @@ typedef struct {
     uint32_t generation;
     uint32_t owner_pid;
     uint32_t public_rights;
-    uint32_t size;
-    uint32_t virtual_base;
+    ipo_size_t size;
+    ipo_vaddr_t virtual_base;
     char *name;
     uint8_t *memory;
     uint8_t *allocation;
     ipc_shm_client_t *clients;
-    uint32_t client_capacity;
+    ipo_count_t client_capacity;
 } ipc_shm_region_t;
 
 static spinlock_t ipc_shm_lock;
 static ipc_shm_region_t *ipc_shm_regions;
-static uint32_t ipc_shm_capacity;
+static ipo_count_t ipc_shm_capacity;
 static bool ipc_shm_ready;
 
 static ipc_shm_region_t *ipc_shm_find_id_locked(uint32_t id) {
-    for (uint32_t i = 0u; i < ipc_shm_capacity; i++) {
+    for (ipo_count_t i = 0u; i < ipc_shm_capacity; i++) {
         if (ipc_shm_regions[i].active && ipc_shm_regions[i].id == id)
             return &ipc_shm_regions[i];
     }
@@ -52,7 +52,7 @@ static ipc_shm_region_t *ipc_shm_find_id_locked(uint32_t id) {
 }
 
 static ipc_shm_region_t *ipc_shm_find_name_locked(const char *name) {
-    for (uint32_t i = 0u; i < ipc_shm_capacity; i++) {
+    for (ipo_count_t i = 0u; i < ipc_shm_capacity; i++) {
         ipc_shm_region_t *region = &ipc_shm_regions[i];
         if (region->active && !region->destroyed && region->name &&
             strcmp(region->name, name) == 0)
@@ -75,23 +75,24 @@ static void ipc_shm_clear_locked(ipc_shm_region_t *region) {
     if (allocation) kfree(allocation);
 }
 
-static uint32_t ipc_shm_find_free_vaddr_locked(uint32_t size_aligned) {
-    uint32_t candidate = IPC_SHM_VIRTUAL_BASE;
+static ipo_vaddr_t ipc_shm_find_free_vaddr_locked(ipo_size_t size_aligned) {
+    ipo_vaddr_t candidate = (ipo_vaddr_t)IPC_SHM_VIRTUAL_BASE;
     bool collision;
     do {
         collision = false;
-        if (candidate > 0xF0000000u - size_aligned) {
+        if (size_aligned > (ipo_size_t)0xF0000000u ||
+            candidate > (ipo_vaddr_t)0xF0000000u - (ipo_vaddr_t)size_aligned) {
             return 0u;
         }
-        for (uint32_t i = 0u; i < ipc_shm_capacity; i++) {
+        for (ipo_count_t i = 0u; i < ipc_shm_capacity; i++) {
             ipc_shm_region_t *r = &ipc_shm_regions[i];
             if (!r->active || r->virtual_base == 0u) continue;
-            uint32_t r_aligned = (r->size + IPC_SHM_PAGE_SIZE - 1u) &
-                                 ~(IPC_SHM_PAGE_SIZE - 1u);
+            ipo_size_t r_aligned = (r->size + IPC_SHM_PAGE_SIZE - 1u) &
+                                   ~(ipo_size_t)(IPC_SHM_PAGE_SIZE - 1u);
             if (candidate < r->virtual_base + r_aligned &&
                 candidate + size_aligned > r->virtual_base) {
                 candidate = (r->virtual_base + r_aligned + IPC_SHM_PAGE_SIZE - 1u) &
-                            ~(IPC_SHM_PAGE_SIZE - 1u);
+                            ~(ipo_vaddr_t)(IPC_SHM_PAGE_SIZE - 1u);
                 collision = true;
                 break;
             }
@@ -105,27 +106,27 @@ static bool ipc_shm_map_locked(ipc_shm_region_t *region, process_t *proc,
     if (!region || !proc || !proc->address_space || !region->memory)
         return false;
 
-    uint32_t pages = (region->size + IPC_SHM_PAGE_SIZE - 1u) /
-                     IPC_SHM_PAGE_SIZE;
-    uint32_t virtual_address = region->virtual_base;
-    uint32_t physical_address = (uint32_t)(uintptr_t)region->memory;
-    uint32_t flags = ADDRESS_SPACE_PAGE_PRESENT | ADDRESS_SPACE_PAGE_USER;
+    ipo_size_t pages = (region->size + IPC_SHM_PAGE_SIZE - 1u) /
+                       IPC_SHM_PAGE_SIZE;
+    ipo_vaddr_t virtual_address = region->virtual_base;
+    ipo_paddr_t physical_address = (ipo_paddr_t)(uintptr_t)region->memory;
+    ipo_reg_t flags = ADDRESS_SPACE_PAGE_PRESENT | ADDRESS_SPACE_PAGE_USER;
     if ((rights & IPO_SHM_RIGHT_WRITE) != 0u) {
         flags |= ADDRESS_SPACE_PAGE_WRITABLE;
     }
 
-    for (uint32_t page = 0u; page < pages; page++) {
-        if (page > (UINT32_MAX - virtual_address) / IPC_SHM_PAGE_SIZE ||
-            page > (UINT32_MAX - physical_address) / IPC_SHM_PAGE_SIZE ||
+    for (ipo_size_t page = 0u; page < pages; page++) {
+        if (page > (ipo_size_t)((IPO_VADDR_MAX - virtual_address) / IPC_SHM_PAGE_SIZE) ||
+            page > (ipo_size_t)((IPO_PADDR_MAX - physical_address) / IPC_SHM_PAGE_SIZE) ||
             !address_space_map(proc->address_space,
-                               virtual_address + page * IPC_SHM_PAGE_SIZE,
-                               physical_address + page * IPC_SHM_PAGE_SIZE,
+                               virtual_address + (ipo_vaddr_t)page * IPC_SHM_PAGE_SIZE,
+                               physical_address + (ipo_paddr_t)page * IPC_SHM_PAGE_SIZE,
                                flags)) {
             while (page > 0u) {
                 page--;
                 (void)address_space_unmap(
                     proc->address_space,
-                    virtual_address + page * IPC_SHM_PAGE_SIZE);
+                    virtual_address + (ipo_vaddr_t)page * IPC_SHM_PAGE_SIZE);
             }
             return false;
         }
@@ -135,13 +136,13 @@ static bool ipc_shm_map_locked(ipc_shm_region_t *region, process_t *proc,
 
 static bool ipc_shm_unmap_locked(ipc_shm_region_t *region, process_t *proc) {
     if (!region || !proc || !proc->address_space) return false;
-    uint32_t pages = (region->size + IPC_SHM_PAGE_SIZE - 1u) /
-                     IPC_SHM_PAGE_SIZE;
-    uint32_t virtual_address = region->virtual_base;
+    ipo_size_t pages = (region->size + IPC_SHM_PAGE_SIZE - 1u) /
+                       IPC_SHM_PAGE_SIZE;
+    ipo_vaddr_t virtual_address = region->virtual_base;
     bool result = true;
-    for (uint32_t page = 0u; page < pages; page++) {
+    for (ipo_size_t page = 0u; page < pages; page++) {
         if (!address_space_unmap(proc->address_space,
-                                 virtual_address + page * IPC_SHM_PAGE_SIZE))
+                                 virtual_address + (ipo_vaddr_t)page * IPC_SHM_PAGE_SIZE))
             result = false;
     }
     return result;
@@ -164,18 +165,18 @@ static ipc_shm_client_t *ipc_shm_find_client_locked(
     return NULL;
 }
 
-static int ipc_shm_create(const char *user_name, uint32_t size,
+static int ipc_shm_create(const char *user_name, ipo_size_t size,
                           uint32_t public_rights) {
     process_t *proc = process_get_current();
-    if (!proc || size == 0u || size > 0x10000000u ||
+    if (!proc || size == 0u || size > (ipo_size_t)0x10000000u ||
         (public_rights & ~(IPO_SHM_RIGHT_READ | IPO_SHM_RIGHT_WRITE)) != 0u ||
-        size > UINT32_MAX - (IPC_SHM_PAGE_SIZE - 1u))
+        size > (ipo_size_t)(IPO_SIZE_MAX - (IPC_SHM_PAGE_SIZE - 1u)))
         return IPO_IPC_ERR_INVALID;
     char *name = ipc_copy_name_alloc(user_name);
     if (!name) return IPO_IPC_ERR_INVALID;
 
-    uint32_t aligned_size = (size + IPC_SHM_PAGE_SIZE - 1u) &
-                            ~(IPC_SHM_PAGE_SIZE - 1u);
+    ipo_size_t aligned_size = (size + IPC_SHM_PAGE_SIZE - 1u) &
+                              ~(ipo_size_t)(IPC_SHM_PAGE_SIZE - 1u);
     uint8_t *allocation = (uint8_t *)kmalloc(aligned_size + IPC_SHM_PAGE_SIZE);
     if (!allocation) {
         kfree(name);
@@ -194,7 +195,7 @@ static int ipc_shm_create(const char *user_name, uint32_t size,
         return IPO_IPC_ERR_EXISTS;
     }
 
-    uint32_t vbase = ipc_shm_find_free_vaddr_locked(aligned_size);
+    ipo_vaddr_t vbase = ipc_shm_find_free_vaddr_locked(aligned_size);
     if (vbase == 0u) {
         spin_unlock(&ipc_shm_lock);
         kfree(name);
@@ -202,18 +203,18 @@ static int ipc_shm_create(const char *user_name, uint32_t size,
         return IPO_IPC_ERR_NO_SPACE;
     }
 
-    uint32_t slot = UINT32_MAX;
-    for (uint32_t i = 0u; i < ipc_shm_capacity; i++) {
+    ipo_count_t slot = IPO_COUNT_MAX;
+    for (ipo_count_t i = 0u; i < ipc_shm_capacity; i++) {
         if (!ipc_shm_regions[i].active && !ipc_shm_regions[i].retired) {
             slot = i;
             break;
         }
     }
-    if (slot == UINT32_MAX) {
-        uint32_t new_cap = ipc_shm_capacity ? (ipc_shm_capacity * 2u)
-                                            : IPC_INITIAL_SHM_CAPACITY;
+    if (slot == IPO_COUNT_MAX) {
+        ipo_count_t new_cap = ipc_shm_capacity ? (ipc_shm_capacity * 2u)
+                                               : IPC_INITIAL_SHM_CAPACITY;
         if (new_cap <= ipc_shm_capacity ||
-            new_cap > (SIZE_MAX / sizeof(*ipc_shm_regions))) {
+            new_cap > (IPO_SIZE_MAX / sizeof(*ipc_shm_regions))) {
             spin_unlock(&ipc_shm_lock);
             kfree(name);
             kfree(allocation);
@@ -254,7 +255,7 @@ static int ipc_shm_create(const char *user_name, uint32_t size,
     memset(clients, 0, IPC_INITIAL_SHM_CLIENT_CAPACITY * sizeof(ipc_shm_client_t));
     memset(region, 0, sizeof(*region));
     region->active = true;
-    region->id = ((generation - 1u) << 11) + slot + 1u;
+    region->id = ((generation - 1u) << 11) + (uint32_t)slot + 1u;
     region->generation = generation;
     region->owner_pid = proc->pid;
     region->public_rights = public_rights;
@@ -310,10 +311,10 @@ static int ipc_shm_open(const char *user_name, uint32_t rights) {
         }
     }
     if (!free_client) {
-        uint32_t new_cap = region->client_capacity ? (region->client_capacity * 2u)
-                                                   : IPC_INITIAL_SHM_CLIENT_CAPACITY;
+        ipo_count_t new_cap = region->client_capacity ? (region->client_capacity * 2u)
+                                                      : IPC_INITIAL_SHM_CLIENT_CAPACITY;
         if (new_cap <= region->client_capacity ||
-            new_cap > (SIZE_MAX / sizeof(*region->clients))) {
+            new_cap > (IPO_SIZE_MAX / sizeof(*region->clients))) {
             spin_unlock(&ipc_shm_lock);
             return IPO_IPC_ERR_NO_SPACE;
         }
@@ -339,7 +340,7 @@ static int ipc_shm_open(const char *user_name, uint32_t rights) {
 }
 
 static int ipc_shm_attach(uint32_t id, void **user_address,
-                          uint32_t *user_size) {
+                          ipo_size_t *user_size) {
     process_t *proc = process_get_current();
     if (!proc || !ipc_user_range(user_address, sizeof(*user_address)) ||
         !ipc_user_range(user_size, sizeof(*user_size)))
@@ -447,8 +448,8 @@ void ipc_shared_memory_process_terminated(uint32_t pid) {
     spin_unlock(&ipc_shm_lock);
 }
 
-bool ipc_shared_memory_user_range(uint32_t pid, const void *ptr,
-                                  uint32_t length) {
+bool ipc_shared_memory_user_range(ipo_id_t pid, const void *ptr,
+                                  ipo_size_t length) {
     if (!ipc_shm_ready || !ptr || length == 0u) return false;
     uintptr_t start = (uintptr_t)ptr;
     if (start > UINTPTR_MAX - length) return false;
@@ -472,36 +473,36 @@ bool ipc_shared_memory_user_range(uint32_t pid, const void *ptr,
     return false;
 }
 
-uint32_t ipc_shared_memory_syscall_handler(uint32_t num, uint32_t argc,
-                                           uint32_t *argv) {
-    if (!ipc_shm_ready) return (uint32_t)IPO_IPC_ERR_NO_SPACE;
-    uint32_t args[3] = {0};
+ipo_uarg_t ipc_shared_memory_syscall_handler(ipo_uarg_t num, ipo_uarg_t argc,
+                                             ipo_uarg_t *argv) {
+    if (!ipc_shm_ready) return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_NO_SPACE;
+    ipo_uarg_t args[3] = {0};
     switch (num) {
         case IPO_SYSCALL_SHM_CREATE:
             if (!ipc_copy_syscall_args(argc, argv, 3u, args))
-                return (uint32_t)IPO_IPC_ERR_INVALID;
-            return (uint32_t)ipc_shm_create(
-                (const char *)(uintptr_t)args[0], args[1], args[2]);
+                return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
+            return (ipo_uarg_t)(ipo_sarg_t)ipc_shm_create(
+                (const char *)(ipo_vaddr_t)args[0], (ipo_size_t)args[1], (uint32_t)args[2]);
         case IPO_SYSCALL_SHM_OPEN:
             if (!ipc_copy_syscall_args(argc, argv, 2u, args))
-                return (uint32_t)IPO_IPC_ERR_INVALID;
-            return (uint32_t)ipc_shm_open(
-                (const char *)(uintptr_t)args[0], args[1]);
+                return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
+            return (ipo_uarg_t)(ipo_sarg_t)ipc_shm_open(
+                (const char *)(ipo_vaddr_t)args[0], (uint32_t)args[1]);
         case IPO_SYSCALL_SHM_ATTACH:
             if (!ipc_copy_syscall_args(argc, argv, 3u, args))
-                return (uint32_t)IPO_IPC_ERR_INVALID;
-            return (uint32_t)ipc_shm_attach(
-                args[0], (void **)(uintptr_t)args[1],
-                (uint32_t *)(uintptr_t)args[2]);
+                return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
+            return (ipo_uarg_t)(ipo_sarg_t)ipc_shm_attach(
+                (uint32_t)args[0], (void **)(ipo_vaddr_t)args[1],
+                (ipo_size_t *)(ipo_vaddr_t)args[2]);
         case IPO_SYSCALL_SHM_DETACH:
             if (!ipc_copy_syscall_args(argc, argv, 1u, args))
-                return (uint32_t)IPO_IPC_ERR_INVALID;
-            return (uint32_t)ipc_shm_detach(args[0]);
+                return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
+            return (ipo_uarg_t)(ipo_sarg_t)ipc_shm_detach((uint32_t)args[0]);
         case IPO_SYSCALL_SHM_DESTROY:
             if (!ipc_copy_syscall_args(argc, argv, 1u, args))
-                return (uint32_t)IPO_IPC_ERR_INVALID;
-            return (uint32_t)ipc_shm_destroy(args[0]);
+                return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
+            return (ipo_uarg_t)(ipo_sarg_t)ipc_shm_destroy((uint32_t)args[0]);
         default:
-            return (uint32_t)IPO_IPC_ERR_INVALID;
+            return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
     }
 }

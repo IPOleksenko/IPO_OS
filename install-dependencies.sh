@@ -1,13 +1,11 @@
 #!/bin/bash
 
-# ============================
-# Update and install required packages
-# ============================
+# Update package index and install build tools
 
 echo "Updating package lists..."
 sudo apt update || { echo "Failed to update package lists"; exit 1; }
 
-# Check and install only missing packages
+# Install missing packages
 REQUIRED_PACKAGES=("build-essential" "nasm" "bison" "flex" "libgmp3-dev" "libmpc-dev" "libmpfr-dev" "texinfo" "qemu-system-x86" "xorriso" "grub-pc-bin" "python3" "python3-pip" "python3-venv" "automake" "autoconf")
 for PACKAGE in "${REQUIRED_PACKAGES[@]}"; do
     if dpkg -s $PACKAGE &> /dev/null; then
@@ -18,9 +16,7 @@ for PACKAGE in "${REQUIRED_PACKAGES[@]}"; do
     fi
 done
 
-# ============================
-# Set up cross-compiler
-# ============================
+# Build cross-compiler toolchain
 
 echo "Setting up cross-compiler for $TARGET..."
 
@@ -45,7 +41,7 @@ else
     echo "Binutils already installed. Skipping..."
 fi
 
-# Download and build GCC
+# Download and build cross-compiler
 if [ ! -f "$CROSS_DIR/bin/$TARGET-gcc" ]; then
     echo "Downloading and building GCC..."
     cd /tmp || { echo "Failed to navigate to /tmp"; exit 1; }
@@ -61,17 +57,13 @@ else
     echo "GCC already installed. Skipping..."
 fi
 
-# ============================
-# Set environment variables
-# ============================
+# Add cross-compiler to PATH
 
 echo "Setting up environment variables..."
 echo "export PATH=$CROSS_DIR/bin:\$PATH" >> ~/.bashrc
 export PATH=$CROSS_DIR/bin:$PATH
 
-# ============================
-# Verify installation
-# ============================
+# Verify toolchain installation
 
 echo "Verifying installation..."
 if command -v $TARGET-gcc &> /dev/null && command -v $TARGET-as &> /dev/null; then

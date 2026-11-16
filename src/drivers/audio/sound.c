@@ -16,7 +16,7 @@ static float sound_sinf(float x) {
     return x * (1.0f - x2 * (0.16666667f - x2 * (0.00833333f - x2 * 0.00019841f)));
 }
 
-/* Sound control port */
+/* PPI port B speaker control */
 #define SOUND_CTRL_PORT 0x61
 #define SOUND_CTRL_GATE 0x01
 #define SOUND_CTRL_SPEAKER 0x02
@@ -36,16 +36,14 @@ void sound_play(uint32_t frequency) {
     if (frequency == 0)
         return;
     
-    /* Set PIT counter 2 to desired frequency */
     pit_set_frequency(2, frequency);
     
-    /* Enable speaker */
     uint8_t control = inb(SOUND_CTRL_PORT);
     outb(SOUND_CTRL_PORT, control | SOUND_CTRL_GATE | SOUND_CTRL_SPEAKER);
 }
 
 void sound_stop(void) {
-    /* Disable speaker only if currently enabled to avoid idle I/O port traps. */
+    /* Gate off speaker only when active to avoid idle I/O port traps. */
     uint8_t control = inb(SOUND_CTRL_PORT);
     if (control & (SOUND_CTRL_GATE | SOUND_CTRL_SPEAKER)) {
         outb(SOUND_CTRL_PORT, control & ~(SOUND_CTRL_GATE | SOUND_CTRL_SPEAKER));
@@ -55,7 +53,6 @@ void sound_stop(void) {
 void sound_beep(uint32_t frequency, uint32_t duration) {
     sound_play(frequency);
     
-    /* Delay in milliseconds (busy-wait loop) */
     volatile uint32_t delay = duration * 1000;
     while (delay--) {
         io_wait();

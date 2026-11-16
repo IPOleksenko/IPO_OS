@@ -3,7 +3,7 @@
 #include <kernel/smp.h>
 #include <memory/kmalloc.h>
 #include <memory/memory_map.h>
-#include <driver/net/pci.h>
+#include <driver/pci.h>
 #include <driver/ata/ata.h>
 #include <ioport.h>
 #include <string.h>
@@ -55,7 +55,6 @@ const char *bus_type_to_string(bus_type_t bus) {
     }
 }
 
-/* Dynamic device_resources_t lifecycle implementation */
 void device_resources_init(device_resources_t *res) {
     if (!res) return;
     memset(res, 0, sizeof(*res));
@@ -71,13 +70,13 @@ void device_resources_free(device_resources_t *res) {
     res->bar_cap = 0;
 }
 
-int device_resources_add_bar(device_resources_t *res, uint32_t bar) {
+int device_resources_add_bar(device_resources_t *res, ipo_paddr_t bar) {
     if (!res) return -1;
     if (res->bar_count >= res->bar_cap) {
         size_t new_cap = (res->bar_cap == 0) ? 6 : (res->bar_cap * 2);
-        uint32_t *new_bar = (uint32_t *)krealloc(res->bar, new_cap * sizeof(uint32_t));
+        ipo_paddr_t *new_bar = (ipo_paddr_t *)krealloc(res->bar, new_cap * sizeof(ipo_paddr_t));
         if (!new_bar) return -1;
-        memset(new_bar + res->bar_count, 0, (new_cap - res->bar_count) * sizeof(uint32_t));
+        memset(new_bar + res->bar_count, 0, (new_cap - res->bar_count) * sizeof(ipo_paddr_t));
         res->bar = new_bar;
         res->bar_cap = new_cap;
     }
@@ -94,18 +93,17 @@ int device_resources_copy(device_resources_t *dst, const device_resources_t *src
     dst->bar_count = 0;
     dst->bar_cap = 0;
     if (src->bar && src->bar_count > 0) {
-        dst->bar = (uint32_t *)kmalloc(src->bar_count * sizeof(uint32_t));
+        dst->bar = (ipo_paddr_t *)kmalloc(src->bar_count * sizeof(ipo_paddr_t));
         if (!dst->bar) {
             return -1;
         }
-        memcpy(dst->bar, src->bar, src->bar_count * sizeof(uint32_t));
+        memcpy(dst->bar, src->bar, src->bar_count * sizeof(ipo_paddr_t));
         dst->bar_count = src->bar_count;
         dst->bar_cap = src->bar_count;
     }
     return 0;
 }
 
-/* Dynamic device_node_t lifecycle implementation */
 void device_node_init(device_node_t *dev) {
     if (!dev) return;
     memset(dev, 0, sizeof(*dev));
@@ -263,7 +261,6 @@ device_node_t *device_register(const device_node_t *dev) {
     }
     node->next = NULL;
 
-    /* Append to tail of linked list */
     if (!s_device_head) {
         s_device_head = node;
     } else {
@@ -385,8 +382,6 @@ const device_node_t *device_get_list(void) {
     return s_device_head;
 }
 
-/* Hardware discovery and enumeration */
-
 static void scan_cpu_subsystem(void) {
     char *vendor = smp_get_cpu_vendor_dyn();
     char *brand = smp_get_cpu_brand_dyn();
@@ -471,7 +466,12 @@ static void scan_pci_subsystem(void) {
         }
 
         uint16_t pci_cmd = pci_read_word(pdev->bus, pdev->slot, pdev->func, 0x04);
-        dev.state = (pci_cmd & 0x07u) ? DEVICE_STATE_ACTIVE : DEVICE_STATE_INITIALIZED;
+        if (dev.type == DEVICE_TYPE_NETWORK) {
+            /* Network hardware starts unbound until an external driver attaches */
+            dev.state = DEVICE_STATE_DISCOVERED;
+        } else {
+            dev.state = (pci_cmd & 0x07u) ? DEVICE_STATE_ACTIVE : DEVICE_STATE_INITIALIZED;
+        }
 
         device_node_set_name(&dev, pdev->device_name ? pdev->device_name : pdev->vendor_name);
         device_node_set_vendor(&dev, pdev->vendor_name);
@@ -671,7 +671,7 @@ static device_type_t acpi_hid_to_device_type(const char *hid) {
     return DEVICE_TYPE_SYSTEM;
 }
 
-/* Scan an ACPI DSDT or SSDT AML bytecode table for hardware Device() definitions */
+/* Scan ACPI DSDT/SSDT AML for Device() nodes */
 static void scan_acpi_aml_table(const uint8_t *sdt) {
     if (!sdt) return;
     uint32_t sdt_len = *(const uint32_t *)(sdt + 4);
@@ -744,7 +744,7 @@ static void scan_acpi_aml_table(const uint8_t *sdt) {
                     uint32_t mmio_size = 0;
                     uint8_t irq = 0xFF;
 
-                    /* Extract hardware resources from _CRS buffer descriptors */
+                    /* Parse _CRS resource descriptors */
                     for (size_t m = 0; m + 4 < body_len; m++) {
                         if (memcmp(body + m, "_CRS", 4) == 0) {
                             for (size_t r = m + 4; r + 2 < body_len; r++) {
@@ -950,6 +950,25 @@ static void device_registry_clear(void) {
     spin_unlock(&s_device_lock);
 }
 
+typedef struct {
+    bus_type_t     bus_type;
+    device_type_t  type;
+    uint8_t        pci_bus;
+    uint8_t        pci_slot;
+    uint8_t        pci_func;
+    char          *name;
+    char          *driver_name;
+    device_state_t state;
+} saved_driver_binding_t;
+
+static char *device_strdup_local(const char *s) {
+    if (!s) return NULL;
+    size_t len = strlen(s) + 1u;
+    char *copy = (char *)kmalloc(len);
+    if (copy) memcpy(copy, s, len);
+    return copy;
+}
+
 int device_rescan(void) {
     if (!s_registry_initialized) {
         spinlock_init(&s_device_lock);
@@ -958,14 +977,64 @@ int device_rescan(void) {
         s_registry_initialized = true;
     }
 
+    /* Preserve active driver bindings across rescan */
+    size_t saved_cap = 0u, saved_cnt = 0u;
+    saved_driver_binding_t *saved = NULL;
+    for (const device_node_t *curr = s_device_head; curr; curr = curr->next) {
+        if (!curr->driver_name || !curr->driver_name[0]) continue;
+        if (saved_cnt >= saved_cap) {
+            size_t ncap = saved_cap ? (saved_cap * 2u) : 8u;
+            saved_driver_binding_t *narr = (saved_driver_binding_t *)krealloc(
+                saved, ncap * sizeof(saved_driver_binding_t));
+            if (!narr) break;
+            saved = narr;
+            saved_cap = ncap;
+        }
+        saved[saved_cnt].bus_type    = curr->res.bus_type;
+        saved[saved_cnt].type        = curr->type;
+        saved[saved_cnt].pci_bus     = curr->res.pci_bus;
+        saved[saved_cnt].pci_slot    = curr->res.pci_slot;
+        saved[saved_cnt].pci_func    = curr->res.pci_func;
+        saved[saved_cnt].name        = device_strdup_local(curr->name);
+        saved[saved_cnt].driver_name = device_strdup_local(curr->driver_name);
+        saved[saved_cnt].state       = curr->state;
+        saved_cnt++;
+    }
+
     device_registry_clear();
 
-    /* Rescan all hardware buses and register components */
     scan_cpu_subsystem();
     scan_memory_subsystem();
     scan_pci_subsystem();
     scan_storage_subsystem();
     scan_acpi_and_platform_subsystem();
+
+    for (size_t i = 0; i < saved_cnt; i++) {
+        if (saved[i].driver_name && saved[i].driver_name[0]) {
+            driver_t *drv = driver_find(saved[i].driver_name);
+            if (drv && (drv->flags & DRIVER_FLAG_ACTIVE)) {
+                for (const device_node_t *dn = s_device_head; dn; dn = dn->next) {
+                    bool match = false;
+                    if (saved[i].bus_type == BUS_TYPE_PCI && dn->res.bus_type == BUS_TYPE_PCI) {
+                        match = (dn->res.pci_bus == saved[i].pci_bus &&
+                                 dn->res.pci_slot == saved[i].pci_slot &&
+                                 dn->res.pci_func == saved[i].pci_func);
+                    } else if (saved[i].name && dn->name &&
+                               dn->type == saved[i].type &&
+                               strcmp(dn->name, saved[i].name) == 0) {
+                        match = true;
+                    }
+                    if (match) {
+                        device_set_driver(dn->id, drv->name, drv);
+                        device_set_state(dn->id, saved[i].state);
+                    }
+                }
+            }
+        }
+        if (saved[i].name) kfree(saved[i].name);
+        if (saved[i].driver_name) kfree(saved[i].driver_name);
+    }
+    if (saved) kfree(saved);
 
     serial_printf("[device] Rescan completed: %u devices currently in registry\n", device_get_count());
     return (int)device_get_count();

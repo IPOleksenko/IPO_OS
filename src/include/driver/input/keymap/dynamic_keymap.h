@@ -5,7 +5,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* Standard scancode definitions */
 #define KEY_ESC         0x01
 #define KEY_1           0x02
 #define KEY_2           0x03
@@ -63,126 +62,62 @@
 #define KEY_RSHIFT      0x36
 #define KEY_SPACE       0x39
 
-/**
- * One dictionary entry mapping a hardware scancode to fixed-size normal and
- * shifted output strings.
- */
 typedef struct {
-    uint8_t scancode;          /* Key scancode */
-    const char *normal;        /* Normal output string (supports arbitrary length) */
-    const char *shift;         /* Shift output string (supports arbitrary length) */
+    uint8_t scancode;
+    const char *normal;
+    const char *shift;
 } keymap_entry_t;
 
 #include <vga.h>
 
-/**
- * Register or replace the active dynamic keymap. The glyph arguments are
- * currently ignored.
- */
+/* Register or replace active dynamic keymap; glyph args are ignored */
 int dynamic_keymap_register_with_font(const char *name,
                                       const keymap_entry_t *entries,
                                       uint32_t count,
                                       const dynamic_glyph_def_t *glyphs,
                                       uint32_t glyph_count);
 
-/**
- * Register or replace active dynamic keymap (backwards-compatible wrapper).
- * @param name Language name (any length, will be dynamically allocated)
- * @param entries Array of keymap entries
- * @param count Number of entries
- * @return 0 on success, negative error code on failure
- */
+/* Register or replace active keymap; returns 0 or <0 on error */
 int dynamic_keymap_set(const char *name, const keymap_entry_t *entries, uint32_t count);
 
-/**
- * Get current active language name.
- */
 const char* dynamic_keymap_get_name(void);
 const char* dynamic_keymap_get_name_local(void);
 void dynamic_keymap_reapply_fonts(void);
 
-/**
- * Translate a scancode using the dynamic keymap.
- * @param scancode Hardware scancode
- * @param shift Whether Shift modifier is active
- * @return Output string, or NULL if not mapped in dynamic dictionary
- */
+/* Returns NULL if scancode is not in the active dynamic map */
 const char* dynamic_keymap_translate(uint8_t scancode, bool shift);
 const char* dynamic_keymap_translate_local(uint8_t scancode, bool shift);
 
-/**
- * Returns true if a custom dynamic keymap is currently active.
- */
 bool dynamic_keymap_is_active(void);
 bool dynamic_keymap_is_active_local(void);
 
 void dynamic_keymap_set_default_symbol(const char *symbol);
 const char* dynamic_keymap_get_default_symbol(void);
 
-/**
- * Cycle to next layout in the storage.
- */
 void dynamic_keymap_cycle_next(void);
 void dynamic_keymap_cycle_next_local(void);
 void dynamic_keymap_cycle_prev(void);
 void dynamic_keymap_cycle_prev_local(void);
 
-/**
- * Get total number of registered keymaps.
- */
 uint32_t dynamic_keymap_get_count(void);
 
-/**
- * Get currently active keymap index.
- */
 uint32_t dynamic_keymap_get_active_index(void);
 
-/**
- * Select a specific keymap by index.
- */
 void dynamic_keymap_select(uint32_t index);
 
-/**
- * Disable a keyboard layout by name or index.
- * @return 0 on success, negative on failure
- */
+/* Enable/disable/remove layout by name or index; return 0 or <0 on error */
 int dynamic_keymap_disable(const char *name_or_id);
-
-/**
- * Enable a keyboard layout by name or index.
- * @return 0 on success, negative on failure
- */
 int dynamic_keymap_enable(const char *name_or_id);
-
-/**
- * Remove a keyboard layout completely.
- * @return 0 on success, negative on failure
- */
 int dynamic_keymap_remove(const char *name_or_id);
 
-/**
- * Get count of currently enabled keymaps.
- */
 uint32_t dynamic_keymap_get_enabled_count(void);
 
-/**
- * Check if a keymap at index is enabled.
- */
 bool dynamic_keymap_is_slot_enabled(uint32_t index);
 
-/**
- * Get keymap name at specific index.
- */
 const char* dynamic_keymap_get_slot_name(uint32_t index);
 
-/**
- * Reset back to default system keymap.
- */
 void dynamic_keymap_reset(void);
 
-/**
- * Configure dynamic keymap app mode.
- */
 void dynamic_keymap_set_app_mode(bool is_app);
 
 extern const char default_keymap_name[];

@@ -116,7 +116,7 @@ int dynamic_keymap_set(const char *name, const keymap_entry_t *entries, uint32_t
     keymap_entry_t *new_entries = NULL;
     uint32_t new_count = 0;
     if (entries != NULL && count > 0) {
-        if ((size_t)count > SIZE_MAX / sizeof(keymap_entry_t)) {
+        if (!ipo_size_mul_ok((ipo_size_t)count, sizeof(keymap_entry_t), NULL)) {
             kfree(new_name);
             return -2;
         }
@@ -248,10 +248,10 @@ const char* dynamic_keymap_translate_local(uint8_t scancode, bool shift) {
 
 const char* dynamic_keymap_translate(uint8_t scancode, bool shift) {
     if (should_use_keymap_syscalls()) {
-        uint32_t args[2];
-        args[0] = (uint32_t)scancode;
-        args[1] = (uint32_t)shift;
-        return (const char *)(uintptr_t)ipo_syscall(IPO_SYSCALL_KEYMAP_TRANSLATE, 2u, args);
+        ipo_uarg_t args[2];
+        args[0] = (ipo_uarg_t)scancode;
+        args[1] = (ipo_uarg_t)shift;
+        return (const char *)(ipo_vaddr_t)ipo_syscall(IPO_SYSCALL_KEYMAP_TRANSLATE, 2u, args);
     }
     return dynamic_keymap_translate_local(scancode, shift);
 }
@@ -330,7 +330,7 @@ int dynamic_keymap_disable(const char *name_or_id) {
 
     keymap_storage[slot].enabled = false;
 
-    /* If currently active layout was disabled, switch to first available enabled layout */
+    /* Fall back to the first enabled layout if the active one was disabled */
     if (active_storage_index == (uint32_t)slot) {
         for (uint32_t i = 0; i < keymap_storage_count; i++) {
             if (keymap_storage[i].enabled) {

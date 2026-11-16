@@ -76,8 +76,8 @@ static bool signal_arrays_grow(uintptr_t **handlers, uint64_t **masks,
         }
         new_capacity *= 2u;
     }
-    if ((size_t)new_capacity > SIZE_MAX / sizeof(**handlers) ||
-        (size_t)new_capacity > SIZE_MAX / sizeof(**masks))
+    if (!ipo_size_mul_ok((ipo_size_t)new_capacity, sizeof(**handlers), NULL) ||
+        !ipo_size_mul_ok((ipo_size_t)new_capacity, sizeof(**masks), NULL))
         return false;
 
     uintptr_t *new_handlers =
@@ -136,7 +136,7 @@ static bool signal_extension_actions_ensure(signal_extension_t *state,
         }
         new_capacity *= 2u;
     }
-    if ((size_t)new_capacity > SIZE_MAX / sizeof(uint32_t)) return false;
+    if (!ipo_size_mul_ok((ipo_size_t)new_capacity, sizeof(uint32_t), NULL)) return false;
     uint32_t *new_flags =
         (uint32_t *)kmalloc((size_t)new_capacity * sizeof(*new_flags));
     uint32_t *new_senders =
@@ -406,42 +406,42 @@ static uint32_t signal_apply_action(process_t *current, uint32_t signal,
     return 0u;
 }
 
-static uint32_t signal_dispatch_impl(process_t *current, uint32_t num,
-                                      uint32_t argc, uint32_t *argv,
-                                      uint32_t *args) {
+static ipo_uarg_t signal_dispatch_impl(process_t *current, ipo_uarg_t num,
+                                       ipo_uarg_t argc, ipo_uarg_t *argv,
+                                       ipo_uarg_t *args) {
     if (num == IPO_SYSCALL_KILL) {
-        if (!ipc_copy_syscall_args(argc, argv, 2u, args)) return (uint32_t)-1;
-        return (uint32_t)signal_send((int)args[0], args[1]);
+        if (!ipc_copy_syscall_args(argc, argv, 2u, args)) return (ipo_uarg_t)-1;
+        return (ipo_uarg_t)(ipo_sarg_t)signal_send((int)args[0], (uint32_t)args[1]);
     }
 
     if (num == IPO_SYSCALL_SIGACTION) {
-        uint32_t count = (argc > 7u) ? 8u : 6u;
-        if (!ipc_copy_syscall_args(argc, argv, count, args)) return (uint32_t)-1;
-        uint32_t signal = args[0];
+        ipo_count_t count = (argc > 7u) ? 8u : 6u;
+        if (!ipc_copy_syscall_args(argc, argv, count, args)) return (ipo_uarg_t)-1;
+        uint32_t signal = (uint32_t)args[0];
         if (!signal_number_valid(signal) || signal == IPO_SIGKILL ||
             signal == IPO_SIGSTOP)
-            return (uint32_t)-1;
+            return (ipo_uarg_t)-1;
 
-        uintptr_t new_handler = args[1];
-        uint32_t new_mask = args[2];
-        uintptr_t old_handler = 0u;
+        ipo_vaddr_t new_handler = args[1];
+        uint32_t new_mask = (uint32_t)args[2];
+        ipo_vaddr_t old_handler = 0u;
         uint32_t old_mask = 0u;
         uint32_t old_flags = 0u;
 
         if (count >= 8u) {
-            uintptr_t old_h_ptr = args[3];
-            uintptr_t old_m_ptr = args[4];
-            uint32_t new_flags = args[5];
-            uintptr_t old_f_ptr = args[6];
+            ipo_vaddr_t old_h_ptr = args[3];
+            ipo_vaddr_t old_m_ptr = args[4];
+            uint32_t new_flags = (uint32_t)args[5];
+            ipo_vaddr_t old_f_ptr = args[6];
             bool apply = (args[7] != 0u);
 
             if ((old_h_ptr != 0u &&
-                 !ipc_user_range((void *)old_h_ptr, sizeof(uint32_t))) ||
+                 !ipc_user_range((void *)old_h_ptr, sizeof(ipo_vaddr_t))) ||
                 (old_m_ptr != 0u &&
                  !ipc_user_range((void *)old_m_ptr, sizeof(uint32_t))) ||
                 (old_f_ptr != 0u &&
                  !ipc_user_range((void *)old_f_ptr, sizeof(uint32_t))))
-                return (uint32_t)IPO_IPC_ERR_INVALID;
+                return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
 
             bool need_old = (old_h_ptr != 0u || old_m_ptr != 0u || old_f_ptr != 0u);
             uint32_t err = signal_apply_action(current, signal, new_handler,
@@ -449,17 +449,17 @@ static uint32_t signal_dispatch_impl(process_t *current, uint32_t num,
                                                &old_handler, &old_mask, &old_flags);
             if (err != 0u) return err;
 
-            if (old_h_ptr != 0u) *(uint32_t *)old_h_ptr = (uint32_t)old_handler;
+            if (old_h_ptr != 0u) *(ipo_vaddr_t *)old_h_ptr = old_handler;
             if (old_m_ptr != 0u) *(uint32_t *)old_m_ptr = old_mask;
             if (old_f_ptr != 0u) *(uint32_t *)old_f_ptr = old_flags;
         } else {
-            uint32_t new_flags = args[3];
-            uintptr_t oldact_ptr = args[4];
+            uint32_t new_flags = (uint32_t)args[3];
+            ipo_vaddr_t oldact_ptr = args[4];
             bool apply = (args[5] != 0u);
 
             if (oldact_ptr != 0u &&
-                !ipc_user_range((void *)oldact_ptr, sizeof(uint32_t)))
-                return (uint32_t)IPO_IPC_ERR_INVALID;
+                !ipc_user_range((void *)oldact_ptr, sizeof(ipo_vaddr_t)))
+                return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
 
             uint32_t err = signal_apply_action(current, signal, new_handler,
                                                new_mask, new_flags, oldact_ptr != 0u,
@@ -467,12 +467,12 @@ static uint32_t signal_dispatch_impl(process_t *current, uint32_t num,
             if (err != 0u) return err;
 
             if (oldact_ptr != 0u) {
-                *(uint32_t *)oldact_ptr = (uint32_t)old_handler;
-                if (ipc_user_range((void *)oldact_ptr, sizeof(uint32_t) * 2u)) {
-                    *(uint32_t *)(oldact_ptr + 4u) = old_mask;
+                *(ipo_vaddr_t *)oldact_ptr = old_handler;
+                if (ipc_user_range((void *)oldact_ptr, sizeof(ipo_vaddr_t) + sizeof(uint32_t))) {
+                    *(uint32_t *)(oldact_ptr + sizeof(ipo_vaddr_t)) = old_mask;
                 }
-                if (ipc_user_range((void *)oldact_ptr, sizeof(uint32_t) * 3u)) {
-                    *(uint32_t *)(oldact_ptr + 8u) = old_flags;
+                if (ipc_user_range((void *)oldact_ptr, sizeof(ipo_vaddr_t) + 2u * sizeof(uint32_t))) {
+                    *(uint32_t *)(oldact_ptr + sizeof(ipo_vaddr_t) + sizeof(uint32_t)) = old_flags;
                 }
             }
         }
@@ -480,23 +480,23 @@ static uint32_t signal_dispatch_impl(process_t *current, uint32_t num,
     }
 
     if (num == IPO_SYSCALL_SIGPROCMASK) {
-        if (!ipc_copy_syscall_args(argc, argv, 3u, args)) return (uint32_t)-1;
-        uint32_t how = args[0];
-        if (how > IPO_SIG_SETMASK) return (uint32_t)-1;
+        if (!ipc_copy_syscall_args(argc, argv, 3u, args)) return (ipo_uarg_t)-1;
+        uint32_t how = (uint32_t)args[0];
+        if (how > IPO_SIG_SETMASK) return (ipo_uarg_t)-1;
         if (args[2] != 0u &&
-            !ipc_user_range((void *)(uintptr_t)args[2], sizeof(uint32_t)))
-            return (uint32_t)-1;
+            !ipc_user_range((void *)(ipo_vaddr_t)args[2], sizeof(uint32_t)))
+            return (ipo_uarg_t)-1;
 
         uint32_t set_mask = 0u;
         if (args[1] != 0u) {
-            if (!ipc_user_range((const void *)(uintptr_t)args[1], sizeof(uint32_t)))
-                return (uint32_t)-1;
-            set_mask = *(const uint32_t *)(uintptr_t)args[1];
+            if (!ipc_user_range((const void *)(ipo_vaddr_t)args[1], sizeof(uint32_t)))
+                return (ipo_uarg_t)-1;
+            set_mask = *(const uint32_t *)(ipo_vaddr_t)args[1];
         }
         uint64_t masked_set = (uint64_t)set_mask & ~signal_unblockable_mask();
         uint64_t *mask_ptr = signal_mask_address(current);
         if (args[2] != 0u)
-            *(uint32_t *)(uintptr_t)args[2] = (uint32_t)*mask_ptr;
+            *(uint32_t *)(ipo_vaddr_t)args[2] = (uint32_t)*mask_ptr;
         if (args[1] != 0u) {
             if (how == IPO_SIG_BLOCK) *mask_ptr |= masked_set;
             else if (how == IPO_SIG_UNBLOCK) *mask_ptr &= ~masked_set;
@@ -508,39 +508,39 @@ static uint32_t signal_dispatch_impl(process_t *current, uint32_t num,
     }
 
     if (num == IPO_SYSCALL_SIGALTSTACK) {
-        if (!ipc_copy_syscall_args(argc, argv, 2u, args)) return (uint32_t)-1;
+        if (!ipc_copy_syscall_args(argc, argv, 2u, args)) return (ipo_uarg_t)-1;
         if (args[1] != 0u &&
-            !ipc_user_range((void *)(uintptr_t)args[1], sizeof(ipo_stack_t)))
-            return (uint32_t)-1;
+            !ipc_user_range((void *)(ipo_vaddr_t)args[1], sizeof(ipo_stack_t)))
+            return (ipo_uarg_t)-1;
         if (args[0] != 0u &&
-            !ipc_user_range((const void *)(uintptr_t)args[0], sizeof(ipo_stack_t)))
-            return (uint32_t)-1;
+            !ipc_user_range((const void *)(ipo_vaddr_t)args[0], sizeof(ipo_stack_t)))
+            return (ipo_uarg_t)-1;
 
         process_thread_t *thread = current->current_thread;
         if (args[1] != 0u) {
             ipo_stack_t old_stk;
             signal_altstack_get(current, thread, &old_stk, NULL);
-            *(ipo_stack_t *)(uintptr_t)args[1] = old_stk;
+            *(ipo_stack_t *)(ipo_vaddr_t)args[1] = old_stk;
         }
         if (args[0] != 0u) {
-            ipo_stack_t new_stk = *(const ipo_stack_t *)(uintptr_t)args[0];
-            if (signal_altstack_is_active(current, thread)) return (uint32_t)-1;
-            if (!signal_altstack_valid(&new_stk)) return (uint32_t)-1;
+            ipo_stack_t new_stk = *(const ipo_stack_t *)(ipo_vaddr_t)args[0];
+            if (signal_altstack_is_active(current, thread)) return (ipo_uarg_t)-1;
+            if (!signal_altstack_valid(&new_stk)) return (ipo_uarg_t)-1;
             if (!signal_altstack_set(current, thread, &new_stk))
-                return (uint32_t)IPO_IPC_ERR_NO_SPACE;
+                return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_NO_SPACE;
         }
         return 0u;
     }
 
-    return (uint32_t)-1;
+    return (ipo_uarg_t)-1;
 }
 
-uint32_t process_signal_syscall_handler(uint32_t num, uint32_t argc,
-                                       uint32_t *argv) {
+ipo_uarg_t process_signal_syscall_handler(ipo_uarg_t num, ipo_uarg_t argc,
+                                          ipo_uarg_t *argv) {
     process_t *current = process_get_current();
-    if (!current) return (uint32_t)-1;
+    if (!current) return (ipo_uarg_t)-1;
 
-    uint32_t args[8] = {0};
+    ipo_uarg_t args[8] = {0};
     return signal_dispatch_impl(current, num, argc, argv, args);
 }
 

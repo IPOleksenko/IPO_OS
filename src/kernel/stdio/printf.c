@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
+#include <memory/kmalloc.h>
 
 static void fmt_emit(void (*emit)(void *, char), void *ctx, char ch, int *count) {
     emit(ctx, ch);
@@ -148,18 +150,43 @@ int stdio_vformat(void (*emit)(void *ctx, char ch), void *ctx, const char *forma
         if (plus_sign) space_sign = 0;
 
         int width = 0;
-        while (*format >= '0' && *format <= '9') {
-            width = width * 10 + (*format - '0');
+        if (*format == '*') {
+            width = va_arg(args, int);
             format++;
+            if (width < 0) {
+                left_align = 1;
+                zero_pad = 0;
+                if (width < -4096) width = 4096;
+                else width = -width;
+            }
+        } else {
+            while (*format >= '0' && *format <= '9') {
+                if (width < 4096) {
+                    width = width * 10 + (*format - '0');
+                }
+                format++;
+            }
         }
 
         int precision = -1;
         if (*format == '.') {
             format++;
-            precision = 0;
-            while (*format >= '0' && *format <= '9') {
-                precision = precision * 10 + (*format - '0');
+            if (*format == '*') {
+                precision = va_arg(args, int);
                 format++;
+                if (precision < 0) {
+                    precision = -1;
+                } else if (precision > 4096) {
+                    precision = 4096;
+                }
+            } else {
+                precision = 0;
+                while (*format >= '0' && *format <= '9') {
+                    if (precision < 4096) {
+                        precision = precision * 10 + (*format - '0');
+                    }
+                    format++;
+                }
             }
         }
 
@@ -287,15 +314,51 @@ int stdio_vformat(void (*emit)(void *ctx, char ch), void *ctx, const char *forma
     return count;
 }
 
-static void printf_emit_putchar(void *ctx, char ch) {
-    (void)ctx;
-    putchar(ch);
+typedef struct {
+    char  *data;
+    size_t len;
+    size_t cap;
+    bool   direct_fallback;
+} printf_buf_t;
+
+static void printf_emit_buf(void *ctx, char ch) {
+    printf_buf_t *b = (printf_buf_t *)ctx;
+    if (b->direct_fallback) {
+        putchar(ch);
+        return;
+    }
+    if (b->len >= b->cap) {
+        size_t new_cap = (b->cap == 0u) ? 128u : (b->cap * 2u);
+        char *grown = (char *)krealloc(b->data, new_cap);
+        if (!grown) {
+            if (b->data && b->len > 0u) {
+                putchar_write(b->data, (ipo_size_t)b->len);
+                kfree(b->data);
+                b->data = NULL;
+                b->len = 0u;
+                b->cap = 0u;
+            }
+            b->direct_fallback = true;
+            putchar(ch);
+            return;
+        }
+        b->data = grown;
+        b->cap = new_cap;
+    }
+    b->data[b->len++] = ch;
 }
 
 int printf(const char *format, ...) {
+    printf_buf_t buf = { NULL, 0u, 0u, false };
     va_list args;
     va_start(args, format);
-    int count = stdio_vformat(printf_emit_putchar, NULL, format, args);
+    int count = stdio_vformat(printf_emit_buf, &buf, format, args);
     va_end(args);
+    if (buf.data) {
+        if (buf.len > 0u) {
+            putchar_write(buf.data, (ipo_size_t)buf.len);
+        }
+        kfree(buf.data);
+    }
     return count;
 }

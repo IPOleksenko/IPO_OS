@@ -63,7 +63,7 @@ make setup-tap
 ```
 
 #### `make run` — Launch in QEMU
-Runs `build/disks/disk.img` in QEMU (`2048` MiB RAM, audio enabled via `AUDIODEV`, serial `stdio`; configured in `mk/config.mk`):
+Runs `build/disks/disk.img` in 64-bit QEMU (`qemu-system-x86_64`, `CPU ?= qemu64,+rdrand`, `SMP ?= 4`, `MEM ?= 8192` MiB / `8 GiB` RAM, audio enabled via `AUDIODEV`, serial `stdio`; configured in `mk/config.mk`):
 ```bash
 make run
 ```
@@ -170,12 +170,6 @@ make setup-tap
 # Launch IPO_OS using TAP networking (the default)
 make run NET_MODE=tap
 ```
-
-In the IPO_OS console, check the guest IP address:
-```text
-ifconfig
-```
-Use the address reported by `ifconfig` in the commands below. With the default TAP setup it is typically `192.168.7.2`.
 
 #### HTTP client/server applications
 IPO_OS provides TCP/IP and socket support, while userland HTTP client/server programs are not included in this repository and must be supplied on the virtual disk separately.

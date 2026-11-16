@@ -4,6 +4,7 @@
 #include <ioport.h>
 #include <system/timer.h>
 #include <memory/kmalloc.h>
+#include <string.h>
 
 static uint16_t s_vga_hw_width = 80;
 static uint16_t s_vga_hw_height = 25;
@@ -13,10 +14,13 @@ static uint16_t s_vga_hw_pixel_width = 0;
 static uint16_t s_vga_hw_pixel_height = 0;
 static bool     s_vga_hw_probed = false;
 
-static const uint8_t s_cursor_bar_glyph[16] = {
-    0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-    0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80
-};
+static void vga_load_cursor_bar_glyph(void) {
+    uint8_t *glyph = (uint8_t *)kmalloc(16u);
+    if (!glyph) return;
+    memset(glyph, 0x80, 16u);
+    vga_load_font(VGA_CURSOR_GLYPH_SLOT, 1, glyph);
+    kfree(glyph);
+}
 
 static uint16_t vga_get_crtc_port(void) {
     return (inb(0x3CC) & 0x01u) ? 0x3D4u : 0x3B4u;
@@ -184,7 +188,7 @@ static void vga_update_cursor_glyph(uint8_t src_char) {
         vga_load_font(VGA_CURSOR_GLYPH_SLOT, 1, cursor_glyph);
         kfree(cursor_glyph);
     } else {
-        vga_load_font(VGA_CURSOR_GLYPH_SLOT, 1, s_cursor_bar_glyph);
+        vga_load_cursor_bar_glyph();
     }
 }
 
@@ -288,7 +292,6 @@ void vga_cursor_reset(void) {
     if (vga_is_graphics_mode()) return;
     vga_cursor_erase();
 
-    /* Sanitize stale cursor glyph slots in VGA memory */
     volatile uint16_t *vga = VGA_MEMORY;
     for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++) {
         if ((vga[i] & 0xFF) == VGA_CURSOR_GLYPH_SLOT) {
@@ -297,7 +300,7 @@ void vga_cursor_reset(void) {
         }
     }
 
-    vga_load_font(VGA_CURSOR_GLYPH_SLOT, 1, s_cursor_bar_glyph);
+    vga_load_cursor_bar_glyph();
 
     last_cursor_glyph_char = ' ';
     cursor_saved_char = ' ';

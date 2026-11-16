@@ -5,13 +5,13 @@
 static spinlock_t s_serial_lock = {0};
 
 void serial_init(void) {
-    outb(0x3F9, 0x00);    // Disable all interrupts
-    outb(0x3FB, 0x80);    // Enable DLAB (set baud rate divisor)
-    outb(0x3F8, 0x01);    // Set divisor to 1 (lo byte) 115200 baud
-    outb(0x3F9, 0x00);    //                  (hi byte)
-    outb(0x3FB, 0x03);    // 8 bits, no parity, one stop bit
-    outb(0x3FA, 0xC7);    // Enable FIFO, clear them, with 14-byte threshold
-    outb(0x3FC, 0x0B);    // IRQs enabled, RTS/DSR set
+    outb(0x3F9, 0x00);    // IER: disable interrupts
+    outb(0x3FB, 0x80);    // LCR: enable DLAB for divisor latch
+    outb(0x3F8, 0x01);    // DLL: 115200 baud (divisor = 1)
+    outb(0x3F9, 0x00);    // DLM: divisor high byte
+    outb(0x3FB, 0x03);    // LCR: 8N1, clear DLAB
+    outb(0x3FA, 0xC7);    // FCR: enable/clear FIFOs, 14-byte threshold
+    outb(0x3FC, 0x0B);    // MCR: DTR, RTS, OUT2
 }
 
 void serial_putc_raw(char c) {
@@ -25,7 +25,7 @@ void serial_putc_raw(char c) {
 }
 
 void serial_putc(char c) {
-    uint32_t flags = spin_lock_irqsave(&s_serial_lock);
+    ipo_reg_t flags = spin_lock_irqsave(&s_serial_lock);
     serial_putc_raw(c);
     spin_unlock_irqrestore(&s_serial_lock, flags);
 }

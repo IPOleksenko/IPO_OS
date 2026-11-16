@@ -29,8 +29,9 @@ typedef struct {
     uint64_t last_ms;
 } irq_sub_slot_t;
 
-static volatile uint32_t s_irq_counts[16];
-static uint32_t s_irq_enable_refs[16];
+static volatile uint32_t *s_irq_counts = NULL;
+static uint32_t *s_irq_enable_refs = NULL;
+static size_t s_irq_line_cap = 0u;
 static uint32_t s_cascade_refs = 0;
 
 static irq_handler_slot_t *s_handlers = NULL;
@@ -41,6 +42,30 @@ static irq_sub_slot_t *s_subs = NULL;
 static uint32_t s_sub_cap = 0;
 
 static spinlock_t s_irq_lock;
+
+static bool irq_ensure_line_cap_locked(uint8_t irq) {
+    size_t need = (size_t)irq + 1u;
+    if (need <= s_irq_line_cap && s_irq_counts && s_irq_enable_refs) {
+        return true;
+    }
+    size_t old_cap = s_irq_line_cap;
+    size_t new_cap = (old_cap > 0u) ? old_cap : 16u;
+    while (new_cap < need) {
+        new_cap *= 2u;
+    }
+    uint32_t *nc = (uint32_t *)krealloc((void *)s_irq_counts, new_cap * sizeof(uint32_t));
+    if (!nc) return false;
+    s_irq_counts = (volatile uint32_t *)nc;
+    uint32_t *nr = (uint32_t *)krealloc(s_irq_enable_refs, new_cap * sizeof(uint32_t));
+    if (!nr) return false;
+    s_irq_enable_refs = nr;
+    for (size_t i = old_cap; i < new_cap; i++) {
+        s_irq_counts[i] = 0u;
+        s_irq_enable_refs[i] = 0u;
+    }
+    s_irq_line_cap = new_cap;
+    return true;
+}
 
 static void pic_set_mask_bit(uint8_t irq, bool masked) {
     if (irq > 15u) return;
@@ -58,6 +83,7 @@ static void pic_set_mask_bit(uint8_t irq, bool masked) {
 
 static bool irq_enable_locked(uint8_t irq) {
     if (irq < IRQ_MIN_LINE || irq > IRQ_MAX_LINE) return false;
+    if (!irq_ensure_line_cap_locked(irq)) return false;
     if (s_irq_enable_refs[irq] == 0u) {
         if (irq >= 8u) {
             if (s_cascade_refs == 0u) {
@@ -73,6 +99,7 @@ static bool irq_enable_locked(uint8_t irq) {
 
 static bool irq_disable_locked(uint8_t irq) {
     if (irq < IRQ_MIN_LINE || irq > IRQ_MAX_LINE) return false;
+    if (!s_irq_enable_refs || (size_t)irq >= s_irq_line_cap) return false;
     if (s_irq_enable_refs[irq] == 0u) return false;
     s_irq_enable_refs[irq]--;
     if (s_irq_enable_refs[irq] == 0u) {
@@ -91,20 +118,25 @@ static bool irq_disable_locked(uint8_t irq) {
 
 void irq_init(void) {
     spinlock_init(&s_irq_lock);
-    memset((void *)s_irq_counts, 0, sizeof(s_irq_counts));
-    memset(s_irq_enable_refs, 0, sizeof(s_irq_enable_refs));
+    (void)irq_ensure_line_cap_locked(15u);
+    if (s_irq_counts && s_irq_line_cap > 0u) {
+        memset((void *)s_irq_counts, 0, s_irq_line_cap * sizeof(uint32_t));
+    }
+    if (s_irq_enable_refs && s_irq_line_cap > 0u) {
+        memset(s_irq_enable_refs, 0, s_irq_line_cap * sizeof(uint32_t));
+    }
     s_cascade_refs = 0;
 }
 
 bool irq_enable(uint8_t irq) {
-    uint32_t flags = spin_lock_irqsave(&s_irq_lock);
+    ipo_reg_t flags = spin_lock_irqsave(&s_irq_lock);
     bool ok = irq_enable_locked(irq);
     spin_unlock_irqrestore(&s_irq_lock, flags);
     return ok;
 }
 
 bool irq_disable(uint8_t irq) {
-    uint32_t flags = spin_lock_irqsave(&s_irq_lock);
+    ipo_reg_t flags = spin_lock_irqsave(&s_irq_lock);
     bool ok = irq_disable_locked(irq);
     spin_unlock_irqrestore(&s_irq_lock, flags);
     return ok;
@@ -116,7 +148,7 @@ static uint32_t irq_next_handle_locked(void) {
     return handle;
 }
 
-/* Reserve a slot (growing table dynamically) without assuming slot layout beyond leading `active` */
+/* Slot arrays must start with `bool active` */
 static bool irq_ensure_slot(void **arr_ptr, uint32_t *cap_ptr, size_t elem_size, uint32_t *out_slot) {
     uint8_t *base = (uint8_t *)(*arr_ptr);
     uint32_t cap = *cap_ptr;
@@ -159,8 +191,10 @@ void irq_common_dispatch(uint32_t irq) {
 
     if (irq >= 16u) return;
 
-    uint32_t flags = spin_lock_irqsave(&s_irq_lock);
-    s_irq_counts[irq]++;
+    ipo_reg_t flags = spin_lock_irqsave(&s_irq_lock);
+    if (s_irq_counts && (size_t)irq < s_irq_line_cap) {
+        s_irq_counts[irq]++;
+    }
     uint64_t now_ms = timer_millis();
 
     for (uint32_t i = 0; i < s_sub_cap; i++) {
@@ -176,7 +210,7 @@ void irq_common_dispatch(uint32_t irq) {
         active_pid = sctx->current_process->pid;
     }
 
-    /* Snapshot matching handlers by strictly increasing handle without holding lock across callback */
+    /* Walk handlers in ascending handle order without holding s_irq_lock during callbacks */
     uint32_t min_handle = 0u;
     for (;;) {
         uint32_t best_handle = UINT32_MAX;
@@ -211,7 +245,7 @@ void irq_common_dispatch(uint32_t irq) {
 uint32_t irq_register_handler(uint8_t irq, irq_handler_fn_t fn, void *ctx, uint32_t owner_pid) {
     if (irq < IRQ_MIN_LINE || irq > IRQ_MAX_LINE || !fn) return 0u;
 
-    uint32_t flags = spin_lock_irqsave(&s_irq_lock);
+    ipo_reg_t flags = spin_lock_irqsave(&s_irq_lock);
 
     uint32_t slot = 0;
     if (!irq_ensure_slot((void **)&s_handlers, &s_handler_cap, sizeof(irq_handler_slot_t), &slot)) {
@@ -236,7 +270,7 @@ uint32_t irq_register_handler(uint8_t irq, irq_handler_fn_t fn, void *ctx, uint3
 
 int irq_unregister_handler(uint32_t handle, uint32_t caller_pid) {
     if (handle == 0u) return -1;
-    uint32_t flags = spin_lock_irqsave(&s_irq_lock);
+    ipo_reg_t flags = spin_lock_irqsave(&s_irq_lock);
 
     int rc = -1;
     for (uint32_t i = 0; i < s_handler_cap; i++) {
@@ -261,7 +295,7 @@ int irq_unregister_handler(uint32_t handle, uint32_t caller_pid) {
 uint32_t irq_subscribe(uint8_t irq, uint32_t owner_pid) {
     if (irq < IRQ_MIN_LINE || irq > IRQ_MAX_LINE) return 0u;
 
-    uint32_t flags = spin_lock_irqsave(&s_irq_lock);
+    ipo_reg_t flags = spin_lock_irqsave(&s_irq_lock);
 
     uint32_t slot = 0;
     if (!irq_ensure_slot((void **)&s_subs, &s_sub_cap, sizeof(irq_sub_slot_t), &slot)) {
@@ -286,7 +320,7 @@ uint32_t irq_subscribe(uint8_t irq, uint32_t owner_pid) {
 
 int irq_unsubscribe(uint32_t handle, uint32_t caller_pid) {
     if (handle == 0u) return -1;
-    uint32_t flags = spin_lock_irqsave(&s_irq_lock);
+    ipo_reg_t flags = spin_lock_irqsave(&s_irq_lock);
 
     int rc = -1;
     for (uint32_t i = 0; i < s_sub_cap; i++) {
@@ -309,7 +343,7 @@ int irq_unsubscribe(uint32_t handle, uint32_t caller_pid) {
 
 uint32_t irq_poll(uint32_t handle, uint32_t caller_pid, uint32_t *out_total, uint64_t *out_last_ms) {
     if (handle == 0u) return 0u;
-    uint32_t flags = spin_lock_irqsave(&s_irq_lock);
+    ipo_reg_t flags = spin_lock_irqsave(&s_irq_lock);
 
     uint32_t pending = 0u;
     for (uint32_t i = 0; i < s_sub_cap; i++) {
@@ -317,7 +351,10 @@ uint32_t irq_poll(uint32_t handle, uint32_t caller_pid, uint32_t *out_total, uin
             (caller_pid == 0u || s_subs[i].owner_pid == caller_pid)) {
             pending = s_subs[i].pending;
             s_subs[i].pending = 0u;
-            if (out_total) *out_total = s_irq_counts[s_subs[i].irq];
+            if (out_total) {
+                *out_total = (s_irq_counts && (size_t)s_subs[i].irq < s_irq_line_cap)
+                             ? s_irq_counts[s_subs[i].irq] : 0u;
+            }
             if (out_last_ms) *out_last_ms = s_subs[i].last_ms;
             break;
         }
@@ -328,13 +365,15 @@ uint32_t irq_poll(uint32_t handle, uint32_t caller_pid, uint32_t *out_total, uin
 }
 
 uint32_t irq_get_count(uint8_t irq) {
-    if (irq >= 16u) return 0u;
-    return s_irq_counts[irq];
+    ipo_reg_t flags = spin_lock_irqsave(&s_irq_lock);
+    uint32_t cnt = (s_irq_counts && (size_t)irq < s_irq_line_cap) ? s_irq_counts[irq] : 0u;
+    spin_unlock_irqrestore(&s_irq_lock, flags);
+    return cnt;
 }
 
 void irq_cleanup_pid(uint32_t pid) {
     if (pid == 0u) return;
-    uint32_t flags = spin_lock_irqsave(&s_irq_lock);
+    ipo_reg_t flags = spin_lock_irqsave(&s_irq_lock);
 
     for (uint32_t i = 0; i < s_handler_cap; i++) {
         if (s_handlers[i].active && s_handlers[i].owner_pid == pid) {

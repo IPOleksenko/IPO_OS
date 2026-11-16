@@ -110,7 +110,7 @@ const char* keyboard_get_key_string(uint8_t scancode) {
         return NULL;
     }
 
-    /* Never emit characters for modifier keys */
+    /* Never emit characters for modifier or navigation/function keys */
     if (scancode == SC_PRESS_CTRL || scancode == SC_PRESS_LEFT_SHIFT ||
         scancode == SC_PRESS_RIGHT_SHIFT || scancode == SC_PRESS_ALT ||
         scancode == 0x3A /* CapsLock */ || scancode == 0x45 /* NumLock */ ||
@@ -118,7 +118,6 @@ const char* keyboard_get_key_string(uint8_t scancode) {
         return NULL;
     }
 
-    /* Never emit characters for navigation/editing/function keys */
     if (scancode == 0x48 /* Up */ || scancode == 0x50 /* Down */ ||
         scancode == 0x4B /* Left */ || scancode == 0x4D /* Right */ ||
         scancode == 0x47 /* Home */ || scancode == 0x4F /* End */ ||
@@ -129,21 +128,19 @@ const char* keyboard_get_key_string(uint8_t scancode) {
         return NULL;
     }
 
-    /* Check dynamic keymap translation (supports full scancode range) */
     const char *dyn = dynamic_keymap_translate(scancode, shift_mode);
     if (dyn != NULL) {
         if (dyn[0] == '\0') {
-            return ""; /* Key explicitly disabled, outputs nothing */
+            return ""; /* Disabled key */
         }
         return dyn;
     }
 
-    /* Break codes (hardware key releases) do not emit text characters */
+    /* Ignore break codes */
     if (scancode >= 0x80u) {
         return NULL;
     }
 
-    /* When a custom layout is active: check control keys or custom fallback symbol */
     if (dynamic_keymap_is_active()) {
         if (scancode == KEY_ENTER)     return "\n";
         if (scancode == KEY_BACKSPACE) return "\b";

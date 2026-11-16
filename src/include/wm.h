@@ -1,39 +1,6 @@
-/**
- * wm.h  —  Window Manager API for IPO_OS (VGA Mode 13h: 320×200, 256 colours)
- *
- * Architecture
- * ============
- * The WM session is serviced by kernel paths that invoke
- * wm_compositor_tick(); it does not register a periodic async task.
- *
- * wm_session_start()  — activates the session, conditionally switches to
- *                        VGA mode, and returns immediately.
- * wm_session_stop()   — ends the session, destroys its windows, and restores
- *                        text mode.
- *
- * Apps that want to show windows:
- *   1. Call wm_create_window() → window added to
- *      the shared global list.
- *   2. Return from main().  Kernel paths continue servicing the WM session.
- *   3. Optionally call wm_destroy_window() before returning to remove it.
- *
- * Multiple separate programs running simultaneously can each create windows
- * independently:
- *   - each program creates its windows and returns or runs an event loop.
- *   - WM ticks composite the visible windows.
- *
- * System overlay
- * ==============
- * The close button in the bottom-left corner can be hidden with
- * VGA_OVERLAY_HIDE_BUTTON. Clicking it invokes the close handler, which
- * closes the displayed workspace or stops the WM session depending on mode.
- *
- * Mouse cursor
- * ============
- * The compositor draws a software arrow cursor using the position from
- * mouse_get_state(), unless VGA_OVERLAY_HIDE_CURSOR is set. Mouse boundaries
- * are derived from the active display area during session start/mode switches.
- */
+/* Window manager API (VGA Mode 13h 320x200x8 / linear framebuffer).
+ * Driven synchronously by wm_compositor_tick() rather than an async task.
+ * Apps register windows via wm_create_window() and either poll events or return. */
 
 #ifndef LIB_WM_H
 #define LIB_WM_H
@@ -43,34 +10,30 @@
 #include <stdbool.h>
 #include <vga_gfx.h>
 
-/* Decoration style */
 typedef enum {
-    WM_DECOR_DEFAULT = 0, /* Standard title bar + border                     */
-    WM_DECOR_THIN,        /* 1-pixel border, no title bar                    */
-    WM_DECOR_NONE,        /* No border or title bar at all                   */
+    WM_DECOR_DEFAULT = 0, /* title bar + border */
+    WM_DECOR_THIN,        /* 1px border, no title bar */
+    WM_DECOR_NONE,        /* borderless */
 } wm_decor_style_t;
 
-/* Event codes passed to event_cb */
 #define WM_EVENT_KEY_DOWN   0x00000001u
 #define WM_EVENT_KEY_UP     0x00000002u
-#define WM_EVENT_KEY_EXT    0x00000004u  /* full 32-bit keycode in low 31 bits; bit 31 = break */
+#define WM_EVENT_KEY_EXT    0x00000004u  /* low 31 bits = keycode; bit 31 = break */
 #define WM_EVENT_FOCUS_IN   0x00000010u
 #define WM_EVENT_FOCUS_OUT  0x00000020u
 #define WM_EVENT_CLOSE      0x00000100u
 #define WM_EVENT_RESIZE     0x00000200u
 #define WM_EVENT_MOVE       0x00000400u
-#define WM_EVENT_CLICK      0x00001000u  /* left mouse click inside window without dragging */
-#define WM_EVENT_SHORTCUT   0x00002000u  /* custom registered shortcut fired (data = tag) */
+#define WM_EVENT_CLICK      0x00001000u  /* non-drag left click inside window */
+#define WM_EVENT_SHORTCUT   0x00002000u  /* registered shortcut fired (data = tag) */
 
 typedef struct wm_window wm_window_t;
 
-/* Polled event record returned by wm_poll_event() */
 typedef struct {
     uint32_t type;
     uint32_t data;
 } wm_event_t;
 
-/* Window options passed to wm_create_window() */
 typedef struct {
     int16_t  x, y;
     uint16_t w, h;
@@ -84,11 +47,11 @@ typedef struct {
     uint8_t  title_bg;
     uint8_t  title_fg;
 
-    /* Shape mask (NULL = rectangular) */
+    /* NULL = rectangular */
     const uint8_t *shape_mask;
     uint16_t mask_w, mask_h;
 
-    /* NULL = auto-allocate */
+    /* NULL = heap-allocated */
     uint8_t *framebuf;
 
     void         *user_data;
@@ -110,7 +73,6 @@ typedef struct {
     .user_data   = NULL,              \
 }
 
-/* Window structure */
 struct wm_window {
     int16_t  x, y;
     uint16_t w, h;
@@ -135,47 +97,33 @@ struct wm_window {
 
     const uint8_t *shape_mask;
     uint16_t mask_w, mask_h;
-    bool     shape_mask_owned;  /* true if the WM owns a copied shape mask */
+    bool     shape_mask_owned;  /* true when WM owns a copied shape mask */
 
     void         *user_data;
     uint32_t      owner_pid;
-    int           window_id; // Workspace ID in batch mode
+    int           window_id; /* workspace ID in batch mode */
 
     bool dirty;
 
     wm_window_t *prev;
     wm_window_t *next;
 
-    /* Kernel-only fields (kept at the end so the user-space layout of the
-     * fields above stays ABI compatible). */
-#define WM_EVENT_QUEUE_CAP 64
-    wm_event_t event_queue[WM_EVENT_QUEUE_CAP];
-    uint16_t   event_head;
-    uint16_t   event_tail;
+    /* Kernel-only tail; fields above form the user-space ABI. */
+    wm_event_t *event_queue;
+    uint16_t    event_cap;
+    uint16_t    event_head;
+    uint16_t    event_tail;
     uint32_t   close_requested_ms;
-    bool       cursor_hidden;      /* Hide WM system cursor inside focused client area */
+    bool       cursor_hidden;      /* hide WM cursor inside focused client area */
 };
 
-/* Session API (video-mode lifecycle)
- *
- * wm_session_start() — NON-BLOCKING.
- *   Activates the session and switches to VGA Mode 13h.
- *   Returns immediately. Kernel/process paths invoke wm_compositor_tick() to
- *   service the session. wm_create_window() starts the session automatically
- *   if no session is running.
- *
- * wm_session_stop() — end the session, destroy all windows, and restore
- *   text mode.
- *
- * wm_session_active() — true while the session is active.
- */
+/* wm_session_start() switches mode and returns immediately; wm_create_window()
+ * starts a session on demand if none is active. */
 void wm_session_start(void);
 void wm_session_stop(void);
 bool wm_session_active(void);
 
-/* Core window API */
-
-/** wm_init - (Re)initialise window list without entering video mode. */
+/* Reset window list without entering video mode */
 void wm_init(void);
 
 wm_window_t *wm_create_window(const wm_window_options_t *opts);
@@ -207,27 +155,14 @@ bool wm_resize(wm_window_t *win, uint16_t nw, uint16_t nh);
 void wm_set_title(wm_window_t *win, const char *title);
 void wm_set_shape(wm_window_t *win, const uint8_t *mask, uint16_t mw, uint16_t mh);
 
-/**
- * Show or hide the WM system cursor while this window is focused and the
- * pointer is inside its client area.
- */
+/* Show/hide WM software cursor while win is focused and pointer is in client area */
 void wm_set_cursor_visible(wm_window_t *win, bool visible);
-
-/**
- * Query whether this window leaves the WM system cursor visible when focused.
- */
 bool wm_get_cursor_visible(const wm_window_t *win);
 
-/* Compositor tick (called from terminal_console each kernel loop iteration)
- *
- * Processes mouse/keyboard input and composes/flips the frame.
- */
+/* Driven from terminal_console loop: reads input, composites, and flips */
 void wm_compositor_tick(void);
 void wm_terminal_putc(char c, uint8_t fg, uint8_t bg);
 
-/**
- * Get current display/compositor screen bounds in pixels.
- */
 void wm_get_screen_bounds(int *out_w, int *out_h);
 void wm_on_resolution_changed(void);
 

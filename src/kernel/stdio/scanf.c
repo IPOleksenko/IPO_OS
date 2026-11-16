@@ -30,21 +30,21 @@ int scanf(const char *format, ...) {
 
     char *input = NULL;
 
-    uint32_t syscall_args[] = {
-        (uint32_t)(uintptr_t)&input,
+    ipo_uarg_t syscall_args[] = {
+        (ipo_uarg_t)(ipo_vaddr_t)&input,
         0u
     };
 
     serial_printf("[scanf] waiting for input, format=\"%s\"\n", format);
 
-    int bytes_read = ipo_syscall(
+    int bytes_read = (int)ipo_syscall(
         IPO_SYSCALL_READ,
         2u,
         syscall_args
     );
 
     if (bytes_read == -2) {
-        /* Ctrl+C — read was interrupted, propagate without printing anything */
+        /* Ctrl+C interrupted the read; return early without output */
         if (input != NULL) {
             kfree(input);
         }
@@ -263,8 +263,11 @@ int scanf(const char *format, ...) {
                     invert = true;
                     pattern++;
                 }
-                uint8_t set_chars[256];
-                memset(set_chars, 0, sizeof(set_chars));
+                uint8_t *set_chars = (uint8_t *)kmalloc(256u);
+                if (!set_chars) {
+                    break;
+                }
+                memset(set_chars, 0, 256u);
                 if (*pattern == ']') {
                     set_chars[(unsigned char)']'] = 1;
                     pattern++;
@@ -274,6 +277,7 @@ int scanf(const char *format, ...) {
                     pattern++;
                 }
                 if (*pattern != ']') {
+                    kfree(set_chars);
                     break;
                 }
                 char *output = va_arg(args, char *);
@@ -290,6 +294,7 @@ int scanf(const char *format, ...) {
                     copied++;
                     text++;
                 }
+                kfree(set_chars);
                 if (copied == 0u) {
                     break;
                 }

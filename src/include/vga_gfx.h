@@ -4,22 +4,21 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <types.h>
 #include <vga.h>
 
 #define VGA_GFX_WIDTH         320
 #define VGA_GFX_HEIGHT        200
 #define VGA_GFX_SIZE          ((size_t)VGA_GFX_WIDTH * (size_t)VGA_GFX_HEIGHT)
-#define VGA_GFX_VRAM_ADDR     0xA0000
+#define VGA_GFX_VRAM_ADDR     ((ipo_paddr_t)0xA0000u)
 #define VGA_TEXT_PIXEL_WIDTH  (vga_get_pixel_width())
 #define VGA_TEXT_PIXEL_HEIGHT (vga_get_pixel_height())
 
-/* VGA Raw Graphics Overlay Flags */
 #define VGA_OVERLAY_SHOW_ALL     0x00u
 #define VGA_OVERLAY_HIDE_BUTTON  0x01u
 #define VGA_OVERLAY_HIDE_CURSOR  0x02u
 #define VGA_OVERLAY_HIDE_ALL     (VGA_OVERLAY_HIDE_BUTTON | VGA_OVERLAY_HIDE_CURSOR)
 
-/* Mode switching */
 void vga_set_mode_13h(void);
 void vga_set_mode_text(void);
 void vga_set_mode_13h_hardware(void);
@@ -30,26 +29,22 @@ bool vga_gfx_has_saved_text(void);
 bool vga_gfx_get_saved_text_buffer(uint16_t **out_vram, size_t *out_cells, uint16_t **out_cursor_pos);
 void vga_gfx_scroll_saved_text(void);
 
-/* Palette */
 void vga_gfx_set_palette(uint8_t idx, uint8_t r, uint8_t g, uint8_t b);
 void vga_gfx_init_default_palette(void);
 
-/* Double-buffering offscreen presentation */
 void vga_gfx_flip(const uint8_t *buf);
 void vga_gfx_flip_desktop(const uint8_t *buf);
 void vga_gfx_flip_scaled_buffer(const uint8_t *buf,
                                 int source_width,
                                 int source_height);
 
-/* Pure hardware blit: writes @buf to the BGA framebuffer or 0xA0000 without
- * touching any per-process backup buffers and without yielding. Used by the
- * kernel itself (WM compositor, workspace switching). */
+/* Direct blit to linear framebuffer or 0xA0000 without touching backup buffers
+ * or yielding (used by the compositor and workspace switching). */
 void vga_gfx_blit_hardware(const uint8_t *buf,
                            bool scale_to_display,
                            int source_width,
                            int source_height);
 
-/* Active display bounds & initialization */
 void vga_gfx_init(void);
 void vga_gfx_get_screen_bounds(int *out_w, int *out_h);
 int  vga_gfx_get_width(void);
@@ -61,10 +56,8 @@ int  vga_gfx_get_mode13h_height(void);
 bool vga_gfx_set_resolution(int width, int height);
 void vga_gfx_get_resolution(int *out_w, int *out_h);
 
-/* Raw-graphics WM bridge policy */
 struct process;
 
-/* Overlay controls */
 void vga_set_overlay_flags(uint32_t flags);
 uint32_t vga_get_overlay_flags(void);
 void vga_hide_close_button(void);

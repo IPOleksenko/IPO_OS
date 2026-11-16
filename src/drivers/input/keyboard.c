@@ -91,6 +91,7 @@ void keyboard_poll(void) {
     if (!vga_is_graphics_mode()) {
         vga_cursor_blink_tick();
     }
+    ipo_key_event_t kev = {0};
     while (1) {
         uint8_t status = inb(KBD_STATUS_PORT);
         if (!(status & KBD_STATUS_OUTPUT_BUFFER)) {
@@ -99,16 +100,14 @@ void keyboard_poll(void) {
         uint8_t data = inb(KBD_DATA_PORT);
 
         if (status & 0x20) {
-            /* Auxiliary / Mouse byte (0x00 is valid for dx, dy, dz!) */
+            /* Mouse byte; 0x00 is a valid delta. */
             if (!ipo_ps2_dispatch_byte(true, data)) {
                 mouse_handle_byte(data);
             }
         } else {
-            /* Keyboard PS/2 byte hook */
             if (ipo_ps2_dispatch_byte(false, data)) {
                 continue;
             }
-            /* Keyboard scancode (0x00 is invalid / null scancode) */
             if (data == 0x00u) continue;
             uint8_t scancode = data;
             if (!vga_is_graphics_mode()) {
@@ -116,7 +115,6 @@ void keyboard_poll(void) {
             }
             update_hot_key_state(scancode);
 
-            ipo_key_event_t kev;
             if (!ipo_key_decoder_feed(&s_kbd_decoder, scancode, &kev)) {
                 continue;
             }
@@ -158,16 +156,13 @@ void keyboard_poll(void) {
             if (!is_e0 && !is_e1 && !is_break && sc_low == 0x2Eu &&
                 keyboard_is_ctrl_pressed() && !gfx_active_and_focused) {
                 system_request_interrupt();
-                /* When an app or batch process is active, consume the key
-                 * so the running app gets interrupted via system_is_interrupted().
-                 * When the terminal shell prompt is active, let the scancode
-                 * fall through to shell_queue so terminal.c can handle ^C line clearing. */
+                /* Consume Ctrl+C when an app/batch job runs; let the shell prompt handle ^C line clearing. */
                 if (keyboard_app_input_mode || process_is_batch_active()) {
                     continue;
                 }
             }
 
-            /* Ctrl + PageUp / PageDown: switch between active foreground tabs/processes */
+            /* Ctrl+PageUp/PageDown: switch foreground tab/process */
             if (!is_e1 && (sc_low == 0x49u || sc_low == 0x51u) &&
                 keyboard_is_ctrl_pressed() && process_is_batch_active()) {
                 serial_printf("[kbd] Ctrl+%s switch detected! key=0x%x\n",
@@ -187,6 +182,9 @@ void keyboard_poll(void) {
                 keyboard_queue_push(q, kev.raw_bytes[bi]);
             }
         }
+    }
+    if (kev.raw_bytes) {
+        kfree(kev.raw_bytes);
     }
 }
 

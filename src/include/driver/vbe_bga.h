@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <types.h>
 
 #define VBE_DISPI_IOPORT_INDEX          0x01CE
 #define VBE_DISPI_IOPORT_DATA           0x01CF
@@ -38,9 +39,8 @@
 #define BGA_DEFAULT_LFB_ADDR            0xE0000000
 
 typedef struct {
-    bool     available;
-    uint16_t version;
-    uint32_t lfb_addr;
+    bool        available;
+    ipo_paddr_t lfb_addr;
     int      width;
     int      height;
     int      bpp;
@@ -51,7 +51,7 @@ bool     vbe_bga_is_available(void);
 bool     vbe_bga_is_enabled(void);
 bool     vbe_bga_mode_request_valid(int width, int height, int bpp);
 void     vbe_bga_disable(void);
-uint32_t vbe_bga_get_lfb_address(void);
+ipo_paddr_t vbe_bga_get_lfb_address(void);
 bool     vbe_bga_set_mode(int width, int height, int bpp);
 void     vbe_bga_restore_text_mode(void);
 void    *vbe_bga_get_framebuffer(void);
@@ -59,4 +59,4 @@ int      vbe_bga_get_width(void);
 int      vbe_bga_get_height(void);
 int      vbe_bga_get_bpp(void);
 
-#endif /* LIB_DRIVER_VBE_BGA_H */
+#endif

@@ -6,6 +6,8 @@
 #include <string.h>
 #include <ioport.h>
 #include <syscall.h>
+#include <arch/cpu_regs.h>
+#include "x86_intrinsics.h"
 
 #define LAPIC_DEFAULT_BASE   0xFEE00000u
 #define LAPIC_ID_REG         0x0020u
@@ -21,14 +23,17 @@
 #define APIC_BASE_ENABLE_BIT (1u << 11)
 
 #define SMP_TRAMPOLINE_ADDR  0x8000u
-#define SMP_BOOT_STACK_ADDR  0x80F0u
-#define SMP_BOOT_CPUID_ADDR  0x80F4u
-#define SMP_BOOT_FN_ADDR     0x80F8u
-#define SMP_BOOT_DONE_ADDR   0x80FCu
+#define SMP_BOOT_STACK_ADDR  0x8180u
+#define SMP_BOOT_FN_ADDR     0x8188u
+#define SMP_BOOT_CR3_ADDR    0x8190u
+#define SMP_BOOT_CPUID_ADDR  0x8198u
+#define SMP_BOOT_DONE_ADDR   0x819Cu
+#define SMP_BOOT_BITS_ADDR   0x81A0u
+#define SMP_BOOT_LA57_ADDR   0x81A4u
 
 #define SMP_IPI_VECTOR       0xE0u
 
-/* Hardware on-wire descriptor sizes */
+/* Packed ACPI and MP table header sizes in bytes */
 #define ACPI_RSDP_V1_HW_SIZE         20
 #define ACPI_SDT_HEADER_HW_SIZE      36
 #define ACPI_MADT_HW_SIZE            (ACPI_SDT_HEADER_HW_SIZE + 8)
@@ -89,7 +94,6 @@ typedef struct {
     size_t   feature_cap;
 } mp_floating_pointer_t;
 
-/* Helper to set dynamic strings */
 static int smp_dyn_str_set(char **dst, size_t *len, size_t *cap, const char *src, size_t max_src) {
     size_t slen = 0;
     while (slen < max_src && src && src[slen]) slen++;
@@ -205,7 +209,7 @@ static void mp_floating_pointer_from_raw(mp_floating_pointer_t *dst, const void 
     smp_dyn_buf_set(&dst->feature, &dst->feature_len, &dst->feature_cap, b + 11, 5);
 }
 
-volatile uint32_t smp_lapic_base = LAPIC_DEFAULT_BASE;
+volatile ipo_paddr_t smp_lapic_base = LAPIC_DEFAULT_BASE;
 static cpu_info_t *cpus = NULL;
 static uint32_t cpu_count = 0;
 static uint32_t cpu_capacity = 0;
@@ -288,20 +292,7 @@ static void smp_delay_ms(uint32_t ms) {
 }
 
 static bool check_cpuid_supported(void) {
-    uint32_t eflags1, eflags2;
-    __asm__ volatile(
-        "pushfl\n\t"
-        "popl %0\n\t"
-        "movl %0, %1\n\t"
-        "xorl $0x00200000, %1\n\t"
-        "pushl %1\n\t"
-        "popfl\n\t"
-        "pushfl\n\t"
-        "popl %1\n\t"
-        "pushl %0\n\t"
-        "popfl\n\t"
-        : "=r"(eflags1), "=r"(eflags2));
-    return ((eflags1 ^ eflags2) & 0x00200000) != 0;
+    return x86_has_cpuid();
 }
 
 static uint8_t checksum_calc(const uint8_t *data, size_t len) {
@@ -313,7 +304,7 @@ static uint8_t checksum_calc(const uint8_t *data, size_t len) {
 }
 
 static const void *find_acpi_rsdp_raw(void) {
-    /* 1. Search first 1KB of EBDA */
+    /* Scan first 1 KiB of EBDA */
     uint16_t ebda_seg = *(const volatile uint16_t *)0x040E;
     uint32_t ebda_addr = ((uint32_t)ebda_seg) << 4;
     if (ebda_addr >= 0x80000 && ebda_addr <= 0x9FFFF) {
@@ -326,7 +317,7 @@ static const void *find_acpi_rsdp_raw(void) {
         }
     }
 
-    /* 2. Search BIOS ROM area 0x000E0000 - 0x000FFFFF */
+    /* Scan BIOS ROM area 0x000E0000 - 0x000FFFFF */
     for (uint32_t p = 0x000E0000u; p < 0x00100000u; p += 16) {
         if (memcmp((const void *)(uintptr_t)p, "RSD PTR ", 8) == 0) {
             if (checksum_calc((const uint8_t *)(uintptr_t)p, 20) == 0) {
@@ -537,12 +528,15 @@ static void probe_cpuid_capabilities(void) {
     uint32_t eax, ebx, ecx, edx;
     cpuid(0, &eax, &ebx, &ecx, &edx);
 
-    char vbuf[13];
-    *(uint32_t *)(vbuf + 0) = ebx;
-    *(uint32_t *)(vbuf + 4) = edx;
-    *(uint32_t *)(vbuf + 8) = ecx;
-    vbuf[12] = '\0';
-    smp_dyn_str_set(&s_cpu_vendor, &s_cpu_vendor_len, &s_cpu_vendor_cap, vbuf, 12);
+    char *vbuf = (char *)kmalloc(13u);
+    if (vbuf) {
+        *(uint32_t *)(vbuf + 0) = ebx;
+        *(uint32_t *)(vbuf + 4) = edx;
+        *(uint32_t *)(vbuf + 8) = ecx;
+        vbuf[12] = '\0';
+        smp_dyn_str_set(&s_cpu_vendor, &s_cpu_vendor_len, &s_cpu_vendor_cap, vbuf, 12);
+        kfree(vbuf);
+    }
 
     if (eax >= 1) {
         cpuid(1, &eax, &ebx, &ecx, &edx);
@@ -622,10 +616,10 @@ static void init_per_cpu_stacks(void) {
         }
         void *stack = memory_map_alloc(16384, 4096);
         if (stack) {
-            cpus[i].stack_base = (uint32_t)(uintptr_t)stack;
+            cpus[i].stack_base = (ipo_vaddr_t)(uintptr_t)stack;
             cpus[i].stack_top = cpus[i].stack_base + 16384u;
         } else {
-            cpus[i].stack_base = 0x500000u + ap_fallback_idx * 0x10000u;
+            cpus[i].stack_base = (ipo_vaddr_t)(0x500000u + ap_fallback_idx * 0x10000u);
             cpus[i].stack_top = cpus[i].stack_base + 0x10000u;
             ap_fallback_idx++;
         }
@@ -640,20 +634,22 @@ static void smp_lapic_enable(void) {
         cpu_set_msr(IA32_APIC_BASE_MSR, lo, hi);
     }
 
-    volatile uint32_t *svr = (volatile uint32_t *)(smp_lapic_base + LAPIC_SVR_REG);
+    volatile uint32_t *svr = (volatile uint32_t *)(ipo_vaddr_t)(smp_lapic_base + LAPIC_SVR_REG);
     *svr = (*svr & ~0xFFu) | 0x1FFu;
 
-    volatile uint32_t *tpr = (volatile uint32_t *)(smp_lapic_base + LAPIC_TPR_REG);
+    volatile uint32_t *tpr = (volatile uint32_t *)(ipo_vaddr_t)(smp_lapic_base + LAPIC_TPR_REG);
     *tpr = 0;
 }
 
 static void smp_prepare_trampoline(void) {
     uint32_t len = (uint32_t)(smp_trampoline_end - smp_trampoline_start);
-    if (len > 0 && len < 4096) {
-        memset((void *)SMP_TRAMPOLINE_ADDR, 0, 256);
-        memcpy((void *)SMP_TRAMPOLINE_ADDR, smp_trampoline_start, len);
+    if (len > 0u && len <= 0x180u) {
+        memset((void *)(ipo_vaddr_t)SMP_TRAMPOLINE_ADDR, 0, 512u);
+        memcpy((void *)(ipo_vaddr_t)SMP_TRAMPOLINE_ADDR, smp_trampoline_start, len);
         serial_printf("[smp] Copied AP trampoline (%u bytes) to physical 0x%08x\n",
                       len, SMP_TRAMPOLINE_ADDR);
+    } else {
+        serial_printf("[smp] Warning: AP trampoline size %u exceeds 0x180 mailbox offset!\n", len);
     }
 }
 
@@ -668,9 +664,9 @@ static void smp_lapic_wait_icr(volatile uint32_t *icr_low) {
 static spinlock_t s_ipi_lock = {0};
 
 void smp_send_ipi(uint32_t target_lapic_id, uint8_t vector) {
-    uint32_t irq_flags = spin_lock_irqsave(&s_ipi_lock);
-    volatile uint32_t *icr_high = (volatile uint32_t *)(smp_lapic_base + LAPIC_ICR_HIGH);
-    volatile uint32_t *icr_low  = (volatile uint32_t *)(smp_lapic_base + LAPIC_ICR_LOW);
+    ipo_reg_t irq_flags = spin_lock_irqsave(&s_ipi_lock);
+    volatile uint32_t *icr_high = (volatile uint32_t *)(ipo_vaddr_t)(smp_lapic_base + LAPIC_ICR_HIGH);
+    volatile uint32_t *icr_low  = (volatile uint32_t *)(ipo_vaddr_t)(smp_lapic_base + LAPIC_ICR_LOW);
 
     smp_lapic_wait_icr(icr_low);
 
@@ -682,8 +678,8 @@ void smp_send_ipi(uint32_t target_lapic_id, uint8_t vector) {
 }
 
 void smp_send_broadcast_ipi(uint8_t vector) {
-    uint32_t irq_flags = spin_lock_irqsave(&s_ipi_lock);
-    volatile uint32_t *icr_low = (volatile uint32_t *)(smp_lapic_base + LAPIC_ICR_LOW);
+    ipo_reg_t irq_flags = spin_lock_irqsave(&s_ipi_lock);
+    volatile uint32_t *icr_low = (volatile uint32_t *)(ipo_vaddr_t)(smp_lapic_base + LAPIC_ICR_LOW);
 
     smp_lapic_wait_icr(icr_low);
 
@@ -707,6 +703,20 @@ uint32_t smp_get_ipi_count(uint32_t cpu_id) {
 }
 
 typedef struct {
+    volatile uint32_t state;
+    uint32_t          task_id;
+    uint32_t          requested_cpu;
+    uint32_t          assigned_cpu;
+    volatile uint32_t executed_cpu;
+    volatile uint32_t executed_lapic_id;
+    volatile ipo_uarg_t return_value;
+    volatile uint32_t exec_ticks;
+    ipo_paddr_t       caller_cr3;
+    smp_work_fn_t     fn;
+    uintptr_t         arg;
+} smp_work_item_t;
+
+typedef struct {
     volatile smp_task_fn_t fn;
     void *arg;
     volatile uint8_t *done_flags;
@@ -716,6 +726,86 @@ typedef struct {
 
 static smp_task_desc_t s_broadcast_task = {0};
 static spinlock_t s_task_lock = {0};
+static spinlock_t s_work_lock = {0};
+static smp_work_item_t **s_work_items = NULL;
+static uint32_t s_work_cap = 0u;
+static uint32_t s_next_work_task_id = 1u;
+static uint32_t s_rr_ap_cursor = 1u;
+static volatile ipo_paddr_t s_smp_kernel_cr3 = 0u;
+
+uint32_t smp_get_hw_lapic_id(void) {
+    if (smp_lapic_base) {
+        volatile uint32_t *lapic_id_reg = (volatile uint32_t *)(ipo_vaddr_t)(smp_lapic_base + LAPIC_ID_REG);
+        return (*lapic_id_reg >> 24) & 0xFFu;
+    }
+    return 0u;
+}
+
+static void smp_execute_queued_work_for_cpu(uint32_t cpu_id) {
+    for (;;) {
+        smp_work_item_t *item = NULL;
+        ipo_reg_t irq_flags = spin_lock_irqsave(&s_work_lock);
+        for (uint32_t i = 0; i < s_work_cap; i++) {
+            smp_work_item_t *cand = s_work_items[i];
+            if (cand && cand->assigned_cpu == cpu_id &&
+                __atomic_load_n(&cand->state, __ATOMIC_ACQUIRE) == SMP_TASK_STATE_QUEUED) {
+                __atomic_store_n(&cand->state, SMP_TASK_STATE_RUNNING, __ATOMIC_RELEASE);
+                item = cand;
+                break;
+            }
+        }
+        spin_unlock_irqrestore(&s_work_lock, irq_flags);
+
+        if (!item) {
+            break;
+        }
+        if (cpu_id < cpu_count) {
+            __atomic_store_n(&cpus[cpu_id].busy, 1u, __ATOMIC_RELEASE);
+            __atomic_store_n(&cpus[cpu_id].current_task_id, item->task_id, __ATOMIC_RELEASE);
+        }
+
+        uint32_t start_ticks = (cpu_id < cpu_count) ? cpus[cpu_id].ticks : 0u;
+        uint32_t hw_lapic = smp_get_hw_lapic_id();
+
+        ipo_paddr_t old_root = 0u;
+        bool paging_on = arch_mmu_is_paging_enabled();
+        bool switched_cr3 = false;
+
+        if (paging_on && item->caller_cr3 != 0u) {
+            old_root = arch_mmu_get_root();
+            if (old_root != (item->caller_cr3 & ~(ipo_paddr_t)0xFFFu)) {
+                arch_mmu_set_root(item->caller_cr3);
+                switched_cr3 = true;
+            }
+        }
+
+        ipo_uarg_t ret = 0u;
+        if (item->fn) {
+            ret = item->fn(cpu_id, item->arg);
+        }
+
+        if (switched_cr3 && old_root != 0u) {
+            arch_mmu_set_root(old_root);
+        }
+
+        uint32_t end_ticks = (cpu_id < cpu_count) ? cpus[cpu_id].ticks : 0u;
+        item->return_value = ret;
+        item->executed_cpu = cpu_id;
+        item->executed_lapic_id = hw_lapic;
+        item->exec_ticks = (end_ticks >= start_ticks) ? (end_ticks - start_ticks + 1u) : 1u;
+
+        if (cpu_id < cpu_count) {
+            __atomic_fetch_add(&cpus[cpu_id].tasks_executed, 1u, __ATOMIC_SEQ_CST);
+            if (cpus[cpu_id].tasks_queued > 0u) {
+                __atomic_fetch_sub(&cpus[cpu_id].tasks_queued, 1u, __ATOMIC_SEQ_CST);
+            }
+            __atomic_store_n(&cpus[cpu_id].current_task_id, 0u, __ATOMIC_RELEASE);
+            __atomic_store_n(&cpus[cpu_id].busy, 0u, __ATOMIC_RELEASE);
+        }
+
+        __atomic_store_n(&item->state, SMP_TASK_STATE_COMPLETED, __ATOMIC_SEQ_CST);
+    }
+}
 
 static void smp_check_and_execute_task(uint32_t cpu_id) {
     if (__atomic_load_n(&s_broadcast_task.active, __ATOMIC_ACQUIRE) && s_broadcast_task.fn) {
@@ -724,11 +814,196 @@ static void smp_check_and_execute_task(uint32_t cpu_id) {
             __atomic_store_n(&s_broadcast_task.done_flags[cpu_id], 1, __ATOMIC_SEQ_CST);
         }
     }
+    smp_execute_queued_work_for_cpu(cpu_id);
+}
+
+void smp_poll_local_tasks(void) {
+    uint32_t self_id = smp_get_current_cpu_id();
+    smp_execute_queued_work_for_cpu(self_id);
+}
+
+static void smp_enable_paging_cb(uint32_t cpu_id, void *arg) {
+    if (cpu_id == 0u) return; /* BSP already enabled paging */
+    ipo_paddr_t page_dir = (ipo_paddr_t)(uintptr_t)arg;
+    if (page_dir == 0u) return;
+    uint32_t levels = arch_mmu_get_paging_levels();
+    arch_mmu_enable_paging(page_dir, levels ? levels : 2u);
+}
+
+void smp_sync_paging(ipo_paddr_t kernel_cr3) {
+    s_smp_kernel_cr3 = kernel_cr3;
+    if (active_cpu_count > 1u && kernel_cr3 != 0u) {
+        smp_broadcast_task(smp_enable_paging_cb, (void *)(uintptr_t)kernel_cr3);
+        serial_printf("[smp] Synchronized hardware paging (CR3=0x%llx) across %u online cores\n",
+                      (unsigned long long)kernel_cr3, active_cpu_count);
+    }
+}
+
+static uint32_t smp_select_auto_cpu_locked(void) {
+    if (cpu_count <= 1u || active_cpu_count <= 1u) {
+        return 0u;
+    }
+
+    uint32_t best_cpu = 0u;
+    uint32_t best_score = 0xFFFFFFFFu;
+    uint32_t start = s_rr_ap_cursor;
+    if (start == 0u || start >= cpu_count) start = 1u;
+
+    for (uint32_t step = 0; step < cpu_count; step++) {
+        uint32_t cand = (start + step) % cpu_count;
+        if (cand == 0u) continue; /* Prefer secondary AP cores first */
+        if (!cpus[cand].is_online) continue;
+        uint32_t score = (cpus[cand].busy * 1000u) +
+                         (cpus[cand].tasks_queued * 100u) +
+                         (cpus[cand].tasks_executed & 0x3Fu);
+        if (score < best_score) {
+            best_score = score;
+            best_cpu = cand;
+        }
+    }
+
+    if (best_cpu != 0u) {
+        s_rr_ap_cursor = best_cpu + 1u;
+        if (s_rr_ap_cursor >= cpu_count) s_rr_ap_cursor = 1u;
+        return best_cpu;
+    }
+    return 0u;
+}
+
+int smp_submit_task(uint32_t target_cpu, smp_work_fn_t fn, uintptr_t arg,
+                    uint32_t flags, uint32_t *out_task_id) {
+    (void)flags;
+    if (!fn || (uintptr_t)fn < 0x1000u) {
+        return SMP_ERR_INVALID_PARAM;
+    }
+
+    ipo_reg_t irq_flags = spin_lock_irqsave(&s_work_lock);
+    uint32_t assigned = 0u;
+
+    if (target_cpu == SMP_CPU_ANY) {
+        assigned = smp_select_auto_cpu_locked();
+    } else {
+        if (target_cpu >= cpu_count) {
+            spin_unlock_irqrestore(&s_work_lock, irq_flags);
+            return SMP_ERR_INVALID_CPU;
+        }
+        if (!cpus[target_cpu].is_online) {
+            spin_unlock_irqrestore(&s_work_lock, irq_flags);
+            return SMP_ERR_CPU_OFFLINE;
+        }
+        assigned = target_cpu;
+    }
+
+    uint32_t slot = s_work_cap;
+    for (uint32_t i = 0; i < s_work_cap; i++) {
+        if (s_work_items[i] == NULL) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == s_work_cap) {
+        uint32_t ncap = (s_work_cap == 0u) ? 16u : (s_work_cap * 2u);
+        smp_work_item_t **narr = (smp_work_item_t **)krealloc(
+            s_work_items, (size_t)ncap * sizeof(smp_work_item_t *));
+        if (!narr) {
+            spin_unlock_irqrestore(&s_work_lock, irq_flags);
+            return SMP_ERR_QUEUE_FULL;
+        }
+        memset(&narr[s_work_cap], 0, (size_t)(ncap - s_work_cap) * sizeof(smp_work_item_t *));
+        s_work_items = narr;
+        slot = s_work_cap;
+        s_work_cap = ncap;
+    }
+
+    smp_work_item_t *item = (smp_work_item_t *)kmalloc(sizeof(smp_work_item_t));
+    if (!item) {
+        spin_unlock_irqrestore(&s_work_lock, irq_flags);
+        return SMP_ERR_QUEUE_FULL;
+    }
+
+    ipo_paddr_t cur_cr3 = arch_mmu_is_paging_enabled() ? arch_mmu_get_root() : 0u;
+
+    memset(item, 0, sizeof(*item));
+    item->task_id       = s_next_work_task_id++;
+    if (s_next_work_task_id == 0u) s_next_work_task_id = 1u;
+    item->requested_cpu = target_cpu;
+    item->assigned_cpu  = assigned;
+    item->executed_cpu  = 0xFFFFFFFFu;
+    item->caller_cr3    = (ipo_paddr_t)cur_cr3;
+    item->fn            = fn;
+    item->arg           = arg;
+    s_work_items[slot]  = item;
+    __atomic_fetch_add(&cpus[assigned].tasks_queued, 1u, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&item->state, SMP_TASK_STATE_QUEUED, __ATOMIC_SEQ_CST);
+
+    uint32_t tid = item->task_id;
+    spin_unlock_irqrestore(&s_work_lock, irq_flags);
+
+    if (out_task_id) *out_task_id = tid;
+
+    if (assigned == smp_get_current_cpu_id()) {
+        smp_execute_queued_work_for_cpu(assigned);
+    } else if (assigned < cpu_count && cpus[assigned].is_online) {
+        smp_send_ipi(cpus[assigned].lapic_id, 0xE0u);
+    }
+
+    return SMP_ERR_OK;
+}
+
+int smp_wait_task(uint32_t task_id, uint32_t timeout_ms, smp_task_result_t *out_res) {
+    if (task_id == 0u) return SMP_ERR_INVALID_PARAM;
+
+    ipo_reg_t irq_flags = spin_lock_irqsave(&s_work_lock);
+    smp_work_item_t *target = NULL;
+    for (uint32_t i = 0; i < s_work_cap; i++) {
+        if (s_work_items[i] && s_work_items[i]->task_id == task_id) {
+            target = s_work_items[i];
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&s_work_lock, irq_flags);
+    if (!target) return SMP_ERR_NOT_FOUND;
+
+    uint32_t self_id = smp_get_current_cpu_id();
+    uint32_t loops = (timeout_ms == 0u) ? 500000u : (timeout_ms * 2000u);
+    while (__atomic_load_n(&target->state, __ATOMIC_ACQUIRE) != SMP_TASK_STATE_COMPLETED) {
+        if (target->assigned_cpu == self_id) {
+            smp_execute_queued_work_for_cpu(self_id);
+        }
+        if (loops == 0u) {
+            return SMP_ERR_TIMEOUT;
+        }
+        __builtin_ia32_pause();
+        loops--;
+    }
+
+    if (out_res) {
+        memset(out_res, 0, sizeof(*out_res));
+        out_res->task_id           = target->task_id;
+        out_res->requested_cpu     = target->requested_cpu;
+        out_res->assigned_cpu      = target->assigned_cpu;
+        out_res->executed_cpu      = target->executed_cpu;
+        out_res->executed_lapic_id = target->executed_lapic_id;
+        out_res->state             = target->state;
+        out_res->return_value      = target->return_value;
+        out_res->exec_ticks        = target->exec_ticks;
+    }
+
+    irq_flags = spin_lock_irqsave(&s_work_lock);
+    for (uint32_t i = 0; i < s_work_cap; i++) {
+        if (s_work_items[i] == target) {
+            s_work_items[i] = NULL;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&s_work_lock, irq_flags);
+    kfree(target);
+    return SMP_ERR_OK;
 }
 
 void smp_broadcast_task(smp_task_fn_t fn, void *arg) {
     if (!fn) return;
-    uint32_t irq_flags = spin_lock_irqsave(&s_task_lock);
+    ipo_reg_t irq_flags = spin_lock_irqsave(&s_task_lock);
 
     if (cpu_count > s_broadcast_task.flags_cap || !s_broadcast_task.done_flags) {
         size_t new_cap = (s_broadcast_task.flags_cap == 0) ? 8 : s_broadcast_task.flags_cap;
@@ -783,13 +1058,13 @@ static void ap_main(uint32_t cpu_id) {
 
     smp_lapic_enable();
 
-    /* Mask LINT0 and LINT1 so legacy 8259 PIC IRQs stay on the BSP */
-    volatile uint32_t *lint0 = (volatile uint32_t *)(smp_lapic_base + LAPIC_LINT0_REG);
-    volatile uint32_t *lint1 = (volatile uint32_t *)(smp_lapic_base + LAPIC_LINT1_REG);
+    /* Mask LINT0/LINT1 so PIC IRQs remain routed to the BSP */
+    volatile uint32_t *lint0 = (volatile uint32_t *)(ipo_vaddr_t)(smp_lapic_base + LAPIC_LINT0_REG);
+    volatile uint32_t *lint1 = (volatile uint32_t *)(ipo_vaddr_t)(smp_lapic_base + LAPIC_LINT1_REG);
     *lint0 = 0x00010000u;
     *lint1 = 0x00010000u;
 
-    volatile uint32_t *lapic_id_reg = (volatile uint32_t *)(smp_lapic_base + LAPIC_ID_REG);
+    volatile uint32_t *lapic_id_reg = (volatile uint32_t *)(ipo_vaddr_t)(smp_lapic_base + LAPIC_ID_REG);
     uint32_t hw_lapic_id = (*lapic_id_reg >> 24) & 0xFFu;
     if (cpus[cpu_id].lapic_id != hw_lapic_id) {
         while (1) { __asm__ volatile("cli; hlt"); }
@@ -798,11 +1073,11 @@ static void ap_main(uint32_t cpu_id) {
     cpus[cpu_id].is_online = true;
     __atomic_fetch_add(&active_cpu_count, 1, __ATOMIC_SEQ_CST);
 
-    *(volatile uint32_t *)SMP_BOOT_DONE_ADDR = 1;
+    *(volatile uint32_t *)(ipo_vaddr_t)SMP_BOOT_DONE_ADDR = 1;
     __atomic_store_n(&smp_ap_boot_done, 1, __ATOMIC_SEQ_CST);
 
-    serial_printf("[smp] AP core %u online (LAPIC ID=%u, stack=0x%x)\n",
-                  cpu_id, hw_lapic_id, cpus[cpu_id].stack_top);
+    serial_printf("[smp] AP core %u online (LAPIC ID=%u, stack=0x%llx)\n",
+                  cpu_id, hw_lapic_id, (unsigned long long)cpus[cpu_id].stack_top);
 
     __asm__ volatile("sti");
 
@@ -811,7 +1086,7 @@ static void ap_main(uint32_t cpu_id) {
 
         smp_check_and_execute_task(cpu_id);
 
-        for (volatile int i = 0; i < 50000; i++) {
+        for (volatile int i = 0; i < 200; i++) {
             __builtin_ia32_pause();
         }
     }
@@ -826,17 +1101,20 @@ static bool smp_boot_ap(uint32_t cpu_id) {
 
     uint32_t target_lapic = cpus[cpu_id].lapic_id;
 
-    *(volatile uint32_t *)SMP_BOOT_STACK_ADDR = cpus[cpu_id].stack_top;
-    *(volatile uint32_t *)SMP_BOOT_CPUID_ADDR = cpu_id;
-    *(volatile uint32_t *)SMP_BOOT_FN_ADDR    = (uint32_t)(uintptr_t)ap_main;
-    *(volatile uint32_t *)SMP_BOOT_DONE_ADDR  = 0;
+    *(volatile uint64_t *)(ipo_vaddr_t)SMP_BOOT_STACK_ADDR = (uint64_t)cpus[cpu_id].stack_top;
+    *(volatile uint64_t *)(ipo_vaddr_t)SMP_BOOT_FN_ADDR    = (uint64_t)(uintptr_t)ap_main;
+    *(volatile uint64_t *)(ipo_vaddr_t)SMP_BOOT_CR3_ADDR   = (uint64_t)x86_read_cr3();
+    *(volatile uint32_t *)(ipo_vaddr_t)SMP_BOOT_CPUID_ADDR = cpu_id;
+    *(volatile uint32_t *)(ipo_vaddr_t)SMP_BOOT_DONE_ADDR  = 0u;
+    *(volatile uint32_t *)(ipo_vaddr_t)SMP_BOOT_BITS_ADDR  = (arch_mmu_get_paging_levels() >= 4u) ? 64u : 32u;
+    *(volatile uint32_t *)(ipo_vaddr_t)SMP_BOOT_LA57_ADDR  = ((x86_read_cr4() & (ipo_reg_t)(1ULL << 12)) != 0u) ? 1u : 0u;
     smp_ap_boot_done = 0;
 
-    serial_printf("[smp] Booting AP core %u (LAPIC ID=%u, stack=0x%x)...\n",
-                  cpu_id, target_lapic, cpus[cpu_id].stack_top);
+    serial_printf("[smp] Booting AP core %u (LAPIC ID=%u, stack=0x%llx)...\n",
+                  cpu_id, target_lapic, (unsigned long long)cpus[cpu_id].stack_top);
 
-    volatile uint32_t *icr_high = (volatile uint32_t *)(smp_lapic_base + LAPIC_ICR_HIGH);
-    volatile uint32_t *icr_low  = (volatile uint32_t *)(smp_lapic_base + LAPIC_ICR_LOW);
+    volatile uint32_t *icr_high = (volatile uint32_t *)(ipo_vaddr_t)(smp_lapic_base + LAPIC_ICR_HIGH);
+    volatile uint32_t *icr_low  = (volatile uint32_t *)(ipo_vaddr_t)(smp_lapic_base + LAPIC_ICR_LOW);
 
     /* Assert INIT IPI */
     *icr_high = (target_lapic << 24);
@@ -924,13 +1202,11 @@ void smp_init(void) {
         }
     }
 
-    /* Recount active CPUs */
     active_cpu_count = 0;
     for (uint32_t i = 0; i < cpu_count; i++) {
         if (cpus[i].is_online) active_cpu_count++;
     }
 
-    /* Dynamically evaluate AP boot sequence */
     if (cpu_count <= 1) {
         arch_status.ap_boot_sequence = SMP_STATUS_INACTIVE;
     } else if (active_cpu_count > 1) {
@@ -939,15 +1215,14 @@ void smp_init(void) {
         arch_status.ap_boot_sequence = SMP_STATUS_BLOCKED;
     }
 
-    /* Dynamically evaluate multi-core subsystems based on active core count */
     if (active_cpu_count <= 1) {
         arch_status.driver_reentrancy = SMP_STATUS_INACTIVE;
         arch_status.ipi_cross_core_reschedule = SMP_STATUS_INACTIVE;
         arch_status.cross_core_scheduler = SMP_STATUS_INACTIVE;
     } else {
-        arch_status.driver_reentrancy = SMP_STATUS_BLOCKED;
-        arch_status.ipi_cross_core_reschedule = SMP_STATUS_BLOCKED;
-        arch_status.cross_core_scheduler = SMP_STATUS_BLOCKED;
+        arch_status.driver_reentrancy = SMP_STATUS_ACTIVE;
+        arch_status.ipi_cross_core_reschedule = SMP_STATUS_ACTIVE;
+        arch_status.cross_core_scheduler = SMP_STATUS_ACTIVE;
     }
 
     printf("[smp] SMP Initialization Complete: %u core(s) detected, %u core(s) active\n",
@@ -974,7 +1249,7 @@ const cpu_info_t *smp_get_cpu_info(uint32_t cpu_id) {
 
 uint32_t smp_get_current_cpu_id(void) {
     if (smp_lapic_base) {
-        volatile uint32_t *lapic_id_reg = (volatile uint32_t *)(smp_lapic_base + LAPIC_ID_REG);
+        volatile uint32_t *lapic_id_reg = (volatile uint32_t *)(ipo_vaddr_t)(smp_lapic_base + LAPIC_ID_REG);
         uint32_t hw_id = (*lapic_id_reg >> 24) & 0xFFu;
         for (uint32_t i = 0; i < cpu_count; i++) {
             if (cpus[i].lapic_id == hw_id) return cpus[i].cpu_id;
@@ -987,7 +1262,7 @@ const smp_architecture_status_t *smp_get_architecture_status(void) {
     return &arch_status;
 }
 
-uint32_t smp_get_lapic_base(void) {
+ipo_paddr_t smp_get_lapic_base(void) {
     return smp_lapic_base;
 }
 
@@ -998,7 +1273,6 @@ void smp_print_summary(void) {
     serial_printf("  LAPIC Base:                0x%x\n", smp_lapic_base);
     serial_printf("  Subsystem Status:\n");
 
-    /* CPU Capability */
     if (arch_status.cpu_capability_detection == SMP_STATUS_ACTIVE) {
         serial_printf("    CPU Capability (CPUID):  ACTIVE (Vendor: %s, APIC: %s, HTT: %s)\n",
                       s_cpu_vendor ? s_cpu_vendor : "Unknown", s_has_apic ? "yes" : "no", s_has_htt ? "yes" : "no");
@@ -1006,7 +1280,6 @@ void smp_print_summary(void) {
         serial_printf("    CPU Capability (CPUID):  BLOCKED (CPUID or APIC unsupported)\n");
     }
 
-    /* ACPI MADT */
     if (arch_status.acpi_madt_enumeration == SMP_STATUS_ACTIVE) {
         serial_printf("    ACPI MADT Enumeration:   ACTIVE (%u CPU(s) discovered at 0x%x)\n",
                       s_madt_cpu_count, s_madt_addr);
@@ -1014,7 +1287,6 @@ void smp_print_summary(void) {
         serial_printf("    ACPI MADT Enumeration:   INACTIVE (ACPI MADT table not found)\n");
     }
 
-    /* MP Table Fallback */
     if (arch_status.mp_table_fallback == SMP_STATUS_ACTIVE) {
         serial_printf("    MP Table Fallback:       ACTIVE (%u CPU(s) discovered at 0x%x)\n",
                       s_mp_cpu_count, s_mp_table_addr);
@@ -1024,21 +1296,18 @@ void smp_print_summary(void) {
         serial_printf("    MP Table Fallback:       INACTIVE (MP floating pointer not found)\n");
     }
 
-    /* Per-CPU Stacks & State */
     if (arch_status.per_cpu_structures == SMP_STATUS_ACTIVE) {
         serial_printf("    Per-CPU Stacks & State:  ACTIVE (%u stack(s) allocated, 16KiB/core)\n", cpu_count);
     } else {
         serial_printf("    Per-CPU Stacks & State:  BLOCKED (Stack allocation failure)\n");
     }
 
-    /* Atomic Bus Spinlocks */
     if (arch_status.atomic_spinlocks == SMP_STATUS_ACTIVE) {
         serial_printf("    Atomic Bus Spinlocks:    ACTIVE (Hardware test-and-set verified)\n");
     } else {
         serial_printf("    Atomic Bus Spinlocks:    BLOCKED (Atomic lock self-test failed)\n");
     }
 
-    /* AP Boot Sequence */
     if (arch_status.ap_boot_sequence == SMP_STATUS_ACTIVE) {
         serial_printf("    AP Boot Sequence (ICR):  ACTIVE (Trampoline at 0x%x, %u/%u core(s) booted)\n",
                       SMP_TRAMPOLINE_ADDR, active_cpu_count, cpu_count);
@@ -1049,7 +1318,6 @@ void smp_print_summary(void) {
                       cpu_count > 1 ? cpu_count - 1 : 0);
     }
 
-    /* Driver Reentrancy */
     if (arch_status.driver_reentrancy == SMP_STATUS_ACTIVE) {
         serial_printf("    Driver Reentrancy:       ACTIVE\n");
     } else if (arch_status.driver_reentrancy == SMP_STATUS_INACTIVE) {
@@ -1058,7 +1326,6 @@ void smp_print_summary(void) {
         serial_printf("    Driver Reentrancy:       BLOCKED (ATA/VGA/Net drivers use static non-reentrant state)\n");
     }
 
-    /* IPI Cross-Core Reschedule */
     if (arch_status.ipi_cross_core_reschedule == SMP_STATUS_ACTIVE) {
         serial_printf("    IPI Cross-Core Preempt:  ACTIVE (Vector 0x%x registered)\n", SMP_IPI_VECTOR);
     } else if (arch_status.ipi_cross_core_reschedule == SMP_STATUS_INACTIVE) {
@@ -1067,7 +1334,6 @@ void smp_print_summary(void) {
         serial_printf("    IPI Cross-Core Preempt:  BLOCKED (Requires per-CPU APIC timer preemptive vector)\n");
     }
 
-    /* Multi-Queue SMP Scheduler */
     if (arch_status.cross_core_scheduler == SMP_STATUS_ACTIVE) {
         serial_printf("    Multi-Queue SMP Sched:   ACTIVE\n");
     } else if (arch_status.cross_core_scheduler == SMP_STATUS_INACTIVE) {
@@ -1094,13 +1360,19 @@ void smp_get_cpu_vendor(char *buf, size_t max_len) {
     }
     uint32_t eax, ebx, ecx, edx;
     cpuid(0, &eax, &ebx, &ecx, &edx);
-    char vendor[13];
-    memcpy(vendor + 0, &ebx, 4);
-    memcpy(vendor + 4, &edx, 4);
-    memcpy(vendor + 8, &ecx, 4);
-    vendor[12] = '\0';
-    strncpy(buf, vendor[0] ? vendor : "Unknown", max_len - 1);
-    buf[max_len - 1] = '\0';
+    char *vendor = (char *)kmalloc(13u);
+    if (vendor) {
+        memcpy(vendor + 0, &ebx, 4);
+        memcpy(vendor + 4, &edx, 4);
+        memcpy(vendor + 8, &ecx, 4);
+        vendor[12] = '\0';
+        strncpy(buf, vendor[0] ? vendor : "Unknown", max_len - 1);
+        buf[max_len - 1] = '\0';
+        kfree(vendor);
+    } else {
+        strncpy(buf, "Unknown", max_len - 1);
+        buf[max_len - 1] = '\0';
+    }
 }
 
 void smp_get_cpu_brand(char *buf, size_t max_len) {
@@ -1115,19 +1387,23 @@ void smp_get_cpu_brand(char *buf, size_t max_len) {
     uint32_t eax, ebx, ecx, edx;
     cpuid(0x80000000u, &eax, &ebx, &ecx, &edx);
     if (eax >= 0x80000004u) {
-        char brand[49];
-        memset(brand, 0, sizeof(brand));
-        cpuid(0x80000002u, (uint32_t *)(brand + 0),  (uint32_t *)(brand + 4),  (uint32_t *)(brand + 8),  (uint32_t *)(brand + 12));
-        cpuid(0x80000003u, (uint32_t *)(brand + 16), (uint32_t *)(brand + 20), (uint32_t *)(brand + 24), (uint32_t *)(brand + 28));
-        cpuid(0x80000004u, (uint32_t *)(brand + 32), (uint32_t *)(brand + 36), (uint32_t *)(brand + 40), (uint32_t *)(brand + 44));
-        brand[48] = '\0';
+        char *brand = (char *)kmalloc(49u);
+        if (brand) {
+            memset(brand, 0, 49u);
+            cpuid(0x80000002u, (uint32_t *)(brand + 0),  (uint32_t *)(brand + 4),  (uint32_t *)(brand + 8),  (uint32_t *)(brand + 12));
+            cpuid(0x80000003u, (uint32_t *)(brand + 16), (uint32_t *)(brand + 20), (uint32_t *)(brand + 24), (uint32_t *)(brand + 28));
+            cpuid(0x80000004u, (uint32_t *)(brand + 32), (uint32_t *)(brand + 36), (uint32_t *)(brand + 40), (uint32_t *)(brand + 44));
+            brand[48] = '\0';
 
-        const char *p = brand;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p != '\0') {
-            strncpy(buf, p, max_len - 1);
-            buf[max_len - 1] = '\0';
-            return;
+            const char *p = brand;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p != '\0') {
+                strncpy(buf, p, max_len - 1);
+                buf[max_len - 1] = '\0';
+                kfree(brand);
+                return;
+            }
+            kfree(brand);
         }
     }
 

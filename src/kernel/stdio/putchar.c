@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <arch/cpu_regs.h>
 #include <vga.h>
 #include <vga_gfx.h>
 #include <wm.h>
@@ -23,9 +24,9 @@ void putchar_unlock(void) {
     __atomic_clear(&output_lock, __ATOMIC_RELEASE);
 }
 
-static uint32_t acquire_output_lock(void) {
+static ipo_reg_t acquire_output_lock(void) {
     for (;;) {
-        uint32_t flags = irq_save();
+        ipo_reg_t flags = irq_save();
         if (!__atomic_test_and_set(&output_lock, __ATOMIC_ACQUIRE)) {
             return flags;
         }
@@ -38,7 +39,7 @@ static uint32_t acquire_output_lock(void) {
     }
 }
 
-static void release_output_lock(uint32_t flags) {
+static void release_output_lock(ipo_reg_t flags) {
     __atomic_clear(&output_lock, __ATOMIC_RELEASE);
     irq_restore(flags);
 }
@@ -64,9 +65,7 @@ static uint16_t putchar_render_glyph(process_t *curr, bool has_virtual, bool is_
         cursor = VGA_START_CURSOR_POSITION;
     }
 
-    if (is_fg && !vga_is_graphics_mode()) {
-        vga_cursor_erase();
-    } else if (using_saved_gfx_text && (vga[cursor] & 0xFFu) == VGA_CURSOR_GLYPH_SLOT) {
+    if (using_saved_gfx_text && (vga[cursor] & 0xFFu) == VGA_CURSOR_GLYPH_SLOT) {
         vga[cursor] = (uint16_t)((vga[cursor] & 0xFF00u) | ' ');
     }
 
@@ -112,9 +111,16 @@ static uint16_t putchar_render_glyph(process_t *curr, bool has_virtual, bool is_
     return cursor;
 }
 
-static void putchar_color_ex(char c, uint8_t fg, uint8_t bg, bool to_serial, bool capture_buf) {
+static void putchar_write_color_ex(const char *str, ipo_size_t len, uint8_t fg, uint8_t bg,
+                                   bool to_serial, bool capture_buf) {
+    if (!str || len == 0u) {
+        return;
+    }
+
     if (to_serial) {
-        serial_putc(c);
+        for (ipo_size_t i = 0u; i < len; i++) {
+            serial_putc(str[i]);
+        }
     }
 
     process_t *curr = process_get_current();
@@ -123,10 +129,10 @@ static void putchar_color_ex(char c, uint8_t fg, uint8_t bg, bool to_serial, boo
     bool is_fg = (!has_virtual || curr == active_disp ||
                   (curr != NULL && active_disp != NULL && curr->window_id == active_disp->window_id));
 
-    uint32_t irq_flags = acquire_output_lock();
+    ipo_reg_t irq_flags = acquire_output_lock();
 
     if (capture_buf && process_is_batch_active() && curr && !curr->wants_graphics && !curr->is_wm_app) {
-        process_append_text_output(curr, &c, 1u);
+        process_append_text_output(curr, str, len);
     }
 
     uint16_t *saved_vram = NULL;
@@ -140,7 +146,9 @@ static void putchar_color_ex(char c, uint8_t fg, uint8_t bg, bool to_serial, boo
             using_saved_gfx_text = true;
         } else {
             release_output_lock(irq_flags);
-            driver_dispatch_char_output(c);
+            for (ipo_size_t i = 0u; i < len; i++) {
+                driver_dispatch_char_output(str[i]);
+            }
             return;
         }
     }
@@ -156,6 +164,7 @@ static void putchar_color_ex(char c, uint8_t fg, uint8_t bg, bool to_serial, boo
             terminal_return_to_present();
         }
         terminal_on_external_output();
+        vga_cursor_erase();
     }
 
     volatile uint16_t *vga = has_virtual ? curr->text_vram_backup
@@ -167,27 +176,27 @@ static void putchar_color_ex(char c, uint8_t fg, uint8_t bg, bool to_serial, boo
     uint16_t terminal_bottom = (top_row + terminal_rows) * VGA_WIDTH;
     uint16_t last_line_start = (top_row + terminal_rows - 1) * VGA_WIDTH;
 
-    c = driver_dispatch_char_output(c);
-
     static utf_stream_t k_utf_stream = {0};
     utf_stream_t *ustream = curr ? &curr->utf_stream : &k_utf_stream;
 
-    uint64_t codepoint = 0;
-    if (!utf_stream_push_byte(ustream, (uint8_t)c, &codepoint)) {
-        release_output_lock(irq_flags);
-        return;
-    }
+    for (ipo_size_t i = 0u; i < len; i++) {
+        char c = driver_dispatch_char_output(str[i]);
+        uint64_t codepoint = 0;
+        if (!utf_stream_push_byte(ustream, (uint8_t)c, &codepoint)) {
+            continue;
+        }
 
-    uint8_t out_glyph = utf_codepoint_to_vga_glyph(codepoint);
-    cursor = putchar_render_glyph(curr, has_virtual, is_fg, using_saved_gfx_text,
-                                  vga, cursor, terminal_bottom, last_line_start,
-                                  (char)out_glyph, fg, bg);
-
-    while (utf_stream_flush_next(ustream, &codepoint)) {
-        out_glyph = utf_codepoint_to_vga_glyph(codepoint);
+        uint8_t out_glyph = utf_codepoint_to_vga_glyph(codepoint);
         cursor = putchar_render_glyph(curr, has_virtual, is_fg, using_saved_gfx_text,
                                       vga, cursor, terminal_bottom, last_line_start,
                                       (char)out_glyph, fg, bg);
+
+        while (utf_stream_flush_next(ustream, &codepoint)) {
+            out_glyph = utf_codepoint_to_vga_glyph(codepoint);
+            cursor = putchar_render_glyph(curr, has_virtual, is_fg, using_saved_gfx_text,
+                                          vga, cursor, terminal_bottom, last_line_start,
+                                          (char)out_glyph, fg, bg);
+        }
     }
 
     if (has_virtual) {
@@ -203,62 +212,22 @@ static void putchar_color_ex(char c, uint8_t fg, uint8_t bg, bool to_serial, boo
     release_output_lock(irq_flags);
 }
 
-#define PUTCHAR_PACE_US 1500u
-
-/* Throttle live text-console output per character without stalling audio or WM tasks. */
-static void putchar_pace_visible(void) {
-    if (system_get_state() == SYSTEM_STATE_BOOT || vga_is_graphics_mode() ||
-        !process_is_foreground()) {
-        return;
-    }
-
-    uint32_t eflags = 0;
-    __asm__ volatile("pushfl; popl %0" : "=r"(eflags));
-    if ((eflags & 0x200u) == 0u && !process_in_process_context()) {
-        return;
-    }
-
-    uint64_t ticks_per_ms = timer_get_tsc_per_ms();
-    if (ticks_per_ms == 0ULL) {
-        return;
-    }
-
-    uint64_t pace_ticks = (ticks_per_ms * (uint64_t)PUTCHAR_PACE_US) / 1000ULL;
-    if (pace_ticks == 0ULL) {
-        return;
-    }
-
-    uint64_t start_tsc = read_tsc();
-    process_t *curr = process_get_current();
-    while ((read_tsc() - start_tsc) < pace_ticks) {
-        if (vga_is_graphics_mode() || !process_is_foreground() ||
-            (curr && !curr->is_running) ||
-            (process_is_batch_active() && system_is_interrupted())) {
-            break;
-        }
-        timer_tick();
-        if (process_is_batch_active() && process_in_process_context()) {
-            process_yield_kernel();
-        } else {
-            __builtin_ia32_pause();
-        }
-    }
-}
-
 void putchar_color(char c, uint8_t fg, uint8_t bg) {
-    putchar_color_ex(c, fg, bg, true, true);
-    putchar_pace_visible();
+    putchar_write_color_ex(&c, 1u, fg, bg, true, true);
 }
 
 void putchar(char c) {
     putchar_color(c, VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK);
 }
 
-void putchar_vga_replay(const char *str, uint32_t len) {
-    if (!str || len == 0u) {
-        return;
-    }
-    for (uint32_t i = 0u; i < len; i++) {
-        putchar_color_ex(str[i], VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK, false, false);
-    }
+void putchar_write_color(const char *str, ipo_size_t len, uint8_t fg, uint8_t bg) {
+    putchar_write_color_ex(str, len, fg, bg, true, true);
+}
+
+void putchar_write(const char *str, ipo_size_t len) {
+    putchar_write_color_ex(str, len, VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK, true, true);
+}
+
+void putchar_vga_replay(const char *str, ipo_size_t len) {
+    putchar_write_color_ex(str, len, VGA_COLOR_LIGHT_GREY, VGA_COLOR_BLACK, false, false);
 }

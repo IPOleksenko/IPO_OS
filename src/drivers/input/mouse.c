@@ -91,7 +91,7 @@ static uint8_t mouse_wait_read(void) {
 
 static void mouse_write(uint8_t byte) {
     mouse_wait_write();
-    outb(KBD_CMD_PORT, 0xD4); // Route to mouse
+    outb(KBD_CMD_PORT, 0xD4); /* Route to auxiliary PS/2 port */
     mouse_wait_write();
     outb(KBD_DATA_PORT, byte);
 }
@@ -116,49 +116,48 @@ void mouse_init(void) {
 
     printf("[mouse] Initializing PS/2 mouse...\n");
 
-    // Flush any pending data from 8042 controller
     mouse_flush();
 
-    // Enable auxiliary device (mouse port) on 8042
+    /* Enable auxiliary PS/2 port */
     mouse_wait_write();
     outb(KBD_CMD_PORT, 0xA8);
 
-    // Read controller configuration byte
+    /* Read controller config byte */
     mouse_wait_write();
     outb(KBD_CMD_PORT, 0x20);
     uint8_t status = mouse_wait_read();
 
-    // Clear mouse clock disable (bit 5) and keep interrupts polled (clear bit 1 & bit 0)
-    status &= ~0x02;  // IRQ12 disable (polled I/O)
-    status &= ~0x20;  // Mouse clock enable (0 = enabled)
+    /* Polled mode: mask IRQ12 (bit 1) and enable mouse clock (clear bit 5) */
+    status &= ~0x02;
+    status &= ~0x20;
     mouse_wait_write();
     outb(KBD_CMD_PORT, 0x60);
     mouse_wait_write();
     outb(KBD_DATA_PORT, status);
 
-    // Reset to default settings (0xF6)
+    /* Reset defaults (0xF6) */
     mouse_write(0xF6);
-    (void)mouse_read(); // ACK (0xFA)
+    (void)mouse_read(); /* ACK (0xFA) */
 
-    // Set sample rate 200, then 100, then 80
+    /* Magic sample-rate sequence (200, 100, 80) to unlock scroll wheel ID */
     mouse_write(0xF3);
-    (void)mouse_read(); // ACK
+    (void)mouse_read();
     mouse_write(200);
-    (void)mouse_read(); // ACK
+    (void)mouse_read();
 
     mouse_write(0xF3);
-    (void)mouse_read(); // ACK
+    (void)mouse_read();
     mouse_write(100);
-    (void)mouse_read(); // ACK
+    (void)mouse_read();
 
     mouse_write(0xF3);
-    (void)mouse_read(); // ACK
+    (void)mouse_read();
     mouse_write(80);
-    (void)mouse_read(); // ACK
+    (void)mouse_read();
 
-    // Read Device ID (0xF2)
+    /* Query device ID (0xF2) */
     mouse_write(0xF2);
-    (void)mouse_read(); // ACK
+    (void)mouse_read();
     uint8_t dev_id = mouse_read();
     printf("[mouse] PS/2 Device ID: 0x%x\n", dev_id);
     mouse_device_id = dev_id;
@@ -180,18 +179,18 @@ void mouse_init(void) {
         printf("[mouse] Standard PS/2 mouse (3-byte packets, ID=0x%x)\n", dev_id);
     }
 
-    // Set resolution: 4 counts/mm
+    /* Set resolution (0xE8, level 3 = 8 counts/mm) */
     mouse_write(0xE8);
     (void)mouse_read();
     mouse_write(0x03);
     (void)mouse_read();
 
-    // Enable data reporting (0xF4)
+    /* Enable reporting (0xF4) */
     mouse_write(0xF4);
-    uint8_t ack_enable = mouse_read(); // ACK (0xFA)
+    uint8_t ack_enable = mouse_read();
     printf("[mouse] Data reporting enabled (ACK=0x%x)\n", ack_enable);
 
-    // Flush any leftover controller bytes so packet stream starts cleanly
+    /* Drain stale bytes before starting packet framing */
     mouse_flush();
 
     mouse_cycle = 0;
@@ -222,7 +221,6 @@ static void mouse_clamp_and_update_cells(void) {
 
 static void mouse_process_packet(void) {
     uint8_t flags = mouse_packet[0];
-    // Overflow check
     if (flags & 0xC0) {
         return;
     }
@@ -237,12 +235,7 @@ static void mouse_process_packet(void) {
         raw_dy -= 256;
     }
 
-    /* In standard PS/2 mouse hardware:
-     * raw_dy > 0 when mouse moves UP (forward, away from user).
-     * raw_dy < 0 when mouse moves DOWN (backward, towards user).
-     * In screen coordinates (VGA text/graphics):
-     * y = 0 is top of screen, y increases downwards.
-     * Therefore screen delta dy = -raw_dy. */
+    /* PS/2 Y increases upward, screen Y increases downward. */
     int32_t dy = -raw_dy;
 
     int32_t dz = 0;
@@ -253,7 +246,7 @@ static void mouse_process_packet(void) {
         } else {
             dz = mouse_sign_extend_z4(mouse_packet[3]);
         }
-        /* Invert dz so positive is scroll up and negative is scroll down */
+        /* Flip wheel sign so positive scrolls up */
         dz = -dz;
     }
 
@@ -293,7 +286,7 @@ void mouse_handle_byte(uint8_t data) {
     if (!mouse_packet_ensure_capacity((size_t)mouse_cycle + 1u) || !mouse_packet) return;
 
     if (mouse_cycle == 0) {
-        // Bit 3 of byte 0 must be 1, and bits 6 & 7 (overflow) must be 0 in valid PS/2 packets
+        /* Byte 0 sync check: bit 3 must be set and overflow bits (6..7) clear */
         if ((data & 0x08) == 0 || (data & 0xC0) != 0) {
             return;
         }

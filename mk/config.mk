@@ -5,7 +5,7 @@ CC      := gcc
 LD      := ld
 AR      := ar
 OBJCOPY := objcopy
-QEMU    := qemu-system-i386
+QEMU    := qemu-system-x86_64
 
 # Project directories
 
@@ -14,15 +14,14 @@ BUILD        := build
 
 # Output artifacts
 
-BOOT_BIN   := $(BUILD)/boot/boot.bin
+BOOT_BIN     := $(BUILD)/boot/boot.bin
+KERNEL_ELF   := $(BUILD)/kernel/kernel.elf
+KERNEL_BIN   := $(BUILD)/kernel/kernel.bin
+OS_BIN       := $(BUILD)/IPO_OS.bin
+OS_IMAGE     := $(OS_BIN)
 
-KERNEL_ELF := $(BUILD)/kernel/kernel.elf
-KERNEL_BIN := $(BUILD)/kernel/kernel.bin
-OS_BIN     := $(BUILD)/IPO_OS.bin
-OS_IMAGE   := $(OS_BIN)
-
-DISK_DIR   := $(BUILD)/disks
-DISK_IMG   := $(DISK_DIR)/disk.img
+DISK_DIR     := $(BUILD)/disks
+DISK_IMG     := $(DISK_DIR)/disk.img
 
 # Library paths
 
@@ -36,18 +35,24 @@ BOOT_CFG_OUT   := $(BUILD)/boot/config.inc
 
 # Kernel and subsystem sources
 
-KERNEL_DIRS   := $(SRC)/kernel $(SRC)/drivers $(SRC)/fs $(SRC)/net
+KERNEL_DIRS     := $(SRC)/kernel $(SRC)/drivers $(SRC)/fs
 
-SRCS_C        := $(filter-out $(SRC)/kernel/kernel32.c, $(shell find $(KERNEL_DIRS) -type f -name '*.c' 2>/dev/null))
-SRCS_ASM      := $(filter-out $(SRC)/kernel/entry32.asm, $(shell find $(KERNEL_DIRS) -type f -name '*.asm' 2>/dev/null))
-SRCS_S        := $(shell find $(KERNEL_DIRS) -type f -name '*.s' 2>/dev/null)
-SRCS_CAPS_S   := $(shell find $(KERNEL_DIRS) -type f -name '*.S' 2>/dev/null)
+SRCS_C          := $(filter-out $(SRC)/kernel/kernel.c, $(shell find $(KERNEL_DIRS) -type f -name '*.c' 2>/dev/null))
+SRCS_ASM_COMMON := $(filter-out \
+	$(SRC)/kernel/entry.asm \
+	$(SRC)/kernel/arch/x86/syscall.asm \
+	$(SRC)/kernel/arch/x86/smp_trampoline.asm, \
+	$(shell find $(KERNEL_DIRS) -type f -name '*.asm' 2>/dev/null))
+SRCS_S          := $(shell find $(KERNEL_DIRS) -type f -name '*.s' 2>/dev/null)
+SRCS_CAPS_S     := $(shell find $(KERNEL_DIRS) -type f -name '*.S' 2>/dev/null)
 
-# Library / kernel objects
+# Unified kernel objects
 
 LIB_OBJS := \
 	$(patsubst $(SRC)/%.c,   $(BUILD)/kernel/%.o, $(SRCS_C)) \
-	$(patsubst $(SRC)/%.asm, $(BUILD)/kernel/%.o, $(SRCS_ASM)) \
+	$(patsubst $(SRC)/%.asm, $(BUILD)/kernel/%.o, $(SRCS_ASM_COMMON)) \
+	$(BUILD)/kernel/kernel/arch/x86/syscall.o \
+	$(BUILD)/kernel/kernel/arch/x86/smp_trampoline.o \
 	$(patsubst $(SRC)/%.s,   $(BUILD)/kernel/%.o, $(SRCS_S)) \
 	$(patsubst $(SRC)/%.S,   $(BUILD)/kernel/%.o, $(SRCS_CAPS_S))
 
@@ -55,7 +60,7 @@ KERNEL_OBJS := $(LIB_OBJS)
 
 # Runtime / linker libraries
 
-LIBGCC := $(shell $(CC) -m32 -print-libgcc-file-name)
+LIBGCC   := $(shell $(CC) -m32 -print-libgcc-file-name)
 
 # Compiler / assembler flags
 
@@ -91,22 +96,20 @@ QEMU_SERIAL_FLAGS := -serial stdio
 
 # Firmware and Boot ROM options
 
-# Optional complete BIOS firmware image (not the <32 KiB payload; e.g. IPO_Firmware/build/firmware.bin)
 FIRMWARE ?=
-
-# Optional custom Boot ROM (e.g. make run BOOTROM=../IPO_Boot_ROM/build/bootrom.bin)
 BOOTROM  ?=
 
-# If both are specified, BOOTROM takes precedence. Either selected file is attached as the system BIOS ROM.
 ifneq ($(BOOTROM),)
   QEMU_BIOS_FLAGS := -bios $(BOOTROM)
 else ifneq ($(FIRMWARE),)
   QEMU_BIOS_FLAGS := -bios $(FIRMWARE)
 endif
 
-CPU ?= pentium3,+rdrand
+CPU ?= qemu64,+rdrand
+SMP ?= 4
+MEM ?= 8192
 
-QEMU_FLAGS := 	-M pc -cpu $(CPU) -m 2048 \
+QEMU_FLAGS := 	-M pc -cpu $(CPU) -smp $(SMP) -m $(MEM) \
 				$(QEMU_BIOS_FLAGS) \
 				-drive format=raw,file=$(DISK_IMG),if=ide,index=0,file.locking=off \
                	-device sb16,audiodev=snd \

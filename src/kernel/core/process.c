@@ -25,18 +25,16 @@
 #include <kernel/driver.h>
 #include <kernel/input_ext.h>
 #include <kernel/smp.h>
+#include <kernel/dynmod.h>
+#include <arch/context.h>
 
 
-/**
- * Memory allocation tracker for process binaries
- */
 typedef struct {
-    void *base;             // Base address of allocated block
-    uint32_t size;          // Size of allocated block
-    uint32_t pid;           // Owner process ID (0 = free)
+    void *base;
+    ipo_size_t size;
+    uint32_t pid;           /* 0 = free */
 } memory_block_t;
 
-// Global variables
 static int last_exit_code = 0;
 static process_return_value_t last_return_val;
 static process_return_value_t *last_batch_return_vals = NULL;
@@ -48,11 +46,13 @@ uintptr_t process_current_context_token(void) {
 }
 static process_t *process_list = NULL;
 
-bool process_update_memory_mappings(process_t *proc, uint32_t address,
-                                    uint32_t length, bool allocated) {
+bool process_update_memory_mappings(process_t *proc, ipo_vaddr_t address,
+                                    ipo_size_t length, bool allocated) {
+    ipo_vaddr_t map_end = 0u;
     if (!proc || !length || (address & 0xFFFu) || (length & 0xFFFu) ||
-        (uint64_t)address + length > 0x100000000ULL)
+        !ipo_vaddr_add_ok(address, length, &map_end))
         return false;
+    (void)map_end;
 
     if (proc->address_space) {
         if (!address_space_set_identity_range(proc->address_space, address,
@@ -88,53 +88,52 @@ static bool process_address_space_initialize(process_t *proc) {
         if (other->heap_chunks && other->heap_chunk_count > 0) {
             for (uint32_t i = 0; i < other->heap_chunk_count; i++) {
                 if (other->heap_chunks[i].limit > other->heap_chunks[i].base) {
-                    uint32_t start = other->heap_chunks[i].base & ~0xFFFu;
-                    uint64_t end = ((uint64_t)other->heap_chunks[i].limit + 0xFFFu) & ~0xFFFULL;
-                    if (end > UINT32_MAX ||
+                    ipo_vaddr_t start = ipo_vaddr_align_down(other->heap_chunks[i].base, 4096u);
+                    ipo_vaddr_t end = 0u;
+                    if (!ipo_vaddr_align_up_ok(other->heap_chunks[i].limit, 4096u, &end) ||
                         (end > start &&
                          !address_space_set_identity_range(
                              proc->address_space, start,
-                             (uint32_t)end - start, false)))
+                             (ipo_size_t)(end - start), false)))
                         return false;
                 }
             }
         } else if (other->user_heap_limit > other->user_heap_base) {
-            uint32_t start = other->user_heap_base & ~0xFFFu;
-            uint64_t end =
-                ((uint64_t)other->user_heap_limit + 0xFFFu) & ~0xFFFULL;
-            if (end > UINT32_MAX ||
+            ipo_vaddr_t start = ipo_vaddr_align_down(other->user_heap_base, 4096u);
+            ipo_vaddr_t end = 0u;
+            if (!ipo_vaddr_align_up_ok(other->user_heap_limit, 4096u, &end) ||
                 (end > start &&
                  !address_space_set_identity_range(
                      proc->address_space, start,
-                     (uint32_t)end - start, false)))
+                     (ipo_size_t)(end - start), false)))
                 return false;
         }
         if (other->binary_base && other->binary_size &&
-            (uint32_t)(uintptr_t)other->binary_base != PROCESS_HEAP_START) {
+            (ipo_vaddr_t)(uintptr_t)other->binary_base != PROCESS_HEAP_START) {
             address_space_set_identity_range(
                 proc->address_space,
-                (uint32_t)(uintptr_t)other->binary_base,
+                (ipo_vaddr_t)(uintptr_t)other->binary_base,
                 other->binary_size, false);
         }
     }
 
     if (proc->binary_base && proc->binary_size) {
-        for (uint32_t off = 0; off < proc->binary_size; off += 4096) {
+        for (ipo_size_t off = 0; off < proc->binary_size; off += 4096u) {
             if (!address_space_map(proc->address_space,
-                                  PROCESS_HEAP_START + off,
-                                  (uint32_t)(uintptr_t)proc->binary_base + off,
+                                  (ipo_vaddr_t)PROCESS_HEAP_START + (ipo_vaddr_t)off,
+                                  (ipo_paddr_t)(uintptr_t)proc->binary_base + (ipo_paddr_t)off,
                                   ADDRESS_SPACE_PAGE_PRESENT |
                                   ADDRESS_SPACE_PAGE_WRITABLE |
                                   ADDRESS_SPACE_PAGE_USER)) {
                 return false;
             }
         }
-        if ((uint32_t)(uintptr_t)proc->binary_base != PROCESS_HEAP_START) {
+        if ((ipo_vaddr_t)(uintptr_t)proc->binary_base != PROCESS_HEAP_START) {
             for (process_t *other = process_list; other; other = other->next) {
                 if (other != proc && other->address_space) {
                     address_space_set_identity_range(
                         other->address_space,
-                        (uint32_t)(uintptr_t)proc->binary_base,
+                        (ipo_vaddr_t)(uintptr_t)proc->binary_base,
                         proc->binary_size, false);
                 }
             }
@@ -322,7 +321,7 @@ void process_return_val_copy(process_return_value_t *dst, const process_return_v
 static process_t **batch_procs = NULL;
 static int batch_proc_count = 0;
 static int batch_current_idx = 0;
-static uint32_t scheduler_esp = 0;
+static ipo_vaddr_t scheduler_esp = 0;
 static bool batch_active = false;
 static bool batch_separate_windows = false;
 static bool batch_shared_console_view = false;
@@ -349,24 +348,8 @@ process_t *process_get_mapped_app(void) {
     return currently_mapped_app;
 }
 
-__attribute__((naked)) static void process_switch_context(uint32_t *old_esp, uint32_t new_esp) {
-    __asm__ volatile(
-        "pushl %ebp\n\t"
-        "pushl %ebx\n\t"
-        "pushl %esi\n\t"
-        "pushl %edi\n\t"
-        "pushfl\n\t"
-        "movl 24(%esp), %eax\n\t"
-        "movl 28(%esp), %edx\n\t"
-        "movl %esp, (%eax)\n\t"
-        "movl %edx, %esp\n\t"
-        "popfl\n\t"
-        "popl %edi\n\t"
-        "popl %esi\n\t"
-        "popl %ebx\n\t"
-        "popl %ebp\n\t"
-        "ret\n\t"
-    );
+static void process_switch_context(ipo_vaddr_t *old_esp, ipo_vaddr_t new_esp) {
+    arch_context_switch_raw(old_esp, new_esp);
 }
 
 static bool in_process_context = false;
@@ -395,7 +378,7 @@ void process_yield_kernel(void) {
 
     in_process_context = false;
     if (current_process->current_thread) {
-        process_switch_context(&current_process->current_thread->context_esp,
+        process_switch_context(&current_process->current_thread->context_sp,
                                scheduler_esp);
     } else {
         process_switch_context(&current_process->stack_ptr, scheduler_esp);
@@ -663,8 +646,7 @@ static void process_switch_workspace_screen(process_t *old_fg, process_t *new_fg
     if (old_fg == new_fg) return;
     if (!process_get_separate_windows()) return;
 
-    /* If both processes belong to the same workspace, they share the same screen.
-       Do not switch hardware modes or swap VRAM buffers. */
+    /* Same workspace shares screen state; skip mode switch and VRAM swap. */
     if (old_fg && new_fg && old_fg->window_id == new_fg->window_id) {
         batch_displayed_fg = new_fg;
         process_shared_ctx_t *ctx = process_get_shared_context();
@@ -688,7 +670,7 @@ static void process_switch_workspace_screen(process_t *old_fg, process_t *new_fg
     keyboard_flush_queue();
     keyboard_flush_app_queue();
 
-    /* 1. Preserve outgoing graphics or text screen state */
+    /* Save outgoing screen state */
     if (old_fg && !old_fg->completed_and_acknowledged) {
         bool old_uses_wm = old_fg->is_wm_app ||
                            workspace_has_wm_or_bridge(old_fg->window_id);
@@ -749,7 +731,7 @@ static void process_switch_workspace_screen(process_t *old_fg, process_t *new_fg
     batch_displayed_fg = new_fg;
     process_sync_shared_context();
 
-    /* 2. Restore incoming graphics or text screen state */
+    /* Restore incoming screen state */
     if (new_fg == NULL) {
         keyboard_set_app_input_mode(false);
         if (process_wm_has_focus()) {
@@ -889,14 +871,13 @@ void process_init_text_screen(process_t *proc) {
     proc->scroll_top_count = 0;
     proc->scroll_bottom_count = 0;
 
-    /* Fill screen with clean blank spaces before drawing header */
     for (size_t i = 0; i < cells; i++) {
         proc->text_vram_backup[i] = 0x0720;
     }
 
     print_header_row(proc->text_vram_backup, vga_w);
 
-    /* Start at beginning of workspace display content (row 2, column 0) */
+    /* Start below header rows (row 2, col 0) */
     proc->text_cursor_pos = (uint16_t)VGA_START_CURSOR_POSITION;
     proc->text_cursor_visible = true;
 }
@@ -1344,7 +1325,6 @@ static bool is_valid_string_pointer(const void *ptr, uint32_t *out_len) {
     uint32_t addr = (uint32_t)(uintptr_t)ptr;
     if (addr < 0x1000) return false;
 
-    /* Verify start of string is within valid RAM (no hardcoded boundaries) */
     if (!memory_map_is_valid_ram(addr, 1)) {
         return false;
     }
@@ -1357,7 +1337,7 @@ static bool is_valid_string_pointer(const void *ptr, uint32_t *out_len) {
     uint32_t len = 0;
     const uint32_t MAX_STR_LEN = 4096;
     while (len < MAX_STR_LEN) {
-        /* On crossing a 4KB page boundary, re-verify RAM validity to prevent kernel page fault */
+        /* Re-check RAM validity on each 4 KiB page crossing */
         if (len > 0 && ((addr + len) & 0xFFF) == 0) {
             if (!memory_map_is_valid_ram(addr + len, 1)) {
                 return false;
@@ -1369,7 +1349,6 @@ static bool is_valid_string_pointer(const void *ptr, uint32_t *out_len) {
             break;
         }
 
-        /* Printable ASCII, common whitespace (\t, \r, \n), or UTF-8 multi-byte */
         if ((c >= 0x20 && c <= 0x7E) || c == '\n' || c == '\r' || c == '\t' || c >= 0x80) {
             len++;
             continue;
@@ -1736,7 +1715,6 @@ static void format_struct_fields_internal(process_return_value_t *ret_val,
         while (*p == ' ' || *p == '\t' || *p == ',' || *p == ';') p++;
         if (!*p || *p == '}' || *p == ']') break;
 
-        /* Check for packing directive */
         if (match_keyword(p, "packed", 6)) {
             is_packed = true;
             p += 6;
@@ -1748,9 +1726,8 @@ static void format_struct_fields_internal(process_return_value_t *ret_val,
             continue;
         }
 
-        /* Check for nested struct */
         if (*p == '{') {
-            p++; /* skip '{' */
+            p++;
             if (*bit_off_ptr > 0) {
                 *off_ptr += (*bit_off_ptr + 7) / 8;
                 *bit_off_ptr = 0;
@@ -1763,7 +1740,7 @@ static void format_struct_fields_internal(process_return_value_t *ret_val,
             process_return_val_append_str(ret_val, " }");
             first_elem = false;
             if (*p == '}') p++;
-            /* Skip any trailing variable name: e.g. "} inner_var;" */
+            /* Skip trailing field name, e.g. "} inner_var;" */
             while (*p == ' ' || *p == '\t') p++;
             if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || *p == '_') {
                 while ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '_') p++;
@@ -1771,9 +1748,7 @@ static void format_struct_fields_internal(process_return_value_t *ret_val,
             continue;
         }
 
-        /* Check for field name prefix (e.g. "data: char*" or "len: i")
-         * Note: distinguish from bit-field "int a:3" where digit follows colon.
-         */
+        /* Field name prefix ("name: type"); bit-fields have a digit after ':' */
         const char *scan = p;
         while (*scan && *scan != ':' && *scan != ',' && *scan != ';' && *scan != '{' && *scan != '}' && *scan != '[' && *scan != ']') scan++;
         if (*scan == ':') {
@@ -1784,7 +1759,7 @@ static void format_struct_fields_internal(process_return_value_t *ret_val,
             }
         }
 
-        /* Parse array count prefix: e.g. [4i] or [16c] */
+        /* Array count prefix: e.g. [4i] or [16c] */
         uint32_t count = 1;
         bool has_count_prefix = false;
         if (*p == '[') {
@@ -1798,13 +1773,11 @@ static void format_struct_fields_internal(process_return_value_t *ret_val,
             while (*p == ' ' || *p == '\t') p++;
         }
 
-        /* Skip optional "const" */
         if (match_keyword(p, "const", 5)) {
             p += 5;
             while (*p == ' ' || *p == '\t') p++;
         }
 
-        /* Parse type */
         char type_char = '\0';
         uint32_t elem_size = 1;
         uint32_t elem_align = 1;
@@ -1912,7 +1885,7 @@ static void format_struct_fields_internal(process_return_value_t *ret_val,
                 case 'p': type_char = 'p'; elem_size = 4; elem_align = 4; p++; break;
                 case 's': type_char = 's'; elem_size = 4; elem_align = 4; p++; break;
                 default: {
-                    /* Custom type name: e.g. struct name or typedef */
+                    /* Custom struct or typedef name */
                     while ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '_') p++;
                     while (*p == ' ' || *p == '\t') p++;
                     if (*p == '*') {
@@ -1928,7 +1901,6 @@ static void format_struct_fields_internal(process_return_value_t *ret_val,
             }
         }
 
-        /* Check for pointer suffix (e.g. "int *ptr" or "Foo*") */
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '*') {
             p++;
@@ -1939,13 +1911,11 @@ static void format_struct_fields_internal(process_return_value_t *ret_val,
             }
         }
 
-        /* Skip field variable name */
         while (*p == ' ' || *p == '\t') p++;
         if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || *p == '_') {
             while ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '_') p++;
         }
 
-        /* Parse array suffix: e.g. c[16] or [4] */
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '[') {
             p++;
@@ -1961,7 +1931,6 @@ static void format_struct_fields_internal(process_return_value_t *ret_val,
             if (*p == ']') p++;
         }
 
-        /* Check for bit-field width: e.g. ": 3" */
         while (*p == ' ' || *p == '\t') p++;
         uint32_t bit_width = 0;
         if (*p == ':') {
@@ -1972,7 +1941,6 @@ static void format_struct_fields_internal(process_return_value_t *ret_val,
             }
         }
 
-        /* Skip remaining delimiters in this field declaration */
         while (*p && *p != ',' && *p != ';' && *p != '}' && *p != ']') p++;
         if (*p == ',' || *p == ';') p++;
 
@@ -1980,7 +1948,6 @@ static void format_struct_fields_internal(process_return_value_t *ret_val,
             elem_align = 1;
         }
 
-        /* Bit-field handling */
         if (bit_width > 0) {
             uint32_t bit_off = *bit_off_ptr;
             uint32_t cur_off = *off_ptr;
@@ -2014,13 +1981,13 @@ static void format_struct_fields_internal(process_return_value_t *ret_val,
             continue;
         }
 
-        /* If previous fields used bit-fields, align to byte boundary */
+        /* Flush partial bit-field byte before byte-aligned fields */
         if (*bit_off_ptr > 0) {
             *off_ptr += (*bit_off_ptr + 7) / 8;
             *bit_off_ptr = 0;
         }
 
-        /* If it is an array of char (e.g. c[32]) and contains a null-terminated string */
+        /* Treat NUL-terminated char[] as a string */
         if (type_char == 'c' && count > 1) {
             uint32_t cur_off = *off_ptr;
             if (elem_align > 1) {
@@ -2048,7 +2015,6 @@ static void format_struct_fields_internal(process_return_value_t *ret_val,
             }
         }
 
-        /* Format each element */
         bool is_array = (count > 1);
         if (is_array) {
             if (!first_elem) process_return_val_append_str(ret_val, ", ");
@@ -2130,15 +2096,19 @@ static void format_struct_fields_internal(process_return_value_t *ret_val,
                     break;
                 }
                 case 'p': {
-                    uint32_t ptr = struct_read_u32(buf + cur_off);
-                    if (ptr == 0) field_str = kstrdup("NULL");
+                    ipo_vaddr_t ptr = (sizeof(void *) >= 8u)
+                        ? (ipo_vaddr_t)struct_read_u64(buf + cur_off)
+                        : (ipo_vaddr_t)struct_read_u32(buf + cur_off);
+                    if (ptr == 0u) field_str = kstrdup("NULL");
                     else field_str = format_hex_dynamic((uint64_t)ptr);
                     break;
                 }
                 case 's': {
-                    uint32_t ptr = struct_read_u32(buf + cur_off);
+                    ipo_vaddr_t ptr = (sizeof(void *) >= 8u)
+                        ? (ipo_vaddr_t)struct_read_u64(buf + cur_off)
+                        : (ipo_vaddr_t)struct_read_u32(buf + cur_off);
                     uint32_t slen = 0;
-                    if (ptr == 0) {
+                    if (ptr == 0u) {
                         field_str = kstrdup("NULL");
                         field_arg = kstrdup("NULL");
                     } else if (is_valid_string_pointer((const void*)ptr, &slen)) {
@@ -2203,7 +2173,7 @@ static void format_struct_fields(process_return_value_t *ret_val,
     process_return_val_set_str(ret_val, "{ ");
     const char *p = fmt;
     while (*p == ' ' || *p == '\t') p++;
-    if (*p == '{') p++; /* skip leading '{' if present */
+    if (*p == '{') p++;
 
     uint32_t off = 0;
     uint32_t bit_off = 0;
@@ -2222,7 +2192,7 @@ static void format_struct_fields_universal(process_return_value_t *ret_val, cons
     bool first_field = true;
 
     while (off < written_size) {
-        /* Skip any unwritten poison padding (0xDD) or intra-struct alignment padding */
+        /* Skip 0xDD poison bytes and alignment padding */
         while (off < written_size && (struct_buf[off] == 0xDD || ((off % 4 != 0) && struct_buf[off] == 0))) {
             off++;
         }
@@ -2235,21 +2205,15 @@ static void format_struct_fields_universal(process_return_value_t *ret_val, cons
         char *field_arg = NULL;
         uint32_t advance = 0;
 
-        /* Case 1: Unaligned offset (off % 4 != 0)
-         * In 32-bit x86 C ABI, int and pointer fields are always 4-byte aligned.
-         * Therefore, any field at an unaligned offset CANNOT be an int or pointer.
-         * It must be a 1-byte char (or int8), or 2-byte short (if off % 2 == 0).
-         */
+        /* Unaligned offset: 32-bit ABI ints/pointers are 4-byte aligned, so this is char/int8 or 2-byte short */
         if (off % 4 != 0) {
             if ((off % 2 == 0) && rem >= 2 && struct_buf[off + 1] != 0xDD &&
                 !is_char_byte(struct_buf[off])) {
-                /* 16-bit short integer */
                 int16_t sval = struct_read_i16(struct_buf + off);
                 field_str = format_int_dynamic((int32_t)sval);
                 if (field_str) field_arg = kstrdup(field_str);
                 advance = 2;
             } else {
-                /* 1-byte char, bool or int8 */
                 uint8_t c = struct_buf[off];
                 if (c == 1 && (off + 1 >= written_size || struct_buf[off + 1] == 0 || struct_buf[off + 1] == 0xDD)) {
                     field_str = kstrdup("true");
@@ -2264,7 +2228,7 @@ static void format_struct_fields_universal(process_return_value_t *ret_val, cons
                 advance = 1;
             }
         }
-        /* Case 2: 1-byte remaining (or explicit 0xDD poison immediately after) */
+        /* 1 byte left, or followed by 0xDD poison sentinel */
         else if (rem == 1 || (off + 1 < written_size && struct_buf[off + 1] == 0xDD)) {
             uint8_t c = struct_buf[off];
             if (is_char_byte(c)) {
@@ -2276,14 +2240,15 @@ static void format_struct_fields_universal(process_return_value_t *ret_val, cons
             }
             advance = 1;
         }
-        /* Case 3: 4 or more bytes aligned at 4-byte boundary */
         else if (rem >= 4) {
             uint32_t val32 = struct_read_u32(struct_buf + off);
+            ipo_vaddr_t ptr_cand = (sizeof(void *) >= 8u && rem >= 8 && (off % 8 == 0))
+                ? (ipo_vaddr_t)struct_read_u64(struct_buf + off)
+                : (ipo_vaddr_t)val32;
             uint32_t str_len = 0;
 
-            /* Check if valid string pointer */
-            if (is_valid_string_pointer((const void*)val32, &str_len)) {
-                const char *src_str = (const char*)val32;
+            if (is_valid_string_pointer((const void*)ptr_cand, &str_len)) {
+                const char *src_str = (const char*)ptr_cand;
                 field_str = (char*)kmalloc(str_len + 3);
                 if (field_str) {
                     field_str[0] = '"';
@@ -2292,9 +2257,8 @@ static void format_struct_fields_universal(process_return_value_t *ret_val, cons
                     field_str[str_len + 2] = '\0';
                 }
                 field_arg = kstrdup(src_str);
-                advance = 4;
+                advance = (sizeof(void *) >= 8u && rem >= 8 && (off % 8 == 0)) ? 8u : 4u;
             }
-            /* Check if multiple packed chars/bytes (e.g. char c1, c2, ... or char + bool) */
             else if (rem >= 2 &&
                      is_char_byte(struct_buf[off]) &&
                      is_char_byte(struct_buf[off + 1])) {
@@ -2303,7 +2267,7 @@ static void format_struct_fields_universal(process_return_value_t *ret_val, cons
                 field_arg = format_char_arg_dynamic(c);
                 advance = 1;
             }
-            /* 64-bit integer check (negative sign extension or 64-bit architecture) */
+            /* 64-bit integer (negative sign-extended or native 64-bit) */
             else if (rem >= 8 && (off % 8 == 0) &&
                      #if UINTPTR_MAX > 0xFFFFFFFFU
                      true
@@ -2317,19 +2281,17 @@ static void format_struct_fields_universal(process_return_value_t *ret_val, cons
                 advance = 8;
             }
             else if (val32 >= 0x01000000u && memory_map_is_valid_ram(val32, 1) && (val32 % 4 == 0) &&
-                     !is_valid_string_pointer((const void*)val32, NULL)) {
+                     !is_valid_string_pointer((const void*)(ipo_vaddr_t)val32, NULL)) {
                 field_str = format_hex_dynamic(val32);
                 if (field_str) field_arg = kstrdup(field_str);
                 advance = 4;
             }
-            /* Standard 32-bit integer */
             else {
                 field_str = format_int_dynamic((int32_t)val32);
                 if (field_str) field_arg = kstrdup(field_str);
                 advance = 4;
             }
         }
-        /* Case 4: 2 or 3 bytes remaining */
         else {
             uint8_t c = struct_buf[off];
             if (is_char_byte(c)) {
@@ -2342,7 +2304,6 @@ static void format_struct_fields_universal(process_return_value_t *ret_val, cons
             advance = 1;
         }
 
-        /* Only append comma if field_str allocation succeeded */
         if (field_str) {
             if (!first_field) {
                 process_return_val_append_str(ret_val, ", ");
@@ -2375,71 +2336,36 @@ static void process_trampoline(void) {
     if (struct_buf) memset(struct_buf, 0xDD, struct_buf_cap);
 
     bool is_struct = is_entry_struct_return((void*)proc->entry_point);
-    uint32_t ret_eax = 0;
-    uint32_t ret_edx = 0;
+    ipo_reg_t ret_eax = 0;
+    ipo_reg_t ret_edx = 0;
 
     if (proc->entry_point != 0) {
-        uint32_t cur_esp;
-        __asm__ volatile("movl %%esp, %0" : "=r"(cur_esp));
-        serial_printf("[process] pid=%u calling entry=0x%x esp=0x%x is_struct=%d\n",
-                      proc->pid, proc->entry_point, cur_esp, (int)is_struct);
+        ipo_vaddr_t saved_sp = arch_stack_get_sp();
+        serial_printf("[process] pid=%u calling entry=0x%llx sp=0x%llx is_struct=%d\n",
+                      proc->pid, (unsigned long long)proc->entry_point,
+                      (unsigned long long)saved_sp, (int)is_struct);
 
-        uint32_t saved_esp;
-        __asm__ volatile("movl %%esp, %0" : "=r"(saved_esp));
-
-        if (is_struct && struct_buf) {
-            typedef void* (*struct_entry_func_t)(void *ret_buf, int argc, char **argv, char **envp);
-            struct_entry_func_t struct_entry = (struct_entry_func_t)proc->entry_point;
-            __asm__ volatile("sti" ::: "memory");
-            struct_entry(struct_buf, proc->argc, argv, default_env);
-            __asm__ volatile("cli" ::: "memory");
-            ret_eax = (uint32_t)(uintptr_t)struct_buf;
-        } else {
-            typedef int (*entry_func_t)(int, char**, char**);
-            entry_func_t entry = (entry_func_t)proc->entry_point;
-            char **envp_ptr = default_env;
-            int argc_val = proc->argc;
-            __asm__ volatile(
-                "pushl %%ebx\n\t"
-                "pushl %%esi\n\t"
-                "pushl %%edi\n\t"
-                "pushl %3\n\t"
-                "pushl %4\n\t"
-                "pushl %5\n\t"
-                "xorl %%ebx, %%ebx\n\t"
-                "xorl %%ecx, %%ecx\n\t"
-                "xorl %%edx, %%edx\n\t"
-                "xorl %%esi, %%esi\n\t"
-                "xorl %%edi, %%edi\n\t"
-                "sti\n\t"
-                "call *%%eax\n\t"
-                "cli\n\t"
-                "addl $12, %%esp\n\t"
-                "popl %%edi\n\t"
-                "popl %%esi\n\t"
-                "popl %%ebx\n\t"
-                : "=a"(ret_eax), "=d"(ret_edx)
-                : "0"(entry), "m"(envp_ptr), "m"(argv), "m"(argc_val)
-                : "ecx", "memory", "cc"
-            );
-        }
-
-        __asm__ volatile("movl %0, %%esp" : : "r"(saved_esp));
+        arch_context_exec_user_entry(
+            proc->entry_point, struct_buf, is_struct,
+            proc->argc, argv, default_env,
+            &ret_eax, &ret_edx);
     }
 
     if (!proc->return_val_explicit) {
         process_return_val_reset(&proc->return_val);
 
-        /* Check if process has an auto-detected or embedded return format descriptor */
+        /* Check for embedded 'IPOR' return-format descriptor */
         const char *embedded_fmt = proc->return_format;
         if (!embedded_fmt && proc->binary_base && proc->binary_size >= 8) {
             const uint8_t *bin = (const uint8_t *)proc->binary_base;
-            uint32_t limit = proc->binary_size - 8;
-            for (uint32_t i = 0; i <= limit; i++) {
+            ipo_size_t limit = proc->binary_size - (ipo_size_t)sizeof(void *) - 4u;
+            for (ipo_size_t i = 0; i <= limit; i++) {
                 if (bin[i] == 0x49 && bin[i+1] == 0x50 && bin[i+2] == 0x4F && bin[i+3] == 0x52) {
-                    uint32_t str_ptr = struct_read_u32(bin + i + 4);
+                    ipo_vaddr_t str_ptr = (sizeof(void *) >= 8u)
+                        ? (ipo_vaddr_t)struct_read_u64(bin + i + 4)
+                        : (ipo_vaddr_t)struct_read_u32(bin + i + 4);
                     const char *candidate = NULL;
-                    uint32_t base = (uint32_t)(uintptr_t)proc->binary_base;
+                    ipo_vaddr_t base = (ipo_vaddr_t)(uintptr_t)proc->binary_base;
                     if (str_ptr >= base && str_ptr < base + proc->binary_size) {
                         candidate = (const char *)(bin + (str_ptr - base));
                     } else if (is_valid_string_pointer((const void*)str_ptr, NULL)) {
@@ -2454,7 +2380,7 @@ static void process_trampoline(void) {
         }
 
         if (is_struct && struct_buf) {
-            /* Find exact written size in poisoned buffer */
+            /* Scan backwards over 0xDD poison to find written struct size */
             int last_written = -1;
             for (int i = (int)struct_buf_cap - 1; i >= 0; i--) {
                 if (struct_buf[i] != 0xDD) {
@@ -2471,12 +2397,11 @@ static void process_trampoline(void) {
                 process_return_val_set_type_name(&proc->return_val, "struct");
             }
             process_return_val_set_struct_data(&proc->return_val, struct_buf, written_size);
-            proc->return_val.raw_eax = (uint32_t)(uintptr_t)struct_buf;
+            proc->return_val.raw_eax = (ipo_reg_t)(uintptr_t)struct_buf;
             proc->return_val.raw_edx = 0;
             proc->return_val.int_val = 0;
             proc->exit_code = 0;
 
-            /* Output formatting: use explicit descriptor if provided, else universal */
             if (embedded_fmt && embedded_fmt[0] != '\0') {
                 format_struct_fields(&proc->return_val, struct_buf, written_size, embedded_fmt);
             } else {
@@ -2557,9 +2482,9 @@ static void process_trampoline(void) {
                     process_return_val_add_arg(&proc->return_val, "NULL");
                 } else {
                     process_return_val_set_str(&proc->return_val, "\"");
-                    process_return_val_append_str(&proc->return_val, (const char*)ret_eax);
+                    process_return_val_append_str(&proc->return_val, (const char*)(uintptr_t)ret_eax);
                     process_return_val_append_str(&proc->return_val, "\"");
-                    process_return_val_add_arg(&proc->return_val, (const char*)ret_eax);
+                    process_return_val_add_arg(&proc->return_val, (const char*)(uintptr_t)ret_eax);
                 }
             } else if (embedded_fmt && embedded_fmt[0] == '{') {
                 uint8_t *reg_buf = (uint8_t *)kmalloc(8u);
@@ -2585,7 +2510,7 @@ static void process_trampoline(void) {
                 process_return_val_set_type_name(&proc->return_val, "int");
                 process_return_val_set_str(&proc->return_val, "0");
                 process_return_val_add_arg(&proc->return_val, "0");
-            } else if (is_valid_string_pointer((const void*)ret_eax, &str_len)) {
+            } else if (is_valid_string_pointer((const void*)(uintptr_t)ret_eax, &str_len)) {
                 proc->return_val.type = PROC_RET_STRING;
                 proc->return_val.int_val = 0;
                 proc->return_val.raw_eax = ret_eax;
@@ -2593,9 +2518,9 @@ static void process_trampoline(void) {
                 proc->exit_code = 0;
                 process_return_val_set_type_name(&proc->return_val, "char*");
                 process_return_val_set_str(&proc->return_val, "\"");
-                process_return_val_append_str(&proc->return_val, (const char*)ret_eax);
+                process_return_val_append_str(&proc->return_val, (const char*)(uintptr_t)ret_eax);
                 process_return_val_append_str(&proc->return_val, "\"");
-                process_return_val_add_arg(&proc->return_val, (const char*)ret_eax);
+                process_return_val_add_arg(&proc->return_val, (const char*)(uintptr_t)ret_eax);
             } else if (ret_eax >= 0x01000000u && memory_map_is_valid_ram(ret_eax, 1) && (ret_eax % 4 == 0)) {
                 proc->return_val.type = PROC_RET_POINTER;
                 process_return_val_set_type_name(&proc->return_val, "void*");
@@ -2726,7 +2651,6 @@ static uint32_t allocate_pid(void) {
     }
 }
 
-// Memory allocation tracking
 static memory_block_t *allocated_blocks = NULL;
 static int block_count = 0;
 static int max_blocks = 0;
@@ -2780,11 +2704,11 @@ static void log_process_heap_state(const char *stage) {
 }
 
 typedef struct {
-    uint32_t start;
-    uint32_t end;
+    ipo_vaddr_t start;
+    ipo_vaddr_t end;
 } mem_interval_t;
 
-static bool mem_interval_push(mem_interval_t **arr, int *count, int *cap, uint32_t start, uint32_t end) {
+static bool mem_interval_push(mem_interval_t **arr, int *count, int *cap, ipo_vaddr_t start, ipo_vaddr_t end) {
     if (*count >= *cap) {
         int new_cap = *cap > 0 ? (*cap * 2) : 16;
         mem_interval_t *grown = (mem_interval_t *)krealloc(*arr, (size_t)new_cap * sizeof(mem_interval_t));
@@ -2825,16 +2749,16 @@ bool process_heap_ensure_capacity(process_t *proc, uint32_t min_chunks) {
     return true;
 }
 
-static uint32_t get_user_heap_start(uint64_t total_ram) {
-    uint32_t heap_start = USER_HEAP_START;
+static ipo_vaddr_t get_user_heap_start(uint64_t total_ram) {
+    ipo_vaddr_t heap_start = (ipo_vaddr_t)USER_HEAP_START;
     if (total_ram > 0 && total_ram <= heap_start) {
         /* On low-RAM systems (<= 256 MiB), start user heap at 144 MiB (0x09000000),
          * reserving 128..144 MiB (0x08000000..0x09000000) for kernel page tables. */
-        heap_start = 0x09000000u;
+        heap_start = (ipo_vaddr_t)0x09000000u;
     }
     const memory_region_t *reg0 = memory_map_get_region(0);
     if (reg0 && reg0->is_usable && reg0->used > 0) {
-        uint32_t min_start = (reg0->base + reg0->used + 0x00FFFFFFu) & ~0x003FFFFFu;
+        ipo_vaddr_t min_start = (ipo_vaddr_t)((reg0->base + reg0->used + 0x00FFFFFFu) & ~0x003FFFFFu);
         if (min_start > heap_start) {
             heap_start = min_start;
         }
@@ -2861,7 +2785,6 @@ bool process_heap_init(process_t *proc) {
         return false;
     }
 
-    /* Collect all existing active process heaps and binaries dynamically */
     mem_interval_t *active = NULL;
     int count = 0;
     int cap = 0;
@@ -2897,7 +2820,6 @@ bool process_heap_init(process_t *proc) {
         curr = curr->next;
     }
 
-    /* Sort active ranges by start address ascending */
     for (int i = 0; i < count - 1; i++) {
         for (int j = i + 1; j < count; j++) {
             if (active[j].start < active[i].start) {
@@ -2908,7 +2830,6 @@ bool process_heap_init(process_t *proc) {
         }
     }
 
-    /* If no other processes exist, place at heap_start */
     if (count == 0) {
         if (active) kfree(active);
         proc->heap_chunk_count = 1;
@@ -2925,12 +2846,10 @@ bool process_heap_init(process_t *proc) {
         return true;
     }
 
-    /* Find the largest gap between existing processes and boundaries */
     uint32_t best_gap_start = 0;
     uint32_t best_gap_end = 0;
     uint32_t best_gap_size = 0;
 
-    /* Gap 0: Before the first active process */
     if (active[0].start > heap_start) {
         uint32_t sz = active[0].start - heap_start;
         if (sz > best_gap_size) {
@@ -2940,7 +2859,6 @@ bool process_heap_init(process_t *proc) {
         }
     }
 
-    /* Gaps between processes */
     for (int i = 0; i < count - 1; i++) {
         uint32_t gap_s = active[i].end > active[i].start ? active[i].end : active[i].start;
         uint32_t gap_e = active[i + 1].start;
@@ -2954,7 +2872,6 @@ bool process_heap_init(process_t *proc) {
         }
     }
 
-    /* Gap after the last active process */
     uint32_t last_end = active[count - 1].end > active[count - 1].start ?
                         active[count - 1].end : active[count - 1].start;
     if (heap_end > last_end) {
@@ -2966,7 +2883,7 @@ bool process_heap_init(process_t *proc) {
         }
     }
 
-    if (best_gap_size < 0x01000000u) { /* At least 16 MiB */
+    if (best_gap_size < 0x01000000u) { /* 16 MiB minimum */
         if (active) kfree(active);
         serial_printf("[process] Physical RAM exhausted for pid=%u heap (best gap=%u KiB)\n",
                       proc->pid, best_gap_size / 1024);
@@ -2975,12 +2892,9 @@ bool process_heap_init(process_t *proc) {
 
     uint32_t candidate_base;
     if (best_gap_start == heap_start && active[0].start > heap_start) {
-        /* Take the beginning of heap space directly */
         candidate_base = heap_start;
     } else {
-        /* Split the gap in half so the previous process can still grow,
-         * or if the previous process already has plenty of space, give balanced room.
-         * Align to 4 MiB boundary (0x400000). */
+        /* Split gap in half (4 MiB aligned) so adjacent heap can still grow */
         uint32_t mid = best_gap_start + (best_gap_end - best_gap_start) / 2;
         candidate_base = (mid + 0x003FFFFFu) & ~0x003FFFFFu;
         if (candidate_base >= best_gap_end - 0x00400000u) {
@@ -3027,49 +2941,49 @@ void process_heap_cleanup(process_t *proc) {
     }
 }
 
-bool process_heap_chunk_can_expand(process_t *proc, uint32_t chunk_idx, uint32_t new_limit) {
+bool process_heap_chunk_can_expand(process_t *proc, uint32_t chunk_idx, ipo_vaddr_t new_limit) {
     if (!proc || !proc->heap_chunks || chunk_idx >= proc->heap_chunk_count) return false;
-    uint32_t cur_limit = proc->heap_chunks[chunk_idx].limit;
+    ipo_vaddr_t cur_limit = proc->heap_chunks[chunk_idx].limit;
     if (new_limit <= cur_limit) return true;
 
     uint64_t total_ram = get_process_heap_capacity();
     if (total_ram > 0 && (uint64_t)new_limit > total_ram) return false;
     if ((uint64_t)new_limit > 0xB0000000ULL) return false;
 
-    /* Check other chunks of the SAME process */
     for (uint32_t i = 0; i < proc->heap_chunk_count; i++) {
         if (i == chunk_idx) continue;
-        uint32_t o_base = proc->heap_chunks[i].base;
-        uint32_t o_end = proc->heap_chunks[i].limit > o_base ?
-                         proc->heap_chunks[i].limit : (o_base + 4096u);
+        ipo_vaddr_t o_base = proc->heap_chunks[i].base;
+        ipo_vaddr_t o_end = proc->heap_chunks[i].limit > o_base ?
+                            proc->heap_chunks[i].limit : (o_base + 4096u);
         if (cur_limit < o_end && new_limit > o_base) {
             return false;
         }
     }
 
-    /* Check against all OTHER processes */
     for (process_t *curr = process_list; curr; curr = curr->next) {
         if (curr == proc) continue;
-        /* Check other process binary */
         if (curr->binary_base && curr->binary_size) {
-            uint32_t b_start = (uint32_t)(uintptr_t)curr->binary_base;
-            uint32_t b_end = (b_start + curr->binary_size + 0xFFFu) & ~0xFFFu;
+            ipo_vaddr_t b_start = (ipo_vaddr_t)(uintptr_t)curr->binary_base;
+            ipo_vaddr_t b_end = 0u;
+            if (!ipo_vaddr_add_ok(b_start, curr->binary_size, &b_end) ||
+                !ipo_vaddr_align_up_ok(b_end, 4096u, &b_end)) {
+                return false;
+            }
             if (cur_limit < b_end && new_limit > b_start) return false;
         }
-        /* Check other process heap chunks */
         if (curr->heap_chunks && curr->heap_chunk_count > 0) {
             for (uint32_t i = 0; i < curr->heap_chunk_count; i++) {
-                uint32_t o_base = curr->heap_chunks[i].base;
-                uint32_t o_end = curr->heap_chunks[i].limit > o_base ?
-                                 curr->heap_chunks[i].limit : (o_base + 4096u);
+                ipo_vaddr_t o_base = curr->heap_chunks[i].base;
+                ipo_vaddr_t o_end = curr->heap_chunks[i].limit > o_base ?
+                                    curr->heap_chunks[i].limit : (o_base + 4096u);
                 if (cur_limit < o_end && new_limit > o_base) {
                     return false;
                 }
             }
         } else if (curr->user_heap_base > 0) {
-            uint32_t o_base = curr->user_heap_base;
-            uint32_t o_end = curr->user_heap_limit > curr->user_heap_base ?
-                             curr->user_heap_limit : (o_base + 4096u);
+            ipo_vaddr_t o_base = curr->user_heap_base;
+            ipo_vaddr_t o_end = curr->user_heap_limit > curr->user_heap_base ?
+                                curr->user_heap_limit : (o_base + 4096u);
             if (cur_limit < o_end && new_limit > o_base) {
                 return false;
             }
@@ -3078,13 +2992,13 @@ bool process_heap_chunk_can_expand(process_t *proc, uint32_t chunk_idx, uint32_t
     return true;
 }
 
-bool process_heap_can_expand(process_t *proc, uint32_t new_limit) {
+bool process_heap_can_expand(process_t *proc, ipo_vaddr_t new_limit) {
     if (!proc) return false;
     uint32_t idx = proc->heap_chunk_count > 0 ? proc->heap_chunk_count - 1 : 0;
     return process_heap_chunk_can_expand(proc, idx, new_limit);
 }
 
-uint32_t process_heap_allocate_new_chunk(process_t *proc, uint32_t needed_size) {
+ipo_vaddr_t process_heap_allocate_new_chunk(process_t *proc, ipo_size_t needed_size) {
     if (!proc || needed_size == 0) {
         return 0;
     }
@@ -3104,49 +3018,49 @@ uint32_t process_heap_allocate_new_chunk(process_t *proc, uint32_t needed_size) 
     }
 
     uint64_t total_ram = get_process_heap_capacity();
-    uint32_t heap_start = get_user_heap_start(total_ram);
-    uint32_t heap_end = ((total_ram > 0 && total_ram < 0xB0000000ULL)
-        ? (uint32_t)total_ram : 0x7FFE0000u) & ~0xFFFu;
+    ipo_vaddr_t heap_start = get_user_heap_start(total_ram);
+    ipo_vaddr_t heap_end = ipo_vaddr_align_down(
+        (total_ram > 0 && total_ram < 0xB0000000ULL)
+        ? (ipo_vaddr_t)total_ram : (ipo_vaddr_t)0x7FFE0000u, 4096u);
 
     mem_interval_t *occupied = NULL;
     int occ_count = 0;
     int occ_cap = 0;
 
     for (process_t *curr = process_list; curr; curr = curr->next) {
-        /* Binary */
         if (curr->binary_base && curr->binary_size) {
-            uint32_t b_start = (uint32_t)(uintptr_t)curr->binary_base;
-            uint32_t b_end = (b_start + curr->binary_size + 0xFFFu) & ~0xFFFu;
-            if (b_end > heap_start && b_start < heap_end) {
-                uint32_t s = b_start < heap_start ? heap_start : b_start;
-                uint32_t e = b_end > heap_end ? heap_end : b_end;
+            ipo_vaddr_t b_start = (ipo_vaddr_t)(uintptr_t)curr->binary_base;
+            ipo_vaddr_t b_end = 0u;
+            if (ipo_vaddr_add_ok(b_start, curr->binary_size, &b_end) &&
+                ipo_vaddr_align_up_ok(b_end, 4096u, &b_end) &&
+                b_end > heap_start && b_start < heap_end) {
+                ipo_vaddr_t s = b_start < heap_start ? heap_start : b_start;
+                ipo_vaddr_t e = b_end > heap_end ? heap_end : b_end;
                 mem_interval_push(&occupied, &occ_count, &occ_cap, s, e);
             }
         }
-        /* Heap chunks */
         if (curr->heap_chunks && curr->heap_chunk_count > 0) {
             for (uint32_t i = 0; i < curr->heap_chunk_count; i++) {
                 if (curr == proc && reuse_empty_active && i == active_idx) {
                     continue;
                 }
-                uint32_t c_base = curr->heap_chunks[i].base;
-                uint32_t c_end = curr->heap_chunks[i].limit > c_base ?
-                                 curr->heap_chunks[i].limit : (c_base + 4096u);
+                ipo_vaddr_t c_base = curr->heap_chunks[i].base;
+                ipo_vaddr_t c_end = curr->heap_chunks[i].limit > c_base ?
+                                    curr->heap_chunks[i].limit : (c_base + 4096u);
                 if (c_base > 0) {
                     mem_interval_push(&occupied, &occ_count, &occ_cap, c_base, c_end);
                 }
             }
         } else if (curr->user_heap_base > 0 && !(curr == proc && reuse_empty_active)) {
-            uint32_t c_base = curr->user_heap_base;
-            uint32_t c_end = curr->user_heap_limit > curr->user_heap_base ?
-                             curr->user_heap_limit : (c_base + 4096u);
+            ipo_vaddr_t c_base = curr->user_heap_base;
+            ipo_vaddr_t c_end = curr->user_heap_limit > curr->user_heap_base ?
+                                curr->user_heap_limit : (c_base + 4096u);
             if (c_base > 0) {
                 mem_interval_push(&occupied, &occ_count, &occ_cap, c_base, c_end);
             }
         }
     }
 
-    /* Sort occupied intervals by start address ascending */
     for (int i = 0; i < occ_count - 1; i++) {
         for (int j = i + 1; j < occ_count; j++) {
             if (occupied[j].start < occupied[i].start) {
@@ -3157,7 +3071,6 @@ uint32_t process_heap_allocate_new_chunk(process_t *proc, uint32_t needed_size) 
         }
     }
 
-    /* Merge overlapping/contiguous intervals dynamically */
     mem_interval_t *merged = NULL;
     int merged_count = 0;
     int merged_cap = 0;
@@ -3177,21 +3090,21 @@ uint32_t process_heap_allocate_new_chunk(process_t *proc, uint32_t needed_size) 
         }
     }
 
-    uint32_t aligned_needed = (needed_size + 0xFFFu) & ~0xFFFu;
-    uint32_t current_chunk_end = 0;
+    ipo_size_t aligned_needed = (needed_size + 0xFFFu) & ~(ipo_size_t)0xFFFu;
+    ipo_vaddr_t current_chunk_end = 0;
     if (proc->heap_chunks && proc->heap_chunk_count > 0) {
         current_chunk_end = proc->heap_chunks[proc->heap_chunk_count - 1].limit;
     }
 
-    uint32_t chosen_gap_start = 0;
+    ipo_vaddr_t chosen_gap_start = 0;
 
-    /* Scan gaps after current chunk */
-    uint32_t cur_pos = heap_start;
+    ipo_vaddr_t cur_pos = heap_start;
     for (int i = 0; i < merged_count; i++) {
         if (merged[i].start > cur_pos) {
-            uint32_t gap_start = (cur_pos + 0xFFFu) & ~0xFFFu;
-            uint32_t gap_end = merged[i].start & ~0xFFFu;
-            if (gap_end > gap_start && (gap_end - gap_start) >= aligned_needed) {
+            ipo_vaddr_t gap_start = 0u;
+            ipo_vaddr_t gap_end = ipo_vaddr_align_down(merged[i].start, 4096u);
+            if (ipo_vaddr_align_up_ok(cur_pos, 4096u, &gap_start) &&
+                gap_end > gap_start && (ipo_size_t)(gap_end - gap_start) >= aligned_needed) {
                 if (gap_start >= current_chunk_end && chosen_gap_start == 0) {
                     chosen_gap_start = gap_start;
                     break;
@@ -3203,23 +3116,24 @@ uint32_t process_heap_allocate_new_chunk(process_t *proc, uint32_t needed_size) 
         }
     }
 
-    /* Check gap after last interval */
     if (chosen_gap_start == 0 && heap_end > cur_pos) {
-        uint32_t gap_start = (cur_pos + 0xFFFu) & ~0xFFFu;
-        if (heap_end > gap_start && (heap_end - gap_start) >= aligned_needed &&
+        ipo_vaddr_t gap_start = 0u;
+        if (ipo_vaddr_align_up_ok(cur_pos, 4096u, &gap_start) &&
+            heap_end > gap_start && (ipo_size_t)(heap_end - gap_start) >= aligned_needed &&
             gap_start >= current_chunk_end) {
             chosen_gap_start = gap_start;
         }
     }
 
-    /* If no gap found after current chunk, search anywhere from heap_start */
+    /* Fall back to scanning from heap_start if no gap follows the current chunk */
     if (chosen_gap_start == 0) {
         cur_pos = heap_start;
         for (int i = 0; i < merged_count; i++) {
             if (merged[i].start > cur_pos) {
-                uint32_t gap_start = (cur_pos + 0xFFFu) & ~0xFFFu;
-                uint32_t gap_end = merged[i].start & ~0xFFFu;
-                if (gap_end > gap_start && (gap_end - gap_start) >= aligned_needed) {
+                ipo_vaddr_t gap_start = 0u;
+                ipo_vaddr_t gap_end = ipo_vaddr_align_down(merged[i].start, 4096u);
+                if (ipo_vaddr_align_up_ok(cur_pos, 4096u, &gap_start) &&
+                    gap_end > gap_start && (ipo_size_t)(gap_end - gap_start) >= aligned_needed) {
                     chosen_gap_start = gap_start;
                     break;
                 }
@@ -3229,8 +3143,9 @@ uint32_t process_heap_allocate_new_chunk(process_t *proc, uint32_t needed_size) 
             }
         }
         if (chosen_gap_start == 0 && heap_end > cur_pos) {
-            uint32_t gap_start = (cur_pos + 0xFFFu) & ~0xFFFu;
-            if (heap_end > gap_start && (heap_end - gap_start) >= aligned_needed) {
+            ipo_vaddr_t gap_start = 0u;
+            if (ipo_vaddr_align_up_ok(cur_pos, 4096u, &gap_start) &&
+                heap_end > gap_start && (ipo_size_t)(heap_end - gap_start) >= aligned_needed) {
                 chosen_gap_start = gap_start;
             }
         }
@@ -3240,19 +3155,18 @@ uint32_t process_heap_allocate_new_chunk(process_t *proc, uint32_t needed_size) 
     if (occupied) kfree(occupied);
 
     if (chosen_gap_start == 0) {
-        serial_printf("[process] Cannot allocate new heap chunk of size %u KiB for pid=%u (no free gap)\n",
-                      needed_size / 1024, proc->pid);
+        serial_printf("[process] Cannot allocate new heap chunk of size %llu KiB for pid=%u (no free gap)\n",
+                      (unsigned long long)(needed_size / 1024u), proc->pid);
         return 0;
     }
 
-    /* Allocate new chunk (or reuse empty active chunk in place) */
     uint32_t chunk_idx = reuse_empty_active ? active_idx : proc->heap_chunk_count;
-    uint32_t chunk_base = chosen_gap_start;
-    uint32_t chunk_limit = chunk_base + aligned_needed;
+    ipo_vaddr_t chunk_base = chosen_gap_start;
+    ipo_vaddr_t chunk_limit = chunk_base + (ipo_vaddr_t)aligned_needed;
 
     if (!process_update_memory_mappings(proc, chunk_base, aligned_needed, true)) {
-        serial_printf("[process] Failed to map new heap chunk at 0x%x for pid=%u\n",
-                      chunk_base, proc->pid);
+        serial_printf("[process] Failed to map new heap chunk at 0x%llx for pid=%u\n",
+                      (unsigned long long)chunk_base, proc->pid);
         return 0;
     }
 
@@ -3274,7 +3188,7 @@ uint32_t process_heap_allocate_new_chunk(process_t *proc, uint32_t needed_size) 
     return chunk_base;
 }
 
-/* On-demand ELF segment loader: maps headers and initial chunk, streaming remaining pages on yields. */
+/* Stream remaining binary chunks across process yields */
 
 void process_demand_load_step(process_t *proc) {
     if (!proc || !proc->demand_loading) return;
@@ -3324,18 +3238,14 @@ void process_demand_load_finish(process_t *proc) {
     }
 }
 
-/**
- * Add a memory block to tracking
- */
-static int add_memory_block(void *base, uint32_t size, uint32_t pid) {
-    // Expand array if needed
+static int add_memory_block(void *base, ipo_size_t size, uint32_t pid) {
     if (block_count >= max_blocks) {
         int new_max = max_blocks + 16;
-        memory_block_t *new_blocks = kmalloc(new_max * sizeof(memory_block_t));
+        memory_block_t *new_blocks = kmalloc((size_t)new_max * sizeof(memory_block_t));
         if (!new_blocks) return -1;
         
         if (allocated_blocks) {
-            memcpy(new_blocks, allocated_blocks, block_count * sizeof(memory_block_t));
+            memcpy(new_blocks, allocated_blocks, (size_t)block_count * sizeof(memory_block_t));
             kfree(allocated_blocks);
         }
         allocated_blocks = new_blocks;
@@ -3378,11 +3288,7 @@ void process_set_keep_alive(process_t *proc, int enabled) {
     }
 }
 
-/**
- * process_init - Initialize process manager
- */
 void process_init(void) {
-    // Initialize process memory tracking
     global_process_heap_used = 0;
     block_count = 0;
     max_blocks = 0;
@@ -3392,65 +3298,55 @@ void process_init(void) {
     printf("[process] Process manager initialized (capacity: %llu MiB).\n", get_process_heap_capacity() / (1024 * 1024));
 }
 
-/**
- * allocate_process_memory - Allocates memory for a process dynamically
- */
-static void *allocate_process_memory(process_t *proc, uint32_t size, uint32_t prot_flags) {
+static void *allocate_process_memory(process_t *proc, ipo_size_t size, uint32_t prot_flags) {
     (void)prot_flags;
 
     if (proc == NULL || size == 0) {
         return NULL;
     }
 
-    // First, try to find a free block that fits
     for (int i = 0; i < block_count; i++) {
         if (allocated_blocks[i].pid == 0 && allocated_blocks[i].size >= size) {
-            // Found a free block that fits
             void *addr = allocated_blocks[i].base;
-            uint32_t old_size = allocated_blocks[i].size;
+            ipo_size_t old_size = allocated_blocks[i].size;
             
-            // Mark as allocated
             allocated_blocks[i].pid = proc->pid;
             
-            // If the block is larger than needed, split it
             if (old_size > size) {
-                // Create a new free block for the remaining space
                 if (add_memory_block((uint8_t*)addr + size, old_size - size, 0) < 0) {
-                    // Failed to create free block, use the whole block
                     allocated_blocks[i].size = old_size;
                 } else {
                     allocated_blocks[i].size = size;
                 }
             }
             
-            serial_printf("Reused free block at 0x%x, size=%u (was %u)\n", 
-                         (uint32_t)addr, size, old_size);
+            serial_printf("Reused free block at 0x%llx, size=%llu (was %llu)\n", 
+                         (unsigned long long)(uintptr_t)addr,
+                         (unsigned long long)size,
+                         (unsigned long long)old_size);
             return addr;
         }
     }
     
-    uint32_t base = PROCESS_HEAP_START + (uint32_t)global_process_heap_used;
+    ipo_vaddr_t base = (ipo_vaddr_t)PROCESS_HEAP_START + (ipo_vaddr_t)global_process_heap_used;
     uint64_t total_ram = get_process_heap_capacity();
 
-    /* Dynamically allocate as much space as the application needs,
-     * bounded only by physical RAM available on the machine. */
     if (total_ram > 0 && ((uint64_t)base + size) > total_ram) {
-        serial_printf("[process] Physical RAM exhausted: requested base 0x%x + size %u exceeds total RAM %llu bytes\n",
-                     base, size, total_ram);
+        serial_printf("[process] Physical RAM exhausted: requested base 0x%llx + size %llu exceeds total RAM %llu bytes\n",
+                     (unsigned long long)base, (unsigned long long)size, total_ram);
         return NULL;
     }
 
     void *addr = (void *)base;
 
-    // Track this allocation
     if (add_memory_block(addr, size, proc->pid) < 0) {
         return NULL;
     }
 
     global_process_heap_used += size;
 
-    serial_printf("Allocated process memory at end: base=0x%x, size=%u, used=%llu\n",
-                 base, size, global_process_heap_used);
+    serial_printf("Allocated process memory at end: base=0x%llx, size=%llu, used=%llu\n",
+                 (unsigned long long)base, (unsigned long long)size, global_process_heap_used);
 
     return addr;
 }
@@ -3479,14 +3375,14 @@ static void coalesce_free_blocks(void) {
         }
     }
 
-    // Shrink heap usage if free blocks exist at the top of heap
+    /* Trim trailing free blocks from top of heap */
     bool shrunk = true;
     while (shrunk) {
         shrunk = false;
         for (int i = 0; i < block_count; i++) {
             if (allocated_blocks[i].pid == 0) {
-                uint32_t block_top = (uint32_t)allocated_blocks[i].base + allocated_blocks[i].size;
-                if (block_top == PROCESS_HEAP_START + (uint32_t)global_process_heap_used) {
+                ipo_vaddr_t block_top = (ipo_vaddr_t)(uintptr_t)allocated_blocks[i].base + allocated_blocks[i].size;
+                if (block_top == (ipo_vaddr_t)PROCESS_HEAP_START + (ipo_vaddr_t)global_process_heap_used) {
                     global_process_heap_used -= allocated_blocks[i].size;
                     for (int k = i; k < block_count - 1; k++) {
                         allocated_blocks[k] = allocated_blocks[k + 1];
@@ -3500,26 +3396,23 @@ static void coalesce_free_blocks(void) {
     }
 }
 
-/**
- * free_process_memory - Frees up process memory
- * Marks block as free (pid=0) so it can be reused
- */
-static void free_process_memory(process_t *proc, void *addr, uint32_t size) {
+static void free_process_memory(process_t *proc, void *addr, ipo_size_t size) {
     (void)proc;
     (void)size;
 
-    // Find the block and mark it as free
     for (int i = 0; i < block_count; i++) {
         if (allocated_blocks[i].base == addr) {
-            allocated_blocks[i].pid = 0;  // Mark as free
-            serial_printf("Marked memory as free: base=0x%x, size=%u\n", 
-                         (uint32_t)addr, allocated_blocks[i].size);
+            allocated_blocks[i].pid = 0;
+            serial_printf("Marked memory as free: base=0x%llx, size=%llu\n", 
+                         (unsigned long long)(uintptr_t)addr,
+                         (unsigned long long)allocated_blocks[i].size);
             coalesce_free_blocks();
             return;
         }
     }
     
-    serial_printf("Warning: tried to free unknown block at 0x%x\n", (uint32_t)addr);
+    serial_printf("Warning: tried to free unknown block at 0x%llx\n",
+                  (unsigned long long)(uintptr_t)addr);
 }
 
 static void process_release_execution_memory(process_t *proc) {
@@ -3591,7 +3484,7 @@ static void process_release_execution_memory(process_t *proc) {
     process_heap_cleanup(proc);
 }
 
-static int setup_arguments(process_t *proc, int argc, char **argv, uint32_t *argv_addr_out) {
+static int setup_arguments(process_t *proc, int argc, char **argv, ipo_vaddr_t *argv_addr_out) {
     if (argc <= 0 || argv == NULL) {
         proc->argc = 0;
         *argv_addr_out = 0;
@@ -3623,17 +3516,14 @@ static int setup_arguments(process_t *proc, int argc, char **argv, uint32_t *arg
     argv_array[argc] = 0;
 
     proc->argc = argc;
-    *argv_addr_out = (uint32_t)(uintptr_t)argv_array;
+    *argv_addr_out = (ipo_vaddr_t)(uintptr_t)argv_array;
     proc->argv_kernel = argv_array;
 
     return 0;
 }
 
-/**
- * setup_stack - Configures the process stack for startup.
- * Start with a modest reserve and let the app request more when it actually needs it.
- */
-static uint32_t setup_stack(process_t *proc) {
+/* Map an initial 4 KiB stack page with an unmapped guard page below; grows on fault. */
+static ipo_vaddr_t setup_stack(process_t *proc) {
     if (!proc) return 0;
     if (!proc->address_space) {
         proc->address_space = address_space_create();
@@ -3645,15 +3535,15 @@ static uint32_t setup_stack(process_t *proc) {
         }
     }
 
-    uint32_t stack_top = 0xC0000000u;
-    uint32_t initial_page = stack_top - 4096u;
-    uint32_t guard_page = initial_page - 4096u;
+    ipo_vaddr_t stack_top = (ipo_vaddr_t)0xC0000000u;
+    ipo_vaddr_t initial_page = stack_top - 4096u;
+    ipo_vaddr_t guard_page = initial_page - 4096u;
 
     void *frame = memory_page_alloc();
     if (!frame) return 0;
 
     if (!address_space_map(proc->address_space, initial_page,
-                           (uint32_t)(uintptr_t)frame,
+                           (ipo_paddr_t)(uintptr_t)frame,
                            ADDRESS_SPACE_PAGE_PRESENT |
                            ADDRESS_SPACE_PAGE_WRITABLE |
                            ADDRESS_SPACE_PAGE_USER)) {
@@ -3699,7 +3589,9 @@ void process_cleanup(process_t *proc) {
     utf_stream_free(&proc->utf_stream);
     driver_unregister_by_owner(proc);
     input_ext_cleanup_pid(proc->pid);
+    dynmod_revoke(proc->pid);
     process_thread_cleanup(proc);
+    arch_context_destroy(&proc->arch_ctx);
 
     if (!proc->threads && proc->address_space && proc->stack_start) {
         uint32_t phys = address_space_get_physical(proc->address_space, proc->stack_start);
@@ -3823,24 +3715,19 @@ void process_cleanup(process_t *proc) {
         proc->text_output_cap = 0;
     }
     
-    // Freeing arguments
     if (proc->argv_kernel) {
-        // argv_kernel contains a pointer to the argv array
-        uint32_t *argv_array = (uint32_t *)proc->argv_kernel;
+        char **argv_array = (char **)proc->argv_kernel;
         
-        // Freeing up argument structures
         for (int i = 0; i < proc->argc; i++) {
             if (argv_array[i]) {
                 kfree((void*)argv_array[i]);
             }
         }
         
-        // Freeing the array itself
         kfree(argv_array);
         proc->argv_kernel = NULL;
     }
     
-    // Remove from the list of processes
     if (process_list == proc) {
         process_list = proc->next;
     } else {
@@ -3877,9 +3764,9 @@ void process_crash_exit(void) {
 }
 
 void process_emergency_crash_exit(void) {
-    __asm__ volatile("cli" ::: "memory");
+    arch_irq_disable();
     extern uint8_t exception_stack_top[];
-    __asm__ volatile("movl %0, %%esp" : : "r"((uint32_t)(uintptr_t)exception_stack_top) : "memory");
+    arch_stack_set_sp((ipo_vaddr_t)(uintptr_t)exception_stack_top);
     address_space_force_unlock();
     process_t *proc = current_process;
     if (proc != NULL) {
@@ -3914,7 +3801,7 @@ void process_emergency_crash_exit(void) {
         if (scheduler_esp != 0) {
             in_process_context = false;
             if (proc->current_thread) {
-                process_switch_context(&proc->current_thread->context_esp, scheduler_esp);
+                process_switch_context(&proc->current_thread->context_sp, scheduler_esp);
             } else {
                 process_switch_context(&proc->stack_ptr, scheduler_esp);
             }
@@ -3933,7 +3820,7 @@ typedef struct custom_binfmt {
     uint32_t magic_len;
     uint32_t offset;
     char *runner_path;
-    struct custom_binfmt *next;     /* Dynamic linked list (no count limit) */
+    struct custom_binfmt *next;
 } custom_binfmt_t;
 
 static custom_binfmt_t *g_binfmt_list = NULL;
@@ -4064,12 +3951,6 @@ static char **binfmt_split_cmd(const char *cmd, int *out_count) {
     return argv;
 }
 
-/**
- * exec_load - Standard Bare-Metal Executable Loader.
- *
- * Loads raw machine code instructions directly into memory at
- * PROCESS_HEAP_START without headers, structures, or sections.
- */
 static uint32_t binfmt_max_header_needed(void) {
     uint32_t max_needed = 0;
     for (custom_binfmt_t *f = g_binfmt_list; f != NULL; f = f->next) {
@@ -4081,12 +3962,12 @@ static uint32_t binfmt_max_header_needed(void) {
     return max_needed;
 }
 
+/* Load raw flat binary directly at PROCESS_HEAP_START */
 static int exec_load(process_t *proc, struct ipo_inode *stat) {
     if (!proc || !stat || stat->size == 0) {
         return -1;
     }
 
-    /* Standard Bare-Metal Executable Loader */
     uint32_t total_memsz = ((uint32_t)stat->size + 4095u) & ~4095u;
     void *mem = allocate_process_memory(proc, total_memsz, PROT_READ | PROT_WRITE | PROT_EXEC);
     if (!mem) {
@@ -4124,9 +4005,6 @@ static int exec_load(process_t *proc, struct ipo_inode *stat) {
 }
 
 
-/**
- * process_spawn - Creates, loads, and initializes a process ready to run
- */
 process_t *process_spawn(const char *path, int argc, char **argv) {
     if (path == NULL) {
         return NULL;
@@ -4165,7 +4043,7 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
         return NULL;
     }
 
-    /* Check registered custom headers (regardless of file extension / naming) */
+    /* Match registered binary format magic headers */
     uint32_t max_hdr = binfmt_max_header_needed();
     if (max_hdr > 0 && stat.size > 0) {
         uint32_t to_read = (uint32_t)stat.size < max_hdr ? (uint32_t)stat.size : max_hdr;
@@ -4176,7 +4054,7 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
                 static int spawn_depth = 0;
                 custom_binfmt_t *matched_fmt = (spawn_depth < 16) ? binfmt_find_match(hdr_buf, (uint32_t)n) : NULL;
                 if (matched_fmt != NULL) {
-                    /* Prevent recursion: if actual_path is the runner executable itself, load it natively */
+                    /* Avoid recursion if the runner matches its own format magic */
                     if (strcmp(actual_path, matched_fmt->runner_path) == 0 ||
                         strstr(matched_fmt->runner_path, actual_path) != NULL) {
                         matched_fmt = NULL;
@@ -4234,7 +4112,6 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
 
     log_process_heap_state("before spawn");
 
-    // Creating process structure
     process_t *proc = kmalloc(sizeof(process_t));
     if (!proc) {
         printf("Failed to allocate process structure\n");
@@ -4259,7 +4136,6 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
     proc->next = process_list;
     process_list = proc;
 
-    // Load executable as bare-metal
     int load_res = exec_load(proc, &stat);
     if (resolved != NULL) kfree(resolved);
  
@@ -4270,8 +4146,7 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
         return NULL;
     }
  
-    // Setting up arguments - argv is allocated in kernel memory
-    uint32_t argv_addr = 0;
+    ipo_vaddr_t argv_addr = 0;
     if (setup_arguments(proc, argc, argv, &argv_addr) < 0) {
         printf("Failed to setup arguments\n");
         process_set_last_exit_code(126);
@@ -4279,7 +4154,6 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
         return NULL;
     }
  
-    // Setting up the stack for calling main()
     if (setup_stack(proc) == 0) {
         printf("Failed to allocate process stack\n");
         process_set_last_exit_code(126);
@@ -4287,7 +4161,6 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
         return NULL;
     }
  
-    // Defensive validation: a broken application must never crash the kernel.
     if (proc->binary_base == NULL || proc->binary_size == 0 ||
         proc->entry_point < PROCESS_HEAP_START) {
         printf("[process] pid=%u: invalid app image, closing process safely\n", proc->pid);
@@ -4296,17 +4169,24 @@ process_t *process_spawn(const char *path, int argc, char **argv) {
         return NULL;
     }
  
-    // Set up trampoline stack frame for cooperative multitasking
-    uint32_t *frame_sp = (uint32_t *)((uintptr_t)proc->stack_base + 4096u);
-    frame_sp = (uint32_t *)((uint32_t)frame_sp & ~15u);
-    frame_sp[-1] = (uint32_t)process_trampoline;
-    frame_sp[-2] = 0;       // ebp
-    frame_sp[-3] = 0;       // ebx
-    frame_sp[-4] = 0;       // esi
-    frame_sp[-5] = 0;       // edi
-    frame_sp[-6] = 0x02;    // eflags (reserved bit 1=1, IF=0)
-    uint32_t offset = (uint32_t)((uintptr_t)proc->stack_base + 4096u - (uintptr_t)&frame_sp[-6]);
-    proc->stack_ptr = 0xC0000000u - offset;
+    arch_stack_state_t init_st = {
+        .stack_base = (ipo_vaddr_t)(uintptr_t)proc->stack_base,
+        .stack_size = 4096u,
+        .virtual_top = (ipo_vaddr_t)0xC0000000u,
+        .virtual_bottom = (ipo_vaddr_t)(0xC0000000u - 4096u),
+        .guard_page = 0u,
+        .sp = 0u
+    };
+    if (arch_context_prepare(&proc->arch_ctx, &init_st,
+                             (ipo_vaddr_t)(uintptr_t)process_trampoline,
+                             (ipo_uarg_t)proc->pid,
+                             (void *)((ipo_vaddr_t)(uintptr_t)proc->stack_base + 4096u),
+                             &proc->stack_ptr) < 0) {
+        printf("Failed to initialize process context\n");
+        process_set_last_exit_code(126);
+        process_cleanup(proc);
+        return NULL;
+    }
 
     if (!process_thread_init(proc)) {
         printf("Failed to initialize main thread\n");
@@ -4439,16 +4319,10 @@ bool process_close_current_workspace(void) {
     return true;
 }
 
-/**
- * process_run_batch_windows - Runs all processes in one batch with window grouping.
- * Processes with the same window_id share a single virtual text screen (workspace).
- * Processes with unique window_ids each get their own workspace.
- * All processes execute truly in parallel in one batch loop.
- */
+/* Run processes concurrently; matching window_ids share a virtual text screen. */
 int process_run_batch_windows(process_t **procs, int count, const int *window_ids) {
     if (!procs || count <= 0 || !window_ids) return -1;
 
-    /* Count unique window IDs */
     int unique_wids = 0;
     for (int i = 0; i < count; i++) {
         if (!procs[i]) continue;
@@ -4464,7 +4338,6 @@ int process_run_batch_windows(process_t **procs, int count, const int *window_id
 
     bool separate_windows = (unique_wids > 1);
 
-    /* Assign window_id to every process */
     for (int i = 0; i < count; i++) {
         if (procs[i]) {
             procs[i]->window_id = window_ids[i];
@@ -4473,13 +4346,11 @@ int process_run_batch_windows(process_t **procs, int count, const int *window_id
     }
 
     if (separate_windows) {
-        /* Initialize text screens: first process in each window group owns the buffers,
-           subsequent processes in the same group share them. */
+        /* First process per window_id owns the text/scroll buffers; siblings share them. */
         for (int i = 0; i < count; i++) {
             if (!procs[i]) continue;
             int wid = procs[i]->window_id;
 
-            /* Find the first process in this window group */
             process_t *owner = NULL;
             for (int k = 0; k < i; k++) {
                 if (procs[k] && procs[k]->window_id == wid) {
@@ -4489,10 +4360,9 @@ int process_run_batch_windows(process_t **procs, int count, const int *window_id
             }
 
             if (owner == NULL) {
-                /* First process in this group — allocate its own text screen */
                 process_init_text_screen(procs[i]);
             } else {
-                /* Share text buffers from the owner (graphics buffers remain private per process) */
+                /* Graphics buffers stay private per process */
                 procs[i]->text_vram_backup = owner->text_vram_backup;
                 procs[i]->text_cursor_pos = owner->text_cursor_pos;
                 procs[i]->text_cursor_visible = owner->text_cursor_visible;
@@ -4510,17 +4380,12 @@ int process_run_batch_windows(process_t **procs, int count, const int *window_id
     return process_run_batch_ex(procs, count, separate_windows);
 }
 
-/**
- * process_run_batch - Executes one or more processes concurrently using cooperative multitasking
- */
 int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
     if (!procs || count <= 0) {
         return -1;
     }
 
-    /* If separate_windows is requested, initialize virtual text screens for all processes.
-       Skip processes with text_screen_shared=true — their buffers are already set up
-       by process_run_batch_windows(). */
+    /* Skip text_screen_shared processes whose buffers come from process_run_batch_windows(). */
     if (separate_windows) {
         for (int i = 0; i < count; i++) {
             if (procs[i] && !procs[i]->text_screen_shared) {
@@ -4540,9 +4405,9 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
     bool old_batch_shared_console_view = batch_shared_console_view;
     bool old_batch_wm_was_active = batch_wm_was_active;
     process_t *old_batch_foreground_proc = batch_foreground_proc;
-    uint32_t old_scheduler_esp = scheduler_esp;
+    ipo_vaddr_t old_scheduler_esp = scheduler_esp;
     bool old_in_process_context = in_process_context;
-    uint32_t entry_flags = irq_save();
+    ipo_reg_t entry_flags = irq_save();
     in_process_context = false;
 
     batch_procs = procs;
@@ -4565,10 +4430,11 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
     if (vga_is_graphics_mode() || wm_session_active()) {
         had_graphics = true;
     }
+    (void)had_graphics;
 
     bool batch_saved_was_text = !vga_is_graphics_mode() && !wm_session_active();
 
-    /* Capture pristine text screen and cursor before any batch process alters them */
+    /* Snapshot pre-batch text screen and cursor */
     size_t vga_cells = (size_t)VGA_WIDTH * (size_t)VGA_HEIGHT;
     uint16_t *batch_saved_screen = (uint16_t *)kmalloc(vga_cells * sizeof(uint16_t));
     uint16_t batch_saved_cursor = vga_get_cursor_position();
@@ -4720,8 +4586,7 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
             last_fg = fg;
         } else if (fg && fg_ws_wants_gfx && !vga_is_graphics_mode() &&
                    (!batch_shared_console_view || separate_windows)) {
-            /* If the foreground workspace transitioned into graphics/WM mode after
-               initial launch (e.g. via elf_loader), switch VGA hardware now. */
+            /* Switch to graphics mode if the foreground switched to WM/graphics after launch. */
             vga_set_mode_13h_hardware();
             if (fg_ws_has_wm || (!process_get_separate_windows() && process_wm_has_focus())) {
                 vga_gfx_init_default_palette();
@@ -4751,7 +4616,6 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
             }
         }
 
-        /* Release execution memory for any process that has stopped running */
         int active_count = 0;
         for (int i = 0; i < count; i++) {
             process_t *p = procs[i];
@@ -4767,7 +4631,6 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
             }
         }
 
-        /* If all processes have finished: the process batch has finished */
         if (active_count == 0) {
             break;
         }
@@ -4776,7 +4639,6 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
             keyboard_flush_app_queue();
         }
 
-        /* Clean up any terminated and acknowledged process windows */
         if (separate_windows) {
             for (int i = 0; i < count; i++) {
                 if (procs[i] && !process_is_active_or_has_windows(procs[i])) {
@@ -4824,13 +4686,11 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
             }
         }
 
-        // Drive async tasks and WM compositor if active, in graphics mode, and not in raw fullscreen VGA graphics
         async_scheduler_tick();
         if (process_wm_has_focus() && vga_is_graphics_mode()) {
             wm_compositor_tick();
         }
 
-        // Find next runnable process
         int found = -1;
         for (int step = 0; step < count; step++) {
             int idx = (batch_current_idx + step) % count;
@@ -4895,12 +4755,10 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
         }
         process_sync_shared_context();
 
-        // Map process binary to 0x800000
         process_map_app(current_process);
 
         in_process_context = true;
-        // Switch to process!
-        process_switch_context(&scheduler_esp, selected_thread->context_esp);
+        process_switch_context(&scheduler_esp, selected_thread->context_sp);
         in_process_context = false;
         process_t *ran_proc = current_process;
         current_process = NULL;
@@ -4910,7 +4768,6 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
         } else {
             (void)address_space_activate_kernel();
         }
-        // Process yields back here
         if (ran_proc && !ran_proc->is_running) {
             ipc_process_terminated(ran_proc->pid);
             process_release_execution_memory(ran_proc);
@@ -4966,15 +4823,14 @@ int process_run_batch_ex(process_t **procs, int count, bool separate_windows) {
         system_set_state(SYSTEM_STATE_TERMINAL_IDLE);
     }
 
-    /* Thoroughly flush keyboard input buffers to ensure zero residual characters leak into console */
+    /* Flush residual keystrokes before returning to console */
     keyboard_flush_hardware();
     keyboard_flush_queue();
     keyboard_flush_app_queue();
     keyboard_clear_key_state();
 
     bool interrupted = (was_interrupted || system_is_interrupted());
-    /* Tear down any auto-started WM session once all batch windows have closed;
-     * explicit startwm sessions stay open and mixed batches restore terminal view cleanly. */
+    /* Restore text mode and saved screen if returning outside WM */
     if (!wm_session_active()) {
         if (vga_is_graphics_mode()) {
             vga_set_mode_text_hardware();
@@ -5114,9 +4970,6 @@ int process_exec(const char *path, int argc, char **argv) {
     return universal_process_execute(path, argc, argv);
 }
 
-/**
- * process_get_exit_code - Returns the exit code of the last process.
- */
 int process_get_exit_code(void) {
     return last_exit_code;
 }
@@ -5261,9 +5114,6 @@ void process_set_current_return_value(process_return_type_t type, const char *ty
     process_return_val_copy(&last_return_val, &proc->return_val);
 }
 
-/**
- * process_get_current - Returns the current process
- */
 process_t *process_get_current(void) {
     process_shared_ctx_t *ctx = process_get_shared_context();
     if (ctx && ctx->magic == PROCESS_SHARED_MAGIC && ctx->current_process != NULL) {
@@ -5287,9 +5137,6 @@ bool process_is_valid(process_t *proc) {
     return false;
 }
 
-/**
- * process_list_print - Lists all running and background processes
- */
 void process_list_print(void) {
     if (process_list == NULL) {
         printf("No active or background processes running.\n");
@@ -5335,20 +5182,15 @@ void process_list_print(void) {
     printf("  Total processes: %u\n", count);
 }
 
-/**
- * process_kill_by_pid - Terminates a process and its async tasks by PID
- */
 int process_kill_by_pid(uint32_t pid) {
     process_t *curr = process_list;
     while (curr != NULL) {
         if (curr->pid == pid) {
             char *name_copy = curr->name ? kstrdup(curr->name) : NULL;
 
-            /* Stop all async tasks owned by this process */
             async_stop_tasks_by_owner(curr);
             curr->async_task_count = 0;
 
-            /* Cleanup memory and unlink from list */
             process_cleanup(curr);
             printf("[process] pid=%u (%s) killed and memory freed.\n",
                    pid, name_copy ? name_copy : "unnamed");
@@ -5362,9 +5204,6 @@ int process_kill_by_pid(uint32_t pid) {
     return -1;
 }
 
-/**
- * process_find_by_pid - Find process struct by PID
- */
 process_t *process_find_by_pid(uint32_t pid) {
     process_t *curr = process_list;
     while (curr != NULL) {
@@ -5374,17 +5213,11 @@ process_t *process_find_by_pid(uint32_t pid) {
     return NULL;
 }
 
-/**
- * process_is_alive - Check if a process with @pid is still in the process list.
- * Returns true if the process exists (even in background/keep-alive state).
- */
+/* True while process stays in process_list (including keep-alive). */
 bool process_is_alive(uint32_t pid) {
     return process_find_by_pid(pid) != NULL;
 }
 
-/**
- * process_kill_all - Terminates all active and background processes
- */
 int process_kill_all(void) {
     if (process_list == NULL) {
         printf("No active processes to kill.\n");

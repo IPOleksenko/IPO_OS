@@ -161,7 +161,7 @@ static int ipc_pipe_create(const char *user_name, uint32_t public_rights,
         uint32_t new_cap = ipc_pipe_capacity ? (ipc_pipe_capacity * 2u)
                                              : IPC_INITIAL_PIPE_CAPACITY;
         if (new_cap <= ipc_pipe_capacity ||
-            new_cap > (SIZE_MAX / sizeof(*ipc_pipes))) {
+            !ipo_size_mul_ok((ipo_size_t)new_cap, sizeof(*ipc_pipes), NULL)) {
             spin_unlock(&ipc_stream_lock);
             kfree(name);
             return IPO_IPC_ERR_NO_SPACE;
@@ -278,7 +278,7 @@ static int ipc_pipe_open(const char *user_name, uint32_t rights) {
         uint32_t new_cap = pipe->client_capacity ? (pipe->client_capacity * 2u)
                                                 : IPC_INITIAL_PIPE_CLIENT_CAPACITY;
         if (new_cap <= pipe->client_capacity ||
-            new_cap > (SIZE_MAX / sizeof(*pipe->clients))) {
+            !ipo_size_mul_ok((ipo_size_t)new_cap, sizeof(*pipe->clients), NULL)) {
             spin_unlock(&ipc_stream_lock);
             return IPO_IPC_ERR_NO_SPACE;
         }
@@ -540,7 +540,7 @@ static ipc_notification_queue_t *ipc_notification_find_locked(uint32_t pid,
                                ? (ipc_notification_capacity * 2u)
                                : IPC_INITIAL_NOTIFICATION_RECIPIENT_CAPACITY;
         if (new_cap <= ipc_notification_capacity ||
-            new_cap > (SIZE_MAX / sizeof(*ipc_notifications)))
+            !ipo_size_mul_ok((ipo_size_t)new_cap, sizeof(*ipc_notifications), NULL))
             return NULL;
         ipc_notification_queue_t *grown = (ipc_notification_queue_t *)krealloc(
             ipc_notifications, new_cap * sizeof(*ipc_notifications));
@@ -574,7 +574,7 @@ static int ipc_notify_enqueue_locked(uint32_t recipient_pid,
     if (queue->count == queue->capacity) {
         uint32_t new_cap = queue->capacity * 2u;
         if (new_cap <= queue->capacity ||
-            new_cap > (SIZE_MAX / sizeof(*queue->events))) {
+            !ipo_size_mul_ok((ipo_size_t)new_cap, sizeof(*queue->events), NULL)) {
             return IPO_IPC_ERR_WOULD_BLOCK;
         }
         ipo_ipc_notification_t *new_events =
@@ -717,50 +717,50 @@ void ipc_stream_process_terminated(uint32_t pid) {
     spin_unlock(&ipc_stream_lock);
 }
 
-uint32_t ipc_stream_syscall_handler(uint32_t num, uint32_t argc,
-                                    uint32_t *argv) {
-    if (!ipc_stream_ready) return (uint32_t)IPO_IPC_ERR_NO_SPACE;
-    uint32_t args[4] = {0};
+ipo_uarg_t ipc_stream_syscall_handler(ipo_uarg_t num, ipo_uarg_t argc,
+                                      ipo_uarg_t *argv) {
+    if (!ipc_stream_ready) return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_NO_SPACE;
+    ipo_uarg_t args[4] = {0};
     switch (num) {
         case IPO_SYSCALL_IPC_PIPE_CREATE:
             if (!ipc_copy_syscall_args(argc, argv, 3u, args))
-                return (uint32_t)IPO_IPC_ERR_INVALID;
-            return (uint32_t)ipc_pipe_create(
-                (const char *)(uintptr_t)args[0], args[1],
-                (uint32_t *)(uintptr_t)args[2]);
+                return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
+            return (ipo_uarg_t)(ipo_sarg_t)ipc_pipe_create(
+                (const char *)(ipo_vaddr_t)args[0], (uint32_t)args[1],
+                (uint32_t *)(ipo_vaddr_t)args[2]);
         case IPO_SYSCALL_IPC_PIPE_OPEN:
             if (!ipc_copy_syscall_args(argc, argv, 2u, args))
-                return (uint32_t)IPO_IPC_ERR_INVALID;
-            return (uint32_t)ipc_pipe_open(
-                (const char *)(uintptr_t)args[0], args[1]);
+                return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
+            return (ipo_uarg_t)(ipo_sarg_t)ipc_pipe_open(
+                (const char *)(ipo_vaddr_t)args[0], (uint32_t)args[1]);
         case IPO_SYSCALL_IPC_PIPE_CLOSE:
             if (!ipc_copy_syscall_args(argc, argv, 2u, args))
-                return (uint32_t)IPO_IPC_ERR_INVALID;
-            return (uint32_t)ipc_pipe_close(args[0], args[1]);
+                return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
+            return (ipo_uarg_t)(ipo_sarg_t)ipc_pipe_close((uint32_t)args[0], (uint32_t)args[1]);
         case IPO_SYSCALL_IPC_PIPE_DESTROY:
             if (!ipc_copy_syscall_args(argc, argv, 1u, args))
-                return (uint32_t)IPO_IPC_ERR_INVALID;
-            return (uint32_t)ipc_pipe_destroy(args[0]);
+                return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
+            return (ipo_uarg_t)(ipo_sarg_t)ipc_pipe_destroy((uint32_t)args[0]);
         case IPO_SYSCALL_IPC_PIPE_READ:
             if (!ipc_copy_syscall_args(argc, argv, 4u, args))
-                return (uint32_t)IPO_IPC_ERR_INVALID;
-            return (uint32_t)ipc_pipe_read(
-                args[0], (uint8_t *)(uintptr_t)args[1], args[2], args[3]);
+                return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
+            return (ipo_uarg_t)(ipo_sarg_t)ipc_pipe_read(
+                (uint32_t)args[0], (uint8_t *)(ipo_vaddr_t)args[1], (uint32_t)args[2], (uint32_t)args[3]);
         case IPO_SYSCALL_IPC_PIPE_WRITE:
             if (!ipc_copy_syscall_args(argc, argv, 4u, args))
-                return (uint32_t)IPO_IPC_ERR_INVALID;
-            return (uint32_t)ipc_pipe_write(
-                args[0], (const uint8_t *)(uintptr_t)args[1], args[2], args[3]);
+                return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
+            return (ipo_uarg_t)(ipo_sarg_t)ipc_pipe_write(
+                (uint32_t)args[0], (const uint8_t *)(ipo_vaddr_t)args[1], (uint32_t)args[2], (uint32_t)args[3]);
         case IPO_SYSCALL_IPC_NOTIFY_SEND:
             if (!ipc_copy_syscall_args(argc, argv, 3u, args))
-                return (uint32_t)IPO_IPC_ERR_INVALID;
-            return (uint32_t)ipc_notify_send(args[0], args[1], args[2]);
+                return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
+            return (ipo_uarg_t)(ipo_sarg_t)ipc_notify_send((uint32_t)args[0], (uint32_t)args[1], (uint32_t)args[2]);
         case IPO_SYSCALL_IPC_NOTIFY_WAIT:
             if (!ipc_copy_syscall_args(argc, argv, 2u, args))
-                return (uint32_t)IPO_IPC_ERR_INVALID;
-            return (uint32_t)ipc_notify_wait(
-                (ipo_ipc_notification_t *)(uintptr_t)args[0], args[1]);
+                return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
+            return (ipo_uarg_t)(ipo_sarg_t)ipc_notify_wait(
+                (ipo_ipc_notification_t *)(ipo_vaddr_t)args[0], (uint32_t)args[1]);
         default:
-            return (uint32_t)IPO_IPC_ERR_INVALID;
+            return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
     }
 }

@@ -1,5 +1,5 @@
 #include <driver/ata/ata.h>
-#include <driver/net/pci.h>
+#include <driver/pci.h>
 #include <driver/storage/block_dev.h>
 #include <storage/storage_pool.h>
 #include <memory/kmalloc.h>
@@ -29,7 +29,6 @@
 #define ATA_SR_DRQ  0x08
 #define ATA_SR_ERR  0x01
 
-/* Discovered ATA devices and controller channels */
 static ata_device_t *ata_devices = NULL;
 static uint32_t ata_device_count = 0;
 static uint32_t ata_device_capacity = 0;
@@ -160,7 +159,7 @@ static bool ata_wait_bsy_clear(uint16_t base, uint16_t ctrl) {
         ata_io_wait_port(ctrl);
     }
 
-    /* Continue waiting for long flushes while BSY=1 and ERR=0, up to ATA_EXT_TIMEOUT_MS */
+    /* Allow long cache flushes up to ATA_EXT_TIMEOUT_MS while BSY=1 and ERR=0 */
     uint8_t st = inb(base + ATA_REG_STATUS);
     if ((st & ATA_SR_BSY) && !(st & ATA_SR_ERR)) {
         while (((st = inb(base + ATA_REG_STATUS)) & ATA_SR_BSY) &&
@@ -486,7 +485,7 @@ bool ata_read_drive_sectors_lba28(uint32_t drive_idx, uint32_t lba, uint8_t coun
     return ata_pio_transfer(base, ctrl, false, count, buf);
 }
 
-bool ata_write_drive_sectors_lba28(uint32_t drive_idx, uint32_t lba, uint8_t count, const void *buf) {
+static bool ata_write_lba28_impl(uint32_t drive_idx, uint32_t lba, uint8_t count, const void *buf, bool flush) {
     if (count == 0 || buf == NULL) return false;
     uint16_t base, ctrl;
     uint8_t drive_bit;
@@ -503,7 +502,13 @@ bool ata_write_drive_sectors_lba28(uint32_t drive_idx, uint32_t lba, uint8_t cou
     if (!ata_wait_bsy_clear(base, ctrl)) return false;
     outb(base + ATA_REG_COMMAND, 0x30);
     if (!ata_pio_transfer(base, ctrl, true, count, (void *)(uintptr_t)buf)) return false;
-    return ata_flush_cache(base, ctrl, 0xE7);
+    if (flush) return ata_flush_cache(base, ctrl, 0xE7);
+    if (!ata_wait_bsy_clear(base, ctrl)) return false;
+    return (inb(base + ATA_REG_STATUS) & ATA_SR_ERR) == 0;
+}
+
+bool ata_write_drive_sectors_lba28(uint32_t drive_idx, uint32_t lba, uint8_t count, const void *buf) {
+    return ata_write_lba28_impl(drive_idx, lba, count, buf, true);
 }
 
 bool ata_read_drive_sectors_lba48(uint32_t drive_idx, uint64_t lba, uint16_t count, void *buf) {
@@ -530,7 +535,7 @@ bool ata_read_drive_sectors_lba48(uint32_t drive_idx, uint64_t lba, uint16_t cou
     return ata_pio_transfer(base, ctrl, false, count, buf);
 }
 
-bool ata_write_drive_sectors_lba48(uint32_t drive_idx, uint64_t lba, uint16_t count, const void *buf) {
+static bool ata_write_lba48_impl(uint32_t drive_idx, uint64_t lba, uint16_t count, const void *buf, bool flush) {
     if (count == 0 || buf == NULL) return false;
     uint16_t base, ctrl;
     uint8_t drive_bit;
@@ -552,7 +557,13 @@ bool ata_write_drive_sectors_lba48(uint32_t drive_idx, uint64_t lba, uint16_t co
     if (!ata_wait_bsy_clear(base, ctrl)) return false;
     outb(base + ATA_REG_COMMAND, 0x34);
     if (!ata_pio_transfer(base, ctrl, true, count, (void *)(uintptr_t)buf)) return false;
-    return ata_flush_cache(base, ctrl, 0xEA);
+    if (flush) return ata_flush_cache(base, ctrl, 0xEA);
+    if (!ata_wait_bsy_clear(base, ctrl)) return false;
+    return (inb(base + ATA_REG_STATUS) & ATA_SR_ERR) == 0;
+}
+
+bool ata_write_drive_sectors_lba48(uint32_t drive_idx, uint64_t lba, uint16_t count, const void *buf) {
+    return ata_write_lba48_impl(drive_idx, lba, count, buf, true);
 }
 
 bool ata_read_drive_sectors(uint32_t drive_idx, uint64_t lba, uint16_t count, void *buf) {
@@ -562,11 +573,15 @@ bool ata_read_drive_sectors(uint32_t drive_idx, uint64_t lba, uint16_t count, vo
     return ata_read_drive_sectors_lba48(drive_idx, lba, count, buf);
 }
 
-bool ata_write_drive_sectors(uint32_t drive_idx, uint64_t lba, uint16_t count, const void *buf) {
+static bool ata_write_drive_sectors_impl(uint32_t drive_idx, uint64_t lba, uint16_t count, const void *buf, bool flush) {
     if (count > 0 && count <= 255u && lba < 0x10000000ULL && (uint64_t)count <= 0x10000000ULL - lba) {
-        return ata_write_drive_sectors_lba28(drive_idx, (uint32_t)lba, (uint8_t)count, buf);
+        return ata_write_lba28_impl(drive_idx, (uint32_t)lba, (uint8_t)count, buf, flush);
     }
-    return ata_write_drive_sectors_lba48(drive_idx, lba, count, buf);
+    return ata_write_lba48_impl(drive_idx, lba, count, buf, flush);
+}
+
+bool ata_write_drive_sectors(uint32_t drive_idx, uint64_t lba, uint16_t count, const void *buf) {
+    return ata_write_drive_sectors_impl(drive_idx, lba, count, buf, true);
 }
 
 static inline uint32_t ata_get_default_target_drive(void) {
@@ -576,7 +591,7 @@ static inline uint32_t ata_get_default_target_drive(void) {
     return (ata_device_count > 1) ? 1 : 0;
 }
 
-/* Backward-compatible wrappers with portable boot-drive priority */
+/* Legacy single-drive wrappers targeting the default boot drive */
 bool ata_read_sectors_lba28(uint32_t lba, uint8_t count, void *buf) {
     uint32_t target = ata_get_default_target_drive();
     return ata_read_drive_sectors_lba28(target, lba, count, buf);
@@ -678,10 +693,16 @@ static bool ata_bdev_read(block_device_t *bdev, uint64_t lba, uint16_t count, vo
 
 static bool ata_bdev_write(block_device_t *bdev, uint64_t lba, uint16_t count, const void *buf) {
     uint32_t drive_idx = (uint32_t)(uintptr_t)bdev->priv_data;
-    return ata_write_drive_sectors(drive_idx, lba, count, buf);
+    return ata_write_drive_sectors_impl(drive_idx, lba, count, buf, false);
 }
 
 static bool ata_bdev_flush(block_device_t *bdev) {
-    (void)bdev;
-    return true;
+    uint32_t drive_idx = (uint32_t)(uintptr_t)bdev->priv_data;
+    uint16_t base, ctrl;
+    uint8_t drive_bit;
+    if (!ata_select_drive(drive_idx, &base, &ctrl, &drive_bit)) return false;
+    bool is_lba48 = (ata_devices[drive_idx].capacity_sectors > 0x0FFFFFFFULL);
+    outb(base + ATA_REG_HDDEVSEL, (is_lba48 ? 0x40 : 0xE0) | drive_bit);
+    ata_io_wait_port(ctrl);
+    return ata_flush_cache(base, ctrl, is_lba48 ? 0xEA : 0xE7);
 }

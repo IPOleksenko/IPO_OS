@@ -49,57 +49,57 @@ static ipc_endpoint_t *endpoints;
 static uint32_t endpoint_capacity;
 static bool ipc_ready;
 
-bool ipc_user_range(const void *ptr, uint32_t length) {
+bool ipc_user_range(const void *ptr, ipo_size_t length) {
     if (length == 0u) return true;
     if (!ptr) return false;
 
     process_t *proc = process_get_current();
     if (!proc) return false;
 
-    uint64_t start = (uint32_t)(uintptr_t)ptr;
-    uint64_t end = start + length;
-    if (end > 0x100000000ULL) return false;
+    ipo_vaddr_t start = (ipo_vaddr_t)ptr;
+    ipo_vaddr_t end = 0u;
+    if (!ipo_vaddr_add_ok(start, length, &end)) return false;
 
     if (proc->binary_base && proc->binary_size) {
-        uint64_t base = (uint32_t)(uintptr_t)proc->binary_base;
-        uint64_t limit = base + proc->binary_size;
+        ipo_vaddr_t base = (ipo_vaddr_t)proc->binary_base;
+        ipo_vaddr_t limit = base + proc->binary_size;
         if (start >= base && end <= limit) return true;
     }
 
     if (proc->argv_kernel && proc->argc > 0) {
-        uint64_t arr_base = (uint32_t)(uintptr_t)proc->argv_kernel;
-        uint64_t arr_limit = arr_base + (uint64_t)(proc->argc + 1) * sizeof(char *);
+        ipo_vaddr_t arr_base = (ipo_vaddr_t)proc->argv_kernel;
+        ipo_vaddr_t arr_limit = arr_base + (ipo_vaddr_t)(proc->argc + 1) * sizeof(char *);
         if (start >= arr_base && end <= arr_limit) return true;
         for (int i = 0; i < proc->argc; i++) {
             const char *arg = proc->argv_kernel[i];
             if (arg) {
-                uint64_t arg_base = (uint32_t)(uintptr_t)arg;
-                uint64_t arg_limit = arg_base + strlen(arg) + 1u;
+                ipo_vaddr_t arg_base = (ipo_vaddr_t)arg;
+                ipo_vaddr_t arg_limit = arg_base + strlen(arg) + 1u;
                 if (start >= arg_base && end <= arg_limit) return true;
             }
         }
     }
 
     if (!proc->address_space && proc->stack_base && proc->stack_size) {
-        uint64_t base = (uint32_t)(uintptr_t)proc->stack_base;
-        uint64_t limit = base + proc->stack_size;
+        ipo_vaddr_t base = (ipo_vaddr_t)proc->stack_base;
+        ipo_vaddr_t limit = base + proc->stack_size;
         if (start >= base && end <= limit) return true;
     }
 
     if (proc->stack_start && proc->stack_size) {
-        uint64_t base = proc->stack_start;
-        uint64_t limit = base + proc->stack_size;
+        ipo_vaddr_t base = proc->stack_start;
+        ipo_vaddr_t limit = base + proc->stack_size;
         if (start >= base && end <= limit) return true;
     }
 
     for (process_thread_t *th = proc->threads; th; th = th->next) {
         if (th->stack_virtual_top && th->stack_virtual_bottom) {
-            uint64_t base = th->stack_virtual_bottom;
-            uint64_t limit = th->stack_virtual_top;
+            ipo_vaddr_t base = th->stack_virtual_bottom;
+            ipo_vaddr_t limit = th->stack_virtual_top;
             if (start >= base && end <= limit) return true;
         } else if (th->stack_base && th->stack_size) {
-            uint64_t base = (uint32_t)(uintptr_t)th->stack_base;
-            uint64_t limit = base + th->stack_size;
+            ipo_vaddr_t base = (ipo_vaddr_t)th->stack_base;
+            ipo_vaddr_t limit = base + th->stack_size;
             if (start >= base && end <= limit) return true;
         }
     }
@@ -242,7 +242,7 @@ static int ipc_create(const char *name, uint32_t public_rights) {
         uint32_t new_cap = endpoint_capacity ? (endpoint_capacity * 2u)
                                              : IPC_INITIAL_ENDPOINT_CAPACITY;
         if (new_cap <= endpoint_capacity ||
-            new_cap > (SIZE_MAX / sizeof(*endpoints))) {
+            !ipo_size_mul_ok((ipo_size_t)new_cap, sizeof(*endpoints), NULL)) {
             spin_unlock(&ipc_lock);
             kfree(name_copy);
             return IPO_IPC_ERR_NO_SPACE;
@@ -326,7 +326,7 @@ static int ipc_open(const char *name, uint32_t rights) {
             ? (endpoint->client_capacity * 2u)
             : IPC_INITIAL_CLIENT_CAPACITY;
         if (new_cap <= endpoint->client_capacity ||
-            new_cap > (SIZE_MAX / sizeof(ipc_client_t))) {
+            !ipo_size_mul_ok((ipo_size_t)new_cap, sizeof(ipc_client_t), NULL)) {
             spin_unlock(&ipc_lock);
             return IPO_IPC_ERR_NO_SPACE;
         }
@@ -430,7 +430,7 @@ static int ipc_send(int id_int, const void *data, uint32_t length, uint32_t flag
         return IPO_IPC_ERR_PERMISSION;
     }
 
-    /* Unbounded dynamic queue auto-expansion */
+    /* Grow message ring if full */
     if (!endpoint->messages || endpoint->count >= endpoint->message_capacity) {
         uint32_t old_cap = endpoint->message_capacity;
         uint32_t new_cap = (old_cap == 0u) ? IPC_INITIAL_QUEUE_CAPACITY : (old_cap * 2u);
@@ -621,85 +621,85 @@ void ipc_process_terminated(uint32_t pid) {
     ipc_shared_memory_process_terminated(pid);
 }
 
-bool ipc_copy_syscall_args(uint32_t argc, const uint32_t *argv,
-                           uint32_t expected_count, uint32_t *args) {
+bool ipc_copy_syscall_args(ipo_uarg_t argc, const ipo_uarg_t *argv,
+                           ipo_count_t expected_count, ipo_uarg_t *args) {
     if (argc < expected_count || !argv) return false;
-    if (!ipc_user_range((const void *)argv, expected_count * sizeof(uint32_t))) {
+    if (!ipc_user_range((const void *)argv, (ipo_size_t)expected_count * sizeof(ipo_uarg_t))) {
         return false;
     }
-    memcpy(args, argv, expected_count * sizeof(uint32_t));
+    memcpy(args, argv, (size_t)expected_count * sizeof(ipo_uarg_t));
     return true;
 }
 
-uint32_t ipc_syscall_handler(uint32_t num, uint32_t argc, uint32_t *argv) {
+ipo_uarg_t ipc_syscall_handler(ipo_uarg_t num, ipo_uarg_t argc, ipo_uarg_t *argv) {
     if (num >= IPO_SYSCALL_IPC_PIPE_CREATE && num <= IPO_SYSCALL_IPC_NOTIFY_WAIT) {
-        return (uint32_t)ipc_stream_syscall_handler(num, argc, argv);
+        return ipc_stream_syscall_handler(num, argc, argv);
     }
 
-    if (!ipc_ready) return (uint32_t)IPO_IPC_ERR_NO_SPACE;
+    if (!ipc_ready) return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_NO_SPACE;
 
-    uint32_t args[6] = {0};
+    ipo_uarg_t args[6] = {0};
 
     if (num == IPO_SYSCALL_IPC_CREATE) {
         if (!ipc_copy_syscall_args(argc, argv, 2u, args)) {
-            return (uint32_t)IPO_IPC_ERR_INVALID;
+            return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
         }
-        return (uint32_t)ipc_create((const char *)(uintptr_t)args[0], args[1]);
+        return (ipo_uarg_t)(ipo_sarg_t)ipc_create((const char *)(ipo_vaddr_t)args[0], (uint32_t)args[1]);
     }
 
     if (num == IPO_SYSCALL_IPC_OPEN) {
         if (!ipc_copy_syscall_args(argc, argv, 2u, args)) {
-            return (uint32_t)IPO_IPC_ERR_INVALID;
+            return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
         }
-        return (uint32_t)ipc_open((const char *)(uintptr_t)args[0], args[1]);
+        return (ipo_uarg_t)(ipo_sarg_t)ipc_open((const char *)(ipo_vaddr_t)args[0], (uint32_t)args[1]);
     }
 
     if (num == IPO_SYSCALL_IPC_CLOSE) {
         if (!ipc_copy_syscall_args(argc, argv, 1u, args)) {
-            return (uint32_t)IPO_IPC_ERR_INVALID;
+            return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
         }
-        return (uint32_t)ipc_close((int)args[0]);
+        return (ipo_uarg_t)(ipo_sarg_t)ipc_close((int)args[0]);
     }
 
     if (num == IPO_SYSCALL_IPC_DESTROY) {
         if (!ipc_copy_syscall_args(argc, argv, 1u, args)) {
-            return (uint32_t)IPO_IPC_ERR_INVALID;
+            return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
         }
-        return (uint32_t)ipc_destroy((int)args[0]);
+        return (ipo_uarg_t)(ipo_sarg_t)ipc_destroy((int)args[0]);
     }
 
     if (num == IPO_SYSCALL_IPC_SEND) {
         if (!ipc_copy_syscall_args(argc, argv, 4u, args)) {
-            return (uint32_t)IPO_IPC_ERR_INVALID;
+            return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
         }
         if (args[2] > 0u &&
-            !ipc_user_range((const void *)(uintptr_t)args[1], args[2])) {
-            return (uint32_t)IPO_IPC_ERR_INVALID;
+            !ipc_user_range((const void *)(ipo_vaddr_t)args[1], (ipo_size_t)args[2])) {
+            return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
         }
-        return (uint32_t)ipc_send((int)args[0],
-                                  (const void *)(uintptr_t)args[1],
-                                  args[2], args[3]);
+        return (ipo_uarg_t)(ipo_sarg_t)ipc_send((int)args[0],
+                                  (const void *)(ipo_vaddr_t)args[1],
+                                  (uint32_t)args[2], (uint32_t)args[3]);
     }
 
     if (num == IPO_SYSCALL_IPC_RECEIVE) {
         if (!ipc_copy_syscall_args(argc, argv, 6u, args)) {
-            return (uint32_t)IPO_IPC_ERR_INVALID;
+            return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
         }
-        if (!ipc_user_range((void *)(uintptr_t)args[3], sizeof(uint32_t)) ||
-            !ipc_user_range((void *)(uintptr_t)args[4], sizeof(uint32_t))) {
-            return (uint32_t)IPO_IPC_ERR_INVALID;
+        if (!ipc_user_range((void *)(ipo_vaddr_t)args[3], sizeof(uint32_t)) ||
+            !ipc_user_range((void *)(ipo_vaddr_t)args[4], sizeof(uint32_t))) {
+            return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
         }
         if (args[2] > 0u &&
-            !ipc_user_range((void *)(uintptr_t)args[1], args[2])) {
-            return (uint32_t)IPO_IPC_ERR_INVALID;
+            !ipc_user_range((void *)(ipo_vaddr_t)args[1], (ipo_size_t)args[2])) {
+            return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
         }
-        return (uint32_t)ipc_receive((int)args[0],
-                                     (void *)(uintptr_t)args[1],
-                                     args[2],
-                                     (uint32_t *)(uintptr_t)args[3],
-                                     (uint32_t *)(uintptr_t)args[4],
-                                     args[5]);
+        return (ipo_uarg_t)(ipo_sarg_t)ipc_receive((int)args[0],
+                                     (void *)(ipo_vaddr_t)args[1],
+                                     (uint32_t)args[2],
+                                     (uint32_t *)(ipo_vaddr_t)args[3],
+                                     (uint32_t *)(ipo_vaddr_t)args[4],
+                                     (uint32_t)args[5]);
     }
 
-    return (uint32_t)IPO_IPC_ERR_INVALID;
+    return (ipo_uarg_t)(ipo_sarg_t)IPO_IPC_ERR_INVALID;
 }

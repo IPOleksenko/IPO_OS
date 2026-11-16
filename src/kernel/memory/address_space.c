@@ -1,40 +1,52 @@
 #include <memory/address_space.h>
 #include <memory/memory_map.h>
 #include <memory/kmalloc.h>
+#include <arch/cpu_regs.h>
+#include <arch/context.h>
 #include <kernel/smp.h>
 #include <syscall.h>
 #include <stdio.h>
 #include <string.h>
 
-#define PAGE_SIZE       4096u
-#define PAGE_MASK       0xFFFFF000u
-#define PDE_PRESENT     0x001u
-#define PDE_WRITABLE    0x002u
-#define PDE_USER        0x004u
-#define PDE_PAGE_SIZE   0x080u
-#define PDE_ADDRESS     0xFFFFF000u
-#define PDE_LARGE_BASE  0xFFC00000u
-#define PTE_PRESENT     0x001u
-#define PTE_WRITABLE    0x002u
-#define PTE_USER        0x004u
-#define PTE_PWT         0x008u
-#define PTE_PCD         0x010u
-#define PTE_ACCESSED    0x020u
-#define PTE_DIRTY       0x040u
-#define PTE_PAT         0x080u
-#define PTE_GLOBAL      0x100u
-#define PDE_LARGE_PAT   0x1000u
+#define PAGE_SIZE         4096ULL
+#define PAGE_MASK_32      0xFFFFF000u
+#define PAGE_MASK_64      0x000FFFFFFFFFF000ULL
+#define IA32_EFER_MSR     0xC0000080u
+#define IA32_EFER_LMA     (1ULL << 10)
+#define X86_CR4_PSE       (1ULL << 4)
+#define X86_CR4_PAE       (1ULL << 5)
+#define X86_CR4_LA57      (1ULL << 12)
 
-#define ADDRESS_SPACE_TRAMP_BASE        0xC0000000u
-#define ADDRESS_SPACE_TRAMP_AUDIO_TOP   0xC8000000u
-#define ADDRESS_SPACE_TRAMP_COPY_BASE   0xC8000000u
-#define ADDRESS_SPACE_TRAMP_COPY_TOP    0xD0000000u
-#define ADDRESS_SPACE_TRAMP_PDE_START   (ADDRESS_SPACE_TRAMP_BASE >> 22)
-#define ADDRESS_SPACE_TRAMP_PDE_COUNT   ((ADDRESS_SPACE_TRAMP_COPY_TOP - ADDRESS_SPACE_TRAMP_BASE) >> 22)
+#define PDE_PRESENT       0x001u
+#define PDE_WRITABLE      0x002u
+#define PDE_USER          0x004u
+#define PDE_PAGE_SIZE     0x080u
+#define PDE_ADDRESS       0xFFFFF000u
+#define PDE_LARGE_BASE    0xFFC00000u
+#define PTE_PRESENT       0x001u
+#define PTE_WRITABLE      0x002u
+#define PTE_USER          0x004u
+#define PTE_PWT           0x008u
+#define PTE_PCD           0x010u
+#define PTE_ACCESSED      0x020u
+#define PTE_DIRTY         0x040u
+#define PTE_PAT           0x080u
+#define PTE_GLOBAL        0x100u
+#define PDE_LARGE_PAT     0x1000u
+
+#define ADDRESS_SPACE_TRAMP_BASE        0xC0000000ULL
+#define ADDRESS_SPACE_TRAMP_AUDIO_TOP   0xC8000000ULL
+#define ADDRESS_SPACE_TRAMP_COPY_BASE   0xC8000000ULL
+#define ADDRESS_SPACE_TRAMP_COPY_TOP    0xD0000000ULL
+#define ADDRESS_SPACE_TRAMP_SLOTS_32    ((ADDRESS_SPACE_TRAMP_COPY_TOP - ADDRESS_SPACE_TRAMP_BASE) >> 22)
+#define ADDRESS_SPACE_TRAMP_SLOTS_64    ((ADDRESS_SPACE_TRAMP_COPY_TOP - ADDRESS_SPACE_TRAMP_BASE) >> 21)
 
 struct address_space {
-    uint32_t *page_directory;
-    uint32_t **owned_page_tables;
+    ipo_paddr_t root_paddr;
+    uint8_t     paging_levels; /* 2 = 32-bit PDE/PTE, 4 = 4-level PML4, 5 = 5-level LA57 */
+    void      **owned_pages;
+    ipo_count_t owned_count;
+    ipo_count_t owned_cap;
     struct address_space *next;
 };
 
@@ -43,19 +55,21 @@ typedef struct reusable_page {
 } reusable_page_t;
 
 static spinlock_t s_address_space_lock = {0};
-static reusable_page_t *s_reusable_pages;
-static uint32_t *s_kernel_page_directory;
+static reusable_page_t *s_reusable_pages = NULL;
+static ipo_paddr_t s_kernel_root_paddr = 0u;
+static uint8_t s_kernel_paging_levels = 0u;
 static address_space_t *s_space_list = NULL;
-static uint32_t *s_tramp_shared_tables[ADDRESS_SPACE_TRAMP_PDE_COUNT];
-static uint32_t s_tramp_audio_bottom = ADDRESS_SPACE_TRAMP_AUDIO_TOP;
-static uint32_t s_tramp_copy_bottom = ADDRESS_SPACE_TRAMP_COPY_TOP;
+static void **s_tramp_shared_tables = NULL;
+static uint32_t s_tramp_shared_cap = 0u;
+static ipo_vaddr_t s_tramp_audio_bottom = (ipo_vaddr_t)ADDRESS_SPACE_TRAMP_AUDIO_TOP;
+static ipo_vaddr_t s_tramp_copy_bottom = (ipo_vaddr_t)ADDRESS_SPACE_TRAMP_COPY_TOP;
 static bool s_tramp_initialized = false;
 
-static uint32_t address_space_lock(void) {
+static ipo_reg_t address_space_lock(void) {
     return spin_lock_irqsave(&s_address_space_lock);
 }
 
-static void address_space_unlock(uint32_t flags) {
+static void address_space_unlock(ipo_reg_t flags) {
     spin_unlock_irqrestore(&s_address_space_lock, flags);
 }
 
@@ -63,34 +77,30 @@ void address_space_force_unlock(void) {
     spin_unlock(&s_address_space_lock);
 }
 
-static uint32_t read_cr0(void) {
-    uint32_t value;
-    __asm__ volatile("movl %%cr0, %0" : "=r"(value));
-    return value;
+static uint8_t detect_hw_paging_levels(void) {
+    return (uint8_t)arch_mmu_get_paging_levels();
 }
 
-static uint32_t read_cr3(void) {
-    uint32_t value;
-    __asm__ volatile("movl %%cr3, %0" : "=r"(value));
-    return value;
+static ipo_paddr_t active_cr3_paddr(uint8_t levels) {
+    (void)levels;
+    return arch_mmu_get_root();
 }
 
 static void flush_active_address_space(const address_space_t *space) {
-    if (space && (read_cr3() & PAGE_MASK) ==
-                     ((uint32_t)(uintptr_t)space->page_directory & PAGE_MASK)) {
-        uint32_t directory = (uint32_t)(uintptr_t)space->page_directory;
-        __asm__ volatile("movl %0, %%cr3" : : "r"(directory) : "memory");
+    if (!space || space->root_paddr == 0u) return;
+    if (arch_mmu_get_root() == (space->root_paddr & PAGE_MASK_64)) {
+        arch_mmu_flush_all();
     }
 }
 
-static uint32_t *allocate_page(void) {
+static void *allocate_page(void) {
     reusable_page_t *page = s_reusable_pages;
     if (page) {
         s_reusable_pages = page->next;
         memset(page, 0, PAGE_SIZE);
-        return (uint32_t *)page;
+        return (void *)page;
     }
-    return (uint32_t *)memory_map_alloc(PAGE_SIZE, PAGE_SIZE);
+    return memory_map_alloc((size_t)PAGE_SIZE, (size_t)PAGE_SIZE);
 }
 
 static void release_page(void *address) {
@@ -99,7 +109,43 @@ static void release_page(void *address) {
     s_reusable_pages = page;
 }
 
-static uint32_t large_page_to_pte_flags(uint32_t pde) {
+static bool space_own_page(address_space_t *space, void *page) {
+    if (!space || !page) return false;
+    for (ipo_count_t i = 0u; i < space->owned_count; i++) {
+        if (space->owned_pages[i] == page) {
+            return true;
+        }
+    }
+    if (space->owned_count >= space->owned_cap) {
+        ipo_count_t new_cap = space->owned_cap ? (space->owned_cap * 2u) : 16u;
+        if (new_cap <= space->owned_cap || new_cap > (IPO_SIZE_MAX / sizeof(void *))) {
+            return false;
+        }
+        void **grown = (void **)krealloc(space->owned_pages, (size_t)new_cap * sizeof(void *));
+        if (!grown) {
+            return false;
+        }
+        space->owned_pages = grown;
+        space->owned_cap = new_cap;
+    }
+    space->owned_pages[space->owned_count++] = page;
+    return true;
+}
+
+static bool space_owns_paddr(const address_space_t *space, ipo_paddr_t paddr) {
+    if (!space || paddr == 0u) return false;
+    void *ptr = (void *)(uintptr_t)paddr;
+    for (ipo_count_t i = 0u; i < space->owned_count; i++) {
+        if (space->owned_pages[i] == ptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* 2-level 32-bit paging helpers */
+
+static uint32_t large_page_to_pte_flags32(uint32_t pde) {
     uint32_t flags = pde & (PTE_PRESENT | PTE_WRITABLE | PTE_USER |
                             PTE_PWT | PTE_PCD | PTE_ACCESSED |
                             PTE_DIRTY | PTE_GLOBAL);
@@ -107,101 +153,318 @@ static uint32_t large_page_to_pte_flags(uint32_t pde) {
     return flags;
 }
 
-static uint32_t *make_private_page_table(address_space_t *space,
-                                         uint32_t directory_index) {
-    uint32_t pde = space->page_directory[directory_index];
-    uint32_t *table = allocate_page();
+static uint32_t *make_private_pt_2level(address_space_t *space, uint32_t dir_idx) {
+    uint32_t *pd = (uint32_t *)(uintptr_t)space->root_paddr;
+    uint32_t pde = pd[dir_idx];
+
+    if ((pde & PDE_PRESENT) && !(pde & PDE_PAGE_SIZE) &&
+        space_owns_paddr(space, (ipo_paddr_t)(pde & PDE_ADDRESS))) {
+        return (uint32_t *)(uintptr_t)(pde & PDE_ADDRESS);
+    }
+
+    uint32_t *table = (uint32_t *)allocate_page();
     if (!table) return NULL;
+    if (!space_own_page(space, table)) {
+        release_page(table);
+        return NULL;
+    }
 
     if (pde & PDE_PRESENT) {
         if (pde & PDE_PAGE_SIZE) {
-            uint32_t physical_base = pde & PDE_LARGE_BASE;
-            uint32_t flags = large_page_to_pte_flags(pde);
-            for (uint32_t i = 0; i < 1024; i++) {
-                table[i] = (physical_base + i * PAGE_SIZE) | flags;
+            uint32_t phys_base = pde & PDE_LARGE_BASE;
+            uint32_t flags = large_page_to_pte_flags32(pde);
+            for (uint32_t i = 0u; i < 1024u; i++) {
+                table[i] = (phys_base + i * (uint32_t)PAGE_SIZE) | flags;
             }
         } else {
             const uint32_t *shared = (const uint32_t *)(uintptr_t)(pde & PDE_ADDRESS);
-            memcpy(table, shared, PAGE_SIZE);
+            memcpy(table, shared, (size_t)PAGE_SIZE);
         }
     }
 
-    space->owned_page_tables[directory_index] = table;
-    space->page_directory[directory_index] =
-        ((uint32_t)(uintptr_t)table & PDE_ADDRESS) |
-        PDE_PRESENT | PDE_WRITABLE |
-        ((pde & PDE_USER) ? PDE_USER : 0);
+    pd[dir_idx] = ((uint32_t)(uintptr_t)table & PDE_ADDRESS) |
+                  PDE_PRESENT | PDE_WRITABLE |
+                  ((pde & PDE_USER) ? PDE_USER : 0u);
     return table;
 }
 
-static void tramp_sync_pde_locked(uint32_t dir_idx, uint32_t pde_val) {
-    if (s_kernel_page_directory) {
-        s_kernel_page_directory[dir_idx] = pde_val;
+/* 4-level / 5-level long-mode paging helpers */
+
+static uint64_t large_page_to_pte_flags64(uint64_t pde) {
+    uint64_t flags = pde & (uint64_t)(PTE_PRESENT | PTE_WRITABLE | PTE_USER |
+                                      PTE_PWT | PTE_PCD | PTE_ACCESSED |
+                                      PTE_DIRTY | PTE_GLOBAL);
+    if (pde & PDE_LARGE_PAT) flags |= PTE_PAT;
+    return flags;
+}
+
+static uint64_t *ia32e_ensure_private_child(address_space_t *space, uint64_t *parent_tbl,
+                                            ipo_count_t idx, uint8_t child_level,
+                                            bool create_if_missing, bool propagate_user) {
+    uint64_t entry = parent_tbl[idx];
+
+    if (!(entry & PTE_PRESENT)) {
+        if (!create_if_missing) {
+            return NULL;
+        }
+        uint64_t *tbl = (uint64_t *)allocate_page();
+        if (!tbl) return NULL;
+        if (!space_own_page(space, tbl)) {
+            release_page(tbl);
+            return NULL;
+        }
+        parent_tbl[idx] = ((uint64_t)(uintptr_t)tbl & PAGE_MASK_64) |
+                          PDE_PRESENT | PDE_WRITABLE |
+                          (propagate_user ? PDE_USER : 0ULL);
+        return tbl;
+    }
+
+    /* Split 1 GiB or 2 MiB large mapping into child table */
+    if (entry & PDE_PAGE_SIZE) {
+        uint64_t *tbl = (uint64_t *)allocate_page();
+        if (!tbl) return NULL;
+        if (!space_own_page(space, tbl)) {
+            release_page(tbl);
+            return NULL;
+        }
+        if (child_level == 1u) {
+            uint64_t phys_base = entry & 0x000FFFFFC0000000ULL;
+            uint64_t flags = entry & ~(0x000FFFFFC0000000ULL);
+            for (uint64_t i = 0u; i < 512u; i++) {
+                tbl[i] = (phys_base + i * 0x200000ULL) | flags | PDE_PAGE_SIZE;
+            }
+        } else {
+            uint64_t phys_base = entry & 0x000FFFFFFFE00000ULL;
+            uint64_t flags = large_page_to_pte_flags64(entry);
+            for (uint64_t i = 0u; i < 512u; i++) {
+                tbl[i] = (phys_base + i * PAGE_SIZE) | flags;
+            }
+        }
+        parent_tbl[idx] = ((uint64_t)(uintptr_t)tbl & PAGE_MASK_64) |
+                          PDE_PRESENT | PDE_WRITABLE |
+                          ((entry & PDE_USER) ? PDE_USER : 0ULL) |
+                          (propagate_user ? PDE_USER : 0ULL);
+        return tbl;
+    }
+
+    uint64_t *child = (uint64_t *)(uintptr_t)(entry & PAGE_MASK_64);
+    if (space_owns_paddr(space, (ipo_paddr_t)(uintptr_t)child)) {
+        if (propagate_user && !(entry & PDE_USER)) {
+            parent_tbl[idx] = entry | PDE_USER;
+        }
+        return child;
+    }
+
+    /* Clone shared kernel sub-table into this address space on write */
+    uint64_t *clone = (uint64_t *)allocate_page();
+    if (!clone) return NULL;
+    if (!space_own_page(space, clone)) {
+        release_page(clone);
+        return NULL;
+    }
+    memcpy(clone, child, (size_t)PAGE_SIZE);
+    parent_tbl[idx] = ((uint64_t)(uintptr_t)clone & PAGE_MASK_64) |
+                      PDE_PRESENT | PDE_WRITABLE |
+                      ((entry & PDE_USER) ? PDE_USER : 0ULL) |
+                      (propagate_user ? PDE_USER : 0ULL);
+    return clone;
+}
+
+static uint64_t *ia32e_walk_to_level(address_space_t *space, ipo_vaddr_t vaddr,
+                                     uint8_t target_level, bool create_if_missing,
+                                     bool propagate_user) {
+    if (!space || space->root_paddr == 0u || space->paging_levels < 4u) return NULL;
+    uint64_t *tbl = (uint64_t *)(uintptr_t)space->root_paddr;
+    uint8_t lvl = (uint8_t)(space->paging_levels - 1u);
+    while (lvl > target_level) {
+        unsigned shift = 12u + 9u * (unsigned)lvl;
+        ipo_count_t idx = (ipo_count_t)(((uint64_t)vaddr >> shift) & 0x1FFULL);
+        tbl = ia32e_ensure_private_child(space, tbl, idx, (uint8_t)(lvl - 1u),
+                                         create_if_missing, propagate_user);
+        if (!tbl) return NULL;
+        lvl--;
+    }
+    return tbl;
+}
+
+static uint64_t *ia32e_read_pd_for_kernel_vaddr(ipo_paddr_t root_paddr, uint8_t levels,
+                                                ipo_vaddr_t vaddr) {
+    if (root_paddr == 0u || levels < 4u) return NULL;
+    uint64_t *tbl = (uint64_t *)(uintptr_t)root_paddr;
+    uint8_t lvl = (uint8_t)(levels - 1u);
+    while (lvl > 1u) {
+        unsigned shift = 12u + 9u * (unsigned)lvl;
+        ipo_count_t idx = (ipo_count_t)(((uint64_t)vaddr >> shift) & 0x1FFULL);
+        uint64_t entry = tbl[idx];
+        if (!(entry & PTE_PRESENT) || (entry & PDE_PAGE_SIZE)) {
+            return NULL;
+        }
+        tbl = (uint64_t *)(uintptr_t)(entry & PAGE_MASK_64);
+        lvl--;
+    }
+    return tbl;
+}
+
+/* Shared kernel trampoline window [0xC0000000, 0xD0000000) */
+
+static bool kernel_split_trampoline_pd_locked(void) {
+    if (s_kernel_paging_levels < 4u || s_kernel_root_paddr == 0u) {
+        return true;
+    }
+
+    uint64_t *tbl = (uint64_t *)(uintptr_t)s_kernel_root_paddr;
+    uint8_t lvl = (uint8_t)(s_kernel_paging_levels - 1u);
+    ipo_vaddr_t tramp_base = (ipo_vaddr_t)ADDRESS_SPACE_TRAMP_BASE;
+
+    while (lvl > 1u) {
+        unsigned shift = 12u + 9u * (unsigned)lvl;
+        ipo_count_t idx = (ipo_count_t)(((uint64_t)tramp_base >> shift) & 0x1FFULL);
+        uint64_t entry = tbl[idx];
+        if (!(entry & PTE_PRESENT)) {
+            uint64_t *child = (uint64_t *)allocate_page();
+            if (!child) return false;
+            tbl[idx] = ((uint64_t)(uintptr_t)child & PAGE_MASK_64) | PDE_PRESENT | PDE_WRITABLE;
+            tbl = child;
+        } else if (entry & PDE_PAGE_SIZE) {
+            uint64_t *child = (uint64_t *)allocate_page();
+            if (!child) return false;
+            uint64_t phys_base = entry & 0x000FFFFFC0000000ULL;
+            uint64_t flags = entry & ~(0x000FFFFFC0000000ULL);
+            for (uint64_t i = 0u; i < 512u; i++) {
+                child[i] = (phys_base + i * 0x200000ULL) | flags | PDE_PAGE_SIZE;
+            }
+            tbl[idx] = ((uint64_t)(uintptr_t)child & PAGE_MASK_64) | PDE_PRESENT | PDE_WRITABLE;
+            tbl = child;
+        } else {
+            tbl = (uint64_t *)(uintptr_t)(entry & PAGE_MASK_64);
+        }
+        lvl--;
+    }
+    return true;
+}
+
+static void tramp_sync_slot_locked(ipo_vaddr_t vaddr, ipo_paddr_t pt_paddr, bool present) {
+    if (s_kernel_paging_levels == 2u) {
+        uint32_t dir_idx = (uint32_t)(vaddr >> 22);
+        uint32_t pde_val = present ? (((uint32_t)pt_paddr & PDE_ADDRESS) | PDE_PRESENT | PDE_WRITABLE) : 0u;
+        if (s_kernel_root_paddr) {
+            ((uint32_t *)(uintptr_t)s_kernel_root_paddr)[dir_idx] = pde_val;
+        }
+        for (address_space_t *s = s_space_list; s; s = s->next) {
+            if (s->root_paddr) {
+                ((uint32_t *)(uintptr_t)s->root_paddr)[dir_idx] = pde_val;
+            }
+        }
+        return;
+    }
+
+    uint32_t pd_idx = (uint32_t)(((uint64_t)vaddr >> 21) & 0x1FFULL);
+    uint64_t pde_val = present ? ((pt_paddr & PAGE_MASK_64) | PDE_PRESENT | PDE_WRITABLE) : 0ULL;
+    uint64_t *k_pd = ia32e_read_pd_for_kernel_vaddr(s_kernel_root_paddr, s_kernel_paging_levels, vaddr);
+    if (k_pd) {
+        k_pd[pd_idx] = pde_val;
     }
     for (address_space_t *s = s_space_list; s; s = s->next) {
-        if (s->page_directory) {
-            s->page_directory[dir_idx] = pde_val;
+        uint64_t *s_pd = ia32e_read_pd_for_kernel_vaddr(s->root_paddr, s->paging_levels, vaddr);
+        if (s_pd && s_pd != k_pd) {
+            s_pd[pd_idx] = pde_val;
         }
     }
 }
 
-static bool tramp_map_page_locked(uint32_t page_vaddr) {
+static bool tramp_map_page_locked(ipo_vaddr_t page_vaddr) {
     if (page_vaddr < ADDRESS_SPACE_TRAMP_BASE || page_vaddr >= ADDRESS_SPACE_TRAMP_COPY_TOP) {
         return false;
     }
-    uint32_t dir_idx = page_vaddr >> 22;
-    uint32_t slot = dir_idx - ADDRESS_SPACE_TRAMP_PDE_START;
-    uint32_t table_idx = (page_vaddr >> 12) & 0x3FFu;
 
-    uint32_t *table = s_tramp_shared_tables[slot];
-    if (!table) {
-        table = allocate_page();
-        if (!table) return false;
-        s_tramp_shared_tables[slot] = table;
-        uint32_t pde_val = ((uint32_t)(uintptr_t)table & PDE_ADDRESS) | PDE_PRESENT | PDE_WRITABLE;
-        tramp_sync_pde_locked(dir_idx, pde_val);
-    }
-
-    if (table[table_idx] & PTE_PRESENT) {
+    if (s_kernel_paging_levels == 2u) {
+        uint32_t slot = (uint32_t)((page_vaddr - ADDRESS_SPACE_TRAMP_BASE) >> 22);
+        if (!s_tramp_shared_tables || slot >= s_tramp_shared_cap) return false;
+        uint32_t table_idx = (uint32_t)((page_vaddr >> 12) & 0x3FFu);
+        uint32_t *table = (uint32_t *)s_tramp_shared_tables[slot];
+        if (!table) {
+            table = (uint32_t *)allocate_page();
+            if (!table) return false;
+            s_tramp_shared_tables[slot] = table;
+            tramp_sync_slot_locked(page_vaddr, (ipo_paddr_t)(uintptr_t)table, true);
+        }
+        if (table[table_idx] & PTE_PRESENT) {
+            return true;
+        }
+        void *frame = memory_page_alloc();
+        if (!frame) return false;
+        table[table_idx] = ((uint32_t)(uintptr_t)frame & PAGE_MASK_32) | PTE_PRESENT | PTE_WRITABLE;
+        arch_mmu_flush_page(page_vaddr);
         return true;
     }
 
+    uint32_t slot = (uint32_t)((page_vaddr - ADDRESS_SPACE_TRAMP_BASE) >> 21);
+    if (!s_tramp_shared_tables || slot >= s_tramp_shared_cap) return false;
+    uint32_t table_idx = (uint32_t)((page_vaddr >> 12) & 0x1FFu);
+    uint64_t *table = (uint64_t *)s_tramp_shared_tables[slot];
+    if (!table) {
+        table = (uint64_t *)allocate_page();
+        if (!table) return false;
+        s_tramp_shared_tables[slot] = table;
+        tramp_sync_slot_locked(page_vaddr, (ipo_paddr_t)(uintptr_t)table, true);
+    }
+    if (table[table_idx] & PTE_PRESENT) {
+        return true;
+    }
     void *frame = memory_page_alloc();
     if (!frame) return false;
-
-    table[table_idx] = ((uint32_t)(uintptr_t)frame & PAGE_MASK) | PTE_PRESENT | PTE_WRITABLE;
-    __asm__ volatile("invlpg (%0)" : : "r"(page_vaddr) : "memory");
+    table[table_idx] = ((uint64_t)(uintptr_t)frame & PAGE_MASK_64) | PTE_PRESENT | PTE_WRITABLE;
+    arch_mmu_flush_page(page_vaddr);
     return true;
 }
 
 static void tramp_init_locked(void) {
     if (s_tramp_initialized) return;
-    if (!(read_cr0() & 0x80000000u)) return;
+    uint8_t levels = detect_hw_paging_levels();
+    if (levels == 0u) return;
 
-    if (!s_kernel_page_directory) {
-        s_kernel_page_directory = (uint32_t *)(uintptr_t)(read_cr3() & PAGE_MASK);
+    s_kernel_paging_levels = levels;
+    if (s_kernel_root_paddr == 0u) {
+        s_kernel_root_paddr = active_cr3_paddr(levels);
     }
 
-    /* Replace identity 4 MiB PSE mappings in [0xC0000000, 0xD0000000) with shared demand-paged slots */
-    for (uint32_t i = 0; i < ADDRESS_SPACE_TRAMP_PDE_COUNT; i++) {
-        uint32_t dir_idx = ADDRESS_SPACE_TRAMP_PDE_START + i;
-        s_tramp_shared_tables[i] = NULL;
-        tramp_sync_pde_locked(dir_idx, 0u);
+    uint32_t need_slots = (levels >= 4u)
+                        ? (uint32_t)ADDRESS_SPACE_TRAMP_SLOTS_64
+                        : (uint32_t)ADDRESS_SPACE_TRAMP_SLOTS_32;
+    if (need_slots > s_tramp_shared_cap || !s_tramp_shared_tables) {
+        void **grown = (void **)krealloc(s_tramp_shared_tables, (size_t)need_slots * sizeof(void *));
+        if (!grown) return;
+        s_tramp_shared_tables = grown;
+        s_tramp_shared_cap = need_slots;
     }
 
-    s_tramp_audio_bottom = ADDRESS_SPACE_TRAMP_AUDIO_TOP - PAGE_SIZE;
+    if (levels >= 4u) {
+        if (!kernel_split_trampoline_pd_locked()) {
+            return;
+        }
+        for (uint32_t i = 0u; i < need_slots; i++) {
+            s_tramp_shared_tables[i] = NULL;
+            tramp_sync_slot_locked((ipo_vaddr_t)(ADDRESS_SPACE_TRAMP_BASE + ((uint64_t)i << 21)), 0u, false);
+        }
+    } else {
+        for (uint32_t i = 0u; i < need_slots; i++) {
+            s_tramp_shared_tables[i] = NULL;
+            tramp_sync_slot_locked((ipo_vaddr_t)(ADDRESS_SPACE_TRAMP_BASE + ((uint64_t)i << 22)), 0u, false);
+        }
+    }
+
+    s_tramp_audio_bottom = (ipo_vaddr_t)(ADDRESS_SPACE_TRAMP_AUDIO_TOP - PAGE_SIZE);
     tramp_map_page_locked(s_tramp_audio_bottom);
 
-    s_tramp_copy_bottom = ADDRESS_SPACE_TRAMP_COPY_TOP - PAGE_SIZE;
+    s_tramp_copy_bottom = (ipo_vaddr_t)(ADDRESS_SPACE_TRAMP_COPY_TOP - PAGE_SIZE);
     tramp_map_page_locked(s_tramp_copy_bottom);
 
     s_tramp_initialized = true;
-    uint32_t cr3 = read_cr3();
-    __asm__ volatile("movl %0, %%cr3" : : "r"(cr3) : "memory");
+    arch_mmu_flush_all();
 }
 
 void address_space_trampoline_init(void) {
-    uint32_t irq_flags = address_space_lock();
+    ipo_reg_t irq_flags = address_space_lock();
     tramp_init_locked();
     address_space_unlock(irq_flags);
 }
@@ -216,32 +479,32 @@ void *address_space_get_copy_tramp_stack_top(void) {
     return (void *)(uintptr_t)ADDRESS_SPACE_TRAMP_COPY_TOP;
 }
 
-bool address_space_is_trampoline_addr(uint32_t virtual_address) {
+bool address_space_is_trampoline_addr(ipo_vaddr_t virtual_address) {
     return (virtual_address >= ADDRESS_SPACE_TRAMP_BASE &&
             virtual_address < ADDRESS_SPACE_TRAMP_COPY_TOP);
 }
 
-bool address_space_handle_trampoline_fault(uint32_t fault_address,
-                                            uint32_t error_code,
-                                            uint32_t saved_esp) {
+bool address_space_handle_trampoline_fault(ipo_vaddr_t fault_address,
+                                            ipo_reg_t error_code,
+                                            ipo_vaddr_t saved_sp) {
     if ((error_code & 1u) != 0u) return false;
     if (!address_space_is_trampoline_addr(fault_address)) return false;
 
-    uint32_t irq_flags = address_space_lock();
+    ipo_reg_t irq_flags = address_space_lock();
     if (!s_tramp_initialized) {
         address_space_unlock(irq_flags);
         return false;
     }
 
     bool in_audio = (fault_address < ADDRESS_SPACE_TRAMP_AUDIO_TOP);
-    uint32_t reg_base = in_audio ? ADDRESS_SPACE_TRAMP_BASE : ADDRESS_SPACE_TRAMP_COPY_BASE;
-    uint32_t reg_top = in_audio ? ADDRESS_SPACE_TRAMP_AUDIO_TOP : ADDRESS_SPACE_TRAMP_COPY_TOP;
-    uint32_t *bottom_ptr = in_audio ? &s_tramp_audio_bottom : &s_tramp_copy_bottom;
+    ipo_vaddr_t reg_base = (ipo_vaddr_t)(in_audio ? ADDRESS_SPACE_TRAMP_BASE : ADDRESS_SPACE_TRAMP_COPY_BASE);
+    ipo_vaddr_t reg_top = (ipo_vaddr_t)(in_audio ? ADDRESS_SPACE_TRAMP_AUDIO_TOP : ADDRESS_SPACE_TRAMP_COPY_TOP);
+    ipo_vaddr_t *bottom_ptr = in_audio ? &s_tramp_audio_bottom : &s_tramp_copy_bottom;
 
-    uint32_t fault_page = fault_address & PAGE_MASK;
-    uint32_t esp_page = saved_esp & PAGE_MASK;
-    uint32_t target_lowest = fault_page;
-    if (saved_esp >= reg_base && saved_esp < reg_top && esp_page < target_lowest) {
+    ipo_vaddr_t fault_page = ipo_vaddr_align_down(fault_address, (ipo_size_t)PAGE_SIZE);
+    ipo_vaddr_t esp_page = ipo_vaddr_align_down(saved_sp, (ipo_size_t)PAGE_SIZE);
+    ipo_vaddr_t target_lowest = fault_page;
+    if (saved_sp >= reg_base && saved_sp < reg_top && esp_page < target_lowest) {
         target_lowest = esp_page;
     }
 
@@ -250,22 +513,36 @@ bool address_space_handle_trampoline_fault(uint32_t fault_address,
         return false;
     }
 
-    /* If already mapped in shared table (stale TLB on current CPU), invalidate and resume */
-    if (fault_page >= *bottom_ptr) {
-        uint32_t slot = (fault_page >> 22) - ADDRESS_SPACE_TRAMP_PDE_START;
-        uint32_t *tbl = s_tramp_shared_tables[slot];
-        if (tbl && (tbl[(fault_page >> 12) & 0x3FFu] & PTE_PRESENT)) {
-            uint32_t cur_cr3 = read_cr3();
-            uint32_t dir_idx = fault_page >> 22;
-            uint32_t *cur_pd = (uint32_t *)(uintptr_t)(cur_cr3 & PAGE_MASK);
-            cur_pd[dir_idx] = ((uint32_t)(uintptr_t)tbl & PDE_ADDRESS) | PDE_PRESENT | PDE_WRITABLE;
-            __asm__ volatile("invlpg (%0)" : : "r"(fault_address) : "memory");
-            address_space_unlock(irq_flags);
-            return true;
+    /* If already mapped in shared table (stale TLB/PDE on active CPU), sync and resume */
+    if (fault_page >= *bottom_ptr && s_tramp_shared_tables) {
+        if (s_kernel_paging_levels == 2u) {
+            uint32_t slot = (uint32_t)((fault_page - ADDRESS_SPACE_TRAMP_BASE) >> 22);
+            uint32_t *tbl = (slot < s_tramp_shared_cap) ? (uint32_t *)s_tramp_shared_tables[slot] : NULL;
+            if (tbl && (tbl[(fault_page >> 12) & 0x3FFu] & PTE_PRESENT)) {
+                uint32_t *cur_pd = (uint32_t *)(uintptr_t)active_cr3_paddr(2u);
+                cur_pd[fault_page >> 22] = ((uint32_t)(uintptr_t)tbl & PDE_ADDRESS) | PDE_PRESENT | PDE_WRITABLE;
+                arch_mmu_flush_page(fault_address);
+                address_space_unlock(irq_flags);
+                return true;
+            }
+        } else {
+            uint32_t slot = (uint32_t)((fault_page - ADDRESS_SPACE_TRAMP_BASE) >> 21);
+            uint64_t *tbl = (slot < s_tramp_shared_cap) ? (uint64_t *)s_tramp_shared_tables[slot] : NULL;
+            if (tbl && (tbl[(fault_page >> 12) & 0x1FFu] & PTE_PRESENT)) {
+                uint64_t *cur_pd = ia32e_read_pd_for_kernel_vaddr(
+                    active_cr3_paddr(s_kernel_paging_levels), s_kernel_paging_levels, fault_page);
+                if (cur_pd) {
+                    uint32_t pd_idx = (uint32_t)(((uint64_t)fault_page >> 21) & 0x1FFULL);
+                    cur_pd[pd_idx] = ((uint64_t)(uintptr_t)tbl & PAGE_MASK_64) | PDE_PRESENT | PDE_WRITABLE;
+                    arch_mmu_flush_page(fault_address);
+                    address_space_unlock(irq_flags);
+                    return true;
+                }
+            }
         }
     }
 
-    for (uint32_t page = *bottom_ptr - PAGE_SIZE; ; page -= PAGE_SIZE) {
+    for (ipo_vaddr_t page = *bottom_ptr - (ipo_vaddr_t)PAGE_SIZE; ; page -= (ipo_vaddr_t)PAGE_SIZE) {
         if (!tramp_map_page_locked(page)) {
             address_space_unlock(irq_flags);
             return false;
@@ -281,12 +558,13 @@ bool address_space_handle_trampoline_fault(uint32_t fault_address,
 }
 
 address_space_t *address_space_create(void) {
-    if (!(read_cr0() & 0x80000000u)) return NULL;
+    uint8_t levels = detect_hw_paging_levels();
+    if (levels == 0u) return NULL;
 
-    uint32_t irq_flags = address_space_lock();
-    uint32_t active_directory = read_cr3() & PAGE_MASK;
-    if (!s_kernel_page_directory) {
-        s_kernel_page_directory = (uint32_t *)(uintptr_t)active_directory;
+    ipo_reg_t irq_flags = address_space_lock();
+    if (s_kernel_root_paddr == 0u) {
+        s_kernel_root_paddr = active_cr3_paddr(levels);
+        s_kernel_paging_levels = levels;
     }
     tramp_init_locked();
 
@@ -295,19 +573,18 @@ address_space_t *address_space_create(void) {
         address_space_unlock(irq_flags);
         return NULL;
     }
+    memset(space, 0, sizeof(*space));
+    space->paging_levels = levels;
 
-    space->owned_page_tables = (uint32_t **)kmalloc(1024u * sizeof(uint32_t *));
-    space->page_directory = allocate_page();
-    if (!space->owned_page_tables || !space->page_directory) {
-        if (space->page_directory) release_page(space->page_directory);
-        if (space->owned_page_tables) kfree(space->owned_page_tables);
+    void *root = allocate_page();
+    if (!root) {
         kfree(space);
         address_space_unlock(irq_flags);
         return NULL;
     }
+    memcpy(root, (const void *)(uintptr_t)s_kernel_root_paddr, (size_t)PAGE_SIZE);
+    space->root_paddr = (ipo_paddr_t)(uintptr_t)root;
 
-    memset(space->owned_page_tables, 0, 1024u * sizeof(uint32_t *));
-    memcpy(space->page_directory, s_kernel_page_directory, PAGE_SIZE);
     space->next = s_space_list;
     s_space_list = space;
     address_space_unlock(irq_flags);
@@ -315,11 +592,10 @@ address_space_t *address_space_create(void) {
 }
 
 bool address_space_destroy(address_space_t *space) {
-    if (!space || !space->page_directory || !space->owned_page_tables) return false;
+    if (!space || space->root_paddr == 0u) return false;
 
-    uint32_t irq_flags = address_space_lock();
-    if ((read_cr3() & PAGE_MASK) ==
-        ((uint32_t)(uintptr_t)space->page_directory & PAGE_MASK)) {
+    ipo_reg_t irq_flags = address_space_lock();
+    if (active_cr3_paddr(space->paging_levels) == (space->root_paddr & PAGE_MASK_64)) {
         address_space_unlock(irq_flags);
         return false;
     }
@@ -333,140 +609,107 @@ bool address_space_destroy(address_space_t *space) {
         link = &(*link)->next;
     }
 
-    for (uint32_t i = 0; i < 1024; i++) {
-        if (space->owned_page_tables[i]) {
-            release_page(space->owned_page_tables[i]);
+    for (ipo_count_t i = 0u; i < space->owned_count; i++) {
+        if (space->owned_pages[i]) {
+            release_page(space->owned_pages[i]);
         }
     }
-    release_page(space->page_directory);
-    kfree(space->owned_page_tables);
+    release_page((void *)(uintptr_t)space->root_paddr);
+    if (space->owned_pages) {
+        kfree(space->owned_pages);
+    }
     kfree(space);
     address_space_unlock(irq_flags);
     return true;
 }
 
 bool address_space_activate(address_space_t *space) {
-    if (!space || !space->page_directory) return false;
-    uint32_t directory = (uint32_t)(uintptr_t)space->page_directory;
-    if (directory & (PAGE_SIZE - 1u)) return false;
+    if (!space || space->root_paddr == 0u) return false;
+    if (space->root_paddr & (PAGE_SIZE - 1u)) return false;
 
-    uint32_t irq_flags = address_space_lock();
-    __asm__ volatile("movl %0, %%cr3" : : "r"(directory) : "memory");
+    ipo_reg_t irq_flags = address_space_lock();
+    arch_mmu_set_root(space->root_paddr);
     syscall_update_exception_page_directory();
     address_space_unlock(irq_flags);
     return true;
 }
 
 bool address_space_activate_kernel(void) {
-    uint32_t irq_flags = address_space_lock();
-    if (!s_kernel_page_directory) {
+    ipo_reg_t irq_flags = address_space_lock();
+    if (s_kernel_root_paddr == 0u) {
         address_space_unlock(irq_flags);
         return false;
     }
 
-    uint32_t directory = (uint32_t)(uintptr_t)s_kernel_page_directory;
-    __asm__ volatile("movl %0, %%cr3" : : "r"(directory) : "memory");
+    arch_mmu_set_root(s_kernel_root_paddr);
     syscall_update_exception_page_directory();
     address_space_unlock(irq_flags);
     return true;
 }
 
 void __attribute__((noinline, used)) _address_space_trampoline_inner(
-    uint32_t new_cr3, uint32_t old_cr3, void (*fn)(void *), void *arg) {
-    uint32_t irq_flags = address_space_lock();
-    __asm__ volatile("movl %0, %%cr3" : : "r"(new_cr3) : "memory");
+    ipo_reg_t new_cr3, ipo_reg_t old_cr3, void (*fn)(void *), void *arg) {
+    ipo_reg_t irq_flags = address_space_lock();
+    arch_mmu_set_root((ipo_paddr_t)new_cr3);
     syscall_update_exception_page_directory();
     address_space_unlock(irq_flags);
 
     fn(arg);
 
     irq_flags = address_space_lock();
-    __asm__ volatile("movl %0, %%cr3" : : "r"(old_cr3) : "memory");
+    arch_mmu_set_root((ipo_paddr_t)old_cr3);
     syscall_update_exception_page_directory();
     address_space_unlock(irq_flags);
-}
-
-__attribute__((naked)) static void address_space_trampoline_shim(
-    uint32_t new_cr3, uint32_t old_cr3, void (*fn)(void *), void *arg,
-    uint32_t kstack_top) {
-    __asm__ volatile(
-        "movl 4(%%esp), %%eax\n\t"
-        "movl 8(%%esp), %%ecx\n\t"
-        "movl 12(%%esp), %%edx\n\t"
-        "pushl %%esi\n\t"
-        "pushl %%edi\n\t"
-        "movl 24(%%esp), %%esi\n\t"
-        "movl 28(%%esp), %%edi\n\t"
-        "andl $0xFFFFFFF0, %%edi\n\t"
-        "subl $16, %%edi\n\t"
-        "movl %%esp, (%%edi)\n\t"
-        "movl %%edi, %%esp\n\t"
-        "pushl %%esi\n\t"
-        "pushl %%edx\n\t"
-        "pushl %%ecx\n\t"
-        "pushl %%eax\n\t"
-        "call _address_space_trampoline_inner\n\t"
-        "addl $16, %%esp\n\t"
-        "popl %%esp\n\t"
-        "popl %%edi\n\t"
-        "popl %%esi\n\t"
-        "ret\n\t"
-        : : : "memory"
-    );
 }
 
 void address_space_call_on_stack(address_space_t *target, void (*fn)(void *),
                                  void *ctx, void *kstack_top) {
     if (!fn) return;
-    uint32_t cur_cr3 = read_cr3();
-    uint32_t target_cr3 = (target && target->page_directory)
-                              ? (uint32_t)(uintptr_t)target->page_directory
-                              : (uint32_t)(uintptr_t)s_kernel_page_directory;
+    ipo_paddr_t cur_root = arch_mmu_get_root();
+    ipo_paddr_t target_root = (target && target->root_paddr)
+                                  ? target->root_paddr
+                                  : s_kernel_root_paddr;
 
-    if (target_cr3 == 0u || cur_cr3 == target_cr3) {
+    if (target_root == 0u || cur_root == target_root) {
         fn(ctx);
         return;
     }
 
-    uint32_t cur_esp = 0u;
-    __asm__ volatile("movl %%esp, %0" : "=r"(cur_esp));
+    ipo_vaddr_t cur_sp = arch_stack_get_sp();
 
-    /* If already running on a low kernel stack (< 256 MiB) or shared trampoline stack, CR3 switch is safe directly. */
-    if (cur_esp < 0x10000000u ||
-        address_space_is_trampoline_addr(cur_esp) ||
+    if (cur_sp < (ipo_vaddr_t)0x10000000u ||
+        address_space_is_trampoline_addr(cur_sp) ||
         !kstack_top) {
-        _address_space_trampoline_inner(target_cr3, cur_cr3, fn, ctx);
+        _address_space_trampoline_inner((ipo_reg_t)target_root, (ipo_reg_t)cur_root, fn, ctx);
         return;
     }
 
-    uint32_t aligned_top = ((uint32_t)(uintptr_t)kstack_top) & ~0xFu;
-    address_space_trampoline_shim(target_cr3, cur_cr3, fn, ctx, aligned_top);
+    ipo_vaddr_t aligned_top = ipo_vaddr_align_down((ipo_vaddr_t)(uintptr_t)kstack_top, 16u);
+    arch_context_call_on_new_stack(target_root, cur_root,
+                                   _address_space_trampoline_inner,
+                                   fn, ctx, aligned_top);
 }
 
 void address_space_call_with_copy(address_space_t *target, void (*fn)(void *),
                                   void *ctx, size_t ctx_size) {
     if (!fn) return;
-    uint32_t cur_cr3 = read_cr3();
-    uint32_t target_cr3 = (target && target->page_directory)
-                              ? (uint32_t)(uintptr_t)target->page_directory
-                              : (uint32_t)(uintptr_t)s_kernel_page_directory;
+    ipo_paddr_t cur_root = arch_mmu_get_root();
+    ipo_paddr_t target_root = (target && target->root_paddr)
+                                  ? target->root_paddr
+                                  : s_kernel_root_paddr;
 
-    if (target_cr3 == 0u || cur_cr3 == target_cr3) {
+    if (target_root == 0u || cur_root == target_root) {
         fn(ctx);
         return;
     }
 
-    uint32_t cur_esp = 0u;
-    __asm__ volatile("movl %%esp, %0" : "=r"(cur_esp));
+    ipo_vaddr_t cur_sp = arch_stack_get_sp();
 
-    /* If already running on a low kernel stack (< 256 MiB) or shared trampoline stack, CR3 switch is safe directly. */
-    if (cur_esp < 0x10000000u || address_space_is_trampoline_addr(cur_esp)) {
-        _address_space_trampoline_inner(target_cr3, cur_cr3, fn, ctx);
+    if (cur_sp < (ipo_vaddr_t)0x10000000u || address_space_is_trampoline_addr(cur_sp)) {
+        _address_space_trampoline_inner((ipo_reg_t)target_root, (ipo_reg_t)cur_root, fn, ctx);
         return;
     }
 
-    /* Running on a per-process virtual stack: copy ctx into shared kernel heap and
-     * execute on the dynamically demand-paged shared kernel trampoline stack. */
     void *kctx = ctx;
     if (ctx && ctx_size > 0u) {
         kctx = kmalloc(ctx_size);
@@ -486,77 +729,79 @@ void address_space_call_with_copy(address_space_t *target, void (*fn)(void *),
     }
 }
 
-bool address_space_map(address_space_t *space, uint32_t virtual_address,
-                       uint32_t physical_address, uint32_t flags) {
-    if (!space || !space->page_directory ||
+bool address_space_map(address_space_t *space, ipo_vaddr_t virtual_address,
+                       ipo_paddr_t physical_address, ipo_reg_t flags) {
+    if (!space || space->root_paddr == 0u ||
         (virtual_address & (PAGE_SIZE - 1u)) ||
         (physical_address & (PAGE_SIZE - 1u))) {
         return false;
     }
 
-    uint32_t irq_flags = address_space_lock();
-    uint32_t directory_index = virtual_address >> 22;
-    uint32_t table_index = (virtual_address >> 12) & 0x3FFu;
-    uint32_t *table = space->owned_page_tables[directory_index];
-    if (!table) {
-        table = make_private_page_table(space, directory_index);
-    }
-    if (!table) {
-        address_space_unlock(irq_flags);
-        return false;
+    ipo_reg_t irq_flags = address_space_lock();
+    bool prop_user = (flags & PTE_USER) != 0u;
+
+    if (space->paging_levels == 2u) {
+        uint32_t dir_idx = (uint32_t)(virtual_address >> 22);
+        uint32_t tbl_idx = (uint32_t)((virtual_address >> 12) & 0x3FFu);
+        uint32_t *table = make_private_pt_2level(space, dir_idx);
+        if (!table) {
+            address_space_unlock(irq_flags);
+            return false;
+        }
+        uint32_t pte_flags = ((uint32_t)flags & 0x1FFu) | PTE_PRESENT;
+        table[tbl_idx] = ((uint32_t)physical_address & PAGE_MASK_32) | pte_flags;
+        if (prop_user) {
+            ((uint32_t *)(uintptr_t)space->root_paddr)[dir_idx] |= PDE_USER;
+        }
+    } else {
+        uint64_t *pt = ia32e_walk_to_level(space, virtual_address, 0u, true, prop_user);
+        if (!pt) {
+            address_space_unlock(irq_flags);
+            return false;
+        }
+        uint32_t tbl_idx = (uint32_t)(((uint64_t)virtual_address >> 12) & 0x1FFULL);
+        uint64_t pte_flags = ((uint64_t)flags & 0x1FFULL) | PTE_PRESENT;
+        pt[tbl_idx] = ((uint64_t)physical_address & PAGE_MASK_64) | pte_flags;
     }
 
-    uint32_t pte_flags = (flags & 0x1FFu) | PTE_PRESENT;
-    table[table_index] = (physical_address & PAGE_MASK) | pte_flags;
-    if (pte_flags & PTE_USER) {
-        space->page_directory[directory_index] |= PDE_USER;
-    }
     flush_active_address_space(space);
     address_space_unlock(irq_flags);
     return true;
 }
 
-bool address_space_unmap(address_space_t *space, uint32_t virtual_address) {
-    if (!space || !space->page_directory ||
+bool address_space_unmap(address_space_t *space, ipo_vaddr_t virtual_address) {
+    if (!space || space->root_paddr == 0u ||
         (virtual_address & (PAGE_SIZE - 1u))) {
         return false;
     }
 
-    uint32_t irq_flags = address_space_lock();
-    uint32_t directory_index = virtual_address >> 22;
-    uint32_t table_index = (virtual_address >> 12) & 0x3FFu;
-    if (!(space->page_directory[directory_index] & PDE_PRESENT)) {
-        address_space_unlock(irq_flags);
-        return false;
-    }
-
-    uint32_t *table = space->owned_page_tables[directory_index];
-    if (!table) {
-        table = make_private_page_table(space, directory_index);
-    }
-    if (!table) {
-        address_space_unlock(irq_flags);
-        return false;
-    }
-
-    if (!(table[table_index] & PTE_PRESENT)) {
-        address_space_unlock(irq_flags);
-        return false;
-    }
-
-    table[table_index] = 0;
-    bool all_empty = true;
-    for (uint32_t i = 0; i < 1024; i++) {
-        if (table[i] & PTE_PRESENT) {
-            all_empty = false;
-            break;
+    ipo_reg_t irq_flags = address_space_lock();
+    if (space->paging_levels == 2u) {
+        uint32_t *pd = (uint32_t *)(uintptr_t)space->root_paddr;
+        uint32_t dir_idx = (uint32_t)(virtual_address >> 22);
+        uint32_t tbl_idx = (uint32_t)((virtual_address >> 12) & 0x3FFu);
+        if (!(pd[dir_idx] & PDE_PRESENT)) {
+            address_space_unlock(irq_flags);
+            return false;
         }
-    }
-
-    if (all_empty) {
-        space->owned_page_tables[directory_index] = NULL;
-        space->page_directory[directory_index] = 0;
-        release_page(table);
+        uint32_t *table = make_private_pt_2level(space, dir_idx);
+        if (!table || !(table[tbl_idx] & PTE_PRESENT)) {
+            address_space_unlock(irq_flags);
+            return false;
+        }
+        table[tbl_idx] = 0u;
+    } else {
+        uint64_t *pt = ia32e_walk_to_level(space, virtual_address, 0u, false, false);
+        if (!pt) {
+            address_space_unlock(irq_flags);
+            return false;
+        }
+        uint32_t tbl_idx = (uint32_t)(((uint64_t)virtual_address >> 12) & 0x1FFULL);
+        if (!(pt[tbl_idx] & PTE_PRESENT)) {
+            address_space_unlock(irq_flags);
+            return false;
+        }
+        pt[tbl_idx] = 0ULL;
     }
 
     flush_active_address_space(space);
@@ -565,81 +810,90 @@ bool address_space_unmap(address_space_t *space, uint32_t virtual_address) {
 }
 
 bool address_space_set_identity_range(address_space_t *space,
-                                      uint32_t virtual_address,
-                                      uint32_t length, bool mapped) {
-    if (!space || !space->page_directory ||
+                                      ipo_vaddr_t virtual_address,
+                                      ipo_size_t length, bool mapped) {
+    ipo_vaddr_t end = 0u;
+    if (!space || space->root_paddr == 0u ||
         (virtual_address & (PAGE_SIZE - 1u)) ||
         (length & (PAGE_SIZE - 1u)) ||
-        length == 0u) {
+        length == 0u ||
+        !ipo_vaddr_add_ok(virtual_address, length, &end)) {
         return false;
     }
 
-    uint64_t end = (uint64_t)virtual_address + length;
-    if (end > 0x100000000ULL) {
-        return false;
-    }
+    ipo_reg_t irq_flags = address_space_lock();
 
-    uint32_t irq_flags = address_space_lock();
-    uint32_t first_dir = virtual_address >> 22;
-    uint32_t last_dir = (uint32_t)((end - 1u) >> 22);
+    if (space->paging_levels == 2u) {
+        uint32_t *pd = (uint32_t *)(uintptr_t)space->root_paddr;
+        uint32_t first_dir = (uint32_t)(virtual_address >> 22);
+        uint32_t last_dir = (uint32_t)((end - 1u) >> 22);
+        uint32_t tramp_first = (uint32_t)(ADDRESS_SPACE_TRAMP_BASE >> 22);
+        uint32_t tramp_end = tramp_first + (uint32_t)ADDRESS_SPACE_TRAMP_SLOTS_32;
 
-    for (uint32_t dir_idx = first_dir; dir_idx <= last_dir; dir_idx++) {
-        uint64_t chunk_start = (uint64_t)dir_idx << 22;
-        uint64_t chunk_end = chunk_start + 0x400000ULL;
-        bool fully_covered = (chunk_start >= virtual_address && chunk_end <= end);
-        bool is_tramp_pde = (dir_idx >= ADDRESS_SPACE_TRAMP_PDE_START &&
-                             dir_idx < ADDRESS_SPACE_TRAMP_PDE_START + ADDRESS_SPACE_TRAMP_PDE_COUNT);
-
-        if (dir_idx > 3u && fully_covered && !is_tramp_pde) {
-            continue;
-        }
-
-        if (!space->owned_page_tables[dir_idx]) {
-            if (!make_private_page_table(space, dir_idx)) {
+        for (uint32_t dir_idx = first_dir; dir_idx <= last_dir; dir_idx++) {
+            uint64_t chunk_start = (uint64_t)dir_idx << 22;
+            uint64_t chunk_end = chunk_start + 0x400000ULL;
+            bool fully_covered = (chunk_start >= virtual_address && chunk_end <= end);
+            bool is_tramp = (dir_idx >= tramp_first && dir_idx < tramp_end);
+            if (dir_idx > 3u && fully_covered && !is_tramp) {
+                continue;
+            }
+            if (!make_private_pt_2level(space, dir_idx)) {
                 address_space_unlock(irq_flags);
                 return false;
             }
         }
-    }
 
-    for (uint32_t dir_idx = first_dir; dir_idx <= last_dir; dir_idx++) {
-        uint64_t chunk_start = (uint64_t)dir_idx << 22;
-        uint64_t chunk_end = chunk_start + 0x400000ULL;
+        for (uint32_t dir_idx = first_dir; dir_idx <= last_dir; dir_idx++) {
+            uint64_t chunk_start = (uint64_t)dir_idx << 22;
+            uint64_t chunk_end = chunk_start + 0x400000ULL;
+            uint64_t eff_start = (chunk_start > virtual_address) ? chunk_start : virtual_address;
+            uint64_t eff_end = (chunk_end < end) ? chunk_end : end;
+            bool fully_covered = (eff_start == chunk_start && eff_end == chunk_end);
+            bool is_tramp = (dir_idx >= tramp_first && dir_idx < tramp_end);
 
-        uint64_t eff_start = (chunk_start > (uint64_t)virtual_address) ? chunk_start : (uint64_t)virtual_address;
-        uint64_t eff_end = (chunk_end < end) ? chunk_end : end;
-
-        bool fully_covered = (eff_start == chunk_start && eff_end == chunk_end);
-        bool is_tramp_pde = (dir_idx >= ADDRESS_SPACE_TRAMP_PDE_START &&
-                             dir_idx < ADDRESS_SPACE_TRAMP_PDE_START + ADDRESS_SPACE_TRAMP_PDE_COUNT);
-
-        if (dir_idx > 3u && fully_covered && !is_tramp_pde) {
-            uint32_t *table = space->owned_page_tables[dir_idx];
-            if (table) {
-                release_page(table);
-                space->owned_page_tables[dir_idx] = NULL;
+            if (dir_idx > 3u && fully_covered && !is_tramp) {
+                pd[dir_idx] = mapped ? ((dir_idx << 22) | (PDE_PRESENT | PDE_WRITABLE | PDE_PAGE_SIZE)) : 0u;
+            } else {
+                uint32_t *table = (uint32_t *)(uintptr_t)(pd[dir_idx] & PDE_ADDRESS);
+                for (uint64_t page = eff_start; page < eff_end; page += PAGE_SIZE) {
+                    uint32_t tbl_idx = (uint32_t)((page >> 12) & 0x3FFu);
+                    table[tbl_idx] = mapped ? ((uint32_t)page | (PTE_PRESENT | PTE_WRITABLE)) : 0u;
+                }
             }
-            space->page_directory[dir_idx] = mapped ? ((dir_idx << 22) | (PDE_PRESENT | PDE_WRITABLE | PDE_PAGE_SIZE)) : 0u;
-        } else {
-            uint32_t *table = space->owned_page_tables[dir_idx];
-            for (uint64_t page = eff_start; page < eff_end; page += PAGE_SIZE) {
-                uint32_t table_index = (page >> 12) & 0x3FFu;
-                table[table_index] = mapped ? ((uint32_t)page | (PTE_PRESENT | PTE_WRITABLE)) : 0u;
-            }
-
-            if (!mapped) {
-                bool all_zero = true;
-                for (uint32_t i = 0u; i < 1024u; i++) {
-                    if (table[i] & PTE_PRESENT) {
-                        all_zero = false;
-                        break;
+        }
+    } else {
+        uint64_t cur = (uint64_t)virtual_address;
+        while (cur < (uint64_t)end) {
+            bool in_tramp = (cur >= ADDRESS_SPACE_TRAMP_BASE && cur < ADDRESS_SPACE_TRAMP_COPY_TOP);
+            uint64_t rem = (uint64_t)end - cur;
+            if (!in_tramp && cur >= 0x1000000ULL &&
+                (cur & 0x1FFFFFULL) == 0ULL && rem >= 0x200000ULL) {
+                uint64_t *pd = ia32e_walk_to_level(space, (ipo_vaddr_t)cur, 1u, mapped, false);
+                if (!pd) {
+                    if (!mapped) {
+                        cur += 0x200000ULL;
+                        continue;
                     }
+                    address_space_unlock(irq_flags);
+                    return false;
                 }
-                if (all_zero) {
-                    space->owned_page_tables[dir_idx] = NULL;
-                    space->page_directory[dir_idx] = 0u;
-                    release_page(table);
+                uint32_t pd_idx = (uint32_t)((cur >> 21) & 0x1FFULL);
+                pd[pd_idx] = mapped ? ((cur & 0x000FFFFFFFE00000ULL) | PDE_PRESENT | PDE_WRITABLE | PDE_PAGE_SIZE) : 0ULL;
+                cur += 0x200000ULL;
+            } else {
+                uint64_t *pt = ia32e_walk_to_level(space, (ipo_vaddr_t)cur, 0u, mapped, false);
+                if (!pt) {
+                    if (!mapped) {
+                        cur += PAGE_SIZE;
+                        continue;
+                    }
+                    address_space_unlock(irq_flags);
+                    return false;
                 }
+                uint32_t pt_idx = (uint32_t)((cur >> 12) & 0x1FFULL);
+                pt[pt_idx] = mapped ? ((cur & PAGE_MASK_64) | PTE_PRESENT | PTE_WRITABLE) : 0ULL;
+                cur += PAGE_SIZE;
             }
         }
     }
@@ -650,32 +904,56 @@ bool address_space_set_identity_range(address_space_t *space,
 }
 
 bool address_space_range_mapped(address_space_t *space,
-                                uint32_t virtual_address, uint32_t length,
+                                ipo_vaddr_t virtual_address, ipo_size_t length,
                                 bool mapped) {
-    if (!space || !space->page_directory || length == 0u) {
+    ipo_vaddr_t end = 0u;
+    if (!space || space->root_paddr == 0u || length == 0u ||
+        !ipo_vaddr_add_ok(virtual_address, length, &end)) {
         return false;
     }
 
-    uint64_t end = (uint64_t)virtual_address + length;
-    if (end > 0x100000000ULL) {
-        return false;
-    }
+    ipo_reg_t irq_flags = address_space_lock();
+    ipo_vaddr_t start_page = ipo_vaddr_align_down(virtual_address, (ipo_size_t)PAGE_SIZE);
 
-    uint32_t irq_flags = address_space_lock();
-    for (uint64_t page = (uint64_t)(virtual_address & PAGE_MASK); page < end; page += PAGE_SIZE) {
-        uint32_t vaddr = (uint32_t)page;
-        uint32_t dir_index = vaddr >> 22;
-        uint32_t pde = space->page_directory[dir_index];
-        bool is_mapped = (pde & PDE_PRESENT) != 0;
-        if (is_mapped && !(pde & PDE_PAGE_SIZE)) {
-            const uint32_t *table = (const uint32_t *)(uintptr_t)(pde & PDE_ADDRESS);
-            uint32_t pte = table[(vaddr >> 12) & 0x3FFu];
-            is_mapped = (pte & PTE_PRESENT) != 0;
-        }
-
-        if (is_mapped != mapped) {
-            address_space_unlock(irq_flags);
-            return false;
+    for (ipo_vaddr_t page = start_page; page < end; ) {
+        bool is_mapped = false;
+        if (space->paging_levels == 2u) {
+            const uint32_t *pd = (const uint32_t *)(uintptr_t)space->root_paddr;
+            uint32_t pde = pd[(uint32_t)(page >> 22)];
+            is_mapped = (pde & PDE_PRESENT) != 0u;
+            if (is_mapped && !(pde & PDE_PAGE_SIZE)) {
+                const uint32_t *pt = (const uint32_t *)(uintptr_t)(pde & PDE_ADDRESS);
+                is_mapped = (pt[(page >> 12) & 0x3FFu] & PTE_PRESENT) != 0u;
+            }
+            if (is_mapped != mapped) {
+                address_space_unlock(irq_flags);
+                return false;
+            }
+            if (page > IPO_VADDR_MAX - (ipo_vaddr_t)PAGE_SIZE) break;
+            page += (ipo_vaddr_t)PAGE_SIZE;
+        } else {
+            const uint64_t *tbl = (const uint64_t *)(uintptr_t)space->root_paddr;
+            uint8_t lvl = (uint8_t)(space->paging_levels - 1u);
+            while (true) {
+                unsigned shift = 12u + 9u * (unsigned)lvl;
+                uint64_t entry = tbl[(uint32_t)(((uint64_t)page >> shift) & 0x1FFULL)];
+                if (!(entry & PTE_PRESENT)) {
+                    is_mapped = false;
+                    break;
+                }
+                if (lvl == 0u || (entry & PDE_PAGE_SIZE)) {
+                    is_mapped = true;
+                    break;
+                }
+                tbl = (const uint64_t *)(uintptr_t)(entry & PAGE_MASK_64);
+                lvl--;
+            }
+            if (is_mapped != mapped) {
+                address_space_unlock(irq_flags);
+                return false;
+            }
+            if (page > IPO_VADDR_MAX - (ipo_vaddr_t)PAGE_SIZE) break;
+            page += (ipo_vaddr_t)PAGE_SIZE;
         }
     }
 
@@ -683,55 +961,75 @@ bool address_space_range_mapped(address_space_t *space,
     return true;
 }
 
-uint32_t address_space_get_physical(address_space_t *space, uint32_t virtual_address) {
-    if (!space || !space->page_directory) return 0u;
-    uint32_t irq_flags = address_space_lock();
-    uint32_t dir_index = virtual_address >> 22;
-    uint32_t pde = space->page_directory[dir_index];
-    if (!(pde & PDE_PRESENT)) {
+ipo_paddr_t address_space_get_physical(address_space_t *space, ipo_vaddr_t virtual_address) {
+    if (!space || space->root_paddr == 0u) return 0u;
+    ipo_reg_t irq_flags = address_space_lock();
+
+    if (space->paging_levels == 2u) {
+        const uint32_t *pd = (const uint32_t *)(uintptr_t)space->root_paddr;
+        uint32_t pde = pd[(uint32_t)(virtual_address >> 22)];
+        if (!(pde & PDE_PRESENT)) {
+            address_space_unlock(irq_flags);
+            return 0u;
+        }
+        if (pde & PDE_PAGE_SIZE) {
+            address_space_unlock(irq_flags);
+            return (ipo_paddr_t)((pde & PDE_LARGE_BASE) + (virtual_address & 0x003FFFFFu));
+        }
+        const uint32_t *pt = (const uint32_t *)(uintptr_t)(pde & PDE_ADDRESS);
+        if (!pt) {
+            address_space_unlock(irq_flags);
+            return 0u;
+        }
+        uint32_t pte = pt[(virtual_address >> 12) & 0x3FFu];
         address_space_unlock(irq_flags);
-        return 0u;
+        if (!(pte & PTE_PRESENT)) return 0u;
+        return (ipo_paddr_t)((pte & PAGE_MASK_32) | (virtual_address & (PAGE_SIZE - 1u)));
     }
-    if (pde & PDE_PAGE_SIZE) {
-        address_space_unlock(irq_flags);
-        return (pde & PDE_LARGE_BASE) + (virtual_address & 0x003FFFFFu);
+
+    const uint64_t *tbl = (const uint64_t *)(uintptr_t)space->root_paddr;
+    uint8_t lvl = (uint8_t)(space->paging_levels - 1u);
+    while (true) {
+        unsigned shift = 12u + 9u * (unsigned)lvl;
+        uint64_t entry = tbl[(uint32_t)(((uint64_t)virtual_address >> shift) & 0x1FFULL)];
+        if (!(entry & PTE_PRESENT)) {
+            address_space_unlock(irq_flags);
+            return 0u;
+        }
+        if (lvl == 0u || (entry & PDE_PAGE_SIZE)) {
+            uint64_t offset_mask = (1ULL << shift) - 1ULL;
+            uint64_t base_mask = PAGE_MASK_64 & ~offset_mask;
+            address_space_unlock(irq_flags);
+            return (ipo_paddr_t)((entry & base_mask) | ((uint64_t)virtual_address & offset_mask));
+        }
+        tbl = (const uint64_t *)(uintptr_t)(entry & PAGE_MASK_64);
+        lvl--;
     }
-    uint32_t *table = space->owned_page_tables[dir_index];
-    if (!table) {
-        table = (uint32_t *)(uintptr_t)(pde & PDE_ADDRESS);
-    }
-    if (!table) {
-        address_space_unlock(irq_flags);
-        return 0u;
-    }
-    uint32_t pte = table[(virtual_address >> 12) & 0x3FFu];
-    address_space_unlock(irq_flags);
-    if (!(pte & PTE_PRESENT)) return 0u;
-    return (pte & PAGE_MASK) | (virtual_address & (PAGE_SIZE - 1u));
 }
 
 extern uint8_t _kernel_text_start[];
 extern uint8_t _kernel_rodata_end[];
 
-void paging_init(void) {
-    uint32_t *page_dir = (uint32_t *)memory_map_alloc(PAGE_SIZE, PAGE_SIZE);
-    uint32_t *pt_low   = (uint32_t *)memory_map_alloc(4u * PAGE_SIZE, PAGE_SIZE);
+static bool is_guard_low_page(uint32_t page) {
+    return (page == 0u || (page >= 2u && page <= 5u) ||
+            page == 7u || (page >= 9u && page <= 15u));
+}
+
+static void paging_init_2level(ipo_vaddr_t ktext_start, ipo_vaddr_t krodata_end) {
+    uint32_t *page_dir = (uint32_t *)memory_map_alloc((size_t)PAGE_SIZE, (size_t)PAGE_SIZE);
+    uint32_t *pt_low   = (uint32_t *)memory_map_alloc((size_t)(4u * PAGE_SIZE), (size_t)PAGE_SIZE);
     if (!page_dir || !pt_low) {
-        serial_printf("[paging] Failed to allocate page tables\n");
+        serial_printf("[paging] Failed to allocate 2-level page tables\n");
         return;
     }
 
-    memset(page_dir, 0, PAGE_SIZE);
-    memset(pt_low, 0, 4u * PAGE_SIZE);
+    memset(page_dir, 0, (size_t)PAGE_SIZE);
+    memset(pt_low, 0, (size_t)(4u * PAGE_SIZE));
 
-    uint32_t ktext_start = (uint32_t)(uintptr_t)_kernel_text_start;
-    uint32_t krodata_end = ((uint32_t)(uintptr_t)_kernel_rodata_end) & ~0xFFFu;
-
-    /* Identity-map first 16 MiB via 4 KiB pages with low guard holes and RO kernel sections */
-    for (uint32_t page = 0; page < 4096u; page++) {
-        uint32_t addr = page * PAGE_SIZE;
-        if (page == 0 || (page >= 2 && page <= 5) || page == 7 || (page >= 9 && page <= 15)) {
-            pt_low[page] = 0;
+    for (uint32_t page = 0u; page < 4096u; page++) {
+        uint32_t addr = page * (uint32_t)PAGE_SIZE;
+        if (is_guard_low_page(page)) {
+            pt_low[page] = 0u;
         } else if (addr >= ktext_start && addr < krodata_end) {
             pt_low[page] = addr | PTE_PRESENT;
         } else if (addr >= 0x000C0000u && addr < 0x00100000u) {
@@ -741,30 +1039,118 @@ void paging_init(void) {
         }
     }
 
-    for (uint32_t pde = 0; pde < 4u; pde++) {
+    for (uint32_t pde = 0u; pde < 4u; pde++) {
         page_dir[pde] = ((uint32_t)(uintptr_t)&pt_low[pde * 1024u]) | PDE_PRESENT | PDE_WRITABLE;
     }
-
-    /* Identity-map 16 MiB .. 4 GiB using 4 MiB PSE pages */
-    for (uint32_t pde = 4; pde < 1024u; pde++) {
+    for (uint32_t pde = 4u; pde < 1024u; pde++) {
         page_dir[pde] = (pde << 22) | PDE_PRESENT | PDE_WRITABLE | PDE_PAGE_SIZE;
     }
 
-    __asm__ volatile(
-        "movl %%cr4, %%eax\n\t"
-        "orl $0x00000010, %%eax\n\t"
-        "movl %%eax, %%cr4\n\t"
-        "movl %0, %%cr3\n\t"
-        "movl %%cr0, %%eax\n\t"
-        "orl $0x80010001, %%eax\n\t"
-        "movl %%eax, %%cr0\n\t"
-        :
-        : "r"(page_dir)
-        : "eax", "memory"
-    );
+    s_kernel_paging_levels = 2u;
+    s_kernel_root_paddr = (ipo_paddr_t)(uintptr_t)page_dir;
+
+    arch_mmu_enable_paging(s_kernel_root_paddr, 2u);
 
     address_space_trampoline_init();
+    smp_sync_paging(s_kernel_root_paddr);
+}
 
-    serial_printf("[paging] Paging enabled (NULL guard active, kernel .text/.rodata write-protected [0x%x - 0x%x])\n",
-                  ktext_start, krodata_end);
+static void paging_init_ia32e(uint8_t levels, ipo_vaddr_t ktext_start, ipo_vaddr_t krodata_end) {
+    /* Always identity-map at least 4 GiB (MMIO/LAPIC/APIC/trampolines) plus detected RAM */
+    uint64_t map_top = 0x100000000ULL;
+    size_t reg_count = memory_map_get_region_count();
+    for (size_t i = 0u; i < reg_count; i++) {
+        const memory_region_t *reg = memory_map_get_region(i);
+        if (reg && reg->is_usable && reg->size > 0u) {
+            uint64_t r_end = reg->base + reg->size;
+            if (r_end > map_top) {
+                map_top = r_end;
+            }
+        }
+    }
+    /* Round up to 1 GiB boundary so whole PDs cover map_top */
+    uint64_t gb_count = (map_top + 0x3FFFFFFFULL) >> 30;
+    if (gb_count > 512ULL) {
+        gb_count = 512ULL; /* 512 GiB identity span across single PDPT */
+    }
+
+    uint64_t *pml5 = (levels == 5u) ? (uint64_t *)memory_map_alloc((size_t)PAGE_SIZE, (size_t)PAGE_SIZE) : NULL;
+    uint64_t *pml4 = (uint64_t *)memory_map_alloc((size_t)PAGE_SIZE, (size_t)PAGE_SIZE);
+    uint64_t *pdpt = (uint64_t *)memory_map_alloc((size_t)PAGE_SIZE, (size_t)PAGE_SIZE);
+    uint64_t *pt_low = (uint64_t *)memory_map_alloc((size_t)(8u * PAGE_SIZE), (size_t)PAGE_SIZE);
+    if ((levels == 5u && !pml5) || !pml4 || !pdpt || !pt_low) {
+        serial_printf("[paging] Failed to allocate %u-level page tables\n", levels);
+        return;
+    }
+
+    if (pml5) memset(pml5, 0, (size_t)PAGE_SIZE);
+    memset(pml4, 0, (size_t)PAGE_SIZE);
+    memset(pdpt, 0, (size_t)PAGE_SIZE);
+    memset(pt_low, 0, (size_t)(8u * PAGE_SIZE));
+
+    /* First 16 MiB using 8 x 4 KiB PT tables (8 * 512 = 4096 pages) */
+    for (uint32_t page = 0u; page < 4096u; page++) {
+        uint64_t addr = (uint64_t)page * PAGE_SIZE;
+        if (is_guard_low_page(page)) {
+            pt_low[page] = 0ULL;
+        } else if (addr >= ktext_start && addr < krodata_end) {
+            pt_low[page] = addr | PTE_PRESENT;
+        } else if (addr >= 0x000C0000ULL && addr < 0x00100000ULL) {
+            pt_low[page] = addr | PTE_PRESENT;
+        } else {
+            pt_low[page] = addr | PTE_PRESENT | PTE_WRITABLE;
+        }
+    }
+
+    for (uint64_t gb = 0u; gb < gb_count; gb++) {
+        uint64_t *pd = (uint64_t *)memory_map_alloc((size_t)PAGE_SIZE, (size_t)PAGE_SIZE);
+        if (!pd) {
+            serial_printf("[paging] Failed to allocate PD for GiB %llu\n", (unsigned long long)gb);
+            return;
+        }
+        memset(pd, 0, (size_t)PAGE_SIZE);
+        uint64_t gb_base = gb << 30;
+        for (uint64_t idx = 0u; idx < 512u; idx++) {
+            uint64_t phys = gb_base + (idx << 21);
+            if (gb == 0u && idx < 8u) {
+                pd[idx] = ((uint64_t)(uintptr_t)&pt_low[idx * 512u]) | PDE_PRESENT | PDE_WRITABLE;
+            } else {
+                pd[idx] = phys | PDE_PRESENT | PDE_WRITABLE | PDE_PAGE_SIZE;
+            }
+        }
+        pdpt[gb] = ((uint64_t)(uintptr_t)pd & PAGE_MASK_64) | PDE_PRESENT | PDE_WRITABLE;
+    }
+
+    pml4[0] = ((uint64_t)(uintptr_t)pdpt & PAGE_MASK_64) | PDE_PRESENT | PDE_WRITABLE;
+    if (pml5) {
+        pml5[0] = ((uint64_t)(uintptr_t)pml4 & PAGE_MASK_64) | PDE_PRESENT | PDE_WRITABLE;
+        s_kernel_root_paddr = (ipo_paddr_t)(uintptr_t)pml5;
+    } else {
+        s_kernel_root_paddr = (ipo_paddr_t)(uintptr_t)pml4;
+    }
+    s_kernel_paging_levels = levels;
+
+    arch_mmu_enable_paging(s_kernel_root_paddr, levels);
+
+    address_space_trampoline_init();
+    smp_sync_paging(s_kernel_root_paddr);
+}
+
+void paging_init(void) {
+    ipo_vaddr_t ktext_start = (ipo_vaddr_t)(uintptr_t)_kernel_text_start;
+    ipo_vaddr_t krodata_end = ipo_vaddr_align_down((ipo_vaddr_t)(uintptr_t)_kernel_rodata_end,
+                                                   (ipo_size_t)PAGE_SIZE);
+    uint8_t active_levels = detect_hw_paging_levels();
+
+    if (active_levels >= 4u) {
+        paging_init_ia32e(active_levels, ktext_start, krodata_end);
+    } else {
+        paging_init_2level(ktext_start, krodata_end);
+    }
+
+    serial_printf("[paging] Paging enabled (%u-level, CR3=0x%llx, RO [0x%llx - 0x%llx])\n",
+                  s_kernel_paging_levels,
+                  (unsigned long long)s_kernel_root_paddr,
+                  (unsigned long long)ktext_start,
+                  (unsigned long long)krodata_end);
 }

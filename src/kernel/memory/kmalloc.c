@@ -11,9 +11,10 @@ static spinlock_t s_kmalloc_lock = {0};
 #define KMALLOC_FREED_MAGIC (0xDEADC0DE)
 
 size_t kmalloc_get_heap_capacity(void) {
-    uint32_t magic = *(volatile uint32_t *)E820_MAGIC_ADDR;
-    uint32_t raw_count = *(volatile uint32_t *)E820_COUNT_ADDR;
-    uint32_t ptr_val = *(volatile uint32_t *)E820_PTR_ADDR;
+    uint32_t magic = *(volatile uint32_t *)(uintptr_t)E820_MAGIC_ADDR;
+    uint32_t raw_count = *(volatile uint32_t *)(uintptr_t)E820_COUNT_ADDR;
+    uint64_t ptr_val = ((uint64_t)*(volatile uint32_t *)(uintptr_t)(E820_PTR_ADDR + 4)) << 32 |
+                       (uint64_t)*(volatile uint32_t *)(uintptr_t)E820_PTR_ADDR;
     const uint64_t heap_start = KMALLOC_HEAP_START;
     const uint64_t heap_limit = 0x08000000ull;
 
@@ -39,36 +40,31 @@ size_t kmalloc_get_heap_capacity(void) {
             : 0u;
     }
 
-    uint64_t fallback_ram = *(volatile uint32_t *)E820_RAM_LOW_ADDR;
+    uint64_t fallback_ram = *(volatile uint32_t *)(uintptr_t)E820_RAM_LOW_ADDR;
     if (fallback_ram <= heap_start) return 0u;
     uint64_t heap_end = fallback_ram < heap_limit ? fallback_ram : heap_limit;
     return (size_t)(heap_end - heap_start);
 }
 
-typedef struct {
+typedef struct __attribute__((aligned(16))) {
     size_t size;           // Total size including this header
-    uint32_t magic;        // Magic number for validation
+    uint32_t magic;        // KMALLOC_MAGIC or KMALLOC_FREED_MAGIC
     uint32_t is_free;      // 1 if free, 0 if allocated
-    uint32_t padding;      // 16-byte alignment
+    uintptr_t padding;     // Pad header to 16-byte boundary
 } kmalloc_block_t;
+
+IPO_STATIC_ASSERT((sizeof(kmalloc_block_t) % 16u) == 0u, "kmalloc_block_t must stay 16-byte aligned");
 
 #define BLOCK_HEADER_SIZE (sizeof(kmalloc_block_t))
 
-// Kernel heap state
 static uint8_t *heap_start = NULL;
 static size_t heap_used = 0;
 
-/**
- * Initialize kernel allocator
- */
 void kmalloc_init(void) {
-    heap_start = (uint8_t *)KMALLOC_HEAP_START;
+    heap_start = (uint8_t *)(uintptr_t)KMALLOC_HEAP_START;
     heap_used = 0;
 }
 
-/**
- * Coalesce adjacent free blocks and shrink the heap tail
- */
 static void kmalloc_coalesce_and_shrink(void) {
     if (heap_start == NULL || heap_used == 0) return;
 
@@ -78,7 +74,7 @@ static void kmalloc_coalesce_and_shrink(void) {
     while ((size_t)(ptr - heap_start) < heap_used) {
         kmalloc_block_t *block = (kmalloc_block_t *)ptr;
         if (block->magic != KMALLOC_MAGIC && block->magic != KMALLOC_FREED_MAGIC) {
-            break;  // Heap corruption guard
+            break;
         }
         if (block->size < BLOCK_HEADER_SIZE) {
             break;
@@ -86,7 +82,6 @@ static void kmalloc_coalesce_and_shrink(void) {
 
         if (block->is_free) {
             if (last_free != NULL) {
-                // Merge current free block into last_free
                 last_free->size += block->size;
             } else {
                 last_free = block;
@@ -98,15 +93,12 @@ static void kmalloc_coalesce_and_shrink(void) {
         ptr += block->size;
     }
 
-    // Shrink heap_used if trailing block(s) at the top of the heap are free
+    /* Reclaim trailing free space from heap top */
     if (last_free != NULL && ((uint8_t *)last_free + last_free->size == heap_start + heap_used)) {
         heap_used = (size_t)((uint8_t *)last_free - heap_start);
     }
 }
 
-/**
- * Find or create a free block suitable for allocation
- */
 static kmalloc_block_t* find_free_block(size_t size) {
     kmalloc_coalesce_and_shrink();
 
@@ -115,16 +107,14 @@ static kmalloc_block_t* find_free_block(size_t size) {
     while ((size_t)(ptr - heap_start) < heap_used) {
         kmalloc_block_t *block = (kmalloc_block_t *)ptr;
 
-        // Validate block
         if (block->magic != KMALLOC_MAGIC && block->magic != KMALLOC_FREED_MAGIC) {
-            return NULL;  // Heap corruption
+            return NULL;
         }
 
         if (block->size < BLOCK_HEADER_SIZE) {
             return NULL;
         }
 
-        // Check if this free block is large enough
         if (block->is_free && block->size >= (size + BLOCK_HEADER_SIZE)) {
             return block;
         }
@@ -135,9 +125,6 @@ static kmalloc_block_t* find_free_block(size_t size) {
     return NULL;
 }
 
-/**
- * Split a free block if it's larger than needed
- */
 static void split_block(kmalloc_block_t *block, size_t needed_size) {
     size_t total_needed = (needed_size + BLOCK_HEADER_SIZE + 15u) & ~15u;
 
@@ -232,7 +219,7 @@ void *kmalloc(size_t size) {
         return NULL;
     }
 
-    uint32_t irq_flags = spin_lock_irqsave(&s_kmalloc_lock);
+    ipo_reg_t irq_flags = spin_lock_irqsave(&s_kmalloc_lock);
     void *user_ptr = kmalloc_locked(aligned_size, NULL);
     spin_unlock_irqrestore(&s_kmalloc_lock, irq_flags);
 
@@ -247,7 +234,7 @@ void kfree(void *ptr) {
         return;
     }
 
-    uint32_t irq_flags = spin_lock_irqsave(&s_kmalloc_lock);
+    ipo_reg_t irq_flags = spin_lock_irqsave(&s_kmalloc_lock);
     kfree_locked(ptr);
     spin_unlock_irqrestore(&s_kmalloc_lock, irq_flags);
 }
@@ -266,7 +253,7 @@ void *krealloc(void *ptr, size_t size) {
         return NULL;
     }
 
-    uint32_t irq_flags = spin_lock_irqsave(&s_kmalloc_lock);
+    ipo_reg_t irq_flags = spin_lock_irqsave(&s_kmalloc_lock);
     if (heap_start == NULL) {
         spin_unlock_irqrestore(&s_kmalloc_lock, irq_flags);
         return NULL;
@@ -348,7 +335,7 @@ bool kgrow_array(void **ptr, size_t *cap, size_t min_cap, size_t elem_size, size
 void kmalloc_get_stats(kmalloc_stats_t *out) {
     if (out == NULL) return;
 
-    uint32_t irq_flags = spin_lock_irqsave(&s_kmalloc_lock);
+    ipo_reg_t irq_flags = spin_lock_irqsave(&s_kmalloc_lock);
 
     out->heap_total   = KMALLOC_HEAP_SIZE;
     out->heap_used    = heap_used;

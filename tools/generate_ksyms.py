@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""
-tools/generate_ksyms.py
-Extracts defined symbols from the pre-linked kernel ELF image and generates
-a compiled kernel symbol table (C source file).
-"""
+"""Generate a sorted C kernel symbol table from an ELF image or object files."""
 
 import sys
 import os
@@ -27,12 +23,12 @@ def extract_symbols_from_elf(elf_path: str):
             if len(parts) >= 3:
                 addr_str, stype, sname = parts[0], parts[1], parts[2]
                 if stype != "U":
-                    # Avoid characters that cannot form valid C string literals
+                    # Skip symbols containing quotes or backslashes (invalid in C strings)
                     if '"' in sname or '\\' in sname:
                         continue
                     try:
                         addr = int(addr_str, 16)
-                        # Prefer global/weak symbol over local static duplicate
+                        # Prefer global/weak over local static when names collide
                         if sname not in symbols or (stype.isupper() and not symbols[sname][1].isupper()):
                             symbols[sname] = (addr, stype)
                     except ValueError:
@@ -84,7 +80,7 @@ def generate_c_file_from_elf(sym_map, output_path):
     lines.append("const kernel_sym_entry_t s_kernel_syms[] = {")
     for sym in sorted_syms:
         addr = sym_map[sym]
-        lines.append(f"    {{\"{sym}\", (void *)0x{addr:08x}U}},")
+        lines.append(f"    {{\"{sym}\", (void *)(uintptr_t)0x{addr:016x}ULL}},")
     lines.append("    {NULL, NULL}")
     lines.append("};")
     lines.append("")

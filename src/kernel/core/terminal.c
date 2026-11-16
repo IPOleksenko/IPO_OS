@@ -10,6 +10,7 @@
 #include <kernel/process.h>
 #include <memory/kmalloc.h>
 #include <system/timer.h>
+#include <system/rtc.h>
 #include <kernel/async.h>
 #include <system/state.h>
 #include <driver/sound.h>
@@ -22,19 +23,16 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdio.h>
-#include <net/net.h>
-#include <net/loopback.h>
 #include <kernel/device.h>
 #include <kernel/smp.h>
 #include <memory/memory_map.h>
-#include <driver/net/pci.h>
-#include <driver/net/rtl8139.h>
+#include <driver/pci.h>
 #include <driver/storage/block_dev.h>
 #include <driver/storage/partition.h>
 #include <storage/storage_pool.h>
 #include <kernel/kmod.h>
+#include <kernel/cpu_info.h>
 
-/* Terminal input locking */
 static bool terminal_input_locked = false;
 
 void terminal_lock_input(void) {
@@ -51,7 +49,6 @@ bool terminal_is_input_locked(void) {
     return terminal_input_locked;
 }
 
-/* Scancodes for navigation */
 #define SC_PAGE_UP   0x49
 #define SC_PAGE_DOWN 0x51
 #define SC_ARROW_UP  0x48
@@ -62,11 +59,9 @@ bool terminal_is_input_locked(void) {
 #define SC_END       0x4F
 #define SC_DELETE    0x53
 
-/* Prompt / styling */
 #define PROMPT_FG VGA_COLOR_LIGHT_GREEN
 #define INPUT_FG VGA_COLOR_LIGHT_GREY
 
-/* Input buffer for simple command handling: no hard maximum length. */
 static char *input_buf = NULL;
 static size_t input_capacity = 0;
 static size_t input_len = 0;
@@ -95,19 +90,17 @@ static uint32_t last_history_action_ms = 0;
 
 static char *terminal_cwd = NULL;
 
-/* Replace terminal_cwd with a heap copy of 'path'.  Never fails silently —
- * on allocation failure the old value is preserved. */
+/* Keep old terminal_cwd if allocation fails. */
 static void terminal_cwd_set(const char *path) {
     if (!path || !*path) path = "/";
     size_t len = strlen(path);
     char *buf = kmalloc(len + 1u);
-    if (!buf) return;   /* keep old value on OOM */
+    if (!buf) return;
     memcpy(buf, path, len + 1u);
     kfree(terminal_cwd);
     terminal_cwd = buf;
 }
 
-/* Ensure terminal_cwd is initialised (called once from terminal_init). */
 static void terminal_cwd_init(void) {
     if (!terminal_cwd) terminal_cwd_set("/");
 }
@@ -116,7 +109,6 @@ static size_t terminal_top_cap = 0;
 static uint16_t *terminal_bottom_buffer = NULL;
 static size_t terminal_bottom_cap = 0;
 
-/* Scroll state */
 static int top_buffer_count = 0;
 static int bottom_buffer_count = 0;
 
@@ -236,7 +228,6 @@ static inline int *active_bottom_count(void) {
 void terminal_scroll_up(void);
 void terminal_scroll_down(void);
 
-// Terminal drawing area (below header)
 static inline uint16_t terminal_top_row(void) {
     return VGA_START_CURSOR_POSITION / VGA_WIDTH;
 }
@@ -296,7 +287,6 @@ void terminal_render_language_bar(void) {
     uint32_t count = dynamic_keymap_get_enabled_count();
     uint16_t row1_start = VGA_WIDTH;
 
-    /* Display language bar only if there are more than 1 enabled layouts in the system */
     if (count <= 1) {
         volatile uint16_t *vga = VGA_MEMORY;
         for (size_t col = 0; col < (size_t)VGA_WIDTH; col++) {
@@ -312,7 +302,6 @@ void terminal_render_language_bar(void) {
     size_t len = strlen(lang_name);
 
     if (len + 12 <= (size_t)VGA_WIDTH) {
-        /* Fits in 80 columns: display formatted cleanly */
         size_t bar_cap = len + 32u;
         char *bar_text = (char *)kmalloc(bar_cap);
         if (bar_text) {
@@ -322,7 +311,7 @@ void terminal_render_language_bar(void) {
             kfree(bar_text);
         }
     } else {
-        /* Longer names scroll through the circular marquee. */
+        /* Scroll long layout names as a marquee */
         const char *sep = "   ***   ";
         size_t sep_len = strlen(sep);
         size_t loop_len = len + sep_len;
@@ -374,7 +363,6 @@ void terminal_language_bar_tick(void) {
     terminal_render_language_bar();
 }
 
-/* Read a line from VGA screen */
 static void read_line_from_vga(uint16_t row, uint16_t *buffer) {
     volatile uint16_t* vga = VGA_MEMORY;
     uint16_t offset = row * VGA_WIDTH;
@@ -393,7 +381,6 @@ static void read_line_from_vga(uint16_t row, uint16_t *buffer) {
     }
 }
 
-/* Write a line to VGA screen with preserved colors */
 static void write_line_to_vga(uint16_t row, const uint16_t *buffer) {
     volatile uint16_t* vga = VGA_MEMORY;
     uint16_t offset = row * VGA_WIDTH;
@@ -625,7 +612,6 @@ static void push_command_history(const char *cmd) {
         return;
     }
 
-    /* Expand history capacity if full */
     if (command_history_count >= command_history_capacity) {
         int new_cap = (command_history_capacity == 0) ? 16 : (command_history_capacity * 2);
         char **new_history = (char **)kmalloc(new_cap * sizeof(char *));
@@ -710,7 +696,6 @@ static void save_top_line(uint16_t row) {
     (*top_cnt)++;
 }
 
-/* Scroll down - restore next line from history if available */
 void terminal_scroll_down(void) {
     int *bot_cnt = active_bottom_count();
     int *top_cnt = active_top_count();
@@ -773,7 +758,7 @@ void terminal_scroll_down(void) {
     }
 }
 
-/* Return to present - restore current output when user starts typing */
+/* Scroll bottom history down to live view */
 void terminal_return_to_present(void) {
     while (*active_bottom_count() > 0) {
         terminal_scroll_down();
@@ -789,7 +774,6 @@ int terminal_get_bottom_buffer_count(void) {
     return *active_bottom_count();
 }
 
-/* Scroll up - show previous line from history */
 void terminal_scroll_up(void) {
     int *top_cnt = active_top_count();
     int *bot_cnt = active_bottom_count();
@@ -926,11 +910,11 @@ bool terminal_is_builtin(const char *name) {
         "df",
         "free",
         "drivers",
-        "symbols",
+        "kernel_symbols",
         "storage",
         "keymap",
         "return",
-        "ifconfig",
+        "rtc",
         "hardware",
         "startwm",
         "stopwm",
@@ -1001,14 +985,10 @@ static void builtin_help(void) {
     printf("        The request is sent to the video device without checking its supported modes.\n");
     printf("        BGA registers encode dimensions from 0 to 65535; rejected modes are not restored.\n");
     printf("\n");
-    printf("  [Networking]\n");
-    printf("    ifconfig [<new_ip> [netmask] [gateway] [dns]]\n");
-    printf("      - Query or configure device IP address, netmask, gateway and MAC.\n");
-    printf("\n");
     printf("  [Drivers & Kernel Modules]\n");
-    printf("    drivers [list | info <id/name> | load <path> | unload <id/name> | status | symbols [filter]]\n");
-    printf("      - Manage kernel drivers and dynamic runtime modules (KMOD ABI 0x0100).\n");
-    printf("    symbols [filter]\n");
+    printf("    drivers [list | info <id/name> | load <path> | unload <id/name> | status]\n");
+    printf("      - Manage kernel drivers and dynamic runtime modules (KMOD).\n");
+    printf("    kernel_symbols [filter]\n");
     printf("      - Inspect generated kernel symbol names and addresses.\n");
     printf("\n");
     printf("  [Hardware Resources & Infrastructure]\n");
@@ -1020,7 +1000,7 @@ static void builtin_help(void) {
     printf("          memory             : BIOS E820 physical memory map and managed memory pools.\n");
     printf("          pci                : Enumerated PCI bus devices (B:S.F, Vendor:Device, Class:Subclass, IRQ).\n");
     printf("          storage            : Detected ATA/IDE drives (model, serial, firmware, capacity) and pool size.\n");
-    printf("          network            : Physical PCI network controllers (MAC, link, speed) and resources.\n");
+    printf("          network            : Physical PCI network controllers and hardware resources.\n");
     printf("          usb                : Discovered PCI USB host controllers and resources.\n");
     printf("          refresh            : Re-enumerate hardware buses (SMP, E820, PCI, ATA, ACPI) and rebuild registry.\n");
     printf("          info <id>          : Detailed hardware resource report for device <id> from 'hardware list'.\n");
@@ -1043,7 +1023,22 @@ static void builtin_help(void) {
     printf("    keymap [list | on <id/name> | off <id/name> | rm <id/name>]\n");
     printf("      - Manage keyboard layouts: list registered layouts, enable (on), disable (off), or remove (rm).\n");
     printf("    return [on | off]\n");
-    printf("      - Toggle display of process exit return value (Return value: X).\n");
+    printf("      - Toggle display of process exit return value.\n");
+    printf("    rtc [status | resync | fmt <format> | timefmt <format> | datefmt <format> | show <format> | set <spec> | set ms <N> | set sec <N> | set days <N> | add <unit> <amount>]\n");
+    printf("      - Manage hardware MC146818 CMOS RTC and IRQ8 real-time clock and calendar:\n");
+    printf("          (no arguments)     : Show live date, time, active formats, total counters, and CMOS/IRQ8 status.\n");
+    printf("          status             : Show hardware CMOS registers, battery state (VRT), resolution, and IRQ8 counters.\n");
+    printf("          resync             : Force an immediate UIP-safe re-read from hardware CMOS RTC registers.\n");
+    printf("          fmt <format>       : Set StartWM top-line and shell time format using any tokens, order, and '...' text.\n");
+    printf("          timefmt <format>   : Set StartWM top-line and shell time format using any tokens, order, and '...' text.\n");
+    printf("          datefmt <format>   : Set StartWM bottom-line and shell date format using any tokens, order, and '...' text.\n");
+    printf("          show <format>      : Format live RTC once with any custom pattern without saving it.\n");
+    printf("          set <spec>         : Write date/time to CMOS RTC ('YYYY-MM-DD HH:MM:SS', 'DD.MM.YYYY', 'HH:MM:SS').\n");
+    printf("          set ms <N>         : Set hardware RTC from total milliseconds since year 0.\n");
+    printf("          set sec <N>        : Set hardware RTC from total seconds since year 0.\n");
+    printf("          set days <N>       : Set hardware RTC calendar date from total days since year 0.\n");
+    printf("          add <unit> <amount>: Shift hardware RTC by +/- ms, sec, min, hour, day, week, month, or year.\n");
+    printf("          tokens             : Free-order tokens Y YYYY YY M MO MM D DD H HH h hh S SS Ms MsMs AM PM TT TS TM TH TD TMS.\n");
     printf("\n");
     printf("  [System & Power Controls]\n");
     printf("    clear\n");
@@ -1628,15 +1623,15 @@ static void builtin_reboot(void) {
     printf("Rebooting system...\n");
     for (volatile int i = 0; i < 500000; i++) io_wait();
 
-    // 8042 Keyboard Controller reset
+    /* 8042 controller reset */
     while (inb(0x64) & 0x02) io_wait();
     outb(0x64, 0xFE);
 
-    // Fast A20 / reset port 0x92
+    /* Fast reset through port 0x92 */
     uint8_t temp = inb(0x92);
     outb(0x92, (temp | 0x01));
 
-    // Fallback: Triple fault by loading empty IDT
+    /* Fallback: triple fault with a null IDT */
     struct { uint16_t limit; uint32_t base; } __attribute__((packed)) null_idt = { 0, 0 };
     __asm__ volatile("lidt %0; int3" : : "m"(null_idt));
 
@@ -1648,13 +1643,13 @@ static void builtin_reboot(void) {
 static void builtin_shutdown(void) {
     printf("Shutting down...\n");
 
-    // QEMU modern ACPI shutdown
+    /* ACPI PM1a shutdown port (0x604) */
     outw(0x604, 0x2000);
-    // QEMU older / Bochs ACPI shutdown
+    /* Alternate ACPI PM1a shutdown port (0xB004) */
     outw(0xB004, 0x2000);
-    // VirtualBox shutdown
+    /* Alternate ACPI shutdown port (0x4004) */
     outw(0x4004, 0x3400);
-    // APM shutdown
+    /* APM shutdown */
     outw(0x5307, 0x0001);
 
     printf("System halted. You may safely turn off your computer.\n");
@@ -1671,19 +1666,15 @@ static void builtin_reinstall_fs(void) {
 
     printf("=== Reinstalling Filesystem ===\n");
 
-    /* 1. Kill all running processes */
     printf("[1/4] Terminating all processes...\n");
     process_kill_all();
 
-    /* 2. Reset in-memory filesystem state and file descriptors */
     printf("[2/4] Resetting filesystem state...\n");
     ipo_fs_reset_state();
 
-    /* 3. Completely wipe connected storage devices (protecting boot disk) */
     printf("[3/4] Wiping storage devices...\n");
     ipo_fs_wipe_storage();
 
-    /* 4. Format fresh filesystem and mount */
     printf("[4/4] Formatting & mounting fresh filesystem...\n");
     if (!ipo_fs_install()) {
         printf("reinstall_fs: installation FAILED\n");
@@ -1722,7 +1713,6 @@ static void builtin_killall(void) {
     process_kill_all();
 }
 
-/* Count used/total data blocks from the block bitmap. */
 static void fs_count_blocks(uint32_t *out_used, uint32_t *out_total) {
     *out_total = 0;
     *out_used  = 0;
@@ -1739,7 +1729,6 @@ static void fs_count_blocks(uint32_t *out_used, uint32_t *out_total) {
     *out_used = bitmap_count_set(sb.block_bitmap_start, total);
 }
 
-/* Count used/total inodes from filesystem statistics. */
 static void fs_count_inodes(uint32_t *out_used, uint32_t *out_total) {
     uint64_t total = 0, used = 0, free_ino = 0, dyn_chunks = 0;
     if (ipo_fs_get_inode_stats(&total, &used, &free_ino, &dyn_chunks)) {
@@ -1903,6 +1892,239 @@ bool terminal_get_show_return_value(void) {
     return terminal_show_return_value;
 }
 
+static char *rtc_join_args(int argc, char **argv, int start_idx) {
+    if (start_idx >= argc) return NULL;
+    size_t total = 1u;
+    for (int i = start_idx; i < argc; i++) {
+        total += strlen(argv[i]) + 1u;
+    }
+    char *out = (char *)kmalloc(total);
+    if (!out) return NULL;
+    out[0] = '\0';
+    for (int i = start_idx; i < argc; i++) {
+        if (i > start_idx) strcat(out, " ");
+        strcat(out, argv[i]);
+    }
+    return out;
+}
+
+static void rtc_print_field(const char *label, char *value, rtc_status_t err) {
+    if (value) {
+        printf("%s%s\n", label, value);
+        kfree(value);
+    } else {
+        printf("%s<error: %s>\n", label, rtc_status_str(err));
+    }
+}
+
+static void rtc_print_status_block(void) {
+    rtc_info_t info;
+    rtc_get_info(&info);
+    printf("RTC HW:     %s (%s)\n",
+           info.hw_ready ? "READY" : "ERROR",
+           rtc_status_str(info.last_error));
+    printf("IRQ8:       %s (registered=%s, total=%u, PF=%u, UF=%u, ticks=%u)\n",
+           info.irq8_active ? "ACTIVE" : "INACTIVE",
+           info.irq8_registered ? "yes" : "no",
+           info.irq8_total_count,
+           info.irq8_pf_count,
+           info.irq8_uf_count,
+           info.pi_ticks_in_sec);
+    printf("Resolution: %s\n",
+           info.subsecond_available ? "1024 Hz (IRQ8 PIE subsecond active)"
+                                    : "1 s (IRQ8 PIE inactive, Ms unavailable)");
+    printf("CMOS regs:  A=0x%02x B=0x%02x C=0x%02x D=0x%02x (%s, %s, VRT=%s, stopped=%s, CenReg=0x%02x %s)\n",
+           info.reg_a, info.reg_b, info.reg_c, info.reg_d,
+           info.bcd_mode ? "BCD" : "BIN",
+           info.hour24_mode ? "24h" : "12h",
+           info.battery_ok ? "OK" : "BAD",
+           info.hw_stopped ? "yes" : "no",
+           info.century_reg,
+           info.century_from_fadt ? "ACPI-FADT" : "default");
+    if (info.epoch_offset_active) {
+        printf("CMOS base:  %04u-%02u-%02u %02u:%02u:%02u (HW anchor + BigInt epoch offset)\n",
+               info.hw_year, info.hw_month, info.hw_day,
+               info.hw_hour, info.hw_minute, info.hw_second);
+    }
+}
+
+static void builtin_rtc(int argc, char **argv) {
+    rtc_poll();
+
+    if (argc < 2) {
+        rtc_info_t info;
+        rtc_get_info(&info);
+
+        rtc_status_t err = RTC_OK;
+        char *d_str = rtc_format_date_alloc(NULL, &err);
+        rtc_print_field("Date:       ", d_str, err);
+
+        err = RTC_OK;
+        char *t_str = rtc_format_time_alloc(NULL, &err);
+        rtc_print_field("Time:       ", t_str, err);
+
+        err = RTC_OK;
+        const char *full_pat = info.subsecond_available ? "YYYY-MM-DD HH:MM:SS:MsMs"
+                                                        : "YYYY-MM-DD HH:MM:SS";
+        char *iso = rtc_format_alloc(full_pat, NULL, &err);
+        rtc_print_field("ISO 8601:   ", iso, err);
+
+        char *tfmt = rtc_get_time_format_alloc();
+        char *dfmt = rtc_get_date_format_alloc();
+        printf("Formats:    time=\"%s\" date=\"%s\"\n",
+               tfmt ? tfmt : "<err>", dfmt ? dfmt : "<err>");
+        if (tfmt) kfree(tfmt);
+        if (dfmt) kfree(dfmt);
+
+        err = RTC_OK;
+        char *tsec = rtc_get_total_sec_alloc(&err);
+        rtc_print_field("Total sec:  ", tsec, err);
+
+        err = RTC_OK;
+        char *tms = rtc_get_total_ms_alloc(&err);
+        rtc_print_field("Total ms:   ", tms, err);
+
+        err = RTC_OK;
+        char *tdays = rtc_get_total_days_alloc(&err);
+        rtc_print_field("Total days: ", tdays, err);
+
+        rtc_print_status_block();
+        return;
+    }
+
+    const char *sub = argv[1];
+
+    if (strcmp(sub, "status") == 0) {
+        rtc_print_status_block();
+        return;
+    }
+
+    if (strcmp(sub, "resync") == 0) {
+        bool ok = rtc_resync_hw();
+        printf("rtc resync: %s\n", ok ? "OK" : rtc_status_str(rtc_last_error()));
+        rtc_print_status_block();
+        return;
+    }
+
+    if (strcmp(sub, "fmt") == 0 || strcmp(sub, "format") == 0 || strcmp(sub, "timefmt") == 0) {
+        if (argc < 3) {
+            char *fmt = rtc_get_time_format_alloc();
+            printf("Time format: %s\n", fmt ? fmt : "<err>");
+            if (fmt) kfree(fmt);
+            return;
+        }
+        char *joined = rtc_join_args(argc, argv, 2);
+        if (!joined || !rtc_set_time_format(joined)) {
+            printf("rtc: invalid time format '%s'\n", joined ? joined : "");
+            if (joined) kfree(joined);
+            return;
+        }
+        rtc_status_t err = RTC_OK;
+        char *now = rtc_format_time_alloc(NULL, &err);
+        if (now) {
+            printf("Time format set to '%s' -> %s\n", joined, now);
+            kfree(now);
+        } else {
+            printf("Time format set to '%s' (preview error: %s)\n", joined, rtc_status_str(err));
+        }
+        kfree(joined);
+        return;
+    }
+
+    if (strcmp(sub, "datefmt") == 0) {
+        if (argc < 3) {
+            char *fmt = rtc_get_date_format_alloc();
+            printf("Date format: %s\n", fmt ? fmt : "<err>");
+            if (fmt) kfree(fmt);
+            return;
+        }
+        char *joined = rtc_join_args(argc, argv, 2);
+        if (!joined || !rtc_set_date_format(joined)) {
+            printf("rtc: invalid date format '%s'\n", joined ? joined : "");
+            if (joined) kfree(joined);
+            return;
+        }
+        rtc_status_t err = RTC_OK;
+        char *now = rtc_format_date_alloc(NULL, &err);
+        if (now) {
+            printf("Date format set to '%s' -> %s\n", joined, now);
+            kfree(now);
+        } else {
+            printf("Date format set to '%s' (preview error: %s)\n", joined, rtc_status_str(err));
+        }
+        kfree(joined);
+        return;
+    }
+
+    if (strcmp(sub, "show") == 0) {
+        if (argc < 3) {
+            printf("Usage: rtc show <format>\n");
+            return;
+        }
+        char *joined = rtc_join_args(argc, argv, 2);
+        rtc_status_t err = RTC_OK;
+        char *out = joined ? rtc_format_alloc(joined, NULL, &err) : NULL;
+        if (out) {
+            printf("%s\n", out);
+            kfree(out);
+        } else {
+            printf("rtc show error: %s\n", rtc_status_str(err));
+        }
+        if (joined) kfree(joined);
+        return;
+    }
+
+    if (strcmp(sub, "set") == 0) {
+        if (argc < 3) {
+            printf("Usage: rtc set <YYYY-MM-DD HH:MM:SS | YYYY-MM-DD | HH:MM:SS | ms <N> | sec <N> | days <N>>\n");
+            return;
+        }
+        rtc_status_t err = RTC_OK;
+        bool ok = false;
+        if (argc >= 4 && (strcmp(argv[2], "ms") == 0 || strcmp(argv[2], "total_ms") == 0)) {
+            ok = rtc_set_spec(argv[3], RTC_SET_MS, &err);
+        } else if (argc >= 4 && (strcmp(argv[2], "sec") == 0 || strcmp(argv[2], "s") == 0)) {
+            ok = rtc_set_spec(argv[3], RTC_SET_SEC, &err);
+        } else if (argc >= 4 && (strcmp(argv[2], "days") == 0 || strcmp(argv[2], "d") == 0)) {
+            ok = rtc_set_spec(argv[3], RTC_SET_DAYS, &err);
+        } else {
+            char *joined = rtc_join_args(argc, argv, 2);
+            if (joined) {
+                ok = rtc_set_spec(joined, RTC_SET_AUTO, &err);
+                kfree(joined);
+            } else {
+                err = RTC_ERR_NOMEM;
+            }
+        }
+        if (!ok) {
+            printf("rtc set failed: %s\n", rtc_status_str(err));
+            return;
+        }
+        rtc_status_t ferr = RTC_OK;
+        char *iso = rtc_format_alloc("YYYY-MM-DD HH:MM:SS", NULL, &ferr);
+        rtc_print_field("RTC set -> ", iso, ferr);
+        return;
+    }
+
+    if (strcmp(sub, "add") == 0) {
+        if (argc < 4) {
+            printf("Usage: rtc add <ms|sec|min|hour|day|week|month|year> <amount>\n");
+            return;
+        }
+        rtc_status_t err = RTC_OK;
+        if (!rtc_add_unit_dec(argv[2], argv[3], &err)) {
+            printf("rtc add failed: %s\n", rtc_status_str(err));
+            return;
+        }
+        rtc_status_t ferr = RTC_OK;
+        char *iso = rtc_format_alloc("YYYY-MM-DD HH:MM:SS", NULL, &ferr);
+        rtc_print_field("RTC updated -> ", iso, ferr);
+        return;
+    }
+
+    printf("Usage: rtc [status | resync | fmt <format> | timefmt <format> | datefmt <format> | show <format> | set <spec> | add <unit> <amount>]\n");
+}
+
 void terminal_initialize(void) {
     s_terminal_init_count++;
     terminal_cwd_init();
@@ -1911,7 +2133,7 @@ void terminal_initialize(void) {
 
     builtin_clear();
 
-    /* Flush any scancodes that accumulated during boot */
+    /* Flush any scancodes accumulated during boot */
     keyboard_flush_hardware();
     keyboard_flush_queue();
     keyboard_flush_app_queue();
@@ -1930,10 +2152,8 @@ void terminal_initialize(void) {
 
     input_start_cursor = 0;
 
-    /* Erase past commands history buffer (especially on repeated initialization) */
     terminal_clear_command_history();
 
-    /* Allocate or clear scrollback buffers */
     if (!terminal_top_buffer) {
         terminal_top_cap = 128u;
         terminal_top_buffer = (uint16_t *)kmalloc(terminal_top_cap * (size_t)VGA_WIDTH * sizeof(uint16_t));
@@ -1965,7 +2185,6 @@ void terminal_initialize(void) {
     last_terminal_key_ms = 0;
     last_history_action_ms = 0;
 
-    /* Erase pending injected commands and serial input buffers */
     if (pending_terminal_input != NULL) {
         kfree(pending_terminal_input);
         pending_terminal_input = NULL;
@@ -1981,7 +2200,6 @@ void terminal_initialize(void) {
     printf("[terminal] Terminal interface initialized (call #%u, VGA 80x25 text mode, font cache ready).\n", s_terminal_init_count);
 }
 
-/* Print the command prompt */
 static void print_prompt(void) {
     terminal_suppress_external_hook = true;
     vga_hide_cursor();
@@ -2007,7 +2225,7 @@ static void print_prompt(void) {
     input_start_cursor = (int32_t)vga_get_cursor_position();
     previous_rendered_vis_len = 0;
 
-    /* Clear the remainder of the prompt line to avoid leftover artifacts from previous screen content */
+    /* Clear trailing cells on prompt line */
     volatile uint16_t *vga = VGA_MEMORY;
     int32_t line_end = ((input_start_cursor / VGA_WIDTH) + 1) * VGA_WIDTH;
     if (line_end > VGA_WIDTH * VGA_HEIGHT) {
@@ -2018,7 +2236,6 @@ static void print_prompt(void) {
     }
 
     if (input_buf != NULL && input_len > 0) {
-        /* Restore existing user input on the new line! */
         render_input_line(0);
     } else {
         input_len = 0;
@@ -2103,71 +2320,6 @@ void terminal_apply_pending_input(void) {
     kfree(text);
 }
 
-static void builtin_ifconfig(int argc, char **argv) {
-    net_if_t *netif = net_get_interface();
-    if (!netif) {
-        printf("ifconfig: no network interface available\n");
-        return;
-    }
-
-    if (argc >= 2) {
-        if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
-            printf("Usage: ifconfig [<ip> [netmask] [gateway] [dns]]\n");
-            return;
-        }
-
-        ip4_addr_t new_ip = 0;
-        if (!str_to_ip(argv[1], &new_ip)) {
-            printf("ifconfig: invalid IP address '%s'\n", argv[1]);
-            return;
-        }
-
-        ip4_addr_t netmask = 0;
-        if (argc >= 3) {
-            if (!str_to_ip(argv[2], &netmask)) {
-                printf("ifconfig: invalid netmask '%s'\n", argv[2]);
-                return;
-            }
-        }
-
-        ip4_addr_t gateway = 0;
-        if (argc >= 4) {
-            if (!str_to_ip(argv[3], &gateway)) {
-                printf("ifconfig: invalid gateway '%s'\n", argv[3]);
-                return;
-            }
-        }
-
-        ip4_addr_t dns = 0;
-        if (argc >= 5) {
-            if (!str_to_ip(argv[4], &dns)) {
-                printf("ifconfig: invalid DNS '%s'\n", argv[4]);
-                return;
-            }
-        }
-
-        net_set_ip(new_ip, netmask, gateway, dns);
-        printf("[ifconfig] Network settings updated.\n");
-    }
-
-    char *ip_str = ip_to_str_dyn(netif->ip);
-    char *mask_str = ip_to_str_dyn(netif->netmask);
-    char *gw_str = ip_to_str_dyn(netif->gateway);
-    char *dns_str = ip_to_str_dyn(netif->dns);
-
-    printf("eth0: flags=<%s> mtu 1500\n", netif->link_up ? "UP,RUNNING" : "DOWN");
-    printf("      inet %s  netmask %s\n", ip_str ? ip_str : "Unknown", mask_str ? mask_str : "Unknown");
-    printf("      gateway %s  dns %s\n", gw_str ? gw_str : "Unknown", dns_str ? dns_str : "Unknown");
-    char *mac_buf = mac_format_dyn(&netif->mac);
-    printf("      ether %s\n", (mac_buf && mac_buf[0]) ? mac_buf : "00:00:00:00:00:00");
-    if (mac_buf) kfree(mac_buf);
-
-    if (ip_str) kfree(ip_str);
-    if (mask_str) kfree(mask_str);
-    if (gw_str) kfree(gw_str);
-    if (dns_str) kfree(dns_str);
-}
-
 static void builtin_hardware(int argc, char **argv) {
     if (argc < 2 || strcmp(argv[1], "overview") == 0) {
         printf("================ IPO_OS Hardware Resources Overview ================\n");
@@ -2191,8 +2343,15 @@ static void builtin_hardware(int argc, char **argv) {
         printf("  Storage:   %u ATA/IDE drive(s) present, pool capacity: %u MiB\n",
                ata_get_device_count(), (uint32_t)(ata_get_pool_capacity() / 2048ull));
 
-        uint32_t net_devs = device_get_count_by_type(DEVICE_TYPE_NETWORK);
-        printf("  Network:   %u network interface(s) registered\n", net_devs);
+        uint32_t active_net = 0;
+        for (const device_node_t *dn = device_get_list(); dn; dn = dn->next) {
+            if (dn->type == DEVICE_TYPE_NETWORK && dn->state == DEVICE_STATE_ACTIVE &&
+                dn->driver_name && dn->driver_name[0]) {
+                active_net++;
+            }
+        }
+        printf("  Network:   %u active interface(s) (%u PCI controller(s) discovered)\n",
+               active_net, device_get_count_by_type(DEVICE_TYPE_NETWORK));
 
         printf("  Registry:  Total devices: %u (ACTIVE: %u, INITIALIZED: %u)\n",
                device_get_count(),
@@ -2224,7 +2383,7 @@ static void builtin_hardware(int argc, char **argv) {
                         snprintf(res_str, res_size, "IO 0x%x", curr->res.io_base);
                     }
                 } else if (curr->res.mmio_base != 0) {
-                    snprintf(res_str, res_size, "MMIO 0x%x", curr->res.mmio_base);
+                    snprintf(res_str, res_size, "MMIO 0x%llx", (unsigned long long)curr->res.mmio_base);
                 } else if (curr->res.irq > 0 && curr->res.irq < 255) {
                     snprintf(res_str, res_size, "IRQ %u", curr->res.irq);
                 } else {
@@ -2261,18 +2420,21 @@ static void builtin_hardware(int argc, char **argv) {
         if (features) kfree(features);
 
         printf("\n  Logical Cores Table:\n");
-        printf("  CORE  LAPIC  ROLE     STATUS   TICKS       STACK TOP   STACK BASE\n");
-        printf("  --------------------------------------------------------------------\n");
+        printf("  CORE  LAPIC  ROLE     STATUS   TICKS       STACK TOP           STACK BASE\n");
+        printf("  ------------------------------------------------------------------------------\n");
         for (uint32_t i = 0; i < smp_get_cpu_count(); i++) {
             const cpu_info_t *c = smp_get_cpu_info(i);
             if (!c) continue;
-            printf("  %-4u  %-5u  %-7s  %-7s  %-10u  0x%08x  0x%08x\n",
+            printf("  %-4u  %-5u  %-7s  %-7s  %-10u  0x%016llx  0x%016llx\n",
                    c->cpu_id, c->lapic_id,
                    c->is_bsp ? "BSP" : "AP",
                    c->is_online ? "ONLINE" : "OFFLINE",
                    c->ticks,
-                   c->stack_top, c->stack_base);
+                   (unsigned long long)c->stack_top,
+                   (unsigned long long)c->stack_base);
         }
+
+        cpu_info_print_report();
 
         const smp_architecture_status_t *as = smp_get_architecture_status();
         printf("\n  SMP Architectural Components Status:\n");
@@ -2394,18 +2556,20 @@ static void builtin_hardware(int argc, char **argv) {
     }
 
     if (strcmp(argv[1], "network") == 0) {
-        printf("=== Network Interfaces & Controllers ===\n");
+        printf("=== Network Hardware Controllers ===\n");
         uint32_t net_pci_count = 0;
         uint32_t count = pci_get_count();
         for (uint32_t i = 0; i < count; i++) {
             const pci_device_t *p = pci_get_device(i);
             if (!p || p->class_code != 0x02) continue;
             net_pci_count++;
-            printf("  Controller #%u: %s [0x%04X:0x%04X], Class 0x%02X:0x%02X\n",
+            printf("  Controller #%u: %s [0x%04X:0x%04X], Class 0x%02X:0x%02X, ProgIF 0x%02X, Rev 0x%02X\n",
                    net_pci_count,
                    (p->device_name && p->device_name[0]) ? p->device_name : "Unknown",
-                   p->vendor_id, p->device_id, p->class_code, p->subclass);
-            printf("     Vendor:    %s\n", (p->vendor_name && p->vendor_name[0]) ? p->vendor_name : "Unknown");
+                   p->vendor_id, p->device_id, p->class_code, p->subclass, p->prog_if, p->revision_id);
+            printf("     Vendor:    %s (Subsys 0x%04X:0x%04X)\n",
+                   (p->vendor_name && p->vendor_name[0]) ? p->vendor_name : "Unknown",
+                   p->subsys_vendor_id, p->subsys_id);
             printf("     Location:  PCI %02x:%02x.%x, IRQ: %u\n",
                    p->bus, p->slot, p->func, p->irq);
             for (size_t b = 0; b < p->bar_count; b++) {
@@ -2416,29 +2580,10 @@ static void builtin_hardware(int argc, char **argv) {
                     printf("     BAR[%u]:    MMIO 0x%08x\n", (unsigned)b, (unsigned int)(p->bar[b] & ~0xFu));
                 }
             }
-
-            if (rtl8139_is_present() && p->vendor_id == rtl8139_get_vendor_id() && p->device_id == rtl8139_get_device_id()) {
-                size_t m_len = 0;
-                const uint8_t *m = rtl8139_get_mac(&m_len);
-                if (m && m_len > 0) {
-                    mac_addr_t tmp_mac;
-                    mac_init(&tmp_mac);
-                    mac_set(&tmp_mac, m, m_len);
-                    char *m_str = mac_format_dyn(&tmp_mac);
-                    printf("     MAC:       %s\n", m_str ? m_str : "Unknown");
-                    if (m_str) kfree(m_str);
-                    mac_free(&tmp_mac);
-                } else {
-                    printf("     MAC:       Unknown\n");
-                }
-                uint16_t io = (p->bar_count > 0) ? (uint16_t)(p->bar[0] & ~3u) : 0;
-                if (io != 0) {
-                    uint8_t msr = inb(io + 0x58);
-                    bool link_up = (msr & 0x04) == 0;
-                    int speed = (msr & 0x08) ? 10 : 100;
-                    printf("     Hardware:  Link %s (%d Mbps)\n", link_up ? "UP" : "DOWN", speed);
-                }
-            }
+            uint16_t pci_cmd = pci_read_word(p->bus, p->slot, p->func, 0x04);
+            printf("     PCI State: %s (Cmd=0x%04X)\n",
+                   (pci_cmd & 0x07u) ? "ACTIVE" : "INITIALIZED",
+                   pci_cmd);
         }
         if (net_pci_count == 0) {
             printf("  No physical PCI network controllers detected.\n");
@@ -2681,12 +2826,12 @@ static void builtin_storage(int argc, char **argv) {
     printf("Usage: storage [list | status | usage | check | create [uuid] [dev] | add <dev> | recover | save]\n");
 }
 
-static void builtin_symbols(int argc, char **argv) {
+static void builtin_kernel_symbols(int argc, char **argv) {
     const char *filter = (argc >= 2) ? argv[1] : NULL;
     size_t count = 0;
     const kernel_sym_entry_t *syms = kmod_get_symbols(&count);
     if (!syms || count == 0) {
-        printf("symbols: No kernel symbols found.\n");
+        printf("kernel_symbols: No kernel symbols found.\n");
         return;
     }
     printf("=== Kernel Symbols (%u total) ===\n", (uint32_t)count);
@@ -2706,7 +2851,7 @@ static void builtin_drivers(int argc, char **argv) {
     if (argc < 2 || strcmp(argv[1], "list") == 0) {
         printf("=== Loaded Drivers & Dynamic Modules ===\n");
         printf("  Loaded Dynamic Drivers:  %u active\n", driver_count_kernel() + driver_count_user());
-        printf("  Dynamic Modules (KMOD):  %u loaded (ABI 0x%04x)\n\n", kmod_count(), KMOD_ABI_VERSION);
+        printf("  Dynamic Modules (KMOD):  %u loaded\n\n", kmod_count());
         driver_print_list();
         printf("\n");
         kmod_print_list();
@@ -2719,9 +2864,7 @@ static void builtin_drivers(int argc, char **argv) {
         printf("=== Driver Subsystem Status ===\n");
         printf("  Loaded Dynamic Drivers:  %u active\n", driver_count_kernel() + driver_count_user());
         printf("  Dynamic Modules (KMOD):  %u loaded\n", kmod_count());
-        printf("  KMOD ABI Version:        0x%04x (v1.0)\n", KMOD_ABI_VERSION);
         printf("  Kernel Symbols:          %u entries\n", (uint32_t)ksym_cnt);
-        printf("  KMOD Executable Format:  IKMD Header, Relocatable 32-bit ELF payload\n");
         return;
     }
 
@@ -2739,9 +2882,7 @@ static void builtin_drivers(int argc, char **argv) {
             printf("=== Dynamic Driver Module: %s ===\n", (mod->name && mod->name[0]) ? mod->name : "Unknown");
             printf("  Module ID:   %u\n", mod->id);
             printf("  Author:      %s\n", (mod->author && mod->author[0]) ? mod->author : "Unknown");
-            printf("  Version:     %s\n", (mod->version && mod->version[0]) ? mod->version : "Unknown");
             printf("  Description: %s\n", (mod->description && mod->description[0]) ? mod->description : "Unknown");
-            printf("  ABI Version: 0x%04x\n", mod->abi_version);
             printf("  Memory Base: %p (%u bytes)\n", mod->image_base, (uint32_t)mod->image_size);
             printf("  References:  %u\n", mod->ref_count);
             printf("  Status:      %s\n", (mod->flags & KMOD_FLAG_ACTIVE) ? "ACTIVE" : "LOADED");
@@ -2809,11 +2950,6 @@ static void builtin_drivers(int argc, char **argv) {
         return;
     }
 
-    if (strcmp(argv[1], "symbols") == 0 || strcmp(argv[1], "syms") == 0) {
-        builtin_symbols(argc - 1, argv + 1);
-        return;
-    }
-
     printf("drivers: unknown subcommand '%s'.\n", argv[1]);
     printf("Usage: drivers [list | info <id/name> | load <path> | unload <id/name> | status]\n");
 }
@@ -2829,7 +2965,6 @@ int try_execute_command(const char *cmdline) {
     }
     const char *name = argv[0];
 
-    // Check Builtins
     int builtin_handled = 0;
     if (strcmp(name, "help") == 0) {
         builtin_help();
@@ -2894,8 +3029,8 @@ int try_execute_command(const char *cmdline) {
     } else if (strcmp(name, "drivers") == 0) {
         builtin_drivers(argc, argv);
         builtin_handled = 1;
-    } else if (strcmp(name, "symbols") == 0) {
-        builtin_symbols(argc, argv);
+    } else if (strcmp(name, "kernel_symbols") == 0) {
+        builtin_kernel_symbols(argc, argv);
         builtin_handled = 1;
     } else if (strcmp(name, "storage") == 0) {
         builtin_storage(argc, argv);
@@ -2906,14 +3041,16 @@ int try_execute_command(const char *cmdline) {
     } else if (strcmp(name, "return") == 0) {
         builtin_show_return(argc, argv);
         builtin_handled = 1;
-    } else if (strcmp(name, "ifconfig") == 0) {
-        builtin_ifconfig(argc, argv);
+    } else if (strcmp(name, "rtc") == 0) {
+        builtin_rtc(argc, argv);
         builtin_handled = 1;
     } else if (strcmp(name, "hardware") == 0) {
         builtin_hardware(argc, argv);
         builtin_handled = 1;
+    } else if (strcmp(name, "cpuinfo") == 0) {
+        cpu_info_print_report();
+        builtin_handled = 1;
     } else if (strcmp(name, "run") == 0) {
-        /* Find the part of cmdline after "run " */
         const char *run_args = cmdline;
         while (*run_args == ' ' || *run_args == '\t') run_args++;
         if (strncmp(run_args, "run", 3) == 0) run_args += 3;
@@ -2924,7 +3061,6 @@ int try_execute_command(const char *cmdline) {
         process_set_last_exit_code(res);
         return 1000;
     } else if (strcmp(name, "startwm") == 0) {
-        /* Start the WM video-mode session */
         if (!wm_session_active()) {
             wm_session_start();
         }
@@ -2939,7 +3075,6 @@ int try_execute_command(const char *cmdline) {
         }
         builtin_handled = 1;
     } else if (strcmp(name, "stopwm") == 0) {
-        /* Stop the WM session and return to text mode */
         wm_session_stop();
         builtin_handled = 1;
     } else if (strcmp(name, "resolution") == 0) {
@@ -2952,20 +3087,17 @@ int try_execute_command(const char *cmdline) {
     if (builtin_handled) {
         process_set_last_exit_code(0);
         cmdline_free_args(argc, argv);
-        return 1000; // Special code for builtin success
+        return 1000; /* builtin handled */
     }
 
-    // Resolve to filesystem path for external executables
     char *path = resolve_command_path(name);
     if (!path) {
         cmdline_free_args(argc, argv);
-        return 0; // not found
+        return 0; /* not found */
     }
 
-    // Execute program with arguments (supports ELF, scripts, and flat binaries natively)
     int result = universal_process_execute(path, argc, argv);
 
-    // Free allocated argument copies
     cmdline_free_args(argc, argv);
     kfree(path);
     return result;
@@ -2978,12 +3110,11 @@ void terminal_poll_serial_commands(void) {
 
     static bool serial_wm_prompt_shown = false;
 
-    /* When WM session is active, show '> ' prompt via serial once per input cycle */
+    /* Emit one serial prompt per input cycle while WM is active */
     if (wm_session_active() && !serial_wm_prompt_shown && s_serial_cmd_len == 0) {
         serial_printf("> ");
         serial_wm_prompt_shown = true;
     }
-    /* If WM session ended, reset prompt state */
     if (!wm_session_active()) {
         serial_wm_prompt_shown = false;
     }
@@ -3081,7 +3212,7 @@ void terminal_poll_serial_commands(void) {
 }
 
 void terminal_console(void){
-    /* Poll and process serial commands in all states, including active WM */
+    /* Poll serial even when WM is active */
     terminal_poll_serial_commands();
 
     if (terminal_input_locked || system_is_input_state() || system_get_state() == SYSTEM_STATE_PROCESS_RUNNING) {
@@ -3094,10 +3225,8 @@ void terminal_console(void){
         system_set_state(SYSTEM_STATE_TERMINAL_IDLE);
     }
 
-    /* When the WM session is active, run the compositor directly and return.
-       Must happen BEFORE driver_dispatch_tick() and terminal_language_bar_tick()
-       to prevent text-mode VGA writes (cursor blink, language bar rendering)
-       from corrupting the Mode 13h CRTC registers. */
+    /* Run WM compositor before text-mode ticks so cursor blink or language bar
+       updates do not touch VGA memory or CRTC registers in Mode 13h. */
     if (wm_session_active()) {
         wm_compositor_tick();
         return;
@@ -3116,7 +3245,6 @@ void terminal_console(void){
 
         bool is_break_code = (scancode & 0x80) != 0;
 
-        /* Check external driver key filter first */
         if (driver_dispatch_key(scancode, is_break_code)) {
             return;
         }
@@ -3136,7 +3264,7 @@ void terminal_console(void){
             last_terminal_key_ms = now;
         }
 
-        /* Default Ctrl + C: clear current command input */
+        /* Ctrl+C clears current input line */
         if (!is_break_code && keyboard_is_ctrl_pressed() && scancode == 0x2E) {
             sound_stop();
             system_clear_interrupt();
@@ -3149,12 +3277,6 @@ void terminal_console(void){
             return;
         }
 
-        /* Keybindings:
-         * Left / Right arrows: cursor movement in current line
-         * Up / Down arrows: command history navigation
-         * PageUp / PageDown: screen scrolling
-         * Home / End / Delete: in-line editing
-         */
         if (!is_break_code) {
             if (scancode == SC_PAGE_UP) {
                 if (*active_top_count() > 0) {
@@ -3297,10 +3419,8 @@ void terminal_console(void){
         if (!is_break_code) {
             const char *out_str = keyboard_get_key_string(scancode);
             if (out_str != NULL && out_str[0] != '\0') {
-                // Return to present when user starts typing
                 terminal_return_to_present();
                 
-                /* Handle newline / carriage return */
                 if (out_str[0] == '\n' || out_str[0] == '\r') {
                     terminal_suppress_external_hook = true;
                     size_t vis_end = terminal_visual_offset(input_len);
@@ -3336,7 +3456,6 @@ void terminal_console(void){
                         }
                     }
 
-                    /* Reset buffer */
                     input_len = 0;
                     cursor_pos = 0;
                     if (input_buf != NULL) {
@@ -3348,12 +3467,12 @@ void terminal_console(void){
                     command_history_index = -1;
                     prompt_shown = false;
                     terminal_suppress_external_hook = false;
-                    /* Don't print the prompt if we just entered graphics mode */
+                    /* Skip prompt if the command switched to graphics mode */
                     if (!wm_session_active()) {
                         print_prompt();
                     }
                 }
-                /* Handle backspace (UTF-8 aware) */
+                /* UTF-8 aware backspace */
                 else if (out_str[0] == '\b' || out_str[0] == 127) {
                     if (cursor_pos > 0 && input_buf != NULL) {
                         size_t del_bytes = 1;
@@ -3369,7 +3488,6 @@ void terminal_console(void){
                         render_input_line(old_len);
                     }
                 }
-                /* Handle tab */
                 else if (out_str[0] == '\t') {
                     ensure_input_buffer(input_len + 1u);
                     if (input_buf != NULL) {
@@ -3382,7 +3500,6 @@ void terminal_console(void){
                         render_input_line(old_len);
                     }
                 }
-                /* Printable string (arbitrary length: UTF-8 character, word, symbol, emoji) */
                 else {
                     size_t slen = strlen(out_str);
                     ensure_input_buffer(input_len + slen + 1u);
@@ -3401,7 +3518,6 @@ void terminal_console(void){
     }
 }
 
-/* Auto scroll when terminal overflows - keep only current screen in RAM */
 void terminal_auto_scroll(void) {
     volatile uint16_t *vga = VGA_MEMORY;
 

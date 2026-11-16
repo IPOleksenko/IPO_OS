@@ -3,52 +3,37 @@
 
 #include <stdint.h>
 
-/**
- * Initialize sound driver
- */
 void sound_init(void);
 
-/**
- * Play sound at specified frequency (Hz)
- * @param frequency Frequency in Hz (440 = A4, typical range 37-20000 Hz)
- */
+/* Frequency in Hz (440 = A4, ~37..20000 Hz) */
 void sound_play(uint32_t frequency);
 
-/**
- * Stop playing sound
- */
 void sound_stop(void);
 
-/**
- * Play beep with specified duration
- * @param frequency Frequency in Hz
- * @param duration Duration in milliseconds (approximate)
- */
+/* Duration in ms (approximate) */
 void sound_beep(uint32_t frequency, uint32_t duration);
 
-/**
- * Play OS boot startup melody via active audio backend or PC speaker
- */
+/* Play boot chime on active audio backend or PC speaker */
 void play_startup_sound(void);
 
-/* Define musical notes with their corresponding frequencies (in Hz) */
+/* Note frequencies in Hz */
 #define NOTE_REST 0
 
-/* Notes for octave 1 (C1–B1) */
+/* Octave 1 (C1-B1) */
 #define NOTE_C1   33
-#define NOTE_CS1  35  // C#1
+#define NOTE_CS1  35
 #define NOTE_D1   37
-#define NOTE_DS1  39  // D#1
+#define NOTE_DS1  39
 #define NOTE_E1   41
 #define NOTE_F1   44
-#define NOTE_FS1  46  // F#1
+#define NOTE_FS1  46
 #define NOTE_G1   49
-#define NOTE_GS1  52  // G#1
+#define NOTE_GS1  52
 #define NOTE_A1   55
-#define NOTE_AS1  58  // A#1
+#define NOTE_AS1  58
 #define NOTE_B1   62
 
-/* Notes for octave 2 (C2–B2) */
+/* Octave 2 (C2-B2) */
 #define NOTE_C2   65
 #define NOTE_CS2  69
 #define NOTE_D2   73
@@ -62,7 +47,7 @@ void play_startup_sound(void);
 #define NOTE_AS2  117
 #define NOTE_B2   123
 
-/* Notes for octave 3 (C3–B3) */
+/* Octave 3 (C3-B3) */
 #define NOTE_C3   131
 #define NOTE_CS3  139
 #define NOTE_D3   147
@@ -76,7 +61,7 @@ void play_startup_sound(void);
 #define NOTE_AS3  233
 #define NOTE_B3   247
 
-/* Notes for octave 4 (C4–B4) */
+/* Octave 4 (C4-B4) */
 #define NOTE_C4   261
 #define NOTE_CS4  277
 #define NOTE_D4   294
@@ -90,7 +75,7 @@ void play_startup_sound(void);
 #define NOTE_AS4  466
 #define NOTE_B4   494
 
-/* Notes for octave 5 (C5–B5) */
+/* Octave 5 (C5-B5) */
 #define NOTE_C5   523
 #define NOTE_CS5  554
 #define NOTE_D5   587
@@ -104,7 +89,7 @@ void play_startup_sound(void);
 #define NOTE_AS5  932
 #define NOTE_B5   988
 
-/* Notes for octave 6 (C6–B6) */
+/* Octave 6 (C6-B6) */
 #define NOTE_C6   1047
 #define NOTE_CS6  1109
 #define NOTE_D6   1175
@@ -118,7 +103,7 @@ void play_startup_sound(void);
 #define NOTE_AS6  1865
 #define NOTE_B6   1976
 
-/* Notes for octave 7 (C7–B7) */
+/* Octave 7 (C7-B7) */
 #define NOTE_C7   2093
 #define NOTE_CS7  2217
 #define NOTE_D7   2349
@@ -132,7 +117,7 @@ void play_startup_sound(void);
 #define NOTE_AS7  3729
 #define NOTE_B7   3951
 
-/* Notes for octave 8 (C8–B8) */
+/* Octave 8 (C8-B8) */
 #define NOTE_C8   4186
 #define NOTE_CS8  4435
 #define NOTE_D8   4699

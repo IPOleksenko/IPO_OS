@@ -5,9 +5,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/**
- * Standard string and memory routines
- */
 char* strcpy(char *dest, const char *src);
 char* strcat(char *dest, const char *src);
 void* memset(void *s, int c, size_t n);
@@ -27,7 +24,6 @@ void print_padded(const char *s, int width);
 int format_size(uint64_t bytes, char *buf, size_t buf_size);
 char *format_size_dynamic(uint64_t bytes);
 
-/* Command argument tokenization */
 int cmdline_split(const char *cmdline, int *out_argc, char ***out_argv);
 void cmdline_free_args(int argc, char **argv);
 

@@ -7,7 +7,7 @@
 #include <driver/input/keyboard.h>
 #include <driver/input/mouse.h>
 #include <driver/input/keymap/keymap.h>
-#include <driver/net/pci.h>
+#include <driver/pci.h>
 #include <memory/address_space.h>
 #include <memory/memory_map.h>
 #include <memory/kmalloc.h>
@@ -37,7 +37,7 @@ static uint32_t s_pressed_count = 0u;
 static uint32_t s_pressed_cap = 0u;
 static uint32_t s_ext_modifiers = 0u;
 
-/* Per-PID Extended Key Queue (for processes that subscribe/poll) */
+/* Per-PID key event queue */
 typedef struct {
     bool active;
     uint32_t pid;
@@ -92,6 +92,7 @@ typedef struct {
     uint32_t owner_pid;
     uint32_t device_node_id;
     ipo_input_dev_desc_t desc;
+    char *desc_name;
     uint32_t event_count;
     input_dev_axis_t *axes;
     uint32_t axis_count;
@@ -133,10 +134,10 @@ static uint32_t s_next_ps2_handle = 1u;
 typedef struct {
     bool active;
     bool is_dma;
-    uint32_t owner_pid;
-    uint32_t virt_base;
-    uint32_t phys_base;
-    uint32_t aligned_size;
+    ipo_id_t owner_pid;
+    ipo_vaddr_t virt_base;
+    ipo_paddr_t phys_base;
+    ipo_size_t aligned_size;
 } hw_map_entry_t;
 
 typedef struct {
@@ -153,9 +154,80 @@ static uint32_t s_user_dev_cap = 0u;
 
 static void shortcut_reconcile_chord_states(void);
 
+static bool key_decoder_ensure_cap(ipo_key_decoder_t *dec, uint8_t need) {
+    if (!dec) return false;
+    if (dec->raw_buf && need <= dec->cap) return true;
+    uint16_t ncap = dec->cap ? (uint16_t)dec->cap : 4u;
+    while (ncap < need && ncap < 255u) {
+        ncap = (ncap <= 127u) ? (uint16_t)(ncap * 2u) : 255u;
+    }
+    if (ncap < need) return false;
+    uint8_t *nb = (uint8_t *)krealloc(dec->raw_buf, (size_t)ncap);
+    if (!nb) return false;
+    if (ncap > dec->cap) {
+        memset(nb + dec->cap, 0, (size_t)(ncap - dec->cap));
+    }
+    dec->raw_buf = nb;
+    dec->cap = (uint8_t)ncap;
+    return true;
+}
+
 void ipo_key_decoder_reset(ipo_key_decoder_t *dec) {
     if (!dec) return;
+    uint8_t *buf = dec->raw_buf;
+    uint8_t cap = dec->cap;
     memset(dec, 0, sizeof(*dec));
+    dec->raw_buf = buf;
+    dec->cap = cap;
+    if (buf && cap > 0u) {
+        memset(buf, 0, cap);
+    }
+}
+
+void ipo_key_decoder_free(ipo_key_decoder_t *dec) {
+    if (!dec) return;
+    if (dec->raw_buf) {
+        kfree(dec->raw_buf);
+    }
+    memset(dec, 0, sizeof(*dec));
+}
+
+static bool key_ev_set_raw_bytes(ipo_key_event_t *ev, const uint8_t *bytes, uint32_t len) {
+    if (!ev) return false;
+    if (len == 0u || !bytes) {
+        ev->raw_len = 0u;
+        return true;
+    }
+    if (!ev->raw_bytes || ev->raw_cap < len) {
+        uint8_t *nb = (uint8_t *)krealloc(ev->raw_bytes, len);
+        if (!nb) return false;
+        ev->raw_bytes = nb;
+        ev->raw_cap = len;
+    }
+    memcpy(ev->raw_bytes, bytes, len);
+    ev->raw_len = len;
+    return true;
+}
+
+static void key_ev_reset_preserving_buf(ipo_key_event_t *ev) {
+    uint8_t *saved_buf = ev->raw_bytes;
+    uint32_t saved_cap = ev->raw_cap;
+    memset(ev, 0, sizeof(*ev));
+    ev->raw_bytes = saved_buf;
+    ev->raw_cap = saved_cap;
+}
+
+static void copy_str_to_caller(const char *src, char *dst, uint32_t dst_cap, uint32_t *out_len) {
+    uint32_t len = src ? (uint32_t)strlen(src) : 0u;
+    if (out_len) *out_len = len;
+    if (!dst || dst_cap == 0u) return;
+    if (!src || len == 0u) {
+        dst[0] = '\0';
+        return;
+    }
+    uint32_t copy_len = (len < dst_cap) ? len : (dst_cap - 1u);
+    if (copy_len > 0u) memcpy(dst, src, copy_len);
+    dst[copy_len] = '\0';
 }
 
 bool ipo_key_decoder_feed(ipo_key_decoder_t *dec, uint8_t raw_byte, ipo_key_event_t *out_ev) {
@@ -168,43 +240,52 @@ bool ipo_key_decoder_feed(ipo_key_decoder_t *dec, uint8_t raw_byte, ipo_key_even
 
     if (dec->state == DEC_IDLE) {
         if (raw_byte == 0xE0u) {
+            if (!key_decoder_ensure_cap(dec, 1u)) return false;
             dec->raw_buf[0] = 0xE0u;
             dec->len = 1u;
             dec->state = DEC_E0;
             return false;
         }
         if (raw_byte == 0xE1u) {
+            if (!key_decoder_ensure_cap(dec, 1u)) return false;
             dec->raw_buf[0] = 0xE1u;
             dec->len = 1u;
             dec->state = DEC_E1_B1;
             return false;
         }
-        memset(out_ev, 0, sizeof(*out_ev));
+        key_ev_reset_preserving_buf(out_ev);
         out_ev->keycode = (uint32_t)(raw_byte & 0x7Fu);
         out_ev->flags = (raw_byte & 0x80u) ? IPO_KEY_FLAG_BREAK : 0u;
-        out_ev->raw_len = 1u;
-        out_ev->raw_bytes[0] = raw_byte;
         out_ev->timestamp_ms = timer_millis();
-        return true;
+        return key_ev_set_raw_bytes(out_ev, &raw_byte, 1u);
     }
 
     if (dec->state == DEC_E0) {
         if (raw_byte == 0xE0u) {
             return false;
         }
-        memset(out_ev, 0, sizeof(*out_ev));
+        if (!key_decoder_ensure_cap(dec, 2u)) {
+            dec->state = DEC_IDLE;
+            dec->len = 0u;
+            return false;
+        }
+        dec->raw_buf[0] = 0xE0u;
+        dec->raw_buf[1] = raw_byte;
+        key_ev_reset_preserving_buf(out_ev);
         out_ev->keycode = IPO_KEY_MAKE_EXT_E0(raw_byte);
         out_ev->flags = IPO_KEY_FLAG_EXT_E0 | ((raw_byte & 0x80u) ? IPO_KEY_FLAG_BREAK : 0u);
-        out_ev->raw_len = 2u;
-        out_ev->raw_bytes[0] = 0xE0u;
-        out_ev->raw_bytes[1] = raw_byte;
         out_ev->timestamp_ms = timer_millis();
         dec->state = DEC_IDLE;
         dec->len = 0u;
-        return true;
+        return key_ev_set_raw_bytes(out_ev, dec->raw_buf, 2u);
     }
 
     if (dec->state == DEC_E1_B1) {
+        if (!key_decoder_ensure_cap(dec, 2u)) {
+            dec->state = DEC_IDLE;
+            dec->len = 0u;
+            return false;
+        }
         dec->e1_b1 = raw_byte;
         dec->raw_buf[1] = raw_byte;
         dec->len = 2u;
@@ -213,17 +294,21 @@ bool ipo_key_decoder_feed(ipo_key_decoder_t *dec, uint8_t raw_byte, ipo_key_even
     }
 
     /* DEC_E1_B2 */
-    memset(out_ev, 0, sizeof(*out_ev));
+    if (!key_decoder_ensure_cap(dec, 3u)) {
+        dec->state = DEC_IDLE;
+        dec->len = 0u;
+        return false;
+    }
+    dec->raw_buf[0] = 0xE1u;
+    dec->raw_buf[1] = dec->e1_b1;
+    dec->raw_buf[2] = raw_byte;
+    key_ev_reset_preserving_buf(out_ev);
     out_ev->keycode = IPO_KEY_MAKE_EXT_E1(dec->e1_b1, raw_byte);
     out_ev->flags = IPO_KEY_FLAG_EXT_E1 | ((dec->e1_b1 & 0x80u) ? IPO_KEY_FLAG_BREAK : 0u);
-    out_ev->raw_len = 3u;
-    out_ev->raw_bytes[0] = 0xE1u;
-    out_ev->raw_bytes[1] = dec->e1_b1;
-    out_ev->raw_bytes[2] = raw_byte;
     out_ev->timestamp_ms = timer_millis();
     dec->state = DEC_IDLE;
     dec->len = 0u;
-    return true;
+    return key_ev_set_raw_bytes(out_ev, dec->raw_buf, 3u);
 }
 
 static bool pressed_contains(uint32_t kc) {
@@ -368,8 +453,91 @@ static bool FN_NAME(SLOT_T *q, ELEM_T *out_ev) {                                
     return true;                                                                \
 }
 
-DEFINE_RING_PUSH(key_ring_push, key_sub_queue_t, ipo_key_event_t, 32u)
-DEFINE_RING_POP(key_ring_pop, key_sub_queue_t, ipo_key_event_t)
+static bool key_ring_push(key_sub_queue_t *q, const ipo_key_event_t *ev) {
+    if (!q || !ev) return false;
+    if (!q->ring) {
+        q->ring = (ipo_key_event_t *)kmalloc(32u * sizeof(ipo_key_event_t));
+        if (!q->ring) return false;
+        memset(q->ring, 0, 32u * sizeof(ipo_key_event_t));
+        q->cap = 32u;
+        q->head = 0u;
+        q->tail = 0u;
+    }
+    if (((q->head + 1u) % q->cap) == q->tail) {
+        uint32_t old_cap = q->cap;
+        uint32_t new_cap = old_cap * 2u;
+        ipo_key_event_t *nb = (ipo_key_event_t *)kmalloc(new_cap * sizeof(ipo_key_event_t));
+        if (!nb) {
+            if (q->ring[q->tail].raw_bytes) {
+                kfree(q->ring[q->tail].raw_bytes);
+                q->ring[q->tail].raw_bytes = NULL;
+                q->ring[q->tail].raw_cap = 0u;
+            }
+            q->tail = (q->tail + 1u) % old_cap;
+        } else {
+            memset(nb, 0, new_cap * sizeof(ipo_key_event_t));
+            uint32_t cnt = (q->head - q->tail + old_cap) % old_cap;
+            for (uint32_t i = 0; i < cnt; i++) {
+                nb[i] = q->ring[(q->tail + i) % old_cap];
+            }
+            kfree(q->ring);
+            q->ring = nb;
+            q->tail = 0u;
+            q->head = cnt;
+            q->cap = new_cap;
+        }
+    }
+    ipo_key_event_t *dst = &q->ring[q->head];
+    if (dst->raw_bytes) {
+        kfree(dst->raw_bytes);
+        dst->raw_bytes = NULL;
+        dst->raw_cap = 0u;
+    }
+    *dst = *ev;
+    dst->raw_bytes = NULL;
+    dst->raw_cap = 0u;
+    if (ev->raw_bytes && ev->raw_len > 0u) {
+        uint8_t *copy = (uint8_t *)kmalloc(ev->raw_len);
+        if (copy) {
+            memcpy(copy, ev->raw_bytes, ev->raw_len);
+            dst->raw_bytes = copy;
+            dst->raw_cap = ev->raw_len;
+        } else {
+            dst->raw_len = 0u;
+        }
+    }
+    q->head = (q->head + 1u) % q->cap;
+    return true;
+}
+
+static bool key_ring_pop(key_sub_queue_t *q, ipo_key_event_t *out_ev) {
+    if (!q || !q->ring || q->cap == 0u || q->head == q->tail || !out_ev) return false;
+    ipo_key_event_t *src = &q->ring[q->tail];
+    uint8_t *caller_buf = out_ev->raw_bytes;
+    uint32_t caller_cap = out_ev->raw_cap;
+
+    out_ev->keycode = src->keycode;
+    out_ev->modifiers = src->modifiers;
+    out_ev->flags = src->flags;
+    out_ev->source_dev_id = src->source_dev_id;
+    out_ev->timestamp_ms = src->timestamp_ms;
+    out_ev->raw_bytes = caller_buf;
+    out_ev->raw_cap = caller_cap;
+    out_ev->raw_len = src->raw_len;
+
+    if (caller_buf && caller_cap > 0u && src->raw_bytes && src->raw_len > 0u) {
+        uint32_t n = (src->raw_len < caller_cap) ? src->raw_len : caller_cap;
+        memcpy(caller_buf, src->raw_bytes, n);
+    }
+    if (src->raw_bytes) {
+        kfree(src->raw_bytes);
+        src->raw_bytes = NULL;
+        src->raw_cap = 0u;
+    }
+    src->raw_len = 0u;
+    q->tail = (q->tail + 1u) % q->cap;
+    return true;
+}
 
 DEFINE_RING_PUSH(shortcut_ring_push, shortcut_queue_t, ipo_shortcut_event_t, 32u)
 DEFINE_RING_POP(shortcut_ring_pop, shortcut_queue_t, ipo_shortcut_event_t)
@@ -627,7 +795,7 @@ bool ipo_input_process_key_event(const ipo_key_event_t *in_ev,
     bool is_repeat = false;
 
     if (is_break) {
-        /* For ON_RELEASE shortcuts: check before removing from pressed set */
+        /* Check ON_RELEASE chords before dropping the key from pressed set */
         uint32_t mods = ipo_input_get_modifiers();
         bool consumed = false;
         for (uint32_t i = 0; i < s_shortcut_cap; i++) {
@@ -671,7 +839,7 @@ bool ipo_input_process_key_event(const ipo_key_event_t *in_ev,
     ev.modifiers = mods;
     if (is_repeat) ev.flags |= IPO_KEY_FLAG_REPEAT;
 
-    /* Evaluate shortcuts: pass 0 = focused app/window, pass 1 = global */
+    /* Pass 0: focused window/app, pass 1: global shortcuts */
     bool consumed = false;
     for (int pass = 0; pass < 2; pass++) {
         for (uint32_t i = 0; i < s_shortcut_cap; i++) {
@@ -719,7 +887,7 @@ bool ipo_input_process_key_event(const ipo_key_event_t *in_ev,
 }
 
 uint32_t ipo_input_dev_register(const ipo_input_dev_desc_t *desc, uint32_t owner_pid) {
-    if (!desc || desc->name[0] == '\0') return 0u;
+    if (!desc || !desc->name || desc->name[0] == '\0') return 0u;
 
     uint32_t slot = s_input_dev_cap;
     for (uint32_t i = 0; i < s_input_dev_cap; i++) {
@@ -734,6 +902,11 @@ uint32_t ipo_input_dev_register(const ipo_input_dev_desc_t *desc, uint32_t owner
         s_input_dev_cap = nc;
     }
 
+    size_t nlen = strlen(desc->name);
+    char *name_copy = (char *)kmalloc(nlen + 1u);
+    if (!name_copy) return 0u;
+    memcpy(name_copy, desc->name, nlen + 1u);
+
     uint32_t id = s_next_input_dev_id++;
     if (s_next_input_dev_id == 0u) s_next_input_dev_id = 1u;
 
@@ -743,7 +916,8 @@ uint32_t ipo_input_dev_register(const ipo_input_dev_desc_t *desc, uint32_t owner
     dev->id = id;
     dev->owner_pid = owner_pid;
     dev->desc = *desc;
-    dev->desc.name[sizeof(dev->desc.name) - 1u] = '\0';
+    dev->desc_name = name_copy;
+    dev->desc.name = dev->desc_name;
 
     device_node_t node;
     device_node_init(&node);
@@ -754,8 +928,8 @@ uint32_t ipo_input_dev_register(const ipo_input_dev_desc_t *desc, uint32_t owner
                         : BUS_TYPE_VIRTUAL;
     node.res.vendor_id = desc->vendor_id;
     node.res.device_id = desc->product_id;
-    device_node_set_name(&node, dev->desc.name);
-    device_node_set_model(&node, dev->desc.name);
+    device_node_set_name(&node, dev->desc_name);
+    device_node_set_model(&node, dev->desc_name);
     device_node_set_description(&node, "External Registered Input Device");
     device_node_t *reg = device_register(&node);
     dev->device_node_id = reg ? reg->id : 0u;
@@ -772,6 +946,11 @@ static void free_input_dev_slot(input_dev_slot_t *dev) {
         device_unregister(dev->device_node_id);
         dev->device_node_id = 0u;
     }
+    if (dev->desc_name) {
+        kfree(dev->desc_name);
+        dev->desc_name = NULL;
+    }
+    dev->desc.name = NULL;
     if (dev->axes) {
         kfree(dev->axes);
         dev->axes = NULL;
@@ -895,7 +1074,6 @@ uint32_t ipo_input_dev_list(ipo_input_dev_info_t *out_arr, uint32_t max_count) {
         if (out_arr && total < max_count) {
             input_dev_slot_t *d = &s_input_devs[i];
             ipo_input_dev_info_t *info = &out_arr[total];
-            memset(info, 0, sizeof(*info));
             info->id = d->id;
             info->owner_pid = d->owner_pid;
             info->device_node_id = d->device_node_id;
@@ -903,9 +1081,10 @@ uint32_t ipo_input_dev_list(ipo_input_dev_info_t *out_arr, uint32_t max_count) {
             info->bus_type = d->desc.bus_type;
             info->vendor_id = d->desc.vendor_id;
             info->product_id = d->desc.product_id;
-            info->version = d->desc.version;
+            info->pad0 = 0u;
             info->event_count = d->event_count;
-            strncpy(info->name, d->desc.name, sizeof(info->name) - 1u);
+            copy_str_to_caller(d->desc_name ? d->desc_name : d->desc.name,
+                               info->name, info->name_cap, &info->name_len);
         }
         total++;
     }
@@ -1019,8 +1198,8 @@ bool ipo_ps2_dispatch_byte(bool is_aux, uint8_t data) {
     ev.chan_mask = chan;
     ev.byte = data;
     ev.chan = (uint8_t)chan;
-    ev.reserved[0] = 0u;
-    ev.reserved[1] = 0u;
+    ev.pad0 = 0u;
+    ev.pad1 = 0u;
     ev.timestamp_ms = timer_millis();
 
     for (uint32_t i = 0; i < s_ps2_hook_cap; i++) {
@@ -1113,10 +1292,10 @@ int ipo_ps2_transact(const ipo_ps2_transact_req_t *req) {
     return 0;
 }
 
-static void hw_free_phys_pages(uint32_t phys_base, uint32_t aligned_size) {
-    uint32_t pages = aligned_size / HW_PAGE_SIZE;
-    for (uint32_t p = 0u; p < pages; p++) {
-        memory_page_free((void *)(uintptr_t)(phys_base + p * HW_PAGE_SIZE));
+static void hw_free_phys_pages(ipo_paddr_t phys_base, ipo_size_t aligned_size) {
+    ipo_size_t pages = aligned_size / HW_PAGE_SIZE;
+    for (ipo_size_t p = 0u; p < pages; p++) {
+        memory_page_free((void *)(ipo_vaddr_t)(phys_base + p * HW_PAGE_SIZE));
     }
 }
 
@@ -1134,34 +1313,36 @@ static hw_map_entry_t *alloc_hw_map_slot(void) {
     return res;
 }
 
-static bool hw_virt_range_in_use(uint32_t pid, uint32_t start, uint32_t size) {
-    uint64_t end = (uint64_t)start + size;
+static bool hw_virt_range_in_use(ipo_id_t pid, ipo_vaddr_t start, ipo_size_t size) {
+    ipo_vaddr_t end = 0u;
+    if (!ipo_vaddr_add_ok(start, size, &end)) return true;
     for (uint32_t i = 0; i < s_hw_map_cap; i++) {
         if (!s_hw_maps[i].active || s_hw_maps[i].owner_pid != pid) continue;
-        uint64_t s2 = s_hw_maps[i].virt_base;
-        uint64_t e2 = s2 + s_hw_maps[i].aligned_size;
+        ipo_vaddr_t s2 = s_hw_maps[i].virt_base;
+        ipo_vaddr_t e2 = s2 + s_hw_maps[i].aligned_size;
         if (start < e2 && end > s2) return true;
     }
     return false;
 }
 
-bool ipo_hw_user_range(uint32_t pid, const void *ptr, uint32_t length) {
+bool ipo_hw_user_range(ipo_id_t pid, const void *ptr, ipo_size_t length) {
     if (length == 0u) return true;
     if (!ptr || pid == 0u) return false;
-    uint64_t start = (uint32_t)(uintptr_t)ptr;
-    uint64_t end = start + length;
+    ipo_vaddr_t start = (ipo_vaddr_t)ptr;
+    ipo_vaddr_t end = 0u;
+    if (!ipo_vaddr_add_ok(start, length, &end)) return false;
     for (uint32_t i = 0; i < s_hw_map_cap; i++) {
         if (!s_hw_maps[i].active || s_hw_maps[i].owner_pid != pid) continue;
-        uint64_t s2 = s_hw_maps[i].virt_base;
-        uint64_t e2 = s2 + s_hw_maps[i].aligned_size;
+        ipo_vaddr_t s2 = s_hw_maps[i].virt_base;
+        ipo_vaddr_t e2 = s2 + s_hw_maps[i].aligned_size;
         if (start >= s2 && end <= e2) return true;
     }
     return false;
 }
 
-static uint32_t hw_find_free_va(uint32_t pid, uint32_t aligned_size) {
-    for (uint32_t va = HW_MMIO_VBASE_START;
-         va <= HW_MMIO_VBASE_END - aligned_size;
+static ipo_vaddr_t hw_find_free_va(ipo_id_t pid, ipo_size_t aligned_size) {
+    for (ipo_vaddr_t va = (ipo_vaddr_t)HW_MMIO_VBASE_START;
+         va <= (ipo_vaddr_t)HW_MMIO_VBASE_END - aligned_size;
          va += HW_PAGE_SIZE) {
         if (!hw_virt_range_in_use(pid, va, aligned_size)) {
             return va;
@@ -1170,28 +1351,27 @@ static uint32_t hw_find_free_va(uint32_t pid, uint32_t aligned_size) {
     return 0u;
 }
 
-void *ipo_hw_map_mmio(uint32_t phys_addr, uint32_t size, uint32_t flags, uint32_t owner_pid) {
+void *ipo_hw_map_mmio(ipo_paddr_t phys_addr, ipo_size_t size, uint32_t flags, ipo_id_t owner_pid) {
     if (size == 0u) return NULL;
-    uint32_t page_off = phys_addr & (HW_PAGE_SIZE - 1u);
-    uint32_t phys_base = phys_addr & ~(HW_PAGE_SIZE - 1u);
-    uint32_t aligned_size = (page_off + size + HW_PAGE_SIZE - 1u) & ~(HW_PAGE_SIZE - 1u);
+    ipo_paddr_t page_off = phys_addr & (HW_PAGE_SIZE - 1u);
+    ipo_paddr_t phys_base = phys_addr & ~(ipo_paddr_t)(HW_PAGE_SIZE - 1u);
+    ipo_size_t aligned_size = ((ipo_size_t)page_off + size + HW_PAGE_SIZE - 1u) & ~(ipo_size_t)(HW_PAGE_SIZE - 1u);
     if (aligned_size == 0u || aligned_size > (HW_MMIO_VBASE_END - HW_MMIO_VBASE_START)) {
         return NULL;
     }
 
     process_t *proc = owner_pid ? process_find_by_pid(owner_pid) : NULL;
     if (!proc || !proc->address_space) {
-        /* Kernel / shared context can address 32-bit physical MMIO directly */
-        return (void *)(uintptr_t)phys_addr;
+        return (void *)(ipo_vaddr_t)phys_addr;
     }
 
-    uint32_t virt_base = hw_find_free_va(owner_pid, aligned_size);
+    ipo_vaddr_t virt_base = hw_find_free_va(owner_pid, aligned_size);
     if (virt_base == 0u) return NULL;
 
     hw_map_entry_t *slot = alloc_hw_map_slot();
     if (!slot) return NULL;
 
-    uint32_t pte_flags = ADDRESS_SPACE_PAGE_PRESENT | ADDRESS_SPACE_PAGE_WRITABLE | ADDRESS_SPACE_PAGE_USER;
+    ipo_reg_t pte_flags = ADDRESS_SPACE_PAGE_PRESENT | ADDRESS_SPACE_PAGE_WRITABLE | ADDRESS_SPACE_PAGE_USER;
     if (flags == 0u || (flags & IPO_MMIO_CACHE_DISABLE)) {
         pte_flags |= ADDRESS_SPACE_PAGE_CACHE_DISABLE;
     }
@@ -1199,8 +1379,8 @@ void *ipo_hw_map_mmio(uint32_t phys_addr, uint32_t size, uint32_t flags, uint32_
         pte_flags |= ADDRESS_SPACE_PAGE_WRITE_THROUGH;
     }
 
-    uint32_t pages = aligned_size / HW_PAGE_SIZE;
-    for (uint32_t p = 0u; p < pages; p++) {
+    ipo_size_t pages = aligned_size / HW_PAGE_SIZE;
+    for (ipo_size_t p = 0u; p < pages; p++) {
         if (!address_space_map(proc->address_space,
                                virt_base + p * HW_PAGE_SIZE,
                                phys_base + p * HW_PAGE_SIZE,
@@ -1220,13 +1400,13 @@ void *ipo_hw_map_mmio(uint32_t phys_addr, uint32_t size, uint32_t flags, uint32_
     slot->phys_base = phys_base;
     slot->aligned_size = aligned_size;
 
-    return (void *)(uintptr_t)(virt_base + page_off);
+    return (void *)(ipo_vaddr_t)(virt_base + page_off);
 }
 
-int ipo_hw_unmap_mmio(void *virt_addr, uint32_t size, uint32_t caller_pid) {
+int ipo_hw_unmap_mmio(void *virt_addr, ipo_size_t size, ipo_id_t caller_pid) {
     (void)size;
     if (!virt_addr) return -1;
-    uint32_t va_base = (uint32_t)(uintptr_t)virt_addr & ~(HW_PAGE_SIZE - 1u);
+    ipo_vaddr_t va_base = (ipo_vaddr_t)virt_addr & ~(ipo_vaddr_t)(HW_PAGE_SIZE - 1u);
 
     for (uint32_t i = 0; i < s_hw_map_cap; i++) {
         hw_map_entry_t *m = &s_hw_maps[i];
@@ -1234,8 +1414,8 @@ int ipo_hw_unmap_mmio(void *virt_addr, uint32_t size, uint32_t caller_pid) {
             (caller_pid == 0u || m->owner_pid == caller_pid)) {
             process_t *proc = m->owner_pid ? process_find_by_pid(m->owner_pid) : NULL;
             if (proc && proc->address_space) {
-                uint32_t pages = m->aligned_size / HW_PAGE_SIZE;
-                for (uint32_t p = 0u; p < pages; p++) {
+                ipo_size_t pages = m->aligned_size / HW_PAGE_SIZE;
+                for (ipo_size_t p = 0u; p < pages; p++) {
                     address_space_unmap(proc->address_space, m->virt_base + p * HW_PAGE_SIZE);
                 }
             }
@@ -1246,24 +1426,24 @@ int ipo_hw_unmap_mmio(void *virt_addr, uint32_t size, uint32_t caller_pid) {
     return -1;
 }
 
-void *ipo_hw_alloc_dma(uint32_t size, uint32_t alignment, uint32_t *out_phys, uint32_t owner_pid) {
+void *ipo_hw_alloc_dma(ipo_size_t size, ipo_size_t alignment, ipo_paddr_t *out_phys, ipo_id_t owner_pid) {
     if (size == 0u) return NULL;
     if (alignment < HW_PAGE_SIZE) alignment = HW_PAGE_SIZE;
-    uint32_t aligned_size = (size + HW_PAGE_SIZE - 1u) & ~(HW_PAGE_SIZE - 1u);
+    ipo_size_t aligned_size = (size + HW_PAGE_SIZE - 1u) & ~(ipo_size_t)(HW_PAGE_SIZE - 1u);
 
     bool single_page = (aligned_size == HW_PAGE_SIZE && alignment == HW_PAGE_SIZE);
     void *phys_ptr = single_page ? memory_page_alloc() : memory_map_alloc(aligned_size, alignment);
     if (!phys_ptr) return NULL;
     memset(phys_ptr, 0, aligned_size);
 
-    uint32_t phys_base = (uint32_t)(uintptr_t)phys_ptr;
+    ipo_paddr_t phys_base = (ipo_paddr_t)(ipo_vaddr_t)phys_ptr;
     process_t *proc = owner_pid ? process_find_by_pid(owner_pid) : NULL;
     if (!proc || !proc->address_space) {
         if (out_phys) *out_phys = phys_base;
         return phys_ptr;
     }
 
-    uint32_t virt_base = hw_find_free_va(owner_pid, aligned_size);
+    ipo_vaddr_t virt_base = hw_find_free_va(owner_pid, aligned_size);
     if (virt_base == 0u) {
         hw_free_phys_pages(phys_base, aligned_size);
         return NULL;
@@ -1275,10 +1455,10 @@ void *ipo_hw_alloc_dma(uint32_t size, uint32_t alignment, uint32_t *out_phys, ui
         return NULL;
     }
 
-    uint32_t pte_flags = ADDRESS_SPACE_PAGE_PRESENT | ADDRESS_SPACE_PAGE_WRITABLE |
-                         ADDRESS_SPACE_PAGE_USER | ADDRESS_SPACE_PAGE_CACHE_DISABLE;
-    uint32_t pages = aligned_size / HW_PAGE_SIZE;
-    for (uint32_t p = 0u; p < pages; p++) {
+    ipo_reg_t pte_flags = ADDRESS_SPACE_PAGE_PRESENT | ADDRESS_SPACE_PAGE_WRITABLE |
+                          ADDRESS_SPACE_PAGE_USER | ADDRESS_SPACE_PAGE_CACHE_DISABLE;
+    ipo_size_t pages = aligned_size / HW_PAGE_SIZE;
+    for (ipo_size_t p = 0u; p < pages; p++) {
         if (!address_space_map(proc->address_space,
                                virt_base + p * HW_PAGE_SIZE,
                                phys_base + p * HW_PAGE_SIZE,
@@ -1300,12 +1480,12 @@ void *ipo_hw_alloc_dma(uint32_t size, uint32_t alignment, uint32_t *out_phys, ui
     slot->aligned_size = aligned_size;
 
     if (out_phys) *out_phys = phys_base;
-    return (void *)(uintptr_t)virt_base;
+    return (void *)virt_base;
 }
 
-int ipo_hw_free_dma(void *virt_addr, uint32_t caller_pid) {
+int ipo_hw_free_dma(void *virt_addr, ipo_id_t caller_pid) {
     if (!virt_addr) return -1;
-    uint32_t va_base = (uint32_t)(uintptr_t)virt_addr & ~(HW_PAGE_SIZE - 1u);
+    ipo_vaddr_t va_base = (ipo_vaddr_t)virt_addr & ~(ipo_vaddr_t)(HW_PAGE_SIZE - 1u);
 
     for (uint32_t i = 0; i < s_hw_map_cap; i++) {
         hw_map_entry_t *m = &s_hw_maps[i];
@@ -1313,8 +1493,8 @@ int ipo_hw_free_dma(void *virt_addr, uint32_t caller_pid) {
             (caller_pid == 0u || m->owner_pid == caller_pid)) {
             process_t *proc = m->owner_pid ? process_find_by_pid(m->owner_pid) : NULL;
             if (proc && proc->address_space) {
-                uint32_t pages = m->aligned_size / HW_PAGE_SIZE;
-                for (uint32_t p = 0u; p < pages; p++) {
+                ipo_size_t pages = m->aligned_size / HW_PAGE_SIZE;
+                for (ipo_size_t p = 0u; p < pages; p++) {
                     address_space_unmap(proc->address_space, m->virt_base + p * HW_PAGE_SIZE);
                 }
             }
@@ -1326,14 +1506,14 @@ int ipo_hw_free_dma(void *virt_addr, uint32_t caller_pid) {
     return -1;
 }
 
-uint32_t ipo_hw_virt_to_phys(const void *virt_addr, uint32_t caller_pid) {
+ipo_paddr_t ipo_hw_virt_to_phys(const void *virt_addr, ipo_id_t caller_pid) {
     if (!virt_addr) return 0u;
-    uint32_t va = (uint32_t)(uintptr_t)virt_addr;
+    ipo_vaddr_t va = (ipo_vaddr_t)virt_addr;
     process_t *proc = caller_pid ? process_find_by_pid(caller_pid) : process_get_current();
     if (proc && proc->address_space) {
         return address_space_get_physical(proc->address_space, va);
     }
-    return va;
+    return (ipo_paddr_t)va;
 }
 
 int ipo_pci_fill_info(uint32_t index, ipo_pci_dev_info_t *out_info) {
@@ -1341,6 +1521,8 @@ int ipo_pci_fill_info(uint32_t index, ipo_pci_dev_info_t *out_info) {
     const pci_device_t *dev = pci_get_device(index);
     if (!dev) return -1;
 
+    uint32_t *user_bars = out_info->bars;
+    uint32_t bars_cap = out_info->bars_cap;
     memset(out_info, 0, sizeof(*out_info));
     out_info->bus = dev->bus;
     out_info->slot = dev->slot;
@@ -1355,17 +1537,23 @@ int ipo_pci_fill_info(uint32_t index, ipo_pci_dev_info_t *out_info) {
     out_info->prog_if = dev->prog_if;
     out_info->revision_id = dev->revision_id;
     out_info->header_type = dev->header_type;
+    out_info->bars = user_bars;
+    out_info->bars_cap = bars_cap;
 
-    uint32_t cnt = (uint32_t)dev->bar_count;
-    if (cnt > 6u) cnt = 6u;
-    out_info->bar_count = (uint8_t)cnt;
-    if (dev->bar && cnt > 0u) {
-        for (uint32_t i = 0; i < cnt; i++) {
-            out_info->bars[i] = dev->bar[i];
+    if (dev->bar && dev->bar_count > 0u) {
+        uint32_t cnt = (uint32_t)dev->bar_count;
+        out_info->bar_count = cnt;
+        if (user_bars && bars_cap > 0u) {
+            uint32_t copy_cnt = (cnt < bars_cap) ? cnt : bars_cap;
+            for (uint32_t i = 0; i < copy_cnt; i++) {
+                user_bars[i] = dev->bar[i];
+            }
         }
-    } else {
-        out_info->bars[0] = dev->bar0;
-        if (dev->bar0 != 0u) out_info->bar_count = 1u;
+    } else if (dev->bar0 != 0u) {
+        out_info->bar_count = 1u;
+        if (user_bars && bars_cap > 0u) {
+            user_bars[0] = dev->bar0;
+        }
     }
     return 0;
 }
@@ -1380,7 +1568,6 @@ int ipo_device_fill_info(uint32_t index, ipo_device_info_t *out_info) {
     }
     if (!curr) return -1;
 
-    memset(out_info, 0, sizeof(*out_info));
     out_info->id = curr->id;
     out_info->parent_id = curr->parent_id;
     out_info->capabilities = curr->capabilities;
@@ -1395,20 +1582,20 @@ int ipo_device_fill_info(uint32_t index, ipo_device_info_t *out_info) {
     out_info->device_id = curr->res.device_id;
     out_info->io_base = curr->res.io_base;
     out_info->io_size = curr->res.io_size;
-    out_info->mmio_base = curr->res.mmio_base;
-    out_info->mmio_size = curr->res.mmio_size;
+    out_info->mmio_base = (uint64_t)curr->res.mmio_base;
+    out_info->mmio_size = (uint32_t)curr->res.mmio_size;
     out_info->size_bytes = curr->res.size_bytes;
 
-    if (curr->name) strncpy(out_info->name, curr->name, sizeof(out_info->name) - 1u);
-    if (curr->vendor) strncpy(out_info->vendor, curr->vendor, sizeof(out_info->vendor) - 1u);
-    if (curr->model) strncpy(out_info->model, curr->model, sizeof(out_info->model) - 1u);
-    if (curr->description) strncpy(out_info->description, curr->description, sizeof(out_info->description) - 1u);
-    if (curr->driver_name) strncpy(out_info->driver_name, curr->driver_name, sizeof(out_info->driver_name) - 1u);
+    copy_str_to_caller(curr->name, out_info->name, out_info->name_cap, &out_info->name_len);
+    copy_str_to_caller(curr->vendor, out_info->vendor, out_info->vendor_cap, &out_info->vendor_len);
+    copy_str_to_caller(curr->model, out_info->model, out_info->model_cap, &out_info->model_len);
+    copy_str_to_caller(curr->description, out_info->description, out_info->desc_cap, &out_info->desc_len);
+    copy_str_to_caller(curr->driver_name, out_info->driver_name, out_info->driver_name_cap, &out_info->driver_name_len);
     return 0;
 }
 
 uint32_t ipo_device_register_user(const ipo_device_info_t *info, uint32_t owner_pid) {
-    if (!info || info->name[0] == '\0') return 0u;
+    if (!info || !info->name || info->name[0] == '\0') return 0u;
 
     device_node_t node;
     device_node_init(&node);
@@ -1425,15 +1612,15 @@ uint32_t ipo_device_register_user(const ipo_device_info_t *info, uint32_t owner_
     node.res.device_id = info->device_id;
     node.res.io_base = info->io_base;
     node.res.io_size = info->io_size;
-    node.res.mmio_base = info->mmio_base;
-    node.res.mmio_size = info->mmio_size;
+    node.res.mmio_base = (ipo_paddr_t)info->mmio_base;
+    node.res.mmio_size = (ipo_size_t)info->mmio_size;
     node.res.size_bytes = info->size_bytes;
 
     device_node_set_name(&node, info->name);
-    if (info->vendor[0]) device_node_set_vendor(&node, info->vendor);
-    if (info->model[0]) device_node_set_model(&node, info->model);
-    if (info->description[0]) device_node_set_description(&node, info->description);
-    if (info->driver_name[0]) device_node_set_driver_name(&node, info->driver_name);
+    if (info->vendor && info->vendor[0]) device_node_set_vendor(&node, info->vendor);
+    if (info->model && info->model[0]) device_node_set_model(&node, info->model);
+    if (info->description && info->description[0]) device_node_set_description(&node, info->description);
+    if (info->driver_name && info->driver_name[0]) device_node_set_driver_name(&node, info->driver_name);
 
     uint32_t slot = s_user_dev_cap;
     for (uint32_t i = 0; i < s_user_dev_cap; i++) {
@@ -1513,6 +1700,12 @@ void input_ext_cleanup_pid(uint32_t pid) {
         if (s_key_subs[i].active && s_key_subs[i].pid == pid) {
             s_key_subs[i].active = false;
             if (s_key_subs[i].ring) {
+                for (uint32_t k = 0; k < s_key_subs[i].cap; k++) {
+                    if (s_key_subs[i].ring[k].raw_bytes) {
+                        kfree(s_key_subs[i].ring[k].raw_bytes);
+                        s_key_subs[i].ring[k].raw_bytes = NULL;
+                    }
+                }
                 kfree(s_key_subs[i].ring);
                 s_key_subs[i].ring = NULL;
             }

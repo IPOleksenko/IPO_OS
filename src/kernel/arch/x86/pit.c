@@ -33,7 +33,6 @@ void pit_set_frequency(uint8_t counter, uint32_t hz) {
     else if (counter == 1) s_pit1_hz = programmed;
     else if (counter == 2) s_pit2_hz = programmed;
     
-    /* Select counter and set up control word */
     uint8_t counter_select = 0;
     switch (counter) {
         case 0: counter_select = PIT_SELECT_COUNTER_0; break;
@@ -45,7 +44,7 @@ void pit_set_frequency(uint8_t counter, uint32_t hz) {
     uint8_t ocw = counter_select | PIT_WRITE_LSB_MSB | PIT_BINARY_MODE | PIT_SQUARE_WAVE_MODE;
     outb(PIT_REG_COMMAND, ocw);
     
-    /* Write divisor (LSB first, then MSB) */
+    /* PIT expects LSB then MSB */
     outb(PIT_REG_COUNTER_0 + counter, (uint8_t)(divisor & 0xFF));
     io_wait();
     outb(PIT_REG_COUNTER_0 + counter, (uint8_t)((divisor >> 8) & 0xFF));

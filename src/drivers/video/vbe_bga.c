@@ -1,5 +1,5 @@
 #include <driver/vbe_bga.h>
-#include <driver/net/pci.h>
+#include <driver/pci.h>
 #include <ioport.h>
 #include <vga.h>
 #include <vga_gfx.h>
@@ -9,7 +9,6 @@
 
 static vbe_bga_info_t g_bga_info = {
     .available = false,
-    .version   = 0,
     .lfb_addr  = BGA_DEFAULT_LFB_ADDR,
     .width     = 0,
     .height    = 0,
@@ -27,11 +26,11 @@ static inline uint16_t bga_read_register(uint16_t index) {
 }
 
 bool vbe_bga_probe(vbe_bga_info_t *out_info) {
-    /* Probe PCI device 0x1234:0x1111 to locate exact LFB BAR0 address */
+    /* Probe PCI display adapter (0x1234:0x1111) for LFB BAR0 */
     pci_device_t dev;
     bool pci_found = pci_find_device(BGA_PCI_VENDOR_ID, BGA_PCI_DEVICE_ID, &dev);
     if (pci_found) {
-        /* Enable Memory Space (bit 1), I/O Space (bit 0), and Bus Master (bit 2) */
+        /* Enable I/O space (bit 0), memory space (bit 1), and bus mastering (bit 2) */
         uint16_t cmd = pci_read_word(dev.bus, dev.slot, dev.func, 0x04);
         cmd |= 0x07;
         pci_write_word(dev.bus, dev.slot, dev.func, 0x04, cmd);
@@ -44,7 +43,7 @@ bool vbe_bga_probe(vbe_bga_info_t *out_info) {
         }
     }
 
-    /* Probe BGA VBE DISPI registers on I/O ports 0x1CE / 0x1CF */
+    /* Probe DISPI framebuffer registers on I/O ports 0x1CE / 0x1CF */
     bga_write_register(VBE_DISPI_INDEX_ID, VBE_DISPI_ID5);
     uint16_t id = bga_read_register(VBE_DISPI_INDEX_ID);
     if (id < VBE_DISPI_ID0 || id > VBE_DISPI_ID5) {
@@ -59,7 +58,6 @@ bool vbe_bga_probe(vbe_bga_info_t *out_info) {
     }
 
     g_bga_info.available = true;
-    g_bga_info.version   = id;
     if (!pci_found) {
         g_bga_info.lfb_addr = BGA_DEFAULT_LFB_ADDR;
     }
@@ -116,7 +114,7 @@ void vbe_bga_disable(void) {
     }
 }
 
-uint32_t vbe_bga_get_lfb_address(void) {
+ipo_paddr_t vbe_bga_get_lfb_address(void) {
     if (!g_bga_info.available) {
         vbe_bga_probe(NULL);
     }
@@ -135,7 +133,7 @@ bool vbe_bga_set_mode(int width, int height, int bpp) {
     int prev_h = g_bga_info.height;
     int prev_bpp = g_bga_info.bpp;
 
-    /* Save pristine standard VGA text state (fonts, registers, cursor, palette) */
+    /* Save standard VGA text state before mode switch */
     vga_save_text_state();
 
     bga_program_mode_regs((uint16_t)width, (uint16_t)height, (uint16_t)bpp);
@@ -158,16 +156,16 @@ bool vbe_bga_set_mode(int width, int height, int bpp) {
             g_bga_info.height = (int)bga_read_register(VBE_DISPI_INDEX_YRES);
             g_bga_info.bpp = (int)bga_read_register(VBE_DISPI_INDEX_BPP);
         } else {
-            /* Disable BGA without calling vbe_bga_restore_text_mode(), so saved
-             * text VRAM stays intact across Mode 13h fallback until real exit. */
+            /* Disable DISPI framebuffer without restoring text mode so saved
+             * text VRAM stays intact across Mode 13h fallback until exit. */
             vbe_bga_disable();
         }
         mouse_set_bounds_from_display();
         return false;
     }
 
-    /* Bochs/QEMU BGA aligns XRES down to an 8-pixel boundary (e.g. 999 -> 992)
-     * and clamps sub-minimum/oversized requests while keeping BGA enabled. */
+    /* DISPI hardware aligns XRES down to an 8-pixel boundary (e.g. 999 -> 992)
+     * and clamps out-of-range requests while staying enabled. */
     bool width_ok = (actual_width == (uint16_t)width) ||
                     (width >= 8 && actual_width == (uint16_t)(width & ~7));
     if (!width_ok || actual_height != (uint16_t)height) {
@@ -199,7 +197,7 @@ void vbe_bga_restore_text_mode(void) {
 }
 
 void *vbe_bga_get_framebuffer(void) {
-    return (void *)vbe_bga_get_lfb_address();
+    return (void *)(ipo_vaddr_t)vbe_bga_get_lfb_address();
 }
 
 int vbe_bga_get_width(void)  { return g_bga_info.width; }

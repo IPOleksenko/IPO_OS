@@ -3,7 +3,7 @@
 #include <string.h>
 #include <stdio.h>
 
-/* IEEE 802.3 CRC32 Implementation */
+/* IEEE 802.3 CRC32 (poly 0xEDB88320) */
 uint32_t partition_crc32(const void *data, size_t length) {
     static uint32_t *table = NULL;
 
@@ -100,7 +100,6 @@ static int parse_gpt(block_device_t *bdev, partition_table_t *table) {
     uint8_t *sector_buf = (uint8_t *)kmalloc(512u);
     if (!sector_buf) return -1;
 
-    /* Read LBA 1 (GPT Header) */
     if (!block_dev_read(bdev, 1, 1, sector_buf)) {
         kfree(sector_buf);
         return -1;
@@ -111,7 +110,6 @@ static int parse_gpt(block_device_t *bdev, partition_table_t *table) {
         return -2;
     }
 
-    /* Verify Header CRC32 */
     uint32_t orig_crc = *(uint32_t *)(sector_buf + 16);
     uint32_t hdr_size = *(uint32_t *)(sector_buf + 12);
     if (hdr_size < 92 || hdr_size > 512) {
@@ -137,7 +135,7 @@ static int parse_gpt(block_device_t *bdev, partition_table_t *table) {
     hdr.num_partition_entries = *(uint32_t *)(sector_buf + 80);
     hdr.sizeof_partition_entry = *(uint32_t *)(sector_buf + 84);
 
-    /* Bounds check partition entry parameters (min 128 bytes per UEFI spec) */
+    /* GPT requires at least 128 B per partition entry */
     if (hdr.num_partition_entries == 0 || hdr.sizeof_partition_entry < 128 ||
         hdr.sizeof_partition_entry > 512 || hdr.first_usable_lba > hdr.last_usable_lba) {
         kfree(sector_buf);
@@ -210,19 +208,21 @@ static int parse_gpt(block_device_t *bdev, partition_table_t *table) {
             p.valid = true;
 
             size_t name_units = (hdr.sizeof_partition_entry > 56) ? (hdr.sizeof_partition_entry - 56) / 2u : 0;
-            if (name_units > 36) name_units = 36;
             if (name_units > 0) {
-                char tmp_name[37];
-                const uint16_t *wname = (const uint16_t *)(raw_ent + 56);
-                size_t c;
-                for (c = 0; c < name_units; c++) {
-                    uint16_t ch = wname[c];
-                    if (ch == 0) break;
-                    tmp_name[c] = (ch < 128) ? (char)ch : '?';
-                }
-                tmp_name[c] = '\0';
-                if (tmp_name[0] != '\0') {
-                    partition_info_set_name(&p, tmp_name);
+                char *tmp_name = (char *)kmalloc(name_units + 1u);
+                if (tmp_name) {
+                    const uint16_t *wname = (const uint16_t *)(raw_ent + 56);
+                    size_t c;
+                    for (c = 0; c < name_units; c++) {
+                        uint16_t ch = wname[c];
+                        if (ch == 0) break;
+                        tmp_name[c] = (ch < 128) ? (char)ch : '?';
+                    }
+                    tmp_name[c] = '\0';
+                    if (tmp_name[0] != '\0') {
+                        partition_info_set_name(&p, tmp_name);
+                    }
+                    kfree(tmp_name);
                 }
             }
 
@@ -317,7 +317,7 @@ int partition_scan(block_device_t *bdev, partition_table_t *out_table) {
         p.flags = (e->status & 0x80) ? 1 : 0;
         p.valid = true;
 
-        /* Probe partition first sector for an ASCII filesystem signature */
+        /* Sniff first sector for an ASCII filesystem label */
         uint8_t *pbuf = (uint8_t *)kmalloc(512u);
         if (pbuf && block_dev_read(bdev, e->lba_start, 1, pbuf)) {
             size_t sig_len = 0;
@@ -325,10 +325,13 @@ int partition_scan(block_device_t *bdev, partition_table_t *out_table) {
                 sig_len++;
             }
             if (sig_len >= 3) {
-                char sig[17];
-                memcpy(sig, pbuf, sig_len);
-                sig[sig_len] = '\0';
-                partition_info_set_name(&p, sig);
+                char *sig = (char *)kmalloc(sig_len + 1u);
+                if (sig) {
+                    memcpy(sig, pbuf, sig_len);
+                    sig[sig_len] = '\0';
+                    partition_info_set_name(&p, sig);
+                    kfree(sig);
+                }
             }
         }
         if (pbuf) kfree(pbuf);

@@ -4,20 +4,14 @@
 
 #define UTF_REPLACEMENT_CHAR 0xFFFDULL
 
-static const uint8_t s_bom_utf8_bytes[]    = { 0xEFu, 0xBBu, 0xBFu };
-static const uint8_t s_bom_utf16le_bytes[] = { 0xFFu, 0xFEu };
-static const uint8_t s_bom_utf16be_bytes[] = { 0xFEu, 0xFFu };
-static const uint8_t s_bom_utf32le_bytes[] = { 0xFFu, 0xFEu, 0x00u, 0x00u };
-static const uint8_t s_bom_utf32be_bytes[] = { 0x00u, 0x00u, 0xFEu, 0xFFu };
-static const uint8_t s_bom_utf64le_bytes[] = { 0xFFu, 0xFEu, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u };
-static const uint8_t s_bom_utf64be_bytes[] = { 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0xFEu, 0xFFu };
+static inline uint64_t utf8_min_codepoint(size_t total) {
+    if (total <= 1u) return 0ULL;
+    if (total == 2u) return 0x80ULL;
+    return 1ULL << (total * 5u - 4u);
+}
 
 static utf_decode_status_t decode_utf8(const uint8_t *buf, size_t len,
                                        uint64_t *out_cp, size_t *out_consumed) {
-    static const uint64_t s_utf8_min_cp[8] = {
-        0ULL, 0ULL, 0x80ULL, 0x800ULL, 0x10000ULL, 0x200000ULL, 0x4000000ULL, 0x80000000ULL
-    };
-
     if (!buf || len == 0) return UTF_DECODE_INCOMPLETE;
     uint8_t b0 = buf[0];
 
@@ -55,7 +49,7 @@ static utf_decode_status_t decode_utf8(const uint8_t *buf, size_t len,
             }
             cp = (cp << 6) | (uint64_t)(buf[i] & 0x3Fu);
         }
-        if (cp < s_utf8_min_cp[total] || (cp >= 0xD800ULL && cp <= 0xDFFFULL)) {
+        if (cp < utf8_min_codepoint(total) || (cp >= 0xD800ULL && cp <= 0xDFFFULL)) {
             if (out_consumed) *out_consumed = total;
             return UTF_DECODE_INVALID;
         }
@@ -205,34 +199,63 @@ static utf_decode_status_t decode_utf_var(const uint8_t *buf, size_t len, uint64
     return UTF_DECODE_INCOMPLETE;
 }
 
-static const utf_codec_t s_builtin_codecs[] = {
-    { UTF_ENC_UTF8,    "UTF-8",    s_bom_utf8_bytes,    3, 1, decode_utf8    },
-    { UTF_ENC_UTF16LE, "UTF-16LE", s_bom_utf16le_bytes, 2, 2, decode_utf16le },
-    { UTF_ENC_UTF16BE, "UTF-16BE", s_bom_utf16be_bytes, 2, 2, decode_utf16be },
-    { UTF_ENC_UTF32LE, "UTF-32LE", s_bom_utf32le_bytes, 4, 4, decode_utf32le },
-    { UTF_ENC_UTF32BE, "UTF-32BE", s_bom_utf32be_bytes, 4, 4, decode_utf32be },
-    { UTF_ENC_UTF64LE, "UTF-64LE", s_bom_utf64le_bytes, 8, 8, decode_utf64le },
-    { UTF_ENC_UTF64BE, "UTF-64BE", s_bom_utf64be_bytes, 8, 8, decode_utf64be },
-    { UTF_ENC_UTF_VAR, "UTF-VAR",  NULL,                0, 1, decode_utf_var }
-};
+static utf_codec_t *s_codecs = NULL;
+static size_t s_codec_count = 0u;
+static size_t s_codec_cap = 0u;
 
-#define BUILTIN_CODEC_COUNT (sizeof(s_builtin_codecs) / sizeof(s_builtin_codecs[0]))
+static bool utf_add_codec(uint32_t id, const char *name, uint64_t bom_le,
+                          size_t bom_len, size_t unit_bytes, utf_decode_fn_t decode) {
+    if (!kgrow_array((void **)&s_codecs, &s_codec_cap, s_codec_count + 1u, sizeof(utf_codec_t), 8u)) {
+        return false;
+    }
+    uint8_t *bom_buf = NULL;
+    if (bom_len > 0u) {
+        bom_buf = (uint8_t *)kmalloc(bom_len);
+        if (!bom_buf) return false;
+        for (size_t i = 0u; i < bom_len; i++) {
+            bom_buf[i] = (uint8_t)((bom_le >> (i * 8u)) & 0xFFu);
+        }
+    }
+    utf_codec_t *c = &s_codecs[s_codec_count++];
+    c->id = id;
+    c->name = name;
+    c->bom = bom_buf;
+    c->bom_len = bom_len;
+    c->unit_bytes = unit_bytes;
+    c->decode = decode;
+    return true;
+}
+
+static void utf_ensure_codecs(void) {
+    if (s_codec_count > 0u && s_codecs) return;
+    (void)utf_add_codec(UTF_ENC_UTF8,    "UTF-8",    0x00BFBBEFULL,          3u, 1u, decode_utf8);
+    (void)utf_add_codec(UTF_ENC_UTF16LE, "UTF-16LE", 0x0000FEFFULL,          2u, 2u, decode_utf16le);
+    (void)utf_add_codec(UTF_ENC_UTF16BE, "UTF-16BE", 0x0000FFFEULL,          2u, 2u, decode_utf16be);
+    (void)utf_add_codec(UTF_ENC_UTF32LE, "UTF-32LE", 0x0000FEFFULL,          4u, 4u, decode_utf32le);
+    (void)utf_add_codec(UTF_ENC_UTF32BE, "UTF-32BE", 0xFFFE0000ULL,          4u, 4u, decode_utf32be);
+    (void)utf_add_codec(UTF_ENC_UTF64LE, "UTF-64LE", 0x000000000000FEFFULL,  8u, 8u, decode_utf64le);
+    (void)utf_add_codec(UTF_ENC_UTF64BE, "UTF-64BE", 0xFFFE000000000000ULL,  8u, 8u, decode_utf64be);
+    (void)utf_add_codec(UTF_ENC_UTF_VAR, "UTF-VAR",  0ULL,                   0u, 1u, decode_utf_var);
+}
 
 static const uint32_t s_default_encoding_id = UTF_ENC_AUTO;
 
 static const utf_codec_t *utf_find_codec(uint32_t encoding_id) {
+    utf_ensure_codecs();
+    if (!s_codecs || s_codec_count == 0u) return NULL;
     if (encoding_id == UTF_ENC_AUTO) {
         encoding_id = s_default_encoding_id;
     }
-    for (size_t i = 0; i < BUILTIN_CODEC_COUNT; i++) {
-        if (s_builtin_codecs[i].id == encoding_id) {
-            return &s_builtin_codecs[i];
+    for (size_t i = 0; i < s_codec_count; i++) {
+        if (s_codecs[i].id == encoding_id) {
+            return &s_codecs[i];
         }
     }
-    return &s_builtin_codecs[0];
+    return &s_codecs[0];
 }
 
 void utf_init(void) {
+    utf_ensure_codecs();
 }
 
 uint32_t utf_get_default_encoding(void) {
@@ -252,11 +275,12 @@ static bool is_non_ws_ctrl(uint8_t b) {
 static void match_bom_prefix(const uint8_t *buf, size_t len,
                              const utf_codec_t **out_exact,
                              bool *out_has_longer) {
+    utf_ensure_codecs();
     const utf_codec_t *exact = NULL;
     bool has_longer = false;
 
-    for (size_t i = 0; i < BUILTIN_CODEC_COUNT; i++) {
-        const utf_codec_t *c = &s_builtin_codecs[i];
+    for (size_t i = 0; i < s_codec_count; i++) {
+        const utf_codec_t *c = &s_codecs[i];
         if (!c->bom || c->bom_len == 0) continue;
 
         size_t cmp_len = (len < c->bom_len) ? len : c->bom_len;
@@ -310,7 +334,7 @@ static bool auto_wide_codec_mismatch(uint32_t enc_id, const uint8_t *buf, size_t
         return false;
     }
     if (enc_id == UTF_ENC_UTF16LE) {
-        /* Guard BOM signatures or unpaired surrogates right after 1 ASCII byte */
+        /* Check for embedded BOMs or trailing surrogate markers after an ASCII byte */
         if (len >= 2u && buf[0] < 0x80u &&
             (buf[1] == 0xFFu || buf[1] == 0xFEu || buf[1] == 0xEFu)) {
             return true;
@@ -561,7 +585,8 @@ static bool stream_decode_step(utf_stream_t *stream, bool eof, uint64_t *out_cod
 
     if (cfg_enc != UTF_ENC_AUTO) {
         const utf_codec_t *codec = utf_find_codec(cfg_enc);
-        if (!codec || !codec->decode) codec = &s_builtin_codecs[0];
+        if (!codec || !codec->decode) codec = (s_codec_count > 0u) ? &s_codecs[0] : NULL;
+        if (!codec || !codec->decode) return false;
 
         const uint8_t *bom_ptr = codec->bom;
         if (!stream->bom_checked && bom_ptr && codec->bom_len > 0) {
@@ -592,7 +617,7 @@ static bool stream_decode_step(utf_stream_t *stream, bool eof, uint64_t *out_cod
         return true;
     }
 
-    /* Mixed / Automatic UTF mode */
+    /* Auto-detect mixed UTF encodings */
     while (stream->len > 0) {
         const utf_codec_t *exact_bom = NULL;
         bool has_longer_bom = false;
@@ -632,7 +657,7 @@ static bool stream_decode_step(utf_stream_t *stream, bool eof, uint64_t *out_cod
                     return false;
                 }
             }
-            /* Fallback out of locked active encoding on mismatch or EOF remainder */
+            /* Drop locked encoding on mismatch or trailing partial sequence at EOF */
             stream->active_encoding_id = UTF_ENC_AUTO;
         }
 
@@ -668,8 +693,7 @@ bool utf_stream_push_byte(utf_stream_t *stream, uint8_t byte, uint64_t *out_code
                            : s_default_encoding_id;
     uint32_t eff_enc = (cfg_enc != UTF_ENC_AUTO) ? cfg_enc : stream->active_encoding_id;
 
-    /* Fast path: plain 7-bit ASCII text/whitespace when idle in UTF-8/UTF-VAR/AUTO
-     * (never touches kmalloc, safe during earliest pre-heap boot prints). */
+    /* Fast path for idle 7-bit ASCII: avoids kmalloc so early boot prints work pre-heap */
     if (stream->len == 0 && is_ascii_text_or_ws(byte) &&
         (eff_enc == UTF_ENC_AUTO || eff_enc == UTF_ENC_UTF8 || eff_enc == UTF_ENC_UTF_VAR)) {
         if (cfg_enc == UTF_ENC_AUTO) {
@@ -701,7 +725,8 @@ utf_decode_status_t utf_decode_next(uint32_t encoding_id,
     uint32_t eff_enc = (encoding_id != UTF_ENC_AUTO) ? encoding_id : s_default_encoding_id;
     if (eff_enc != UTF_ENC_AUTO) {
         const utf_codec_t *codec = utf_find_codec(eff_enc);
-        if (!codec || !codec->decode) codec = &s_builtin_codecs[0];
+        if (!codec || !codec->decode) codec = (s_codec_count > 0u) ? &s_codecs[0] : NULL;
+        if (!codec || !codec->decode) return UTF_DECODE_INVALID;
         return codec->decode(buf, len, out_codepoint, out_consumed);
     }
 

@@ -5,7 +5,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* Block device capability / state flags */
 #define BLOCK_DEV_READONLY      (1 << 0)
 #define BLOCK_DEV_REMOVABLE     (1 << 1)
 #define BLOCK_DEV_POOL_MEMBER   (1 << 2)
@@ -24,9 +23,9 @@ typedef struct block_device_ops {
 typedef struct block_device {
     char                *name;
     uint32_t            id;
-    uint32_t            device_node_id; /* Matching device_node_t id if present */
+    uint32_t            device_node_id; /* Linked device_node_t id, if any */
     uint64_t            total_sectors;
-    uint32_t            sector_size;    /* Typically 512 */
+    uint32_t            sector_size;    /* bytes (typically 512) */
     uint32_t            flags;
     const block_device_ops_t *ops;
     void               *priv_data;

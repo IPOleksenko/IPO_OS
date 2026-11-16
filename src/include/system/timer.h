@@ -8,6 +8,7 @@ void timer_tick(void);
 void timer_irq_handler(void);
 void timer_update(void);
 uint32_t timer_millis(void);
+uint64_t timer_millis64(void);
 uint32_t timer_seconds(void);
 uint32_t timer_elapsed_ms(uint32_t start_ms);
 int timer_after(uint32_t start_ms, uint32_t delay_ms);

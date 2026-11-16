@@ -9,7 +9,7 @@ static void serial_emit_ch(void *ctx, char ch) {
 }
 
 int serial_printf(const char *format, ...) {
-    uint32_t flags = spin_lock_irqsave(&s_serial_printf_lock);
+    ipo_reg_t flags = spin_lock_irqsave(&s_serial_printf_lock);
 
     va_list args;
     va_start(args, format);

@@ -1,7 +1,4 @@
-/**
- * Default System Keyboard Layout
- * Registered as standard dynamic keymap entries with full scancode dictionary.
- */
+/* Default English keyboard layout */
 
 #include <driver/input/keymap/dynamic_keymap.h>
 

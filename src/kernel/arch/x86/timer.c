@@ -14,6 +14,7 @@
 #define TSC_FALLBACK_PER_MS  1000000ULL
 
 static volatile uint32_t timer_ms = 0;
+static volatile uint64_t timer_ms64 = 0ULL;
 static volatile uint32_t timer_ticks = 0;
 static uint64_t tsc_per_ms = TSC_FALLBACK_PER_MS;
 static uint64_t last_tsc_value = 0ULL;
@@ -36,7 +37,7 @@ static uint64_t calibrate_tsc_per_ms(void) {
     uint32_t max_leaf = 0, ebx = 0, ecx = 0, edx = 0;
     cpuid_query(0, &max_leaf, &ebx, &ecx, &edx);
 
-    /* 1. Try CPUID Leaf 0x15 (TSC / Core Crystal Clock ratio) */
+    /* Check CPUID leaf 0x15 for TSC / crystal clock ratio */
     if (max_leaf >= 0x15u) {
         uint32_t denom = 0, numer = 0, crystal_hz = 0, res = 0;
         cpuid_query(0x15u, &denom, &numer, &crystal_hz, &res);
@@ -48,7 +49,7 @@ static uint64_t calibrate_tsc_per_ms(void) {
         }
     }
 
-    /* 2. Try CPUID Leaf 0x16 (Processor Base Frequency in MHz) */
+    /* Check CPUID leaf 0x16 for base frequency in MHz */
     if (max_leaf >= 0x16u) {
         uint32_t base_mhz = 0, max_mhz = 0, bus_mhz = 0, res = 0;
         cpuid_query(0x16u, &base_mhz, &max_mhz, &bus_mhz, &res);
@@ -58,8 +59,8 @@ static uint64_t calibrate_tsc_per_ms(void) {
         }
     }
 
-    /* Calibrate against 8254 PIT Channel 2 using the median of 3 gates */
-    uint32_t irq_flags = irq_save();
+    /* Fallback: calibrate against PIT channel 2 using median of 3 runs */
+    ipo_reg_t irq_flags = irq_save();
 
     uint8_t orig_gate = inb(PIT_CALIB_PORT61);
     uint64_t m0 = 0ULL, m1 = 0ULL, m2 = 0ULL;
@@ -112,6 +113,7 @@ uint64_t timer_get_tsc_per_ms(void) {
 
 void timer_init(void) {
     timer_ms = 0;
+    timer_ms64 = 0ULL;
     timer_ticks = 0;
     tsc_per_ms = calibrate_tsc_per_ms();
     last_tsc_value = read_tsc();
@@ -122,7 +124,7 @@ void timer_init(void) {
 }
 
 void timer_update(void) {
-    uint32_t irq_flags = irq_save();
+    ipo_reg_t irq_flags = irq_save();
     uint64_t now_tsc = read_tsc();
     if (last_tsc_value == 0ULL) {
         last_tsc_value = now_tsc;
@@ -138,6 +140,7 @@ void timer_update(void) {
     uint32_t delta_ms = (uint32_t)(delta_tsc / tsc_per_ms);
     if (delta_ms != 0u) {
         timer_ms += delta_ms;
+        timer_ms64 += (uint64_t)delta_ms;
         timer_ticks += delta_ms;
         last_tsc_value += (uint64_t)delta_ms * tsc_per_ms;
     }
@@ -157,7 +160,7 @@ void timer_tick(void) {
 }
 
 void timer_irq_handler(void) {
-    uint32_t irq_flags = irq_save();
+    ipo_reg_t irq_flags = irq_save();
     uint64_t before_tsc = last_tsc_value;
     uint32_t prev_ms = timer_ms;
     irq_restore(irq_flags);
@@ -168,6 +171,7 @@ void timer_irq_handler(void) {
     if (timer_ms == prev_ms && read_tsc() == before_tsc) {
         /* Fallback only if hardware TSC is not advancing */
         timer_ms++;
+        timer_ms64++;
         timer_ticks++;
     }
     irq_restore(irq_flags);
@@ -179,6 +183,14 @@ void timer_irq_handler(void) {
 uint32_t timer_millis(void) {
     timer_update();
     return timer_ms;
+}
+
+uint64_t timer_millis64(void) {
+    timer_update();
+    ipo_reg_t irq_flags = irq_save();
+    uint64_t v = timer_ms64;
+    irq_restore(irq_flags);
+    return v;
 }
 
 uint32_t timer_seconds(void) {

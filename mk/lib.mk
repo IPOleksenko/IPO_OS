@@ -1,4 +1,4 @@
-# Kernel subsystem library (libk.a)
+# Kernel static library (libk.a)
 
 .PHONY: lib clean-lib
 

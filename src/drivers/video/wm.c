@@ -9,6 +9,7 @@
 #include <driver/input/keymap/dynamic_keymap.h>
 #include <driver/input/mouse.h>
 #include <system/timer.h>
+#include <system/rtc.h>
 #include <system/state.h>
 #include <ioport.h>
 #include <kernel/terminal.h>
@@ -21,8 +22,11 @@
 
 #define WM_FONT_W 6
 #define WM_FONT_H 8
+#define WM_SMALL_FONT_W 4
+#define WM_SMALL_FONT_H 5
+#define WM_SMALL_FONT_ADV 5
 #define TITLEBAR_H 11
-#define TASKBAR_H  14
+#define TASKBAR_H  20
 
 typedef struct {
     int y;
@@ -51,13 +55,33 @@ static inline int wm_taskbar_y(int sh) { int y = sh - TASKBAR_H; return y > 0 ? 
 static inline int wm_max_win_w(int sw) { int w = sw - 4; return w > 1 ? w : (sw > 0 ? sw : 1); }
 static inline int wm_max_win_h(int sh) { int h = sh - TASKBAR_H - TITLEBAR_H - 4; return h > 1 ? h : (sh > 0 ? sh : 1); }
 
+static char *s_tb_time_text = NULL;
+static size_t s_tb_time_len = 0u;
+static char *s_tb_date_text = NULL;
+static size_t s_tb_date_len = 0u;
+static uint32_t s_time_marquee_off = 0u;
+static uint32_t s_date_marquee_off = 0u;
+static uint32_t s_clock_marquee_last_tick = 0u;
+static bool s_tb_time_overflow = false;
+static bool s_tb_date_overflow = false;
+static bool s_tb_tabs_overflow = false;
+
+#define WM_CLOCK_BOX_W 60
+
+static int wm_calc_taskbar_clock_w(int sw) {
+    int cw = WM_CLOCK_BOX_W;
+    int max_cw = sw - 160;
+    if (max_cw >= 40 && cw > max_cw) cw = max_cw;
+    return cw;
+}
+
 static void wm_get_taskbar_layout(int sw, int sh, wm_taskbar_layout_t *out) {
     out->y = wm_taskbar_y(sh);
     out->close_x = 2;
     out->close_w = 40;
     out->scroll_l_x = 44;
     out->scroll_w = 9;
-    out->clock_w = 36;
+    out->clock_w = wm_calc_taskbar_clock_w(sw);
     out->clock_x = sw - out->clock_w - 2;
     out->lang_w = 85;
     out->lang_x = out->clock_x - out->lang_w - 2;
@@ -318,27 +342,33 @@ static bool s_last_cursor_hidden = false;
 static bool s_cursor_patch_valid = false;
 static int s_cursor_patch_x = 0;
 static int s_cursor_patch_y = 0;
-static uint8_t s_cursor_patch[10][7];
+static uint8_t *s_cursor_patch = NULL;
+static size_t s_cursor_patch_cap = 0;
 static uint32_t s_last_slow_check_ms = 0;
-static int s_last_tb_minute = -1;
-static char s_last_lang_name[32];
+static uint32_t s_last_clock_check_ms = 0;
+static uint32_t s_last_clock_gen = 0;
+static char *s_last_lang_name = NULL;
+static size_t s_last_lang_cap = 0;
 static uint32_t s_last_title_marquee_tick = 0;
 static int s_prev_fg_wid = -1;
 static bool s_prev_gfx_mode = false;
 
 
-static void wm_copy_lang_name(char *dst, size_t cap, const char *src) {
-    if (!dst || cap == 0) return;
-    if (!src) {
-        dst[0] = '\0';
-        return;
+static void wm_set_lang_name(const char *src) {
+    if (!src) src = "";
+    size_t len = strlen(src);
+    if (!s_last_lang_name || len + 1u > s_last_lang_cap) {
+        size_t ncap = (s_last_lang_cap > 0u) ? s_last_lang_cap : 32u;
+        while (ncap < len + 1u) {
+            if (ncap > SIZE_MAX / 2u) { ncap = len + 1u; break; }
+            ncap *= 2u;
+        }
+        char *nb = (char *)krealloc(s_last_lang_name, ncap);
+        if (!nb) return;
+        s_last_lang_name = nb;
+        s_last_lang_cap = ncap;
     }
-    size_t i = 0;
-    while (i + 1 < cap && src[i] != '\0') {
-        dst[i] = src[i];
-        i++;
-    }
-    dst[i] = '\0';
+    memcpy(s_last_lang_name, src, len + 1u);
 }
 
 static void list_append(wm_window_t *w) {
@@ -415,7 +445,6 @@ wm_window_t *wm_create_window(const wm_window_options_t *opts) {
     }
     process_on_wm_window_created(cur_proc);
 
-    /* Auto-start WM session if not already running */
     if (!wm_sess_active) {
         wm_session_start();
     } else if (!vga_is_graphics_mode() && process_wm_has_focus()) {
@@ -487,8 +516,7 @@ wm_window_t *wm_create_window(const wm_window_options_t *opts) {
     win->event_tail   = 0;
     win->close_requested_ms = 0;
 
-    /* Copy the shape mask into kernel heap so it remains valid after the
-       calling app exits (the original array lives in app memory).          */
+    /* Copy shape mask to kernel heap so it outlives the caller's address space. */
     if (opts->shape_mask && opts->mask_w > 0 && opts->mask_h > 0) {
         size_t msz = (size_t)opts->mask_w * opts->mask_h;
         uint8_t *mask_copy = kmalloc(msz);
@@ -553,14 +581,44 @@ static void wm_free_window(wm_window_t *win) {
     if (win->framebuf_owned && win->framebuf) kfree(win->framebuf);
     if (win->shape_mask_owned && win->shape_mask) kfree((void *)win->shape_mask);
     if (win->title) kfree(win->title);
+    if (win->event_queue) kfree(win->event_queue);
     kfree(win);
 }
 
 static void wm_push_event(wm_window_t *win, uint32_t type, uint32_t data) {
     if (!win) return;
-    uint16_t next = (uint16_t)((win->event_head + 1u) % WM_EVENT_QUEUE_CAP);
+    if (!win->event_queue || win->event_cap == 0u) {
+        uint16_t init_cap = 16u;
+        win->event_queue = (wm_event_t *)kmalloc((size_t)init_cap * sizeof(wm_event_t));
+        if (!win->event_queue) return;
+        win->event_cap = init_cap;
+        win->event_head = 0u;
+        win->event_tail = 0u;
+    }
+    uint16_t next = (uint16_t)((win->event_head + 1u) % win->event_cap);
     if (next == win->event_tail) {
-        win->event_tail = (uint16_t)((win->event_tail + 1u) % WM_EVENT_QUEUE_CAP);
+        uint16_t old_cap = win->event_cap;
+        uint16_t new_cap = (old_cap <= 0x7FFFu) ? (uint16_t)(old_cap * 2u) : 0xFFFFu;
+        bool grew = false;
+        if (new_cap > old_cap) {
+            wm_event_t *new_q = (wm_event_t *)kmalloc((size_t)new_cap * sizeof(wm_event_t));
+            if (new_q) {
+                uint16_t count = (uint16_t)((win->event_head - win->event_tail + old_cap) % old_cap);
+                for (uint16_t i = 0u; i < count; i++) {
+                    new_q[i] = win->event_queue[(win->event_tail + i) % old_cap];
+                }
+                kfree(win->event_queue);
+                win->event_queue = new_q;
+                win->event_cap = new_cap;
+                win->event_tail = 0u;
+                win->event_head = count;
+                next = (uint16_t)((win->event_head + 1u) % win->event_cap);
+                grew = true;
+            }
+        }
+        if (!grew) {
+            win->event_tail = (uint16_t)((win->event_tail + 1u) % win->event_cap);
+        }
     }
     win->event_queue[win->event_head].type = type;
     win->event_queue[win->event_head].data = data;
@@ -578,11 +636,11 @@ bool wm_poll_event(wm_window_t *win, wm_event_t *out) {
     if (cur && win->owner_pid != 0u && win->owner_pid != cur->pid) {
         return false;
     }
-    if (win->event_tail == win->event_head) {
+    if (!win->event_queue || win->event_cap == 0u || win->event_tail == win->event_head) {
         return false;
     }
     *out = win->event_queue[win->event_tail];
-    win->event_tail = (uint16_t)((win->event_tail + 1u) % WM_EVENT_QUEUE_CAP);
+    win->event_tail = (uint16_t)((win->event_tail + 1u) % win->event_cap);
     return true;
 }
 
@@ -782,7 +840,7 @@ void wm_move(wm_window_t *win, int16_t nx, int16_t ny) {
     int sw = 0, sh = 0;
     wm_get_dims(&sw, &sh);
     int tb_y = wm_taskbar_y(sh);
-    /* Ensure title bar remains completely accessible and on screen */
+    /* Keep titlebar reachable on screen */
     if (ny < TITLEBAR_H + 2) ny = TITLEBAR_H + 2;
     if (ny > (int16_t)(tb_y - 16)) ny = (int16_t)(tb_y - 16);
     if (nx < -(int16_t)win->w + 30) nx = -(int16_t)win->w + 30;
@@ -984,7 +1042,7 @@ void wm_set_fullscreen(wm_window_t *win, bool enable) {
     wm_invalidate_all();
 }
 
-/* Windows 95 palette indices and 3D primitives */
+/* Classic desktop UI palette indices and 3D primitives */
 
 #define WIN_CLR_DESKTOP        3    /* Teal / Cyan */
 #define WIN_CLR_FACE           7    /* Light Gray */
@@ -1046,36 +1104,130 @@ static void draw_cursor(uint8_t *bb, int bw, int bh, int cx, int cy) {
             }
 }
 
-/* Window decorations, taskbar, and wallpaper */
-/* Titlebar button 6x6 glyph bitmaps inside the 8x8 3D bevel interior */
-static const uint8_t s_icon_close[6] = {
-    0x00, 0x12, 0x0C, 0x0C, 0x12, 0x00 /* X */
-};
-static const uint8_t s_icon_max[6] = {
-    0x00, 0x08, 0x14, 0x22, 0x22, 0x00 /* ^ */
-};
-static const uint8_t s_icon_restore[6] = {
-    0x00, 0x22, 0x22, 0x14, 0x08, 0x00 /* v */
-};
-static const uint8_t s_icon_min[6] = {
-    0x00, 0x00, 0x00, 0x00, 0x1E, 0x00 /* _ */
-};
-static const uint8_t s_icon_fullscreen[6] = {
-    0x08, 0x08, 0x3E, 0x08, 0x08, 0x00 /* + */
-};
+/* Titlebar button 6x6 glyph bitmaps packed into scalar bitmasks */
+#define WM_PACK_ICON6(r0, r1, r2, r3, r4, r5) \
+    ((uint64_t)(r0) | ((uint64_t)(r1) << 8) | ((uint64_t)(r2) << 16) | \
+     ((uint64_t)(r3) << 24) | ((uint64_t)(r4) << 32) | ((uint64_t)(r5) << 40))
+
+#define WM_ICON_CLOSE      WM_PACK_ICON6(0x00u, 0x12u, 0x0Cu, 0x0Cu, 0x12u, 0x00u)
+#define WM_ICON_MAX        WM_PACK_ICON6(0x00u, 0x08u, 0x14u, 0x22u, 0x22u, 0x00u)
+#define WM_ICON_RESTORE    WM_PACK_ICON6(0x00u, 0x22u, 0x22u, 0x14u, 0x08u, 0x00u)
+#define WM_ICON_MIN        WM_PACK_ICON6(0x00u, 0x00u, 0x00u, 0x00u, 0x1Eu, 0x00u)
+#define WM_ICON_FULLSCREEN WM_PACK_ICON6(0x08u, 0x08u, 0x3Eu, 0x08u, 0x08u, 0x00u)
 
 static void draw_titlebar_icon_btn(uint8_t *bb, int bw, int bh,
-                                   int bx, int by, const uint8_t rows[6],
+                                   int bx, int by, uint64_t icon_bits,
                                    uint8_t color) {
     draw_3d_box(bb, bw, bh, bx, by, 8, 8, false);
     for (int r = 0; r < 6; r++) {
-        uint8_t bits = rows[r];
+        uint8_t bits = (uint8_t)((icon_bits >> (r * 8)) & 0xFFu);
         for (int c = 0; c < 6; c++) {
             if (bits & (0x20u >> c)) {
                 wm_buf_put_pixel(bb, bw, bh, bx + 1 + c, by + 1 + r, color);
             }
         }
     }
+}
+
+static char *wm_dup_str(const char *s, size_t *out_len) {
+    size_t len = s ? strlen(s) : 0u;
+    char *copy = (char *)kmalloc(len + 1u);
+    if (!copy) return NULL;
+    if (len > 0u) memcpy(copy, s, len);
+    copy[len] = '\0';
+    if (out_len) *out_len = len;
+    return copy;
+}
+
+static size_t wm_utf8_char_count(const char *src) {
+    if (!src) return 0;
+    size_t src_byte_len = strlen(src);
+    size_t cp_count = 0;
+    size_t pos = 0;
+    while (pos < src_byte_len) {
+        size_t cb = 0;
+        utf8_to_vga_glyph(&src[pos], src_byte_len - pos, &cb);
+        if (cb == 0) { pos++; continue; }
+        pos += cb;
+        cp_count++;
+    }
+    return cp_count;
+}
+
+static char *wm_make_marquee_alloc(const char *src, int vis_chars, uint32_t offset) {
+    if (!src || vis_chars <= 0) return NULL;
+    size_t slen = strlen(src);
+    if (slen <= (size_t)vis_chars) {
+        return wm_dup_str(src, NULL);
+    }
+    const char *sep = "       ";
+    size_t seplen = strlen(sep);
+    size_t total = slen + seplen;
+    char *out = (char *)kmalloc((size_t)vis_chars + 1u);
+    if (!out) return NULL;
+    for (int i = 0; i < vis_chars; i++) {
+        size_t idx = ((size_t)offset + (size_t)i) % total;
+        out[i] = (idx < slen) ? src[idx] : sep[idx - slen];
+    }
+    out[vis_chars] = '\0';
+    return out;
+}
+
+static char *wm_make_marquee_utf8_alloc(const char *src, int vis_chars, uint32_t offset) {
+    if (!src || vis_chars <= 0) return NULL;
+    size_t src_byte_len = strlen(src);
+    if (src_byte_len == 0) return wm_dup_str("", NULL);
+
+    size_t cp_count = wm_utf8_char_count(src);
+    if ((int)cp_count <= vis_chars) {
+        return wm_dup_str(src, NULL);
+    }
+
+    const char *sep = "       ";
+    size_t sep_cp_count = 7u;
+    size_t loop_cp_len = cp_count + sep_cp_count;
+    if (loop_cp_len == 0) return wm_dup_str(src, NULL);
+
+    size_t out_cap = (size_t)vis_chars * 4u + 16u;
+    char *out = (char *)kmalloc(out_cap);
+    if (!out) return NULL;
+
+    uint16_t *cp_pos = (uint16_t *)kmalloc((cp_count + 1u) * sizeof(uint16_t));
+    if (!cp_pos) {
+        kfree(out);
+        return wm_make_marquee_alloc(src, vis_chars, offset);
+    }
+
+    size_t p = 0;
+    size_t ci = 0;
+    while (p < src_byte_len && ci < cp_count) {
+        cp_pos[ci] = (uint16_t)p;
+        size_t cb = 0;
+        utf8_to_vga_glyph(&src[p], src_byte_len - p, &cb);
+        if (cb == 0) { p++; continue; }
+        p += cb;
+        ci++;
+    }
+    cp_pos[ci] = (uint16_t)p;
+
+    size_t out_len = 0;
+    for (int c = 0; c < vis_chars; c++) {
+        size_t cp_idx = ((size_t)offset + (size_t)c) % loop_cp_len;
+        if (cp_idx < cp_count) {
+            uint16_t bstart = cp_pos[cp_idx];
+            uint16_t bend = cp_pos[cp_idx + 1];
+            for (uint16_t b = bstart; b < bend && out_len + 1 < out_cap; b++) {
+                out[out_len++] = src[b];
+            }
+        } else {
+            if (out_len + 1 < out_cap) {
+                out[out_len++] = ' ';
+            }
+        }
+    }
+    out[out_len] = '\0';
+    kfree(cp_pos);
+    return out;
 }
 
 static void draw_decorations(wm_window_t *win, uint8_t *bb, int bw, int bh) {
@@ -1088,7 +1240,7 @@ static void draw_decorations(wm_window_t *win, uint8_t *bb, int bw, int bh) {
         return;
     }
 
-    /* Windows 95 outer 3D beveled frame */
+    /* Classic 3D beveled frame */
     int ox = (int)win->x - 2;
     int oy = (int)win->y - TITLEBAR_H - 2;
     int ow = (int)win->w + 4;
@@ -1116,113 +1268,187 @@ static void draw_decorations(wm_window_t *win, uint8_t *bb, int bw, int bh) {
     wm_buf_draw_line(bb, bw, bh, cx, cy + ch - 1, cx + cw - 1, cy + ch - 1, WIN_CLR_HILIGHT);
     wm_buf_draw_line(bb, bw, bh, cx + cw - 1, cy, cx + cw - 1, cy + ch - 1, WIN_CLR_HILIGHT);
 
-    /* Title bar background */
     uint8_t tbg = focused ? WIN_CLR_ACTIVE_TITLE : WIN_CLR_INACT_TITLE;
     uint8_t tfg = focused ? WIN_CLR_ACTIVE_TEXT : WIN_CLR_INACT_TEXT;
     wm_buf_fill_rect(bb, bw, bh, (int)win->x, (int)win->y - TITLEBAR_H, (int)win->w, TITLEBAR_H, tbg);
 
-    /* Title text */
     if (win->title) {
         int avail_w = (int)win->w - 40;
         int max_chars = avail_w > 0 ? avail_w / 6 : 0;
-        char disp_buf[64];
-        if (max_chars >= (int)sizeof(disp_buf)) {
-            max_chars = (int)sizeof(disp_buf) - 1;
-        }
         if (max_chars > 0) {
-            size_t title_len = strlen(win->title);
-            if (title_len <= (size_t)max_chars) {
-                strncpy(disp_buf, win->title, (size_t)max_chars);
-                disp_buf[max_chars] = '\0';
-            } else {
-                const char *sep = "   *   ";
-                size_t sep_len = strlen(sep);
-                size_t loop_len = title_len + sep_len;
-                uint32_t now = timer_millis();
-                uint32_t offset = (now / 200u) % loop_len;
-                for (int c = 0; c < max_chars; c++) {
-                    size_t idx = (offset + (size_t)c) % loop_len;
-                    if (idx < title_len) {
-                        disp_buf[c] = win->title[idx];
-                    } else {
-                        disp_buf[c] = sep[idx - title_len];
-                    }
-                }
-                disp_buf[max_chars] = '\0';
+            uint32_t now = timer_millis();
+            char *disp_buf = wm_make_marquee_utf8_alloc(win->title, max_chars, now / 180u);
+            if (disp_buf) {
+                wm_buf_draw_string(bb, bw, bh, (int)win->x + 2, (int)win->y - TITLEBAR_H + 2, disp_buf, tfg);
+                kfree(disp_buf);
             }
-            wm_buf_draw_string(bb, bw, bh, (int)win->x + 2, (int)win->y - TITLEBAR_H + 2, disp_buf, tfg);
         }
     }
 
-    /* Titlebar Buttons on the right */
     int btn_y = (int)win->y - TITLEBAR_H + 1;
 
-    /* 1. Close button [X] */
+    /* Close [X] */
     if (wm_window_has_close_button(win)) {
         draw_titlebar_icon_btn(bb, bw, bh, (int)win->x + (int)win->w - 9, btn_y,
-                               s_icon_close, WIN_CLR_DKSHADOW);
+                               WM_ICON_CLOSE, WIN_CLR_DKSHADOW);
     }
 
-    /* 2. Maximize [^] / Restore [v] button */
+    /* Maximize [^] / Restore [v] */
     draw_titlebar_icon_btn(bb, bw, bh, (int)win->x + (int)win->w - 18, btn_y,
-                           win->maximized ? s_icon_restore : s_icon_max, WIN_CLR_DKSHADOW);
+                           win->maximized ? WM_ICON_RESTORE : WM_ICON_MAX, WIN_CLR_DKSHADOW);
 
-    /* 3. Minimize button [_] */
+    /* Minimize [_] */
     draw_titlebar_icon_btn(bb, bw, bh, (int)win->x + (int)win->w - 27, btn_y,
-                           s_icon_min, WIN_CLR_DKSHADOW);
+                           WM_ICON_MIN, WIN_CLR_DKSHADOW);
 
-    /* 4. Fullscreen button [+] (cover entire screen over all WM buttons/taskbar) */
+    /* Fullscreen [+] (covers taskbar and WM chrome) */
     if ((int)win->w >= 40) {
         draw_titlebar_icon_btn(bb, bw, bh, (int)win->x + (int)win->w - 36, btn_y,
-                               s_icon_fullscreen, WIN_CLR_DKSHADOW);
+                               WM_ICON_FULLSCREEN, WIN_CLR_DKSHADOW);
     }
 }
 
-static inline uint8_t cmos_read(uint8_t reg) {
-    outb(0x70, reg);
-    return inb(0x71);
+static char *s_last_time_fmt = NULL;
+static char *s_last_date_fmt = NULL;
+
+static bool wm_refresh_clock_text(void) {
+    rtc_poll();
+    size_t tlen = 0u;
+    size_t dlen = 0u;
+    rtc_status_t terr = RTC_OK;
+    rtc_status_t derr = RTC_OK;
+
+    char *tfmt = rtc_get_time_format_alloc();
+    if (tfmt) {
+        if (!s_last_time_fmt || strcmp(tfmt, s_last_time_fmt) != 0) {
+            if (s_last_time_fmt) kfree(s_last_time_fmt);
+            s_last_time_fmt = tfmt;
+            s_time_marquee_off = 0u;
+        } else {
+            kfree(tfmt);
+        }
+    }
+    char *dfmt = rtc_get_date_format_alloc();
+    if (dfmt) {
+        if (!s_last_date_fmt || strcmp(dfmt, s_last_date_fmt) != 0) {
+            if (s_last_date_fmt) kfree(s_last_date_fmt);
+            s_last_date_fmt = dfmt;
+            s_date_marquee_off = 0u;
+        } else {
+            kfree(dfmt);
+        }
+    }
+
+    char *fresh_t = rtc_format_time_alloc(&tlen, &terr);
+    if (!fresh_t) {
+        const char *msg = (terr == RTC_ERR_NO_SUBSECOND) ? "NO MS (1s)" : "RTC ERR";
+        fresh_t = wm_dup_str(msg, &tlen);
+    }
+    char *fresh_d = rtc_format_date_alloc(&dlen, &derr);
+    if (!fresh_d) {
+        fresh_d = wm_dup_str("RTC ERR", &dlen);
+    }
+
+    bool changed = false;
+    if (fresh_t) {
+        if (!s_tb_time_text || strcmp(fresh_t, s_tb_time_text) != 0) {
+            if (s_tb_time_text) kfree(s_tb_time_text);
+            s_tb_time_text = fresh_t;
+            s_tb_time_len = tlen;
+            changed = true;
+        } else {
+            kfree(fresh_t);
+        }
+    }
+    if (fresh_d) {
+        if (!s_tb_date_text || strcmp(fresh_d, s_tb_date_text) != 0) {
+            if (s_tb_date_text) kfree(s_tb_date_text);
+            s_tb_date_text = fresh_d;
+            s_tb_date_len = dlen;
+            changed = true;
+        } else {
+            kfree(fresh_d);
+        }
+    }
+
+    s_last_clock_gen = rtc_generation();
+    return changed;
 }
 
-static inline uint8_t bcd_to_bin(uint8_t val) {
-    return (uint8_t)(((val >> 4) * 10) + (val & 0x0F));
+static uint32_t wm_small_glyph_bits(char ch) {
+    if (ch >= 'a' && ch <= 'z') ch = (char)(ch - ('a' - 'A'));
+    switch (ch) {
+        case '0': return 0x69996u;
+        case '1': return 0x26227u;
+        case '2': return 0xE168Fu;
+        case '3': return 0xE161Eu;
+        case '4': return 0x99F11u;
+        case '5': return 0xF8E1Eu;
+        case '6': return 0x78E96u;
+        case '7': return 0xF1244u;
+        case '8': return 0x69696u;
+        case '9': return 0x6971Eu;
+        case '-': return 0x00E00u;
+        case '+': return 0x04E40u;
+        case '.': return 0x00004u;
+        case ',': return 0x00048u;
+        case ':': return 0x04040u;
+        case '/': return 0x12248u;
+        case '*': return 0x0A4A0u;
+        case '!': return 0x44404u;
+        case '?': return 0x61202u;
+        case '(': return 0x24442u;
+        case ')': return 0x42224u;
+        case '[': return 0x64446u;
+        case ']': return 0x62226u;
+        case '_': return 0x0000Fu;
+        case '=': return 0x0E0E0u;
+        case 'A': return 0x69F99u;
+        case 'B': return 0xE9E9Eu;
+        case 'C': return 0x78887u;
+        case 'D': return 0xE999Eu;
+        case 'E': return 0xF8E8Fu;
+        case 'F': return 0xF8E88u;
+        case 'G': return 0x78B97u;
+        case 'H': return 0x99F99u;
+        case 'I': return 0xE444Eu;
+        case 'J': return 0x11196u;
+        case 'K': return 0x9ACA9u;
+        case 'L': return 0x8888Fu;
+        case 'M': return 0x9F999u;
+        case 'N': return 0x9DB99u;
+        case 'O': return 0x69996u;
+        case 'P': return 0xE9E88u;
+        case 'Q': return 0x699A5u;
+        case 'R': return 0xE9EA9u;
+        case 'S': return 0x7861Eu;
+        case 'T': return 0xE4444u;
+        case 'U': return 0x99996u;
+        case 'V': return 0x99966u;
+        case 'W': return 0x99BF9u;
+        case 'X': return 0x99699u;
+        case 'Y': return 0x99644u;
+        case 'Z': return 0xF248Fu;
+        default:  return 0x00000u;
+    }
 }
 
-static void wm_get_rtc_time(int *out_h, int *out_m) {
-    static int s_cached_h = -1;
-    static int s_cached_m = -1;
-    static uint32_t s_last_rtc_ms = 0;
-
-    uint32_t now = timer_millis();
-    if (s_cached_h >= 0 && (uint32_t)(now - s_last_rtc_ms) < 1000u) {
-        *out_h = s_cached_h;
-        *out_m = s_cached_m;
-        return;
+static void wm_buf_draw_small_string(uint8_t *buf, uint16_t bw, uint16_t bh,
+                                     int x, int y, const char *str, uint8_t color) {
+    if (!buf || !str) return;
+    int cx = x;
+    for (size_t i = 0u; str[i] != '\0'; i++) {
+        uint32_t bits = wm_small_glyph_bits(str[i]);
+        for (int r = 0; r < WM_SMALL_FONT_H; r++) {
+            uint32_t row_bits = (bits >> ((WM_SMALL_FONT_H - 1 - r) * 4)) & 0x0Fu;
+            for (int c = 0; c < WM_SMALL_FONT_W; c++) {
+                if (row_bits & (0x08u >> c)) {
+                    wm_buf_put_pixel(buf, bw, bh, cx + c, y + r, color);
+                }
+            }
+        }
+        cx += WM_SMALL_FONT_ADV;
     }
-    s_last_rtc_ms = now;
-
-    int timeout = 256;
-    while ((cmos_read(0x0A) & 0x80) && --timeout > 0);
-
-    uint8_t min = cmos_read(0x02);
-    uint8_t hr  = cmos_read(0x04);
-    uint8_t reg_b = cmos_read(0x0B);
-
-    if (!(reg_b & 0x04)) {
-        min = bcd_to_bin(min);
-        hr  = (uint8_t)(((hr & 0x7F) ? bcd_to_bin(hr & 0x7F) : 0) | (hr & 0x80));
-    }
-
-    if (!(reg_b & 0x02)) {
-        bool is_pm = (hr & 0x80) != 0;
-        uint8_t h12 = (uint8_t)(hr & 0x7F);
-        if (h12 == 12) h12 = 0;
-        hr = is_pm ? (uint8_t)(h12 + 12) : h12;
-    }
-
-    s_cached_h = (int)(hr % 24);
-    s_cached_m = (int)(min % 60);
-    *out_h = s_cached_h;
-    *out_m = s_cached_m;
 }
 
 static int taskbar_scroll_offset = 0;
@@ -1247,11 +1473,15 @@ static void wm_draw_close_button(uint8_t *bb, int bw, int bh, int x, int y, int 
     wm_buf_draw_line(bb, bw, bh, x, y + h - 1, x + w - 1, y + h - 1, botright);
     wm_buf_draw_line(bb, bw, bh, x + w - 1, y, x + w - 1, y + h - 1, botright);
 
-    /* Indicator icon (6x6) */
-    wm_buf_fill_rect(bb, bw, bh, x + 2, y + 2, 6, 6, clr_icon);
+    const char *text = "Close";
 
-    /* Text: "Close" */
-    wm_buf_draw_string(bb, bw, bh, x + 10, y + 2, "Close", clr_text);
+    int text_width = 5 * WM_FONT_W;
+    int text_height = WM_FONT_H;
+
+    int tx = x + (w - text_width) / 2;
+    int ty = y + (h - text_height) / 2;
+
+    wm_buf_draw_string(bb, bw, bh, tx, ty, text, clr_text);
 }
 
 static void wm_handle_close_button_click(void) {
@@ -1300,25 +1530,27 @@ static void wm_handle_close_button_click(void) {
 }
 
 static void draw_taskbar(uint8_t *bb, int bw, int bh) {
+    (void)wm_refresh_clock_text();
     wm_taskbar_layout_t tb;
     wm_get_taskbar_layout(bw, bh, &tb);
 
-    /* 3D raised taskbar across the bottom */
+    const int box_y = tb.y + 2;
+    const int box_h = 17;
+    const int text_y = box_y + 5;
+
     wm_buf_fill_rect(bb, bw, bh, 0, tb.y, bw, TASKBAR_H, WIN_CLR_FACE);
     wm_buf_draw_line(bb, bw, bh, 0, tb.y, bw - 1, tb.y, WIN_CLR_HILIGHT);
 
-    /* Close button on the left */
-    wm_draw_close_button(bb, bw, bh, tb.close_x, tb.y + 2, tb.close_w, 10, false);
+    wm_draw_close_button(bb, bw, bh, tb.close_x, box_y, tb.close_w, box_h, false);
 
-    /* Left scroll button '<' */
-    draw_3d_box(bb, bw, bh, tb.scroll_l_x, tb.y + 2, tb.scroll_w, 10, false);
-    wm_buf_draw_string(bb, bw, bh, tb.scroll_l_x + 2, tb.y + 3, "<", WIN_CLR_DKSHADOW);
+    draw_3d_box(bb, bw, bh, tb.scroll_l_x, box_y, tb.scroll_w, box_h, false);
+    wm_buf_draw_string(bb, bw, bh, tb.scroll_l_x + 2, text_y, "<", WIN_CLR_DKSHADOW);
 
-    /* Window tabs between tabs_x0 and tabs_x1 */
     int win_idx = 0;
     int visible_tab = 0;
     int tab_w = tb.tab_w;
-    int tab_h = 10;
+    int tab_h = box_h;
+    s_tb_tabs_overflow = false;
     for (wm_window_t *w = wm_head; w; w = w->next) {
         if (!wm_window_is_visible_for_fg(w)) continue;
         if (win_idx < taskbar_scroll_offset) { win_idx++; continue; }
@@ -1326,7 +1558,7 @@ static void draw_taskbar(uint8_t *bb, int bw, int bh) {
         if (visible_tab >= tb.max_tabs) break;
 
         int tx = tb.tabs_x0 + visible_tab * tb.tab_stride;
-        int ty = tb.y + 2;
+        int ty = box_y;
         bool is_active = (w == wm_get_focused() && !w->minimized);
 
         if (is_active) {
@@ -1336,23 +1568,43 @@ static void draw_taskbar(uint8_t *bb, int bw, int bh) {
             draw_3d_box(bb, bw, bh, tx, ty, tab_w, tab_h, false);
         }
 
-        char title_buf[6];
+        int close_pad = wm_window_has_close_button(w) ? 10 : 2;
+        int max_tab_chars = (tab_w - 2 - close_pad) / 6;
+        if (max_tab_chars < 1) max_tab_chars = 1;
         const char *src_title = w->title ? w->title : "Win";
-        if (w->minimized) {
-            title_buf[0] = '_';
-            strncpy(title_buf + 1, src_title, 3);
-            title_buf[4] = '\0';
-        } else {
-            strncpy(title_buf, src_title, 4);
-            title_buf[4] = '\0';
-        }
         uint8_t text_color = is_active ? WIN_CLR_ACTIVE_TEXT : (w->minimized ? WIN_CLR_SHADOW : WIN_CLR_DKSHADOW);
-        wm_buf_draw_string(bb, bw, bh, tx + 2, ty + 3, title_buf, text_color);
 
-        /* Dedicated [x] close button on this specific tab */
+        int vis_title_chars = (w->minimized && max_tab_chars > 1) ? (max_tab_chars - 1) : max_tab_chars;
+        if (vis_title_chars < 1) vis_title_chars = 1;
+
+        size_t title_cp_cnt = wm_utf8_char_count(src_title);
+        if ((int)title_cp_cnt > vis_title_chars) {
+            s_tb_tabs_overflow = true;
+        }
+
+        uint32_t now = timer_millis();
+        uint32_t tab_marquee_off = now / 180u;
+        char *scrolled_title = wm_make_marquee_utf8_alloc(src_title, vis_title_chars, tab_marquee_off);
+        if (scrolled_title) {
+            if (w->minimized && max_tab_chars > 1) {
+                size_t st_len = strlen(scrolled_title);
+                char *min_buf = (char *)kmalloc(st_len + 2u);
+                if (min_buf) {
+                    min_buf[0] = '_';
+                    memcpy(min_buf + 1, scrolled_title, st_len + 1u);
+                    wm_buf_draw_string(bb, bw, bh, tx + 2, ty + 5, min_buf, text_color);
+                    kfree(min_buf);
+                }
+            } else {
+                wm_buf_draw_string(bb, bw, bh, tx + 2, ty + 5, scrolled_title, text_color);
+            }
+            kfree(scrolled_title);
+        }
+
+        /* Per-tab [x] close button */
         if (wm_window_has_close_button(w)) {
             int close_btn_x = tx + tab_w - 9;
-            int close_btn_y = ty + 1;
+            int close_btn_y = ty + (tab_h - 8) / 2;
             draw_3d_box(bb, bw, bh, close_btn_x, close_btn_y, 8, 8, false);
             wm_buf_draw_string(bb, bw, bh, close_btn_x + 1, close_btn_y, "x", is_active ? 15 : WIN_CLR_DKSHADOW);
         }
@@ -1360,12 +1612,10 @@ static void draw_taskbar(uint8_t *bb, int bw, int bh) {
         visible_tab++;
     }
 
-    /* Right scroll button '>' */
-    draw_3d_box(bb, bw, bh, tb.scroll_r_x, tb.y + 2, tb.scroll_w, 10, false);
-    wm_buf_draw_string(bb, bw, bh, tb.scroll_r_x + 2, tb.y + 3, ">", WIN_CLR_DKSHADOW);
+    draw_3d_box(bb, bw, bh, tb.scroll_r_x, box_y, tb.scroll_w, box_h, false);
+    wm_buf_draw_string(bb, bw, bh, tb.scroll_r_x + 2, text_y, ">", WIN_CLR_DKSHADOW);
 
-    /* Language box in tray */
-    draw_3d_box(bb, bw, bh, tb.lang_x, tb.y + 2, tb.lang_w, 10, true);
+    draw_3d_box(bb, bw, bh, tb.lang_x, box_y, tb.lang_w, box_h, true);
     const char *lang_name = dynamic_keymap_get_name();
     if (!lang_name || lang_name[0] == '\0') {
         lang_name = default_keymap_name;
@@ -1373,7 +1623,6 @@ static void draw_taskbar(uint8_t *bb, int bw, int bh) {
     size_t lang_byte_len = strlen(lang_name);
     int vis_chars = 13; /* (85 - 4) / 6 = 13 character cells */
 
-    /* Count codepoints in lang_name only when byte length exceeds vis_chars */
     size_t lang_cp_count = lang_byte_len;
     if (lang_byte_len > (size_t)vis_chars) {
         lang_cp_count = 0;
@@ -1389,14 +1638,13 @@ static void draw_taskbar(uint8_t *bb, int bw, int bh) {
 
     size_t disp_cap = lang_byte_len + 16u;
     if (disp_cap < 64u) disp_cap = 64u;
-    char lang_stack[64];
-    char *disp_buf = (disp_cap <= sizeof(lang_stack)) ? lang_stack : (char *)kmalloc(disp_cap);
+    char *disp_buf = (char *)kmalloc(disp_cap);
     if (disp_buf) {
         if ((int)lang_cp_count <= vis_chars) {
             memcpy(disp_buf, lang_name, lang_byte_len);
             disp_buf[lang_byte_len] = '\0';
         } else {
-            const char *sep = "   *   ";
+            const char *sep = "       ";
             size_t sep_byte_len = strlen(sep);
             size_t sep_cp_count = sep_byte_len;
             size_t loop_cp_len = lang_cp_count + sep_cp_count;
@@ -1431,22 +1679,41 @@ static void draw_taskbar(uint8_t *bb, int bw, int bh) {
             }
             disp_buf[out] = '\0';
         }
-        wm_buf_draw_string(bb, bw, bh, tb.lang_x + 3, tb.y + 3, disp_buf, WIN_CLR_DKSHADOW);
-        if (disp_buf != lang_stack) kfree(disp_buf);
+        wm_buf_draw_string(bb, bw, bh, tb.lang_x + 3, text_y, disp_buf, WIN_CLR_DKSHADOW);
+        kfree(disp_buf);
     }
 
-    /* System tray clock from hardware CMOS RTC */
-    draw_3d_box(bb, bw, bh, tb.clock_x, tb.y + 2, tb.clock_w, 10, true);
-    int rtc_h = 0, rtc_m = 0;
-    wm_get_rtc_time(&rtc_h, &rtc_m);
-    char clock_buf[6];
-    clock_buf[0] = (char)('0' + (rtc_h / 10));
-    clock_buf[1] = (char)('0' + (rtc_h % 10));
-    clock_buf[2] = ':';
-    clock_buf[3] = (char)('0' + (rtc_m / 10));
-    clock_buf[4] = (char)('0' + (rtc_m % 10));
-    clock_buf[5] = '\0';
-    wm_buf_draw_string(bb, bw, bh, tb.clock_x + 3, tb.y + 3, clock_buf, WIN_CLR_DKSHADOW);
+    /* Hardware RTC two-line panel: larger time above compact date, with ticker on overflow. */
+    draw_3d_box(bb, bw, bh, tb.clock_x, box_y, tb.clock_w, box_h, true);
+    int inner_w = tb.clock_w - 6;
+    if (inner_w < 6) inner_w = 6;
+    int vis_time_chars = inner_w / WM_FONT_W;
+    if (vis_time_chars < 1) vis_time_chars = 1;
+    int vis_date_chars = (inner_w + 1) / WM_SMALL_FONT_ADV;
+    if (vis_date_chars < 1) vis_date_chars = 1;
+
+    s_tb_time_overflow = (s_tb_time_text && s_tb_time_len > (size_t)vis_time_chars);
+    s_tb_date_overflow = (s_tb_date_text && s_tb_date_len > (size_t)vis_date_chars);
+
+    if (s_tb_time_text && s_tb_time_len > 0u) {
+        char *t_draw = wm_make_marquee_alloc(s_tb_time_text, vis_time_chars, s_time_marquee_off);
+        if (t_draw) {
+            int t_px = (int)strlen(t_draw) * WM_FONT_W;
+            int draw_x = tb.clock_x + 3 + ((t_px < inner_w) ? ((inner_w - t_px) / 2) : 0);
+            wm_buf_draw_string(bb, bw, bh, draw_x, box_y + 2, t_draw, WIN_CLR_DKSHADOW);
+            kfree(t_draw);
+        }
+    }
+    if (s_tb_date_text && s_tb_date_len > 0u) {
+        char *d_draw = wm_make_marquee_alloc(s_tb_date_text, vis_date_chars, s_date_marquee_off);
+        if (d_draw) {
+            size_t d_cnt = strlen(d_draw);
+            int d_px = (d_cnt > 0u) ? ((int)d_cnt * WM_SMALL_FONT_ADV - 1) : 0;
+            int draw_x = tb.clock_x + 3 + ((d_px < inner_w) ? ((inner_w - d_px) / 2) : 0);
+            wm_buf_draw_small_string(bb, bw, bh, draw_x, box_y + 10, d_draw, WIN_CLR_DKSHADOW);
+            kfree(d_draw);
+        }
+    }
 }
 
 static void wm_compose_dims(uint8_t *backbuf, int bw, int bh) {
@@ -1458,11 +1725,10 @@ static void wm_compose_dims(uint8_t *backbuf, int bw, int bh) {
                               fw->x <= 0 && fw->y <= 0 &&
                               (int)fw->w >= bw && (int)fw->h >= bh);
     if (!opaque_full_cover) {
-        /* 1. Windows 95 Teal desktop */
         memset(backbuf, WIN_CLR_DESKTOP, (size_t)bw * (size_t)bh);
     }
 
-    /* 2. Windows (back to front). If an opaque fullscreen window is focused, draw it alone over everything. */
+    /* Composite visible windows back-to-front (or solo focused fullscreen) */
     for (wm_window_t *win = wm_head; win; win = win->next) {
         if (!wm_window_is_visible_for_fg(win)) continue;
         if (win->minimized) continue;
@@ -1517,7 +1783,6 @@ static void wm_compose_dims(uint8_t *backbuf, int bw, int bh) {
         draw_decorations(win, backbuf, bw, bh);
     }
 
-    /* 4. Taskbar at bottom (hidden if focused window is fullscreen) */
     if (!top_fullscreen) {
         draw_taskbar(backbuf, bw, bh);
     }
@@ -1542,20 +1807,24 @@ static bool wm_is_cursor_hidden_at(int cx, int cy) {
 }
 
 static void wm_cursor_patch_restore(uint8_t *bb, int sw, int sh) {
-    if (!s_cursor_patch_valid) return;
+    if (!s_cursor_patch_valid || !s_cursor_patch) return;
     for (int r = 0; r < 10; r++) {
         int py = s_cursor_patch_y - 1 + r;
         if (py < 0 || py >= sh) continue;
         for (int c = 0; c < 7; c++) {
             int px = s_cursor_patch_x - 1 + c;
             if (px < 0 || px >= sw) continue;
-            bb[(size_t)py * (size_t)sw + (size_t)px] = s_cursor_patch[r][c];
+            bb[(size_t)py * (size_t)sw + (size_t)px] = s_cursor_patch[(size_t)r * 7u + (size_t)c];
         }
     }
     s_cursor_patch_valid = false;
 }
 
 static void wm_cursor_patch_save(const uint8_t *bb, int sw, int sh, int cx, int cy) {
+    if (!kgrow_array((void **)&s_cursor_patch, &s_cursor_patch_cap, 10u * 7u, sizeof(uint8_t), 70u)) {
+        s_cursor_patch_valid = false;
+        return;
+    }
     s_cursor_patch_x = cx;
     s_cursor_patch_y = cy;
     for (int r = 0; r < 10; r++) {
@@ -1564,7 +1833,7 @@ static void wm_cursor_patch_save(const uint8_t *bb, int sw, int sh, int cx, int 
         for (int c = 0; c < 7; c++) {
             int px = cx - 1 + c;
             if (px < 0 || px >= sw) continue;
-            s_cursor_patch[r][c] = bb[(size_t)py * (size_t)sw + (size_t)px];
+            s_cursor_patch[(size_t)r * 7u + (size_t)c] = bb[(size_t)py * (size_t)sw + (size_t)px];
         }
     }
     s_cursor_patch_valid = true;
@@ -1608,7 +1877,6 @@ static void wm_render_frame(int sw, int sh, int cursor_x, int cursor_y, bool bli
     }
 }
 
-/* Compositor tick and mouse interactions */
 static int16_t drag_offset_x = 0, drag_offset_y = 0;
 static uint16_t drag_start_w = 0, drag_start_h = 0;
 static int16_t drag_start_x = 0, drag_start_y = 0;
@@ -1676,11 +1944,11 @@ void wm_compositor_tick(void) {
         return;
     }
 
-    /* Keyboard */
     uint8_t sc;
+    ipo_key_event_t kev;
+    memset(&kev, 0, sizeof(kev));
     while ((sc = keyboard_get_scancode_raw()) != 0) {
         update_hot_key_state(sc);
-        ipo_key_event_t kev;
         if (!ipo_key_decoder_feed(&s_wm_decoder, sc, &kev)) {
             continue;
         }
@@ -1700,17 +1968,17 @@ void wm_compositor_tick(void) {
 
         if (!is_e1 && !is_break) {
             uint8_t make = (uint8_t)(kev.keycode & 0x7Fu);
-            if (!is_e0 && make == 0x3Cu) { /* F2 key */
+            if (!is_e0 && make == 0x3Cu) { /* F2: cycle keymap */
                 dynamic_keymap_cycle_next();
                 continue;
-            } else if (!is_e0 && make == 0x57u) { /* F11: toggle fullscreen on focused window */
+            } else if (!is_e0 && make == 0x57u) { /* F11: toggle fullscreen */
                 if (fw) wm_set_fullscreen(fw, !fw->fullscreen);
                 continue;
-            } else if (!is_e0 && make == 0x0Fu && keyboard_is_ctrl_pressed() && !keyboard_is_alt_pressed()) { /* Ctrl+Tab / Ctrl+Shift+Tab */
+            } else if (!is_e0 && make == 0x0Fu && keyboard_is_ctrl_pressed() && !keyboard_is_alt_pressed()) { /* Ctrl(+Shift)+Tab */
                 if (keyboard_is_shift_pressed()) wm_focus_prev(); else wm_focus_next();
                 continue;
             } else if (keyboard_is_ctrl_pressed() && (make == 0x49u || make == 0x51u)) {
-                /* Ctrl + PageUp (0x49) / Ctrl + PageDown (0x51): switch workspace in batch mode */
+                /* Ctrl+PageUp (0x49) / Ctrl+PageDown (0x51): switch batch workspace */
                 if (process_is_batch_active()) {
                     if (make == 0x49u) {
                         process_switch_foreground_prev();
@@ -1723,6 +1991,7 @@ void wm_compositor_tick(void) {
                         wm_invalidate_all();
                     }
                 }
+                if (kev.raw_bytes) kfree(kev.raw_bytes);
                 return;
             } else if (keyboard_is_ctrl_pressed() &&
                        (make == 0x48u || make == 0x50u || make == 0x4Bu || make == 0x4Du)) {
@@ -1739,7 +2008,7 @@ void wm_compositor_tick(void) {
         if (fw) {
             uint32_t ext_data = (kev.keycode & 0x7FFFFFFFu) | (is_break ? 0x80000000u : 0u);
             wm_push_event(fw, WM_EVENT_KEY_EXT, ext_data);
-            for (uint8_t bi = 0; bi < kev.raw_len; bi++) {
+            for (uint32_t bi = 0u; bi < kev.raw_len && kev.raw_bytes; bi++) {
                 uint8_t b = kev.raw_bytes[bi];
                 uint32_t ev_t = (b == 0xE0u || b == 0xE1u) ? WM_EVENT_KEY_DOWN
                                 : ((b & 0x80u) ? WM_EVENT_KEY_UP : WM_EVENT_KEY_DOWN);
@@ -1747,13 +2016,13 @@ void wm_compositor_tick(void) {
             }
         }
     }
+    if (kev.raw_bytes) kfree(kev.raw_bytes);
     if (!wm_sess_active) return;
     if (!process_wm_has_focus()) {
         wm_cancel_mouse_interaction();
         return;
     }
 
-    /* Mouse */
     mouse_poll();
     if (!wm_sess_active) return;
     if (!process_wm_has_focus()) {
@@ -1813,9 +2082,7 @@ void wm_compositor_tick(void) {
         drag_win = NULL;
         drag_mode = DRAG_NONE;
 
-        /* 1. Check Taskbar */
         if (ms.y >= tb.y && !top_fullscreen) {
-            /* Close button */
             if (ms.x >= tb.close_x && ms.x <= tb.close_x + tb.close_w) {
                 wm_handle_close_button_click();
                 if (!wm_sess_active || !process_wm_has_focus() || !vga_is_graphics_mode()) {
@@ -1823,17 +2090,14 @@ void wm_compositor_tick(void) {
                 }
                 handled = true;
             }
-            /* Scroll left '<' */
             if (!handled && ms.x >= tb.scroll_l_x && ms.x <= tb.scroll_l_x + tb.scroll_w) {
                 if (taskbar_scroll_offset > 0) taskbar_scroll_offset--;
                 handled = true;
             }
-            /* Scroll right '>' */
             if (!handled && ms.x >= tb.scroll_r_x && ms.x <= tb.scroll_r_x + tb.scroll_w) {
                 if (taskbar_scroll_offset + tb.max_tabs < wm_count_visible_windows()) taskbar_scroll_offset++;
                 handled = true;
             }
-            /* Window tabs */
             if (!handled && ms.x >= tb.tabs_x0 && ms.x <= tb.tabs_x1) {
                 int rel_x = (int)ms.x - tb.tabs_x0;
                 int tab_idx = rel_x / tb.tab_stride;
@@ -1845,7 +2109,6 @@ void wm_compositor_tick(void) {
                         if (!wm_window_is_visible_for_fg(w)) continue;
                         if (cur_idx == target_idx) {
                             if (wm_window_has_close_button(w) && tab_in_x >= 30 && tab_in_x <= 39) {
-                                /* Clicked dedicated [x] button on this tab: close ONLY this window! */
                                 wm_close_window_by_user(w);
                                 int vis_cnt = wm_count_visible_windows();
                                 if (taskbar_scroll_offset > 0 && taskbar_scroll_offset >= vis_cnt) {
@@ -1860,7 +2123,6 @@ void wm_compositor_tick(void) {
                             } else if (w != wm_get_focused()) {
                                 wm_set_focus(w);
                             } else {
-                                /* Already active and focused -> minimize */
                                 w->minimized = true;
                                 for (wm_window_t *pw = wm_tail; pw; pw = pw->prev) {
                                     if (wm_window_is_visible_for_fg(pw) && !pw->minimized) {
@@ -1876,7 +2138,6 @@ void wm_compositor_tick(void) {
                     }
                 }
             }
-            /* Language box click */
             if (!handled && ms.x >= tb.lang_x && ms.x < tb.lang_x + tb.lang_w) {
                 dynamic_keymap_cycle_next();
                 handled = true;
@@ -1884,7 +2145,6 @@ void wm_compositor_tick(void) {
             handled = true;
         }
 
-        /* 2. Check Windows (top to bottom) */
         if (!handled) {
             for (wm_window_t *w = wm_tail; w; w = w->prev) {
                 if (!wm_window_is_visible_for_fg(w)) continue;
@@ -1900,13 +2160,12 @@ void wm_compositor_tick(void) {
                     handled = true;
 
                     if (!w->fullscreen && w->decor_style == WM_DECOR_DEFAULT) {
-                        /* Check Titlebar (any click at or above client top edge y) */
                         if (ms.y < (int)w->y) {
                             int titlebar_button_y = (int)w->y - TITLEBAR_H + 1;
                             bool in_titlebar_button_y =
                                 ms.y >= titlebar_button_y && ms.y < titlebar_button_y + 8;
 
-                            /* Fullscreen button [+] */
+                            /* Fullscreen [+] */
                             if (in_titlebar_button_y && (int)w->w >= 40 &&
                                 ms.x >= (int)w->x + (int)w->w - 36 &&
                                 ms.x < (int)w->x + (int)w->w - 28) {
@@ -1914,7 +2173,7 @@ void wm_compositor_tick(void) {
                                 break;
                             }
 
-                            /* Close button [X] */
+                            /* Close [X] */
                             if (wm_window_has_close_button(w) && in_titlebar_button_y &&
                                 ms.x >= (int)w->x + (int)w->w - 9 &&
                                 ms.x < (int)w->x + (int)w->w - 1) {
@@ -1922,7 +2181,7 @@ void wm_compositor_tick(void) {
                                 break;
                             }
 
-                            /* Maximize [^] / Restore [v] button */
+                            /* Maximize [^] / Restore [v] */
                             if (in_titlebar_button_y &&
                                 ms.x >= (int)w->x + (int)w->w - 18 &&
                                 ms.x < (int)w->x + (int)w->w - 10) {
@@ -1930,7 +2189,7 @@ void wm_compositor_tick(void) {
                                 break;
                             }
 
-                            /* Minimize button [_] */
+                            /* Minimize [_] */
                             if (in_titlebar_button_y &&
                                 ms.x >= (int)w->x + (int)w->w - 27 &&
                                 ms.x < (int)w->x + (int)w->w - 19) {
@@ -1938,7 +2197,6 @@ void wm_compositor_tick(void) {
                                 break;
                             }
 
-                            /* Title bar double-click to toggle maximize */
                             uint32_t now = timer_millis();
                             if (last_title_click_win == w && (now - last_title_click_time) < 400) {
                                 last_title_click_win = NULL;
@@ -1948,7 +2206,6 @@ void wm_compositor_tick(void) {
                             last_title_click_win = w;
                             last_title_click_time = now;
 
-                            /* Title bar drag to move */
                             drag_mode = DRAG_MOVE;
                             drag_win = w;
                             drag_offset_x = (int16_t)(ms.x - w->x);
@@ -1960,13 +2217,12 @@ void wm_compositor_tick(void) {
                             break;
                         }
 
-                        /* Outer resize hit-testing stays outside client pixels so interior clicks
-                         * (e.g. hidden-cursor / custom-cursor apps) never start a resize drag. */
+                        /* Restrict resize hit-testing to the outer frame so client-area
+                         * clicks (including custom-cursor apps) never start a resize drag. */
                         bool on_outer_frame =
                             (ms.x < (int)w->x || ms.x >= (int)w->x + (int)w->w ||
                              ms.y >= (int)w->y + (int)w->h);
 
-                        /* Bottom-right corner resize: strictly on outer corner frame */
                         if (on_outer_frame &&
                             ms.x >= (int)w->x + (int)w->w - 4 && ms.x <= (int)w->x + (int)w->w + 3 &&
                             ms.y >= (int)w->y + (int)w->h - 4 && ms.y <= (int)w->y + (int)w->h + 3) {
@@ -1981,7 +2237,6 @@ void wm_compositor_tick(void) {
                             break;
                         }
 
-                        /* Bottom-left corner resize: strictly on outer corner frame */
                         if (on_outer_frame &&
                             ms.x >= (int)w->x - 3 && ms.x <= (int)w->x + 4 &&
                             ms.y >= (int)w->y + (int)w->h - 4 && ms.y <= (int)w->y + (int)w->h + 3) {
@@ -1996,7 +2251,6 @@ void wm_compositor_tick(void) {
                             break;
                         }
 
-                        /* Left border resize: outer left edge frame */
                         if (ms.x >= (int)w->x - 3 && ms.x < (int)w->x &&
                             ms.y >= (int)w->y && ms.y <= (int)w->y + (int)w->h + 2) {
                             drag_mode = DRAG_RESIZE_L;
@@ -2010,7 +2264,6 @@ void wm_compositor_tick(void) {
                             break;
                         }
 
-                        /* Right border resize: outer right edge frame */
                         if (ms.x >= (int)w->x + (int)w->w && ms.x <= (int)w->x + (int)w->w + 3 &&
                             ms.y >= (int)w->y && ms.y <= (int)w->y + (int)w->h + 2) {
                             drag_mode = DRAG_RESIZE_R;
@@ -2024,7 +2277,6 @@ void wm_compositor_tick(void) {
                             break;
                         }
 
-                        /* Bottom border resize: outer bottom edge frame */
                         if (ms.y >= (int)w->y + (int)w->h && ms.y <= (int)w->y + (int)w->h + 3 &&
                             ms.x >= (int)w->x && ms.x <= (int)w->x + (int)w->w + 2) {
                             drag_mode = DRAG_RESIZE_B;
@@ -2039,7 +2291,6 @@ void wm_compositor_tick(void) {
                         }
                     }
 
-                    /* Client area clicks are delivered without starting a window drag. */
                     if (ms.x >= (int)w->x && ms.x < (int)w->x + (int)w->w &&
                         ms.y >= (int)w->y && ms.y < (int)w->y + (int)w->h) {
                         if (w->owner_pid == 0 || process_is_alive(w->owner_pid)) {
@@ -2053,10 +2304,7 @@ void wm_compositor_tick(void) {
                 }
             }
         }
-
-        /* Desktop Exit button removed - only single Start/Exit button on taskbar */
     } else if (left_now && drag_win != NULL) {
-        /* Mouse drag in progress */
         if (drag_mode == DRAG_MOVE) {
             if (drag_win->maximized) {
                 int dx = (int)ms.x - (int)drag_start_mx;
@@ -2160,36 +2408,58 @@ void wm_compositor_tick(void) {
         w = next;
     }
 
+    rtc_poll();
+
+    {
+        uint32_t now = timer_millis();
+        if ((s_tb_time_overflow || s_tb_date_overflow || s_tb_tabs_overflow) &&
+            (uint32_t)(now - s_clock_marquee_last_tick) >= 180u) {
+            s_clock_marquee_last_tick = now;
+            if (s_tb_time_overflow && s_tb_time_len > 0u) {
+                s_time_marquee_off = (s_time_marquee_off + 1u) % ((uint32_t)s_tb_time_len + 7u);
+            }
+            if (s_tb_date_overflow && s_tb_date_len > 0u) {
+                s_date_marquee_off = (s_date_marquee_off + 1u) % ((uint32_t)s_tb_date_len + 7u);
+            }
+            wm_window_t *fw = wm_get_focused();
+            bool top_fs = (fw && fw->fullscreen && !fw->minimized && wm_window_is_visible_for_fg(fw));
+            if (!top_fs) wm_surface_dirty = true;
+        }
+    }
+
     if (!wm_surface_dirty) {
         uint32_t now = timer_millis();
-        if ((uint32_t)(now - s_last_slow_check_ms) >= 180u) {
+        uint32_t cgen = rtc_generation();
+        uint32_t clock_period = rtc_time_format_uses_subsecond() ? 50u : 180u;
+        if (cgen != s_last_clock_gen || (uint32_t)(now - s_last_clock_check_ms) >= clock_period) {
+            s_last_clock_check_ms = now;
+            wm_window_t *fw = wm_get_focused();
+            bool top_fs = (fw && fw->fullscreen && !fw->minimized && wm_window_is_visible_for_fg(fw));
+            if (!top_fs && wm_refresh_clock_text()) {
+                wm_surface_dirty = true;
+            }
+        }
+        if (!wm_surface_dirty && (uint32_t)(now - s_last_slow_check_ms) >= 180u) {
             s_last_slow_check_ms = now;
             wm_window_t *fw = wm_get_focused();
             bool top_fs = (fw && fw->fullscreen && !fw->minimized && wm_window_is_visible_for_fg(fw));
             if (!top_fs) {
-                int rtc_h = 0, rtc_m = 0;
-                wm_get_rtc_time(&rtc_h, &rtc_m);
-                int cur_min = rtc_h * 60 + rtc_m;
-                if (cur_min != s_last_tb_minute) {
-                    s_last_tb_minute = cur_min;
-                    wm_surface_dirty = true;
-                }
                 const char *cur_lang = dynamic_keymap_get_name();
                 if (!cur_lang || !cur_lang[0]) cur_lang = default_keymap_name;
-                if (strncmp(cur_lang, s_last_lang_name, sizeof(s_last_lang_name) - 1u) != 0) {
-                    wm_copy_lang_name(s_last_lang_name, sizeof(s_last_lang_name), cur_lang);
+                if (!s_last_lang_name || strcmp(cur_lang, s_last_lang_name) != 0) {
+                    wm_set_lang_name(cur_lang);
                     wm_surface_dirty = true;
                 }
-                if (strlen(cur_lang) > 13u) {
+                if (strlen(cur_lang) > 13u || s_tb_tabs_overflow) {
                     wm_surface_dirty = true;
                 } else {
-                    uint32_t mtick = now / 200u;
+                    uint32_t mtick = now / 180u;
                     if (mtick != s_last_title_marquee_tick) {
                         for (wm_window_t *w = wm_head; w; w = w->next) {
                             if (!wm_window_is_visible_for_fg(w) || w->minimized || w->fullscreen || !w->title) continue;
                             if (w->decor_style != WM_DECOR_DEFAULT) continue;
                             int max_chars = ((int)w->w - 40) / 6;
-                            if (max_chars > 0 && (int)strlen(w->title) > max_chars) {
+                            if (max_chars > 0 && (int)wm_utf8_char_count(w->title) > max_chars) {
                                 s_last_title_marquee_tick = mtick;
                                 wm_surface_dirty = true;
                                 break;
@@ -2210,14 +2480,12 @@ void wm_compositor_tick(void) {
     wm_render_frame(sw, sh, (int)ms.x, (int)ms.y, true);
 }
 
-/* Session API */
 bool wm_session_active(void) { return wm_sess_active; }
 
 void wm_get_screen_bounds(int *out_w, int *out_h) {
     vga_gfx_get_screen_bounds(out_w, out_h);
 }
 
-/** wm_session_start — activate the compositor session and return immediately. */
 void wm_session_start(void) {
     if (wm_sess_active) return;
 
@@ -2249,11 +2517,9 @@ void wm_session_start(void) {
     s_last_rendered_sh = 0;
     s_prev_gfx_mode = should_switch_hw;
 
-    /* Draw initial frame */
     wm_render_frame(screen_w, screen_h, screen_w / 2, screen_h / 2, should_switch_hw);
 }
 
-/** wm_session_stop — stop compositor, destroy all windows, restore text mode. */
 void wm_session_stop(void) {
     if (!wm_sess_active) return;
     wm_sess_active = false;
@@ -2328,7 +2594,7 @@ void wm_on_resolution_changed(void) {
 }
 
 void wm_terminal_putc(char c, uint8_t fg, uint8_t bg) {
-    /* Terminal apps render natively in VGA text mode behind WM, not in a WM Terminal window. */
+    /* Terminal apps render directly to VGA text mode behind the WM. */
     (void)c;
     (void)fg;
     (void)bg;

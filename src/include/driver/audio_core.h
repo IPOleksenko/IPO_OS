@@ -18,23 +18,22 @@
 
 typedef struct audio_stream {
     int          format;         /* AUDIO_FORMAT_* */
-    int          channels;       /* 1 (mono), 2 (stereo), etc. */
-    uint32_t     sample_rate;    /* 8000 .. 192000 Hz */
-    const uint8_t *data;         /* Pointer to PCM samples */
-    size_t       data_size;      /* Total size in bytes */
-    size_t       cursor;         /* Current byte offset */
+    int          channels;       /* 1 = mono, 2 = stereo */
+    uint32_t     sample_rate;    /* 8000..192000 Hz */
+    const uint8_t *data;
+    size_t       data_size;      /* bytes */
+    size_t       cursor;         /* byte offset */
     bool         is_playing;
     bool         looping;
-    float        volume;         /* 0.0f .. 1.0f */
-    double       fractional_pos; /* Fractional sample accumulator for resampler */
-    size_t       ring_size;      /* 0 = linear buffer, >0 = circular ring buffer in samples */
-    size_t       buffered_samples;/* Total samples decoded/written so far */
-    bool         is_eof;         /* True when streaming decoder reached end of file */
-    void        *owner;          /* Process owner */
+    float        volume;         /* 0.0f..1.0f */
+    double       fractional_pos; /* resampler accumulator */
+    size_t       ring_size;      /* 0 = linear buffer, >0 = ring buffer capacity in samples */
+    size_t       buffered_samples;
+    bool         is_eof;
+    void        *owner;          /* owning process */
     struct audio_stream *next;
 } audio_stream_t;
 
-/* System-wide audio interface */
 bool            audio_init(void);
 int             audio_get_active_backend(void);
 const char     *audio_get_backend_name(void);
@@ -53,21 +52,16 @@ void            audio_stream_set_volume(audio_stream_t *stream, float volume);
 void            audio_stream_seek(audio_stream_t *stream, double progress_fraction);
 double          audio_stream_get_progress(audio_stream_t *stream);
 
-/* Continuous background DMA replenishment and mixing */
+/* Background DMA refill and stream mixing */
 void            audio_poll(void);
-
-/* Resamples, mixes all active streams and outputs audio to hardware */
 void            audio_tick(void);
 
-/* Audio engine diagnostic metrics */
 uint32_t        audio_get_refill_count(void);
 bool            audio_is_running(void);
 
-/* Stops Sound Blaster 16 DMA output immediately */
+/* Halt ISA DMA audio output immediately */
 void            sb16_stop(void);
-bool            sb16_get_dsp_version(uint8_t *major, uint8_t *minor);
 
-/* Stops all audio playback across all hardware backends */
 void            audio_stop_all(void);
 
 #endif /* LIB_DRIVER_AUDIO_CORE_H */

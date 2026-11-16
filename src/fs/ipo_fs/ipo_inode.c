@@ -150,7 +150,7 @@ static int64_t expand_and_allocate_inode(void) {
         }
     }
 
-    /* Allocate inode table blocks (16 down to 1 block) before linking metadata on disk */
+    /* Allocate table blocks (16 down to 1) before linking the chunk into on-disk metadata */
     uint32_t blocks_to_alloc = 16;
     int64_t table_phys = -1;
     while (blocks_to_alloc >= 1) {
@@ -341,12 +341,11 @@ bool free_inode(uint64_t inode_no) {
     struct ipo_inode inode;
     if (!read_inode(inode_no, &inode)) return false;
 
-    /* Free primary embedded extents */
+    /* Free inline extents and chained extent nodes */
     for (int i = 0; i < IPO_INODE_EXTENTS; i++) {
         free_extent_blocks(&inode.extents[i]);
     }
 
-    /* Free chained extent nodes */
     uint64_t curr_node_blk = inode.next_extent_node;
     while (curr_node_blk != 0) {
         struct ipo_extent_node enode;
@@ -359,11 +358,9 @@ bool free_inode(uint64_t inode_no) {
         curr_node_blk = next_blk;
     }
 
-    /* Zero inode content */
     memset(&inode, 0, sizeof(inode));
     write_inode(inode_no, &inode);
 
-    /* Clear bit in appropriate bitmap */
     if (inode_no <= sb.primary_inodes) {
         bitmap_set(sb.inode_bitmap_start, inode_no - 1, false);
     } else {
@@ -404,7 +401,7 @@ int64_t get_contiguous_data_blocks_for_inode(struct ipo_inode *inode, uint64_t l
     if (!inode) return -1;
     if (out_count) *out_count = 1;
 
-    /* Search embedded primary extents */
+    /* Search inline extents, then chained nodes */
     for (int i = 0; i < IPO_INODE_EXTENTS; i++) {
         struct ipo_extent *e = &inode->extents[i];
         if (e->block_count > 0) {
@@ -416,7 +413,6 @@ int64_t get_contiguous_data_blocks_for_inode(struct ipo_inode *inode, uint64_t l
         }
     }
 
-    /* Search chained extent nodes */
     uint64_t curr_node_blk = inode->next_extent_node;
     while (curr_node_blk != 0) {
         struct ipo_extent_node enode;
@@ -443,7 +439,7 @@ int64_t get_data_block_for_inode(struct ipo_inode *inode, uint64_t logical_index
     if (existing >= 0) return existing;
     if (!alloc) return -1;
 
-    /* Traverse chained extent nodes to locate the tail node */
+    /* Find tail extent node in case inline slots are full */
     uint64_t curr_node_blk = inode->next_extent_node;
     uint64_t last_node_blk = 0;
     struct ipo_extent_node last_enode;
@@ -461,7 +457,7 @@ int64_t get_data_block_for_inode(struct ipo_inode *inode, uint64_t logical_index
     int64_t new_phys = allocate_block();
     if (new_phys < 0) return -1;
 
-    /* Extend last primary extent if physically contiguous */
+    /* Coalesce with an adjacent inline extent if possible */
     for (int i = 0; i < IPO_INODE_EXTENTS; i++) {
         struct ipo_extent *e = &inode->extents[i];
         if (e->block_count > 0 &&
@@ -483,7 +479,7 @@ int64_t get_data_block_for_inode(struct ipo_inode *inode, uint64_t logical_index
         }
     }
 
-    /* Extend or append in the last chained extent node */
+    /* Try extending or appending to the tail extent node */
     if (last_node_blk != 0 && last_enode.count > 0) {
         struct ipo_extent *last_e = &last_enode.extents[last_enode.count - 1];
         if (last_e->logical_block + last_e->block_count == logical_index &&

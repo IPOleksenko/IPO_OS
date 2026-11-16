@@ -14,7 +14,7 @@ static bool write_dir_dots(uint64_t inode_no, uint64_t parent, uint64_t block) {
     if (!buf) return false;
     memset(buf, 0, IPO_FS_BLOCK_SIZE);
 
-    /* "." entry: rec_len = 20, name_len = 1 */
+    /* "." and ".." occupy fixed 20-byte records at offsets 0 and 20 */
     struct ipo_dir_entry d1;
     memset(&d1, 0, sizeof(d1));
     dir_entry_set_inode(&d1, inode_no);
@@ -24,7 +24,6 @@ static bool write_dir_dots(uint64_t inode_no, uint64_t parent, uint64_t block) {
     memcpy(buf, &d1, sizeof(d1));
     memcpy(buf + sizeof(d1), ".\0\0\0", 4);
 
-    /* ".." entry: rec_len = 20, name_len = 2 */
     struct ipo_dir_entry d2;
     memset(&d2, 0, sizeof(d2));
     dir_entry_set_inode(&d2, parent);
@@ -63,8 +62,30 @@ static bool setup_dir_inode(uint64_t ino, uint64_t parent, uint32_t mode) {
     return true;
 }
 
-static bool zero_blocks(uint64_t start_block, uint64_t num_blocks) {
-    #define ZERO_CHUNK_BLOCKS 8
+typedef struct {
+    uint64_t done_blocks;
+    uint64_t total_blocks;
+    uint32_t next_pct;
+} ipo_format_progress_t;
+
+static void ipo_format_log_progress(ipo_format_progress_t *prog, const char *stage, bool force) {
+    if (!prog || prog->total_blocks == 0) return;
+    uint32_t pct = (uint32_t)((prog->done_blocks * 100ULL) / prog->total_blocks);
+    if (pct > 100u) pct = 100u;
+    if (!force && pct < prog->next_pct) return;
+
+    uint64_t remaining = (prog->total_blocks > prog->done_blocks)
+        ? (prog->total_blocks - prog->done_blocks) : 0ULL;
+    printf("[ipo_fs] Format %u%%: formatted=%u blocks, remaining=%u blocks (%s)\n",
+           pct, (uint32_t)prog->done_blocks, (uint32_t)remaining, stage ? stage : "metadata");
+    while (prog->next_pct <= pct) {
+        prog->next_pct += 10u;
+    }
+}
+
+static bool zero_blocks(uint64_t start_block, uint64_t num_blocks,
+                        ipo_format_progress_t *prog, const char *stage) {
+    #define ZERO_CHUNK_BLOCKS 128
     uint8_t *zero_chunk = (uint8_t *)kmalloc(ZERO_CHUNK_BLOCKS * IPO_FS_BLOCK_SIZE);
     if (!zero_chunk) return false;
     memset(zero_chunk, 0, ZERO_CHUNK_BLOCKS * IPO_FS_BLOCK_SIZE);
@@ -72,15 +93,19 @@ static bool zero_blocks(uint64_t start_block, uint64_t num_blocks) {
     uint64_t curr = start_block;
     while (remaining > 0) {
         uint16_t chunk = (remaining > ZERO_CHUNK_BLOCKS) ? ZERO_CHUNK_BLOCKS : (uint16_t)remaining;
-        if (!block_write_multi(curr, chunk, zero_chunk)) {
+        if (!storage_pool_write_raw(fs_start_lba + curr, chunk, zero_chunk)) {
             kfree(zero_chunk);
             return false;
         }
         curr += chunk;
         remaining -= chunk;
+        if (prog) {
+            prog->done_blocks += chunk;
+            ipo_format_log_progress(prog, stage, false);
+        }
     }
     kfree(zero_chunk);
-    return true;
+    return storage_pool_flush();
 }
 
 bool ipo_fs_format(uint64_t disk_start_lba, uint64_t total_blocks, uint64_t total_inodes) {
@@ -139,10 +164,24 @@ bool ipo_fs_format(uint64_t disk_start_lba, uint64_t total_blocks, uint64_t tota
     fs_start_lba = disk_start_lba;
     memcpy(&sb, &s, sizeof(sb));
 
-    bool ok = block_write(0, &sb) &&
-              zero_blocks(s.inode_bitmap_start, inode_bitmap_blocks) &&
-              zero_blocks(s.block_bitmap_start, block_bitmap_blocks) &&
-              zero_blocks(s.inode_table_start, inode_table_blocks);
+    ipo_format_progress_t prog = {
+        .done_blocks = 0,
+        .total_blocks = inode_bitmap_blocks + block_bitmap_blocks + inode_table_blocks,
+        .next_pct = 10u
+    };
+    printf("[ipo_fs] Initializing %u metadata blocks (inode_bmp=%u, block_bmp=%u, inode_table=%u), remaining=%u...\n",
+           (uint32_t)prog.total_blocks,
+           (uint32_t)inode_bitmap_blocks,
+           (uint32_t)block_bitmap_blocks,
+           (uint32_t)inode_table_blocks,
+           (uint32_t)prog.total_blocks);
+
+    bool ok = zero_blocks(s.inode_bitmap_start, inode_bitmap_blocks, &prog, "inode bitmap") &&
+              zero_blocks(s.block_bitmap_start, block_bitmap_blocks, &prog, "block bitmap") &&
+              zero_blocks(s.inode_table_start, inode_table_blocks, &prog, "inode table");
+    if (ok && prog.next_pct <= 100u) {
+        ipo_format_log_progress(&prog, "done", true);
+    }
     if (!ok) {
         printf("ipo_fs_format: failed to initialize metadata blocks\n");
         goto rollback;
@@ -183,6 +222,7 @@ bool ipo_fs_format(uint64_t disk_start_lba, uint64_t total_blocks, uint64_t tota
         printf("ipo_fs_format: failed to write superblock\n");
         goto rollback;
     }
+    printf("[ipo_fs] Superblock and root directories created (remaining=0).\n");
     return true;
 
 rollback:
@@ -223,7 +263,7 @@ bool ipo_fs_mount(uint64_t disk_start_lba) {
     cached_chunk_valid = false;
     ipo_fs_set_last_error(IPO_FS_OK);
 
-    /* Ensure primary inode count and dynamic flag are initialized */
+    /* Backfill primary_inodes and dynamic flag for volumes formatted before dynamic chunks */
     if (sb.primary_inodes == 0 && sb.inode_count > 0) {
         sb.primary_inodes = (uint32_t)(sb.inode_count - sb.dynamic_inodes_count);
         sb.flags |= IPO_FS_FLAG_DYNAMIC_INODES;

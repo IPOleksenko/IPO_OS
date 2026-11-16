@@ -6,13 +6,9 @@
 
 #include <stddef.h>
 #include <stdbool.h>
+#include <types.h>
 
-/**
- * Output a single character to VGA memory at cursor position with specified colors
- * @param c Character to output
- * @param fg Foreground color
- * @param bg Background color
- */
+/* Write a character to VGA text memory at the current cursor with fg/bg colors */
 void putchar_color(char c, uint8_t fg, uint8_t bg);
 
 bool putchar_is_locked(void);
@@ -23,7 +19,9 @@ void serial_putc_raw(char c);
 void serial_putc(char c);
 int serial_getc(void);
 void putchar(char c);
-void putchar_vga_replay(const char *str, uint32_t len);
+void putchar_write_color(const char *str, ipo_size_t len, uint8_t fg, uint8_t bg);
+void putchar_write(const char *str, ipo_size_t len);
+void putchar_vga_replay(const char *str, ipo_size_t len);
 
 int stdio_vformat(void (*emit)(void *ctx, char ch), void *ctx, const char *format, va_list args);
 int printf(const char *format, ...);

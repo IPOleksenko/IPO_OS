@@ -1,4 +1,5 @@
 #include <vga.h>
+#include <arch/cpu_regs.h>
 #include <ioport.h>
 #include <stddef.h>
 #include <string.h>
@@ -15,9 +16,8 @@ static void vga_ensure_font_cache_storage(void) {
     }
 }
 
-uint32_t vga_plane2_font_enter(void) {
-    uint32_t flags;
-    __asm__ volatile("pushf; pop %0; cli" : "=r"(flags));
+ipo_reg_t vga_plane2_font_enter(void) {
+    ipo_reg_t flags = arch_irq_save_regs();
 
     outb(0x3C4, 0x00); outb(0x3C5, 0x01); /* Synchronous reset */
     outb(0x3C4, 0x02); outb(0x3C5, 0x04); /* Plane 2 */
@@ -29,13 +29,13 @@ uint32_t vga_plane2_font_enter(void) {
     outb(0x3CE, 0x03); outb(0x3CF, 0x00);
     outb(0x3CE, 0x04); outb(0x3CF, 0x02); /* Read map = Plane 2 */
     outb(0x3CE, 0x05); outb(0x3CF, 0x00); /* Write mode 0 */
-    outb(0x3CE, 0x06); outb(0x3CF, 0x04); /* Map 64KB at 0xA0000 only */
+    outb(0x3CE, 0x06); outb(0x3CF, 0x04); /* Map 64 KiB at 0xA0000 only */
     outb(0x3CE, 0x08); outb(0x3CF, 0xFF);
 
     return flags;
 }
 
-void vga_plane2_font_exit(uint32_t saved_flags) {
+void vga_plane2_font_exit(ipo_reg_t saved_flags) {
     outb(0x3C4, 0x00); outb(0x3C5, 0x01);
     outb(0x3C4, 0x02); outb(0x3C5, 0x03); /* Enable planes 0 & 1 */
     outb(0x3C4, 0x04); outb(0x3C5, 0x03); /* Odd/even addressing */
@@ -49,7 +49,7 @@ void vga_plane2_font_exit(uint32_t saved_flags) {
     outb(0x3CE, 0x06); outb(0x3CF, 0x0E); /* Map memory back to 0xB8000 */
     outb(0x3CE, 0x08); outb(0x3CF, 0xFF);
 
-    __asm__ volatile("push %0; popf" : : "r"(saved_flags));
+    arch_irq_restore_regs(saved_flags);
 }
 
 void vga_init_font_cache(void) {
@@ -58,14 +58,12 @@ void vga_init_font_cache(void) {
         return;
     }
 
-    for (int i = 0; i < 256; i++) {
-        memcpy(&vga_font_cache[(size_t)i * 16u], vga_default_font_data[i], 16u);
-    }
+    vga_default_font_copy_all(vga_font_cache);
 
-    uint32_t flags = vga_plane2_font_enter();
+    ipo_reg_t flags = vga_plane2_font_enter();
 
     /* Verify Plane 2 font memory is populated by checking 'A' (0x41). */
-    volatile uint8_t *test_ptr = (volatile uint8_t *)(0xA0000 + ((uint32_t)'A' * 32u));
+    volatile uint8_t *test_ptr = (volatile uint8_t *)(ipo_vaddr_t)(0xA0000u + ((uint32_t)'A' * 32u));
     bool readable = false;
     for (int r = 0; r < 16; r++) {
         if (test_ptr[r] != 0) {
@@ -76,7 +74,7 @@ void vga_init_font_cache(void) {
 
     if (readable) {
         for (uint32_t c = 0; c < 256; c++) {
-            volatile uint8_t *src = (volatile uint8_t *)(0xA0000 + (c * 32u));
+            volatile uint8_t *src = (volatile uint8_t *)(ipo_vaddr_t)(0xA0000u + (c * 32u));
             for (int r = 0; r < 16; r++) {
                 vga_font_cache[c * 16u + (uint32_t)r] = src[r];
             }
@@ -93,7 +91,7 @@ const uint8_t* vga_font_get_cached_glyph(uint8_t char_code) {
         vga_init_font_cache();
     }
     if (!vga_font_cache) {
-        return vga_default_font_data[char_code];
+        return vga_default_font_get_glyph(char_code);
     }
     return &vga_font_cache[(size_t)char_code * 16u];
 }
@@ -120,11 +118,11 @@ void vga_load_font(uint8_t start_code, uint32_t count, const uint8_t *glyphs) {
 
     if (vga_is_graphics_mode()) return;
 
-    uint32_t flags = vga_plane2_font_enter();
+    ipo_reg_t flags = vga_plane2_font_enter();
 
     for (uint32_t c = 0; c < count; c++) {
         uint8_t char_code = (uint8_t)(start_code + c);
-        volatile uint8_t *dest = (volatile uint8_t *)(0xA0000 + ((uint32_t)char_code * 32u));
+        volatile uint8_t *dest = (volatile uint8_t *)(ipo_vaddr_t)(0xA0000u + ((uint32_t)char_code * 32u));
         const uint8_t *src = glyphs + (c * 16u);
         for (int row = 0; row < 16; row++) {
             dest[row] = src[row];
@@ -194,7 +192,7 @@ static bool vga_font_db_add(uint32_t codepoint, const uint8_t *bitmap, size_t le
     if (font_db_count >= font_db_capacity) {
         if (font_db_capacity > UINT32_MAX / 2u) return false;
         uint32_t new_cap = (font_db_capacity == 0) ? 32u : (font_db_capacity * 2u);
-        if ((size_t)new_cap > SIZE_MAX / sizeof(font_record_t)) return false;
+        if (!ipo_size_mul_ok((ipo_size_t)new_cap, sizeof(font_record_t), NULL)) return false;
         font_record_t *new_db = (font_record_t *)krealloc(font_db, (size_t)new_cap * sizeof(font_record_t));
         if (!new_db) return false;
         font_db = new_db;
@@ -307,14 +305,17 @@ int vga_font_load_database(const char *path) {
         kfree(raw_buf);
     } else {
         vga_font_db_clear();
-        uint8_t rec[20];
-        for (uint32_t i = 0; i < count; i++) {
-            if (vga_font_file_read(fd, rec, 20u, 8u + i * 20u) != 20) break;
-            uint32_t cp;
-            memcpy(&cp, rec, sizeof(cp));
-            if (!vga_font_db_add(cp, rec + 4, 16u)) {
-                break;
+        uint8_t *rec = (uint8_t *)kmalloc(20u);
+        if (rec) {
+            for (uint32_t i = 0; i < count; i++) {
+                if (vga_font_file_read(fd, rec, 20u, 8u + i * 20u) != 20) break;
+                uint32_t cp;
+                memcpy(&cp, rec, sizeof(cp));
+                if (!vga_font_db_add(cp, rec + 4, 16u)) {
+                    break;
+                }
             }
+            kfree(rec);
         }
         vga_font_file_close(fd);
     }
@@ -355,7 +356,12 @@ int vga_font_load_database(const char *path) {
         }
         for (int i = 0; i < 256; i++) {
             if (!has_glyph[i]) {
-                memcpy(&all_glyphs[(size_t)i * 16u], vga_default_font_data[i], 16u);
+                const uint8_t *def_glyph = vga_default_font_get_glyph((uint8_t)i);
+                if (def_glyph) {
+                    memcpy(&all_glyphs[(size_t)i * 16u], def_glyph, 16u);
+                } else {
+                    memset(&all_glyphs[(size_t)i * 16u], 0, 16u);
+                }
             }
         }
         vga_load_font(0, 256u, all_glyphs);

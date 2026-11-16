@@ -8,9 +8,8 @@
 
 #define STORAGE_POOL_MAGIC               0x504F4F4C /* 'POOL' */
 
-/* Storage pool metadata occupies LBA 2030..2039, and extended members occupy 2040..2047
- * in the MBR gap before FS_START_LBA (2048).
- * The kernel image is loaded from LBA 1 and its sector count depends on the build. */
+/* Pool metadata lives in LBA 2030..2039 and extended members in 2040..2047
+ * (MBR gap before FS_START_LBA = 2048). Kernel image starts at LBA 1. */
 #define STORAGE_POOL_PRIMARY_SB_LBA      2030
 #define STORAGE_POOL_JOURNAL_LBA         2031
 #define STORAGE_POOL_JOURNAL_SECTORS     8
@@ -44,55 +43,51 @@ typedef enum {
     TX_STATE_FAILED
 } tx_state_t;
 
-/* Packed On-Disk Member Descriptor (48 bytes) */
+/* 48 B packed member descriptor */
 typedef struct __attribute__((packed)) {
-    uint8_t  uuid[16];                /* 16 bytes: Member UUID */
-    uint8_t  member_index;            /* 1 byte: Index in pool */
-    uint8_t  flags;                   /* 1 byte: Flags (0x01 = Online, 0x02 = Failed) */
-    char     bdev_name[14];           /* 14 bytes: e.g. "ata0", "ata1" */
-    uint64_t start_pool_lba;          /* 8 bytes: Start LBA offset in pool */
-    uint64_t capacity_sectors;        /* 8 bytes: Member capacity in sectors */
+    uint8_t  uuid[16];
+    uint8_t  member_index;
+    uint8_t  flags;                   /* 0x01 = Online, 0x02 = Failed */
+    char     bdev_name[14];           /* e.g. "ata0" */
+    uint64_t start_pool_lba;
+    uint64_t capacity_sectors;
 } storage_pool_raw_member_t;
 
-/* Packed On-Disk Extended Member Sector (512 bytes)
- * Stores up to 10 additional members beyond the 8 inline members in the primary superblock. */
+/* 512 B extended member sector (holds up to 10 members past the 8 inline superblock slots) */
 typedef struct __attribute__((packed)) {
-    uint32_t magic;                    /* 4 bytes: STORAGE_POOL_EXT_MAGIC */
-    uint32_t sector_index;             /* 4 bytes: 0, 1, ... */
-    uint32_t start_member_index;       /* 4 bytes: Starting index in pool (e.g. 8, 18...) */
-    uint32_t member_count;             /* 4 bytes: Number of members in this sector (<= 10) */
-    uint64_t next_lba;                 /* 8 bytes: Next sector LBA, or 0 if last */
-    uint32_t reserved;                 /* 4 bytes: Reserved padding */
-    storage_pool_raw_member_t members[10]; /* 10 * 48 = 480 bytes */
-    uint32_t crc32;                    /* 4 bytes at offset 508: CRC32 of bytes 0..507 */
+    uint32_t magic;
+    uint32_t sector_index;
+    uint32_t start_member_index;
+    uint32_t member_count;             /* <= 10 */
+    uint64_t next_lba;                 /* 0 if last */
+    uint32_t reserved;
+    storage_pool_raw_member_t members[10];
+    uint32_t crc32;                    /* CRC32 of bytes 0..507 */
 } storage_pool_ext_sector_t;
 
-/* Packed On-Disk Extended Superblock Header (52 bytes)
- * Fits in reserved[52] at offset 456 of the 512-byte raw superblock. */
+/* 52 B extended header stored in reserved[52] at offset 456 of the raw superblock */
 typedef struct __attribute__((packed)) {
-    uint32_t ext_magic;                /* 4 bytes: STORAGE_POOL_EXT_MAGIC (0x58544D42) */
-    uint32_t total_members;            /* 4 bytes: Total member count in pool */
-    uint32_t ext_lba;                  /* 4 bytes: First extended sector LBA (e.g. 2040) */
-    uint32_t ext_sectors;              /* 4 bytes: Total extended sectors count */
-    uint32_t backup_ext_lba;           /* 4 bytes: Backup extended sectors LBA (e.g. 2047) */
-    uint32_t reserved[8];              /* 32 bytes: Reserved */
+    uint32_t ext_magic;
+    uint32_t total_members;
+    uint32_t ext_lba;
+    uint32_t ext_sectors;
+    uint32_t backup_ext_lba;
+    uint32_t reserved[8];
 } storage_pool_ext_header_t;
 
-/* Dynamically allocated in-memory member descriptor. */
 typedef struct {
-    uint8_t  *uuid;                   /* Member UUID */
+    uint8_t  *uuid;
     size_t   uuid_len;
     size_t   uuid_cap;
-    uint8_t  member_index;            /* Index in pool */
-    uint8_t  flags;                   /* Flags (0x01 = Online, 0x02 = Failed) */
-    char     *bdev_name;              /* Dynamic device name, e.g. "ata0", "ata1" */
+    uint8_t  member_index;
+    uint8_t  flags;                   /* 0x01 = Online, 0x02 = Failed */
+    char     *bdev_name;
     size_t   bdev_name_len;
     size_t   bdev_name_cap;
-    uint64_t start_pool_lba;          /* Start LBA offset in pool */
-    uint64_t capacity_sectors;        /* Member capacity in sectors */
+    uint64_t start_pool_lba;
+    uint64_t capacity_sectors;
 } storage_pool_disk_member_t;
 
-/* Dynamic storage_pool_disk_member_t lifecycle methods */
 void storage_pool_disk_member_init(storage_pool_disk_member_t *m);
 void storage_pool_disk_member_free(storage_pool_disk_member_t *m);
 int  storage_pool_disk_member_set_uuid(storage_pool_disk_member_t *m, const uint8_t *uuid, size_t len);
@@ -101,22 +96,20 @@ int  storage_pool_disk_member_copy(storage_pool_disk_member_t *dst, const storag
 void storage_pool_disk_member_from_raw(storage_pool_disk_member_t *m, const storage_pool_raw_member_t *raw);
 void storage_pool_disk_member_to_raw(const storage_pool_disk_member_t *m, storage_pool_raw_member_t *raw);
 
-/* Packed 512-byte on-disk superblock. Member descriptors fit
- * between the header and the fixed recovery/reserved fields. */
+/* 512 B packed superblock; inline members fit before recovery/reserved tail */
 typedef struct __attribute__((packed)) {
-    uint32_t magic;                    /* 4 bytes: 0x504F4F4C */
-    uint8_t  pool_uuid[16];            /* 16 bytes: Pool UUID */
-    uint8_t  local_member_uuid[16];    /* 16 bytes: Local member UUID */
-    uint32_t member_index;             /* 4 bytes: Local member index */
-    uint32_t member_count;             /* 4 bytes: Configured members count */
-    uint64_t total_capacity_sectors;   /* 8 bytes: Total capacity of pool */
-    uint32_t chunk_size_sectors;       /* 4 bytes: Extent chunk size */
-    uint32_t generation;               /* 4 bytes: Generation counter */
-    uint32_t state;                    /* 4 bytes: storage_pool_state_t */
-    storage_pool_raw_member_t members[]; /* Inline descriptors fitting in the 512B sector */
+    uint32_t magic;
+    uint8_t  pool_uuid[16];
+    uint8_t  local_member_uuid[16];
+    uint32_t member_index;
+    uint32_t member_count;
+    uint64_t total_capacity_sectors;
+    uint32_t chunk_size_sectors;
+    uint32_t generation;
+    uint32_t state;                    /* storage_pool_state_t */
+    storage_pool_raw_member_t members[];
 } storage_pool_raw_sb_t;
 
-/* Dynamic in-memory descriptor; its serialized member count is format-limited. */
 typedef struct {
     uint32_t magic;
     uint8_t  *pool_uuid;
@@ -131,7 +124,7 @@ typedef struct {
     uint32_t chunk_size_sectors;
     uint32_t generation;
     uint32_t state;
-    storage_pool_disk_member_t *members; /* Heap-allocated member descriptors */
+    storage_pool_disk_member_t *members;
     size_t   members_count;
     size_t   members_cap;
     uint32_t recovery_count;
@@ -141,7 +134,6 @@ typedef struct {
     uint32_t crc32;
 } storage_pool_disk_sb_t;
 
-/* Dynamic storage_pool_disk_sb_t lifecycle methods */
 void storage_pool_disk_sb_init(storage_pool_disk_sb_t *sb);
 void storage_pool_disk_sb_free(storage_pool_disk_sb_t *sb);
 int  storage_pool_disk_sb_set_pool_uuid(storage_pool_disk_sb_t *sb, const uint8_t *uuid, size_t len);
@@ -151,18 +143,18 @@ int  storage_pool_disk_sb_add_member(storage_pool_disk_sb_t *sb, const storage_p
 void storage_pool_disk_sb_from_raw(storage_pool_disk_sb_t *sb, const storage_pool_raw_sb_t *raw);
 void storage_pool_disk_sb_to_raw(const storage_pool_disk_sb_t *sb, storage_pool_raw_sb_t *raw);
 
-/* Packed On-Disk 64-Byte Journal / WAL Entry (8 entries per 512-byte sector) */
+/* 64 B WAL entry (8 per 512 B sector) */
 typedef struct __attribute__((packed)) {
-    uint32_t magic;                    /* 4 bytes: 0x54584E4C ('TXNL') */
-    uint32_t tx_id;                    /* 4 bytes: Monotonic transaction ID */
-    uint16_t op;                       /* 2 bytes: tx_op_type_t */
-    uint16_t state;                    /* 2 bytes: tx_state_t */
-    uint64_t lba;                      /* 8 bytes: Pool LBA target */
-    uint32_t count;                    /* 4 bytes: Sector count */
-    uint32_t timestamp;                /* 4 bytes: Milliseconds tick */
-    uint32_t data_crc;                 /* 4 bytes: CRC32 of data written */
-    uint32_t entry_crc;                /* 4 bytes: CRC32 of first 32 bytes */
-    uint8_t  reserved[28];             /* 28 bytes: Padding */
+    uint32_t magic;                    /* 'TXNL' */
+    uint32_t tx_id;
+    uint16_t op;                       /* tx_op_type_t */
+    uint16_t state;                    /* tx_state_t */
+    uint64_t lba;
+    uint32_t count;
+    uint32_t timestamp;                /* ms tick */
+    uint32_t data_crc;
+    uint32_t entry_crc;                /* CRC32 of bytes 0..31 */
+    uint8_t  reserved[28];
 } storage_raw_disk_tx_entry_t;
 
 typedef struct {
@@ -261,6 +253,7 @@ uint32_t storage_pool_get_member_count(void);
 
 bool storage_pool_read(uint64_t pool_lba, uint16_t count, void *buf);
 bool storage_pool_write(uint64_t pool_lba, uint16_t count, const void *buf);
+bool storage_pool_write_raw(uint64_t pool_lba, uint16_t count, const void *buf);
 bool storage_pool_flush(void);
 
 int  storage_pool_add_device(block_device_t *bdev);
