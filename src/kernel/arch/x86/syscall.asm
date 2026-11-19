@@ -29,6 +29,7 @@ syscall_isr_entry:
     mov ds, ax
     mov es, ax
     mov fs, ax
+    mov ss, ax
     mov ax, 0x18
     mov gs, ax
 
@@ -60,6 +61,7 @@ page_fault_task_entry:
     mov ds, ax
     mov es, ax
     mov fs, ax
+    mov ss, ax
     mov ax, 0x18
     mov gs, ax
     mov ebp, esp        ; ebp points to hardware error_code
@@ -79,6 +81,7 @@ double_fault_task_entry:
     mov ds, ax
     mov es, ax
     mov fs, ax
+    mov ss, ax
     mov ax, 0x18
     mov gs, ax
     and esp, 0xFFFFFFF0
@@ -153,6 +156,7 @@ isr_common:
     mov ds, ax
     mov es, ax
     mov fs, ax
+    mov ss, ax
     mov ax, 0x18
     mov gs, ax
     mov ebp, esp
@@ -199,6 +203,7 @@ irq_common:
     mov ds, ax
     mov es, ax
     mov fs, ax
+    mov ss, ax
     mov ax, 0x18
     mov gs, ax
     mov eax, [esp + 44]
@@ -258,6 +263,10 @@ irq_stub_%1:
 [BITS 64]
 lm64_syscall_isr_entry:
     cld
+    push rax
+    mov ax, 0x10
+    mov ss, ax
+    pop rax
     jmp far dword [rel .sys_ptr32]
 align 4
 .sys_ptr32:
@@ -287,6 +296,7 @@ align 4
     mov ds, ax
     mov es, ax
     mov fs, ax
+    mov ss, ax
     mov ax, 0x18
     mov gs, ax
 
@@ -312,6 +322,10 @@ global lm64_page_fault_entry
 lm64_page_fault_entry:
     cli
     cld
+    push rax
+    mov ax, 0x10
+    mov ss, ax
+    pop rax
     jmp far dword [rel .pf_ptr32]
 align 4
 .pf_ptr32:
@@ -334,6 +348,7 @@ align 4
     mov ds, ax
     mov es, ax
     mov fs, ax
+    mov ss, ax
     mov ax, 0x18
     mov gs, ax
     lea ebx, [esp + 44]         ; [error_code (8B), iret_frame (40B)]
@@ -367,6 +382,10 @@ global lm64_double_fault_entry
 lm64_double_fault_entry:
     cli
     cld
+    push rax
+    mov ax, 0x10
+    mov ss, ax
+    pop rax
     jmp far dword [rel .df_ptr32]
 align 4
 .df_ptr32:
@@ -426,6 +445,10 @@ LM64_ISR_NOERR 31
 [BITS 64]
 lm64_isr_common:
     cld
+    push rax
+    mov ax, 0x10
+    mov ss, ax
+    pop rax
     jmp far dword [rel .isr_ptr32]
 align 4
 .isr_ptr32:
@@ -448,6 +471,7 @@ align 4
     mov ds, ax
     mov es, ax
     mov fs, ax
+    mov ss, ax
     mov ax, 0x18
     mov gs, ax
     mov ebp, esp
@@ -488,6 +512,10 @@ align 4
 [BITS 64]
 lm64_irq_common:
     cld
+    push rax
+    mov ax, 0x10
+    mov ss, ax
+    pop rax
     jmp far dword [rel .irq_ptr32]
 align 4
 .irq_ptr32:
@@ -510,6 +538,7 @@ align 4
     mov ds, ax
     mov es, ax
     mov fs, ax
+    mov ss, ax
     mov ax, 0x18
     mov gs, ax
     mov eax, [esp + 44]
